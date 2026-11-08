@@ -102,12 +102,14 @@ pub fn serve(listener: TcpListener, mumps: MumpsMode) -> io::Result<()> {
 /// only as the test hook behind [`serve`].
 ///
 /// Each connection is handled on its own thread, so an idle browser
-/// connection never blocks another. Once the flag is set, or `accept` fails
-/// in a way no retry mends, every connection still open is shut down, which
-/// wakes a thread waiting to read or write, and every connection thread is
-/// joined before this returns: none runs on afterwards, and a request still
-/// being answered gets no response. Such an `accept` failure is the error
-/// returned, naming that stage.
+/// connection never blocks another. Serving fails when `accept` fails in a
+/// way no retry mends, or when a connection cannot be given its own thread
+/// or configured; that connection is closed without a response. Once the
+/// flag is set, or serving fails, every connection still open is shut down,
+/// which wakes a thread waiting to read or write, and every connection
+/// thread is joined before this returns: none runs on afterwards, and a
+/// request still being answered gets no response. The first failure is the
+/// error returned, keeping its kind and naming its stage.
 pub fn serve_until(
     listener: TcpListener,
     store: Store,
@@ -117,7 +119,7 @@ pub fn serve_until(
     listener.set_nonblocking(true)?;
     let store = Arc::new(store);
     let mumps = Arc::new(mumps);
-    let mut workers: Vec<(JoinHandle<()>, TcpStream)> = Vec::new();
+    let mut workers: Vec<(JoinHandle<io::Result<()>>, TcpStream)> = Vec::new();
     let served = accept_until(&listener, &store, &mumps, &shutdown, &mut workers);
     let stopped = stop_workers(workers);
     served.and(stopped)
@@ -126,26 +128,25 @@ pub fn serve_until(
 /// The accept loop of [`serve_until`]. It polls `shutdown` about every
 /// [`POLL`], starts one worker per connection, and joins the workers that
 /// have finished, so that `workers` holds only open connections. `Ok` once
-/// the flag is set; `Err` when `accept` fails in a way no retry mends.
+/// the flag is set. `Err` when `accept` fails in a way no retry mends, when
+/// a connection cannot be given its worker, or with the first failure of
+/// the finished workers, once all of them are joined; the workers still
+/// open stay in `workers`.
 fn accept_until(
     listener: &TcpListener,
     store: &Arc<Store>,
     mumps: &Arc<MumpsMode>,
     shutdown: &AtomicBool,
-    workers: &mut Vec<(JoinHandle<()>, TcpStream)>,
+    workers: &mut Vec<(JoinHandle<io::Result<()>>, TcpStream)>,
 ) -> io::Result<()> {
     while !shutdown.load(Ordering::SeqCst) {
+        let mut joined = Ok(());
         for (finished, _) in workers.extract_if(.., |(handle, _)| handle.is_finished()) {
-            // A worker that panicked has already been reported by the panic
-            // hook, and its connection closed with it.
-            let _ = finished.join();
+            joined = joined.and(join_worker(finished));
         }
+        joined?;
         match listener.accept() {
-            Ok((stream, _)) => {
-                if let Some(worker) = start_worker(stream, store, mumps) {
-                    workers.push(worker);
-                }
-            }
+            Ok((stream, _)) => workers.push(start_worker(stream, store, mumps)?),
             Err(e) => {
                 let delay = accept_retry_delay(e)?;
                 if !delay.is_zero() {
@@ -191,40 +192,53 @@ fn accept_retry_delay(e: io::Error) -> io::Result<Duration> {
 
 /// Starts the thread that answers `stream`, and returns it with a clone of
 /// the socket, which [`stop_workers`] uses to wake it. When the clone or the
-/// thread cannot be had, the client is answered 503 on the socket still
-/// held, and there is no worker.
+/// thread cannot be had, there is no worker: the connection is closed
+/// without a response, and the failure is returned, naming that stage.
 fn start_worker(
-    mut stream: TcpStream,
+    stream: TcpStream,
     store: &Arc<Store>,
     mumps: &Arc<MumpsMode>,
-) -> Option<(JoinHandle<()>, TcpStream)> {
-    let mut control = match stream.try_clone() {
-        Ok(control) => control,
-        Err(e) => {
-            refuse(&mut stream, "CONNECTION NOT HANDLED", &e);
-            return None;
-        }
-    };
+) -> io::Result<(JoinHandle<io::Result<()>>, TcpStream)> {
+    let control = stream
+        .try_clone()
+        .map_err(|e| abandon(&stream, "handling a connection", e))?;
     let store = Arc::clone(store);
     let mumps = Arc::clone(mumps);
     let spawned = thread::Builder::new()
         .name("bridge-connection".to_string())
         .spawn(move || handle_connection(stream, &store, &mumps));
     match spawned {
-        Ok(handle) => Some((handle, control)),
+        Ok(handle) => Ok((handle, control)),
         // The failed spawn has dropped `stream`; the clone still holds the
         // socket.
-        Err(e) => {
-            refuse(&mut control, "CONNECTION NOT HANDLED", &e);
-            None
-        }
+        Err(e) => Err(abandon(&control, "handling a connection", e)),
     }
 }
 
+/// Closes a connection the bridge cannot serve, writing nothing to it: each
+/// response status names an outcome of a request, and none names a failure
+/// of the bridge's own resources, so the client sees a closed connection.
+/// Returns the error that ends serving, which keeps `cause`'s kind and
+/// names `stage`.
+fn abandon(stream: &TcpStream, stage: &str, cause: io::Error) -> io::Error {
+    // `NotConnected`, a peer that has already reset the connection, is the
+    // only way this fails, and leaves nothing to close.
+    let _ = stream.shutdown(Shutdown::Both);
+    io::Error::new(cause.kind(), format!("{stage} failed: {cause}"))
+}
+
+/// Joins a connection thread and gives the failure it returned. A thread
+/// that panicked has already been reported by the panic hook, and its
+/// connection closed with it, so it adds no failure.
+fn join_worker(handle: JoinHandle<io::Result<()>>) -> io::Result<()> {
+    handle.join().unwrap_or(Ok(()))
+}
+
 /// Shuts down every connection of `workers`, which wakes a thread waiting
-/// to read from or write to it, then joins every thread. A shutdown failure
-/// other than `NotConnected` is returned once every thread is joined.
-fn stop_workers(workers: Vec<(JoinHandle<()>, TcpStream)>) -> io::Result<()> {
+/// to read from or write to it, then joins every thread. Once every thread
+/// is joined, the first failure is returned: a shutdown failure other than
+/// `NotConnected`, otherwise a worker's own, in the order of `workers`.
+fn stop_workers(workers: Vec<(JoinHandle<io::Result<()>>, TcpStream)>) -> io::Result<()> {
     let mut failure: Option<io::Error> = None;
     for (_, socket) in &workers {
         match socket.shutdown(Shutdown::Both) {
@@ -242,59 +256,50 @@ fn stop_workers(workers: Vec<(JoinHandle<()>, TcpStream)>) -> io::Result<()> {
             }
         }
     }
+    let mut stopped = failure.map_or(Ok(()), Err);
     for (handle, _) in workers {
-        // A worker that panicked has already been reported by the panic
-        // hook, and its connection closed with it.
-        let _ = handle.join();
+        stopped = stopped.and(join_worker(handle));
     }
-    failure.map_or(Ok(()), Err)
-}
-
-/// Answers 503 `{"error": "<stage>: <OS error text>"}` on a connection the
-/// bridge cannot serve, then ends its write side. Best effort, and bounded
-/// by [`POLL`] so that the accept loop, which calls this too, never stalls:
-/// a client that cannot be told is closed all the same, because the bridge
-/// writes HTTP responses only and has no other place to report it.
-fn refuse(stream: &mut TcpStream, stage: &str, cause: &io::Error) {
-    let response = error_response(503, &format!("{stage}: {cause}"));
-    if stream.set_write_timeout(Some(POLL)).is_ok() && write_response(stream, &response).is_ok() {
-        drain(stream, POLL);
-    }
+    stopped
 }
 
 /// Reads one request from `stream`, answers it and closes the connection.
 /// Every exit shuts the socket down: [`serve_until`] holds a clone of it
 /// until it joins this thread, so dropping `stream` alone would not close
-/// the connection.
-fn handle_connection(mut stream: TcpStream, store: &Store, mumps: &MumpsMode) {
-    exchange(&mut stream, store, mumps);
+/// the connection. The result is that of [`exchange`].
+fn handle_connection(mut stream: TcpStream, store: &Store, mumps: &MumpsMode) -> io::Result<()> {
+    let exchanged = exchange(&mut stream, store, mumps);
     // `NotConnected`, a peer that has already reset the connection, is the
     // only way this fails, and leaves nothing to close.
     let _ = stream.shutdown(Shutdown::Both);
+    exchanged
 }
 
-/// The one request and response of [`handle_connection`].
-fn exchange(stream: &mut TcpStream, store: &Store, mumps: &MumpsMode) {
+/// The one request and response of [`handle_connection`]. A connection that
+/// cannot be made blocking with [`IO_TIMEOUT`] for reads and writes is
+/// closed without a response, and that failure is returned, naming the
+/// stage. Every other outcome is `Ok`.
+fn exchange(stream: &mut TcpStream, store: &Store, mumps: &MumpsMode) -> io::Result<()> {
     let configured = stream
         .set_nonblocking(false)
         .and_then(|()| stream.set_read_timeout(Some(IO_TIMEOUT)))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)));
     if let Err(e) = configured {
-        refuse(stream, "CONNECTION NOT CONFIGURED", &e);
-        return;
+        return Err(abandon(stream, "configuring a connection", e));
     }
     let response = match read_request(stream) {
         Ok(Some(request)) => route(&request, store, mumps),
         // The peer closed before sending anything: there is no one to answer.
-        Ok(None) => return,
+        Ok(None) => return Ok(()),
         Err(cause) => error_response(400, &cause),
     };
-    // A response that cannot be written leaves no usable socket, and the
-    // bridge writes HTTP responses only, so the failure has nowhere to go:
-    // the connection is shut down by `handle_connection`.
+    // A response that cannot be written means the client has gone, or has
+    // not read it within `IO_TIMEOUT`: an outcome of that client, which ends
+    // only this connection, shut down by `handle_connection`.
     if write_response(stream, &response).is_ok() {
         drain(stream, DRAIN_TIME);
     }
+    Ok(())
 }
 
 /// Ends the write side, then discards what the client still sends, for at
@@ -485,7 +490,6 @@ fn reason_phrase(status: u16) -> &'static str {
         422 => "Unprocessable Content",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
-        503 => "Service Unavailable",
         _ => "Status",
     }
 }
@@ -1142,14 +1146,23 @@ fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<MumpsSi
     Ok((transcript, None, Vec::new()))
 }
 
-/// The parsed meta file of the first capture directory that has one. With
-/// none present, the error names where the first would be.
+/// The parsed meta file of the first capture directory that has one. A case
+/// with no meta file is skipped, and so is a case entry that is not a
+/// directory, which can hold none. A meta file that cannot be read for any
+/// other reason, is not UTF-8 or does not parse gives `MALFORMED META`
+/// naming it, never a skip. With none present, the error names where the
+/// first would be.
 fn live_meta(golden_dir: &Path) -> Result<Meta, String> {
     for case in CASE_DIRS {
-        let path = golden_dir.join(case).join(META_FILE);
+        let dir = golden_dir.join(case);
+        let path = dir.join(META_FILE);
         let malformed = || format!("MALFORMED META {}", path.display());
         match read_capture_file(&path) {
             Err(CAPTURE_MISSING) => {}
+            // Opening a file below a case entry that is not a directory
+            // fails without the file being missing. Only an entry known
+            // not to be a directory is skipped; a failed check fails closed.
+            Err(CAPTURE_UNREADABLE) if fs::metadata(&dir).is_ok_and(|entry| !entry.is_dir()) => {}
             Ok(text) => return parse_meta(&text).map_err(|_| malformed()),
             // CAPTURE_UNREADABLE or CAPTURE_NON_UTF8.
             Err(_) => return Err(malformed()),
@@ -1629,6 +1642,8 @@ fn supervise(
 /// its limit, `timeout` passes since `started`, or the child cannot be
 /// waited on, which is recorded in `failures`. Gives the exit status seen,
 /// whether the run timed out and whether standard output passed its limit.
+/// A poll that finds the limit passed once `timeout` has passed too reports
+/// both, so [`decide_live_result`] gives the timeout precedence.
 fn watch(
     try_wait: &mut dyn FnMut() -> io::Result<Option<ExitStatus>>,
     workers: &[JoinHandle<PipeOutcome>],
@@ -1649,7 +1664,7 @@ fn watch(
             }
         }
         if exceeded.load(Ordering::SeqCst) {
-            return (status, false, true);
+            return (status, started.elapsed() >= timeout, true);
         }
         if status.is_some() && readers_finished(workers) {
             return (status, false, false);
@@ -2627,6 +2642,45 @@ mod tests {
         assert_eq!(failures, ["WAIT FAILED: injected try_wait"]);
     }
 
+    #[test]
+    fn watch_reports_deadline_and_limit_seen_together() {
+        type Watched = (Option<ExitStatus>, bool, bool);
+        let cases: [(Duration, Watched, LiveFailure); 2] = [
+            (Duration::ZERO, (None, true, true), LiveFailure::Timeout),
+            (
+                Duration::from_secs(3600),
+                (None, false, true),
+                LiveFailure::OutputTooLarge,
+            ),
+        ];
+        for (timeout, expected, failure) in cases {
+            let mut failures = Vec::new();
+            let watched = watch(
+                &mut || Ok(None),
+                &[],
+                &AtomicBool::new(true),
+                timeout,
+                Instant::now(),
+                &mut failures,
+            );
+            assert_eq!(watched, expected, "timeout {timeout:?}");
+            assert!(failures.is_empty(), "timeout {timeout:?}: {failures:?}");
+            let (status, timed_out, output_limit_exceeded) = watched;
+            let result = exec_result(
+                status,
+                timed_out,
+                output_limit_exceeded,
+                failures,
+                Vec::new(),
+            );
+            assert_eq!(
+                decide_live_result(&result),
+                Err(failure),
+                "timeout {timeout:?}"
+            );
+        }
+    }
+
     /// Starts `sleep 5` on the child ends of fresh [`stream_pairs`], giving
     /// the child, the parent's ends and a copy of each child end, which
     /// stands for a descendant holding the child's streams open, reading
@@ -3149,6 +3203,65 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
     }
 
     #[test]
+    fn live_meta_skips_case_entries_that_are_not_directories() -> Result<(), String> {
+        let (first, second) = match (CASE_DIRS.first(), CASE_DIRS.get(1)) {
+            (Some(first), Some(second)) => (*first, *second),
+            _ => return Err("fewer than two capture directories".to_string()),
+        };
+        let root = std::env::temp_dir().join(format!(
+            "ifcap-po-inquiry-unit-live-meta-{}",
+            std::process::id()
+        ));
+        let live = |golden_dir: &Path| MumpsMode::Live {
+            container: "unit-test-never-run".to_string(),
+            golden_dir: golden_dir.to_path_buf(),
+        };
+        // Each layout's second case holds a well-formed meta file whose DUZ
+        // differs, so reaching it gives a DUZ mismatch before anything runs.
+        let meta = META_TEXT.replacen(r#""DUZ":".5""#, r#""DUZ":".6""#, 1);
+        let case_file = root.join("case-file");
+        let meta_dir = root.join("meta-dir");
+        let root_file = root.join("root-file");
+        let malformed = |dir: &Path| {
+            format!(
+                "MALFORMED META {}",
+                dir.join(first).join(META_FILE).display()
+            )
+        };
+        // Every layout is built and run before any assertion, so the
+        // directory is removed whatever the results.
+        let built = (|| -> io::Result<()> {
+            for dir in [&case_file, &meta_dir] {
+                fs::create_dir_all(dir.join(second))?;
+                fs::write(dir.join(second).join(META_FILE), &meta)?;
+            }
+            // The first case is a regular file, which holds no meta file.
+            fs::write(case_file.join(first), "not a directory")?;
+            // The first case is a directory whose meta file is a directory.
+            fs::create_dir_all(meta_dir.join(first).join(META_FILE))?;
+            // The capture root itself is a regular file.
+            fs::write(&root_file, "not a directory")
+        })();
+        let outcomes = built.map(|()| {
+            [
+                (
+                    run_mumps(&live(&case_file), &[]),
+                    "CONTEXT MISMATCH DUZ: expected .5, actual .6".to_string(),
+                ),
+                (run_mumps(&live(&meta_dir), &[]), malformed(&meta_dir)),
+                (run_mumps(&live(&root_file), &[]), malformed(&root_file)),
+            ]
+        });
+        let removed = fs::remove_dir_all(&root);
+        let outcomes = outcomes.map_err(|e| format!("building the layouts: {e}"))?;
+        removed.map_err(|e| format!("removing the layouts: {e}"))?;
+        for (outcome, expected) in outcomes {
+            assert_eq!(outcome, Err(expected));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn accept_errors_retried_or_returned() -> Result<(), String> {
         let retried = [
             (io::Error::from(io::ErrorKind::WouldBlock), POLL),
@@ -3187,7 +3300,7 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
     }
 
     #[test]
-    fn refused_connection_answered_503_then_closed() -> Result<(), String> {
+    fn abandoned_connection_closed_without_response() -> Result<(), String> {
         let fail = |what: &str, e: io::Error| format!("{what}: {e}");
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| fail("bind", e))?;
         let addr = listener.local_addr().map_err(|e| fail("local_addr", e))?;
@@ -3195,22 +3308,112 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         client
             .set_read_timeout(Some(IO_TIMEOUT))
             .map_err(|e| fail("set read timeout", e))?;
-        let (mut accepted, _) = listener.accept().map_err(|e| fail("accept", e))?;
+        let (accepted, _) = listener.accept().map_err(|e| fail("accept", e))?;
         // EAGAIN, as a thread that cannot be created reports it.
         let cause = io::Error::from_raw_os_error(11);
-        refuse(&mut accepted, "CONNECTION NOT HANDLED", &cause);
-        drop(accepted);
+        let (kind, text) = (cause.kind(), cause.to_string());
+        let returned = abandon(&accepted, "handling a connection", cause);
+        // `accepted` is still open, so only the shutdown can end the stream.
         let mut received = Vec::new();
-        client
-            .read_to_end(&mut received)
-            .map_err(|e| fail("read to the close", e))?;
-        let body = format!("{{\"error\":\"CONNECTION NOT HANDLED: {cause}\"}}");
-        let expected = format!(
-            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: {JSON_TYPE}\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
+        let read = client.read_to_end(&mut received);
+        drop(accepted);
+        read.map_err(|e| fail("read to the close", e))?;
+        assert_eq!(String::from_utf8_lossy(&received), "", "no response");
+        assert_eq!(returned.kind(), kind, "kind kept");
+        assert_eq!(
+            returned.to_string(),
+            format!("handling a connection failed: {text}")
         );
-        assert_eq!(String::from_utf8_lossy(&received), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_failures_returned_once_every_worker_is_joined() -> Result<(), String> {
+        /// Waits up to `IO_TIMEOUT` for `release`. When it never comes, sets
+        /// `shutdown`, so that an accept loop still serving ends.
+        fn await_release(release: &AtomicBool, shutdown: &AtomicBool) {
+            let started = Instant::now();
+            while !release.load(Ordering::SeqCst) {
+                if started.elapsed() >= IO_TIMEOUT {
+                    shutdown.store(true, Ordering::SeqCst);
+                    return;
+                }
+                thread::sleep(POLL);
+            }
+        }
+        let fail = |what: &str, e: io::Error| format!("{what}: {e}");
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| fail("bind", e))?;
+        let addr = listener.local_addr().map_err(|e| fail("local_addr", e))?;
+        // Each worker's control socket is the accepted end of a connection
+        // whose client stays open until the end.
+        let mut clients = Vec::new();
+        let mut accept_one = || -> Result<TcpStream, String> {
+            clients.push(TcpStream::connect(addr).map_err(|e| fail("connect", e))?);
+            let (accepted, _) = listener.accept().map_err(|e| fail("accept", e))?;
+            Ok(accepted)
+        };
+        let sockets = (accept_one()?, accept_one()?, accept_one()?);
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| fail("set nonblocking", e))?;
+        let finished = thread::spawn(|| -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "first"))
+        });
+        let started = Instant::now();
+        while !finished.is_finished() {
+            if started.elapsed() >= IO_TIMEOUT {
+                return Err("the failing worker never finished".to_string());
+            }
+            thread::sleep(POLL);
+        }
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let last_joined = Arc::new(AtomicBool::new(false));
+        let second = {
+            let (release, shutdown) = (Arc::clone(&release), Arc::clone(&shutdown));
+            thread::spawn(move || -> io::Result<()> {
+                await_release(&release, &shutdown);
+                Err(io::Error::new(io::ErrorKind::InvalidData, "second"))
+            })
+        };
+        let third = {
+            let (release, shutdown) = (Arc::clone(&release), Arc::clone(&shutdown));
+            let last_joined = Arc::clone(&last_joined);
+            thread::spawn(move || -> io::Result<()> {
+                await_release(&release, &shutdown);
+                thread::sleep(POLL * 5);
+                last_joined.store(true, Ordering::SeqCst);
+                Err(io::Error::new(io::ErrorKind::TimedOut, "third"))
+            })
+        };
+        let mut workers = vec![
+            (finished, sockets.0),
+            (second, sockets.1),
+            (third, sockets.2),
+        ];
+        let store = Arc::new(Store::from_zwr("").map_err(|e| e.to_string())?);
+        let mumps = Arc::new(MumpsMode::Replay {
+            golden_dir: PathBuf::new(),
+        });
+        let served = accept_until(&listener, &store, &mumps, &shutdown, &mut workers);
+        let still_open = workers.len();
+        release.store(true, Ordering::SeqCst);
+        let stopped = stop_workers(workers);
+        let described = |result: io::Result<()>| result.map_err(|e| (e.kind(), e.to_string()));
+        assert_eq!(
+            described(served),
+            Err((io::ErrorKind::PermissionDenied, "first".to_string())),
+            "the finished worker's failure ends the accept loop"
+        );
+        assert!(!shutdown.load(Ordering::SeqCst), "ended before the guard");
+        assert_eq!(still_open, 2, "the open workers are left to stop_workers");
+        assert_eq!(
+            described(stopped),
+            Err((io::ErrorKind::InvalidData, "second".to_string())),
+            "the first open worker's failure wins"
+        );
+        assert!(last_joined.load(Ordering::SeqCst), "every worker joined");
+        drop(clients);
         Ok(())
     }
 }
