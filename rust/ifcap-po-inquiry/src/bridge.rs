@@ -97,12 +97,16 @@ pub fn serve(listener: TcpListener, mumps: MumpsMode) -> io::Result<()> {
     serve_until(listener, store, mumps, Arc::new(AtomicBool::new(false)))
 }
 
-/// Serves `listener` until `shutdown` is set, then returns `Ok(())` within
-/// about one poll interval. Public only as the test hook behind [`serve`].
+/// Serves `listener` until `shutdown` is set, then returns `Ok(())`. Public
+/// only as the test hook behind [`serve`].
 ///
 /// Each connection is handled on its own thread, so an idle browser
-/// connection never blocks another. Connection threads still running when
-/// this returns finish their one request and end on their own.
+/// connection never blocks another. Once the flag is set, or `accept` fails
+/// in a way no retry mends, every connection still open is shut down, which
+/// wakes a thread waiting to read or write, and every connection thread is
+/// joined before this returns: none runs on afterwards, and a request still
+/// being answered gets no response. Such an `accept` failure is the error
+/// returned, naming that stage.
 pub fn serve_until(
     listener: TcpListener,
     store: Store,
@@ -112,60 +116,196 @@ pub fn serve_until(
     listener.set_nonblocking(true)?;
     let store = Arc::new(store);
     let mumps = Arc::new(mumps);
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            return Ok(());
+    let mut workers: Vec<(JoinHandle<()>, TcpStream)> = Vec::new();
+    let served = accept_until(&listener, &store, &mumps, &shutdown, &mut workers);
+    let stopped = stop_workers(workers);
+    served.and(stopped)
+}
+
+/// The accept loop of [`serve_until`]. It polls `shutdown` about every
+/// [`POLL`], starts one worker per connection, and joins the workers that
+/// have finished, so that `workers` holds only open connections. `Ok` once
+/// the flag is set; `Err` when `accept` fails in a way no retry mends.
+fn accept_until(
+    listener: &TcpListener,
+    store: &Arc<Store>,
+    mumps: &Arc<MumpsMode>,
+    shutdown: &AtomicBool,
+    workers: &mut Vec<(JoinHandle<()>, TcpStream)>,
+) -> io::Result<()> {
+    while !shutdown.load(Ordering::SeqCst) {
+        for (finished, _) in workers.extract_if(.., |(handle, _)| handle.is_finished()) {
+            // A worker that panicked has already been reported by the panic
+            // hook, and its connection closed with it.
+            let _ = finished.join();
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                let store = Arc::clone(&store);
-                let mumps = Arc::clone(&mumps);
-                // A thread that cannot be created drops the connection; the
-                // server keeps running.
-                let _ = thread::Builder::new()
-                    .name("bridge-connection".to_string())
-                    .spawn(move || handle_connection(stream, &store, &mumps));
+                if let Some(worker) = start_worker(stream, store, mumps) {
+                    workers.push(worker);
+                }
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            // WouldBlock means no pending connection; any other accept error
-            // (a reset peer, a full descriptor table) is retried the same way.
-            Err(_) => thread::sleep(POLL),
+            Err(e) => {
+                let delay = accept_retry_delay(e)?;
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Linux `errno` values with no `io::ErrorKind` of their own that `accept`
+/// reports for one pending connection that failed before it was taken, the
+/// listener staying sound (accept(2), "Error handling"): ENONET, EPROTO,
+/// ENOPROTOOPT, EOPNOTSUPP and EHOSTDOWN.
+const PENDING_CONNECTION_ERRNOS: [i32; 5] = [64, 71, 92, 95, 112];
+
+/// How long the accept loop waits after `accept` failed with `e` before it
+/// tries again: [`POLL`] when no connection is pending, and no time when one
+/// pending connection failed but the listener is sound. Any other failure
+/// ends serving, with an error that keeps `e`'s kind and names the stage.
+fn accept_retry_delay(e: io::Error) -> io::Result<Duration> {
+    match e.kind() {
+        io::ErrorKind::WouldBlock => return Ok(POLL),
+        io::ErrorKind::Interrupted
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::NetworkDown
+        | io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::HostUnreachable => return Ok(Duration::ZERO),
+        _ => {}
+    }
+    if e.raw_os_error()
+        .is_some_and(|code| PENDING_CONNECTION_ERRNOS.contains(&code))
+    {
+        return Ok(Duration::ZERO);
+    }
+    Err(io::Error::new(
+        e.kind(),
+        format!("accepting a connection failed: {e}"),
+    ))
+}
+
+/// Starts the thread that answers `stream`, and returns it with a clone of
+/// the socket, which [`stop_workers`] uses to wake it. When the clone or the
+/// thread cannot be had, the client is answered 503 on the socket still
+/// held, and there is no worker.
+fn start_worker(
+    mut stream: TcpStream,
+    store: &Arc<Store>,
+    mumps: &Arc<MumpsMode>,
+) -> Option<(JoinHandle<()>, TcpStream)> {
+    let mut control = match stream.try_clone() {
+        Ok(control) => control,
+        Err(e) => {
+            refuse(&mut stream, "CONNECTION NOT HANDLED", &e);
+            return None;
+        }
+    };
+    let store = Arc::clone(store);
+    let mumps = Arc::clone(mumps);
+    let spawned = thread::Builder::new()
+        .name("bridge-connection".to_string())
+        .spawn(move || handle_connection(stream, &store, &mumps));
+    match spawned {
+        Ok(handle) => Some((handle, control)),
+        // The failed spawn has dropped `stream`; the clone still holds the
+        // socket.
+        Err(e) => {
+            refuse(&mut control, "CONNECTION NOT HANDLED", &e);
+            None
         }
     }
 }
 
+/// Shuts down every connection of `workers`, which wakes a thread waiting
+/// to read from or write to it, then joins every thread. A shutdown failure
+/// other than `NotConnected` is returned once every thread is joined.
+fn stop_workers(workers: Vec<(JoinHandle<()>, TcpStream)>) -> io::Result<()> {
+    let mut failure: Option<io::Error> = None;
+    for (_, socket) in &workers {
+        match socket.shutdown(Shutdown::Both) {
+            Ok(()) => {}
+            // The peer has already reset the connection: nothing is left to
+            // wake.
+            Err(e) if e.kind() == io::ErrorKind::NotConnected => {}
+            Err(e) => {
+                if failure.is_none() {
+                    failure = Some(io::Error::new(
+                        e.kind(),
+                        format!("closing a connection at shutdown failed: {e}"),
+                    ));
+                }
+            }
+        }
+    }
+    for (handle, _) in workers {
+        // A worker that panicked has already been reported by the panic
+        // hook, and its connection closed with it.
+        let _ = handle.join();
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+/// Answers 503 `{"error": "<stage>: <OS error text>"}` on a connection the
+/// bridge cannot serve, then ends its write side. Best effort, and bounded
+/// by [`POLL`] so that the accept loop, which calls this too, never stalls:
+/// a client that cannot be told is closed all the same, because the bridge
+/// writes HTTP responses only and has no other place to report it.
+fn refuse(stream: &mut TcpStream, stage: &str, cause: &io::Error) {
+    let response = error_response(503, &format!("{stage}: {cause}"));
+    if stream.set_write_timeout(Some(POLL)).is_ok() && write_response(stream, &response).is_ok() {
+        drain(stream, POLL);
+    }
+}
+
 /// Reads one request from `stream`, answers it and closes the connection.
+/// Every exit shuts the socket down: [`serve_until`] holds a clone of it
+/// until it joins this thread, so dropping `stream` alone would not close
+/// the connection.
 fn handle_connection(mut stream: TcpStream, store: &Store, mumps: &MumpsMode) {
+    exchange(&mut stream, store, mumps);
+    // `NotConnected`, a peer that has already reset the connection, is the
+    // only way this fails, and leaves nothing to close.
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+/// The one request and response of [`handle_connection`].
+fn exchange(stream: &mut TcpStream, store: &Store, mumps: &MumpsMode) {
     let configured = stream
         .set_nonblocking(false)
         .and_then(|()| stream.set_read_timeout(Some(IO_TIMEOUT)))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)));
-    if configured.is_err() {
+    if let Err(e) = configured {
+        refuse(stream, "CONNECTION NOT CONFIGURED", &e);
         return;
     }
-    let response = match read_request(&mut stream) {
+    let response = match read_request(stream) {
         Ok(Some(request)) => route(&request, store, mumps),
         // The peer closed before sending anything: there is no one to answer.
         Ok(None) => return,
         Err(cause) => error_response(400, &cause),
     };
-    if write_response(&mut stream, &response).is_ok() {
-        drain(&mut stream);
+    // A response that cannot be written leaves no usable socket, and the
+    // bridge writes HTTP responses only, so the failure has nowhere to go:
+    // the connection is shut down by `handle_connection`.
+    if write_response(stream, &response).is_ok() {
+        drain(stream, DRAIN_TIME);
     }
 }
 
-/// Ends the write side, then discards what the client still sends, bounded
-/// in time and bytes, so the close is orderly.
-fn drain(stream: &mut TcpStream) {
-    if stream.shutdown(Shutdown::Write).is_err()
-        || stream.set_read_timeout(Some(DRAIN_TIME)).is_err()
-    {
+/// Ends the write side, then discards what the client still sends, for at
+/// most `limit` and [`DRAIN_BYTES`], so the close is orderly.
+fn drain(stream: &mut TcpStream, limit: Duration) {
+    if stream.shutdown(Shutdown::Write).is_err() || stream.set_read_timeout(Some(limit)).is_err() {
         return;
     }
     let started = Instant::now();
     let mut discarded = 0usize;
     let mut buf = [0u8; 8192];
-    while started.elapsed() < DRAIN_TIME && discarded < DRAIN_BYTES {
+    while started.elapsed() < limit && discarded < DRAIN_BYTES {
         match stream.read(&mut buf) {
             Ok(0) | Err(_) => return,
             Ok(n) => discarded = discarded.saturating_add(n),
@@ -344,6 +484,7 @@ fn reason_phrase(status: u16) -> &'static str {
         422 => "Unprocessable Content",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
         _ => "Status",
     }
 }
@@ -2195,5 +2336,71 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             run_mumps(&live, &[]),
             Err(format!("MALFORMED META {}", expected.display()))
         );
+    }
+
+    #[test]
+    fn accept_errors_retried_or_returned() -> Result<(), String> {
+        let retried = [
+            (io::Error::from(io::ErrorKind::WouldBlock), POLL),
+            (io::Error::from(io::ErrorKind::Interrupted), Duration::ZERO),
+            (
+                io::Error::from(io::ErrorKind::ConnectionAborted),
+                Duration::ZERO,
+            ),
+            // EPROTO: one pending connection failed a protocol check.
+            (io::Error::from_raw_os_error(71), Duration::ZERO),
+        ];
+        for (error, expected) in retried {
+            let kind = error.kind();
+            let delay =
+                accept_retry_delay(error).map_err(|e| format!("{kind:?} not retried: {e}"))?;
+            assert_eq!(delay, expected, "retry delay after {kind:?}");
+        }
+        // EMFILE, a full descriptor table, and a refused permission.
+        let unexpected = [
+            io::Error::from_raw_os_error(24),
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        ];
+        for error in unexpected {
+            let kind = error.kind();
+            let text = error.to_string();
+            let Err(returned) = accept_retry_delay(error) else {
+                return Err(format!("{kind:?} was retried"));
+            };
+            assert_eq!(returned.kind(), kind, "kind kept");
+            assert_eq!(
+                returned.to_string(),
+                format!("accepting a connection failed: {text}")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn refused_connection_answered_503_then_closed() -> Result<(), String> {
+        let fail = |what: &str, e: io::Error| format!("{what}: {e}");
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| fail("bind", e))?;
+        let addr = listener.local_addr().map_err(|e| fail("local_addr", e))?;
+        let mut client = TcpStream::connect(addr).map_err(|e| fail("connect", e))?;
+        client
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(|e| fail("set read timeout", e))?;
+        let (mut accepted, _) = listener.accept().map_err(|e| fail("accept", e))?;
+        // EAGAIN, as a thread that cannot be created reports it.
+        let cause = io::Error::from_raw_os_error(11);
+        refuse(&mut accepted, "CONNECTION NOT HANDLED", &cause);
+        drop(accepted);
+        let mut received = Vec::new();
+        client
+            .read_to_end(&mut received)
+            .map_err(|e| fail("read to the close", e))?;
+        let body = format!("{{\"error\":\"CONNECTION NOT HANDLED: {cause}\"}}");
+        let expected = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: {JSON_TYPE}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(String::from_utf8_lossy(&received), expected);
+        Ok(())
     }
 }

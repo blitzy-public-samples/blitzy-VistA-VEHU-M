@@ -31,6 +31,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -41,11 +42,12 @@ use ifcap_po_inquiry::bridge::{
     MumpsMode, normalise, parse_normalisation, serve_until, split_input_lines,
 };
 use ifcap_po_inquiry::store::load_fixtures;
-use ifcap_po_inquiry::{InquiryError, Store, inquire};
+use ifcap_po_inquiry::{InquiryError, Store, StoreError, inquire};
 
 /// Read and write timeout of every client connection.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long `Server::stop` waits for the server thread to finish.
+/// How long [`with_server`] waits, once it has set the shutdown flag, for
+/// the server thread to finish.
 const STOP_BOUND: Duration = Duration::from_secs(5);
 /// The bound `synthetic_shutdown_joins_within_bound` holds the server to.
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(2);
@@ -69,72 +71,78 @@ system and is never parity evidence.
 /// Distinguishes directories created in the same nanosecond.
 static SYNTHETIC_SERIAL: AtomicUsize = AtomicUsize::new(0);
 
-/// One test's own capture directory under `std::env::temp_dir()`, named
+/// Runs `body` with one test's own capture directory under
+/// `std::env::temp_dir()`, named
 /// `ifcap-po-inquiry-synthetic-<test>-<pid>-<nanos>-<serial>` and marked by
-/// `SYNTHETIC.txt`. It is the `golden_dir` of the test's bridge, and its one
-/// case is `GC-01/`. Dropping it removes it, best effort.
-struct SyntheticDir {
-    root: PathBuf,
-}
-
-impl SyntheticDir {
-    fn new(test: &str) -> Result<SyntheticDir, String> {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default();
-        let serial = SYNTHETIC_SERIAL.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!(
-            "ifcap-po-inquiry-synthetic-{test}-{}-{nanos}-{serial}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
-        let dir = SyntheticDir { root };
-        dir.write("SYNTHETIC.txt", SYNTHETIC_MARKER.as_bytes())?;
-        Ok(dir)
-    }
-
-    /// The `GC-01/` case directory, the first one the bridge scans.
-    fn case_dir(&self) -> PathBuf {
-        self.root.join("GC-01")
-    }
-
-    /// The path of `name` inside `GC-01/`.
-    fn case_file(&self, name: &str) -> PathBuf {
-        self.case_dir().join(name)
-    }
-
-    /// Writes `bytes` to `rel` under the directory, creating its parents.
-    fn write(&self, rel: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-        let path = self.root.join(rel);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+/// `SYNTHETIC.txt`. The directory is the `golden_dir` of the test's bridge,
+/// and its one case is `GC-01/`.
+///
+/// The directory is removed on every exit of `body`: `Ok`, `Err` or a
+/// panic, which is resumed once the directory is gone. The result is
+/// `body`'s, or the removal failure when `body` succeeded. A directory
+/// `body` has already removed is not an error.
+fn with_synthetic_dir<T>(
+    test: &str,
+    body: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let serial = SYNTHETIC_SERIAL.fetch_add(1, Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!(
+        "ifcap-po-inquiry-synthetic-{test}-{}-{nanos}-{serial}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root)
+        .map_err(|e| format!("{test}: creating the synthetic directory: {e}"))?;
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        write_file(&root, "SYNTHETIC.txt", SYNTHETIC_MARKER.as_bytes())?;
+        body(&root)
+    }));
+    let removed = match fs::remove_dir_all(&root) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            Err(format!("{test}: removing the synthetic directory: {e}"))
         }
-        fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-        Ok(path)
-    }
-
-    /// Replay mode over this directory.
-    fn replay(&self) -> MumpsMode {
-        MumpsMode::Replay {
-            golden_dir: self.root.clone(),
-        }
-    }
-
-    /// Live mode over this directory, in a container that does not exist.
-    fn live(&self) -> MumpsMode {
-        MumpsMode::Live {
-            container: "synthetic-no-such-container".to_string(),
-            golden_dir: self.root.clone(),
-        }
+        _ => Ok(()),
+    };
+    match outcome {
+        Ok(result) => result.and_then(|value| removed.map(|()| value)),
+        Err(payload) => panic::resume_unwind(payload),
     }
 }
 
-impl Drop for SyntheticDir {
-    fn drop(&mut self) {
-        // Best effort: a directory left behind is still named synthetic and
-        // marked by SYNTHETIC.txt.
-        let _ = fs::remove_dir_all(&self.root);
+/// The path of `name` inside the `GC-01/` case directory under `root`, the
+/// first case the bridge scans.
+fn case_file(root: &Path, name: &str) -> PathBuf {
+    root.join("GC-01").join(name)
+}
+
+/// Writes `bytes` to `rel` under `root`, creating its parents. Errors name
+/// `rel`, never the temporary path.
+fn write_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("creating the parent of synthetic {rel}: {e}"))?;
+    }
+    fs::write(&path, bytes).map_err(|e| format!("writing synthetic {rel}: {e}"))?;
+    Ok(path)
+}
+
+/// Replay mode over the synthetic directory `root`.
+fn replay(root: &Path) -> MumpsMode {
+    MumpsMode::Replay {
+        golden_dir: root.to_path_buf(),
+    }
+}
+
+/// Live mode over the synthetic directory `root`, in a container that does
+/// not exist.
+fn live(root: &Path) -> MumpsMode {
+    MumpsMode::Live {
+        container: "synthetic-no-such-container".to_string(),
+        golden_dir: root.to_path_buf(),
     }
 }
 
@@ -162,7 +170,8 @@ ZWR
 "#;
 
 fn synthetic_store() -> Result<Store, String> {
-    Store::from_zwr(SYNTHETIC_ZWR).map_err(|e| format!("SYNTHETIC_ZWR does not load: {e}"))
+    Store::from_zwr(SYNTHETIC_ZWR)
+        .map_err(|e| format!("SYNTHETIC_ZWR does not load: {}", store_error_cause(&e)))
 }
 
 fn strings(items: &[&str]) -> Vec<String> {
@@ -179,50 +188,56 @@ fn capture_form(inputs: &[String]) -> String {
     text
 }
 
-/// A synthetic session that `inquire` answers with `Ok`, and its answer.
-struct OkCase {
-    inputs: Vec<String>,
-    transcript: String,
-    returned: Option<String>,
+/// The first input of `read_back` that differs from `inputs`, 1-based, or
+/// the count past the shorter list; `None` when the lists are equal.
+fn first_differing_input(read_back: &[String], inputs: &[String]) -> Option<usize> {
+    if read_back == inputs {
+        return None;
+    }
+    let same = read_back
+        .iter()
+        .zip(inputs)
+        .take_while(|(a, b)| a == b)
+        .count();
+    Some(same.saturating_add(1))
 }
 
-/// The first candidate sequence that `inquire` answers with `Ok` on `store`
-/// and whose captured form reads back through `split_input_lines`
-/// unchanged. The candidates shrink because station acceptance or the
-/// order prompt may be BLOCKED by `SPEC.md`; `Err` is the NOT RUN reason.
-fn ok_case(store: &Store) -> Result<OkCase, String> {
+/// A synthetic session that `inquire` answers with `Ok`, as its inputs, its
+/// transcript and its return value: the first candidate sequence that
+/// `inquire` answers with `Ok` on `store` and whose captured form reads back
+/// through `split_input_lines` unchanged. The candidates shrink because
+/// station acceptance or the order prompt may be BLOCKED by `SPEC.md`;
+/// `Err` is the NOT RUN reason, naming each candidate by its number.
+fn ok_case(store: &Store) -> Result<(Vec<String>, String, Option<String>), String> {
     let candidates: [&[&str]; 3] = [&["", "^"], &[""], &[]];
     let mut refusals: Vec<String> = Vec::new();
-    for candidate in candidates {
+    for (number, candidate) in (1usize..).zip(candidates) {
         let inputs = strings(candidate);
-        if split_input_lines(&capture_form(&inputs)) != inputs {
-            refusals.push(format!("{inputs:?} not round-tripping split_input_lines"));
+        let read_back = split_input_lines(&capture_form(&inputs));
+        if let Some(input) = first_differing_input(&read_back, &inputs) {
+            refusals.push(format!(
+                "candidate {number}: input {input} does not round-trip split_input_lines"
+            ));
             continue;
         }
         match inquire(store, &inputs) {
-            Ok(output) => {
-                return Ok(OkCase {
-                    inputs,
-                    transcript: output.transcript,
-                    returned: output.returned,
-                });
-            }
+            Ok(output) => return Ok((inputs, output.transcript, output.returned)),
             Err(InquiryError::UnsupportedBranch(id)) => {
-                refusals.push(format!("UnsupportedBranch({id})"));
+                refusals.push(format!("candidate {number}: UnsupportedBranch({id})"));
             }
-            Err(InquiryError::CorruptStore(record)) => {
-                refusals.push(format!("CorruptStore({record})"));
+            Err(InquiryError::CorruptStore(_)) => {
+                refusals.push(format!("candidate {number}: CorruptStore"));
             }
         }
     }
     Err(format!(
-        "NOT RUN: inquire returns {} for every candidate input",
+        "NOT RUN: inquire refuses every candidate input ({})",
         refusals.join(", ")
     ))
 }
 
 /// [`ok_case`], or `None` after printing the NOT RUN reason for `test`.
-fn ok_case_or_not_run(test: &str, store: &Store) -> Option<OkCase> {
+fn ok_case_or_not_run(test: &str, store: &Store) -> Option<(Vec<String>, String, Option<String>)> {
     match ok_case(store) {
         Ok(case) => Some(case),
         Err(reason) => {
@@ -234,15 +249,14 @@ fn ok_case_or_not_run(test: &str, store: &Store) -> Option<OkCase> {
 
 /// Writes `GC-01/input.txt` in captured form, after confirming it reads
 /// back as `inputs` through `split_input_lines`, so that replay can match.
-fn write_inputs(dir: &SyntheticDir, inputs: &[String]) -> Result<(), String> {
+fn write_inputs(root: &Path, inputs: &[String]) -> Result<(), String> {
     let text = capture_form(inputs);
-    let read_back = split_input_lines(&text);
-    if read_back != inputs {
+    if let Some(input) = first_differing_input(&split_input_lines(&text), inputs) {
         return Err(format!(
-            "synthetic input.txt {text:?} reads back as {read_back:?}, not {inputs:?}"
+            "synthetic GC-01/input.txt: input {input} does not read back through split_input_lines"
         ));
     }
-    dir.write("GC-01/input.txt", text.as_bytes())?;
+    write_file(root, "GC-01/input.txt", text.as_bytes())?;
     Ok(())
 }
 
@@ -250,19 +264,19 @@ fn write_inputs(dir: &SyntheticDir, inputs: &[String]) -> Result<(), String> {
 /// bytes for `None`, and otherwise the value with one trailing newline,
 /// which the bridge removes.
 fn write_case(
-    dir: &SyntheticDir,
+    root: &Path,
     inputs: &[String],
     transcript: &str,
     returned: Option<&str>,
     normalisation: &str,
 ) -> Result<(), String> {
-    write_inputs(dir, inputs)?;
-    dir.write("GC-01/transcript.txt", transcript.as_bytes())?;
+    write_inputs(root, inputs)?;
+    write_file(root, "GC-01/transcript.txt", transcript.as_bytes())?;
     let returned = returned
         .map(|value| format!("{value}\n"))
         .unwrap_or_default();
-    dir.write("GC-01/returned.txt", returned.as_bytes())?;
-    dir.write("GC-01/normalisation.txt", normalisation.as_bytes())?;
+    write_file(root, "GC-01/returned.txt", returned.as_bytes())?;
+    write_file(root, "GC-01/normalisation.txt", normalisation.as_bytes())?;
     Ok(())
 }
 
@@ -284,104 +298,96 @@ fn meta_text(context: &str, docker_exec_args: &str) -> String {
 // Server and client
 // ---------------------------------------------------------------------------
 
-/// A bridge serving on its own `127.0.0.1:0` port in its own thread.
-struct Server {
-    addr: SocketAddr,
-    shutdown: Arc<AtomicBool>,
-    handle: Option<JoinHandle<io::Result<()>>>,
-}
-
-impl Server {
-    fn start(store: Store, mode: MumpsMode) -> Result<Server, String> {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind 127.0.0.1:0: {e}"))?;
-        let addr = listener
-            .local_addr()
-            .map_err(|e| format!("local_addr: {e}"))?;
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&shutdown);
-        let handle = thread::Builder::new()
-            .name("synthetic-bridge".to_string())
-            .spawn(move || serve_until(listener, store, mode, flag))
-            .map_err(|e| format!("spawn the server thread: {e}"))?;
-        Ok(Server {
-            addr,
-            shutdown,
-            handle: Some(handle),
-        })
-    }
-
-    /// Sets the shutdown flag and returns what `serve_until` returned, or an
-    /// error when its thread is still running after [`STOP_BOUND`].
-    fn stop(self) -> io::Result<()> {
-        self.stop_within(STOP_BOUND)
-    }
-
-    fn stop_within(mut self, bound: Duration) -> io::Result<()> {
-        self.shutdown.store(true, Ordering::SeqCst);
-        let Some(handle) = self.handle.take() else {
-            return Err(io::Error::other("server already stopped"));
-        };
-        let started = Instant::now();
-        while !handle.is_finished() {
-            if started.elapsed() >= bound {
-                return Err(io::Error::other(format!(
-                    "server thread still running {} ms after the shutdown flag was set",
-                    bound.as_millis()
-                )));
-            }
-            thread::sleep(Duration::from_millis(5));
+/// Sets `shutdown` and waits up to `bound` for the server thread, then
+/// joins it. `Ok` only when `serve_until` returned `Ok(())` within the
+/// bound; a thread still running then is left behind and reported.
+fn stop_server(
+    shutdown: &AtomicBool,
+    handle: JoinHandle<io::Result<()>>,
+    bound: Duration,
+) -> Result<(), String> {
+    shutdown.store(true, Ordering::SeqCst);
+    let started = Instant::now();
+    while !handle.is_finished() {
+        if started.elapsed() >= bound {
+            return Err(format!(
+                "server stop: serve_until still running {} ms after the shutdown flag was set",
+                bound.as_millis()
+            ));
         }
-        handle
-            .join()
-            .map_err(|_| io::Error::other("server thread panicked"))?
+        thread::sleep(Duration::from_millis(5));
+    }
+    match handle.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("server stop: serve_until returned an error: {e}")),
+        Err(_) => Err("server stop: the server thread panicked".to_string()),
     }
 }
 
-impl Drop for Server {
-    /// A backstop for a test that fails before `stop`: the accept loop ends
-    /// within one poll interval.
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+/// [`with_server_within`] with the stop bound [`STOP_BOUND`].
+fn with_server<T>(
+    store: Store,
+    mode: MumpsMode,
+    client: impl FnOnce(SocketAddr) -> Result<T, String>,
+) -> Result<T, String> {
+    with_server_within(STOP_BOUND, store, mode, client)
+}
+
+/// Runs `client` against a bridge serving `store` in `mode` on its own
+/// `127.0.0.1:0` port, in its own thread, then stops the bridge on every
+/// exit of `client`: `Ok`, `Err` or a panic, which is resumed once the
+/// bridge is stopped. Stopping sets the shutdown flag and joins the server
+/// thread within `bound`. The result is `client`'s, or the stop failure
+/// when `client` succeeded.
+fn with_server_within<T>(
+    bound: Duration,
+    store: Store,
+    mode: MumpsMode,
+    client: impl FnOnce(SocketAddr) -> Result<T, String>,
+) -> Result<T, String> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind 127.0.0.1:0: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&shutdown);
+    let handle = thread::Builder::new()
+        .name("synthetic-bridge".to_string())
+        .spawn(move || serve_until(listener, store, mode, flag))
+        .map_err(|e| format!("spawn the server thread: {e}"))?;
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| client(addr)));
+    let stopped = stop_server(&shutdown, handle, bound);
+    match outcome {
+        Ok(result) => result.and_then(|value| stopped.map(|()| value)),
+        Err(payload) => panic::resume_unwind(payload),
     }
 }
 
-/// Stops `server` and asserts that `serve_until` returned `Ok(())`.
-fn assert_stopped(server: Server) {
-    let stopped = server.stop();
-    assert!(stopped.is_ok(), "server stop: {stopped:?}");
-}
-
-/// One HTTP response.
-struct Resp {
-    status: u16,
-    body: Vec<u8>,
-}
-
-impl Resp {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.body).into_owned()
-    }
-
-    fn json(&self) -> Result<Json, String> {
-        let text = std::str::from_utf8(&self.body)
-            .map_err(|_| format!("response body is not UTF-8: {:?}", self.text()))?;
-        parse_json(text).map_err(|e| format!("response body is not JSON ({e}): {text}"))
-    }
-}
-
-/// Sends one request over a fresh connection and reads its response. The
-/// target is sent literally, so `/../Cargo.toml` reaches the server as
-/// typed; `None` sends an empty body.
-fn http(addr: SocketAddr, method: &str, target: &str, body: Option<&[u8]>) -> Result<Resp, String> {
-    let fail = |what: &str, e: io::Error| format!("{method} {target}: {what}: {e}");
-    let mut stream = TcpStream::connect(addr).map_err(|e| fail("connect", e))?;
+/// A fresh client connection to `addr` with the 5-second read and write
+/// timeouts.
+fn connect(addr: SocketAddr) -> Result<TcpStream, String> {
+    let stream = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
-        .map_err(|e| fail("set read timeout", e))?;
+        .map_err(|e| format!("set read timeout: {e}"))?;
     stream
         .set_write_timeout(Some(IO_TIMEOUT))
-        .map_err(|e| fail("set write timeout", e))?;
+        .map_err(|e| format!("set write timeout: {e}"))?;
+    Ok(stream)
+}
+
+/// Sends one request over a fresh connection and reads its response, as
+/// its status and body. The target is sent literally, so `/../Cargo.toml`
+/// reaches the server as typed; `None` sends an empty body.
+fn http(
+    addr: SocketAddr,
+    method: &str,
+    target: &str,
+    body: Option<&[u8]>,
+) -> Result<(u16, Vec<u8>), String> {
+    let fail = |what: &str, e: io::Error| format!("{method} {target}: {what}: {e}");
+    let mut stream = connect(addr).map_err(|e| format!("{method} {target}: {e}"))?;
     let body = body.unwrap_or_default();
     let mut request = format!("{method} {target} HTTP/1.1\r\nHost: {addr}\r\n");
     let _ = write!(
@@ -396,7 +402,7 @@ fn http(addr: SocketAddr, method: &str, target: &str, body: Option<&[u8]>) -> Re
 }
 
 /// POSTs `body` to `/api/{backend}/session`.
-fn post_session(addr: SocketAddr, backend: &str, body: &[u8]) -> Result<Resp, String> {
+fn post_session(addr: SocketAddr, backend: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     http(addr, "POST", &format!("/api/{backend}/session"), Some(body))
 }
 
@@ -413,7 +419,8 @@ fn read_some(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize, String> {
 
 /// Reads the status line and headers, then exactly `Content-Length` body
 /// bytes, or everything up to end of stream when that header is absent.
-fn read_response(stream: &mut TcpStream) -> Result<Resp, String> {
+/// Errors name the part of the response at fault, never its content.
+fn read_response(stream: &mut TcpStream) -> Result<(u16, Vec<u8>), String> {
     let mut received: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
     let head_end = loop {
@@ -423,8 +430,8 @@ fn read_response(stream: &mut TcpStream) -> Result<Resp, String> {
         let n = read_some(stream, &mut buf)?;
         if n == 0 {
             return Err(format!(
-                "connection closed inside the response head: {:?}",
-                String::from_utf8_lossy(&received)
+                "connection closed inside the response head, after {} bytes",
+                received.len()
             ));
         }
         received.extend_from_slice(buf.get(..n).unwrap_or_default());
@@ -432,29 +439,30 @@ fn read_response(stream: &mut TcpStream) -> Result<Resp, String> {
     let (head, rest) = received
         .split_at_checked(head_end)
         .ok_or_else(|| "response head offset out of range".to_string())?;
-    let head = std::str::from_utf8(head).map_err(|_| "response head is not UTF-8".to_string())?;
+    let head = std::str::from_utf8(head)
+        .map_err(|e| format!("response head is not UTF-8 at byte {}", e.valid_up_to()))?;
     let mut lines = head.trim_end_matches("\r\n").split("\r\n");
     let status_line = lines.next().unwrap_or_default();
     let mut parts = status_line.splitn(3, ' ');
     let (Some(version), Some(code)) = (parts.next(), parts.next()) else {
-        return Err(format!("malformed status line {status_line:?}"));
+        return Err("malformed status line: fewer than two fields".to_string());
     };
     if !version.starts_with("HTTP/1.") {
-        return Err(format!("malformed status line {status_line:?}"));
+        return Err("malformed status line: not HTTP/1.x".to_string());
     }
     let status: u16 = code
         .parse()
-        .map_err(|_| format!("malformed status code in {status_line:?}"))?;
+        .map_err(|_| "malformed status line: the status code is not a number".to_string())?;
     let mut content_length: Option<usize> = None;
-    for line in lines {
+    for (number, line) in (2usize..).zip(lines) {
         let Some((name, value)) = line.split_once(':') else {
-            return Err(format!("malformed header line {line:?}"));
+            return Err(format!("malformed header on head line {number}: no ':'"));
         };
         if name.trim().eq_ignore_ascii_case("content-length") {
             let length = value
                 .trim()
                 .parse()
-                .map_err(|_| format!("malformed Content-Length {value:?}"))?;
+                .map_err(|_| format!("malformed Content-Length on head line {number}"))?;
             content_length = Some(length);
         }
     }
@@ -478,7 +486,7 @@ fn read_response(stream: &mut TcpStream) -> Result<Resp, String> {
     if let Some(length) = content_length {
         body.truncate(length);
     }
-    Ok(Resp { status, body })
+    Ok((status, body))
 }
 
 // ---------------------------------------------------------------------------
@@ -486,235 +494,229 @@ fn read_response(stream: &mut TcpStream) -> Result<Resp, String> {
 // writer
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, PartialEq)]
-enum Json {
-    Null,
-    Bool(bool),
-    Num(String),
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(Vec<(String, Json)>),
+// A JSON text is checked once by `json_body` and then kept as that text.
+// Every scanning function takes the bytes and a position, and returns the
+// position just past what it scanned; errors name the cause and its byte
+// offset, never the text.
+
+/// `body` as text, once it is checked to be UTF-8 holding exactly one JSON
+/// value.
+fn json_body(body: &[u8]) -> Result<&str, String> {
+    let text = std::str::from_utf8(body)
+        .map_err(|e| format!("response body is not UTF-8 at byte {}", e.valid_up_to()))?;
+    parse_json(text).map_err(|e| format!("response body is not JSON: {e}"))?;
+    Ok(text)
 }
 
-/// Parses `text` as exactly one JSON value. Strings may hold `\uXXXX`
-/// escapes, surrogate pairs combined; an unpaired surrogate or an unescaped
-/// control character is an error, so a response that leaves BEL or a tab
-/// raw fails here.
-fn parse_json(text: &str) -> Result<Json, String> {
-    let mut parser = JsonParser {
-        bytes: text.as_bytes(),
-        pos: 0,
-    };
-    parser.whitespace();
-    let value = parser.value()?;
-    parser.whitespace();
-    if parser.pos == parser.bytes.len() {
-        Ok(value)
+/// Checks that `text` is exactly one JSON value with only whitespace around
+/// it. Strings may hold four-hex-digit Unicode escapes, surrogate pairs
+/// combined; an unpaired surrogate or an unescaped control character is an
+/// error, so a response that leaves BEL or a tab raw fails here.
+fn parse_json(text: &str) -> Result<(), String> {
+    let bytes = text.as_bytes();
+    let end = skip_whitespace(bytes, json_value(bytes, skip_whitespace(bytes, 0))?);
+    if end == bytes.len() {
+        Ok(())
     } else {
-        Err(parser.error("trailing text"))
+        Err(json_error("trailing text", end))
     }
 }
 
-struct JsonParser<'t> {
-    bytes: &'t [u8],
+fn json_error(what: &str, pos: usize) -> String {
+    format!("{what} at byte {pos}")
+}
+
+fn skip_whitespace(bytes: &[u8], mut pos: usize) -> usize {
+    while matches!(bytes.get(pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        pos += 1;
+    }
+    pos
+}
+
+/// The byte at `pos` and the position after it.
+fn next_byte(bytes: &[u8], pos: usize) -> Result<(u8, usize), String> {
+    bytes
+        .get(pos)
+        .map(|&byte| (byte, pos + 1))
+        .ok_or_else(|| json_error("unexpected end", pos))
+}
+
+/// The position after `byte`, which must stand at `pos`.
+fn eat(bytes: &[u8], pos: usize, byte: u8) -> Result<usize, String> {
+    match next_byte(bytes, pos)? {
+        (found, next) if found == byte => Ok(next),
+        _ => Err(json_error(&format!("expected {:?}", char::from(byte)), pos)),
+    }
+}
+
+/// Scans the one JSON value that starts at `pos`.
+fn json_value(bytes: &[u8], pos: usize) -> Result<usize, String> {
+    match bytes.get(pos) {
+        Some(b'{') => json_object(bytes, pos, &mut |_, _, _| {}),
+        Some(b'[') => json_array(bytes, pos),
+        Some(b'"') => json_string(bytes, pos).map(|(_, next)| next),
+        Some(b't') => json_literal(bytes, pos, "true"),
+        Some(b'f') => json_literal(bytes, pos, "false"),
+        Some(b'n') => json_literal(bytes, pos, "null"),
+        Some(b'-' | b'0'..=b'9') => json_number(bytes, pos),
+        _ => Err(json_error("expected a value", pos)),
+    }
+}
+
+fn json_literal(bytes: &[u8], mut pos: usize, word: &str) -> Result<usize, String> {
+    for byte in word.bytes() {
+        pos = eat(bytes, pos, byte)?;
+    }
+    Ok(pos)
+}
+
+/// The position after one or more ASCII digits at `pos`; `None` when there
+/// is none.
+fn digits(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    let first = pos;
+    while matches!(bytes.get(pos), Some(b'0'..=b'9')) {
+        pos += 1;
+    }
+    (pos > first).then_some(pos)
+}
+
+fn json_number(bytes: &[u8], mut pos: usize) -> Result<usize, String> {
+    if bytes.get(pos) == Some(&b'-') {
+        pos += 1;
+    }
+    pos = digits(bytes, pos).ok_or_else(|| json_error("expected digits", pos))?;
+    if bytes.get(pos) == Some(&b'.') {
+        let fraction = pos + 1;
+        pos = digits(bytes, fraction)
+            .ok_or_else(|| json_error("expected fraction digits", fraction))?;
+    }
+    if matches!(bytes.get(pos), Some(b'e' | b'E')) {
+        pos += 1;
+        if matches!(bytes.get(pos), Some(b'+' | b'-')) {
+            pos += 1;
+        }
+        pos = digits(bytes, pos).ok_or_else(|| json_error("expected exponent digits", pos))?;
+    }
+    Ok(pos)
+}
+
+fn json_array(bytes: &[u8], pos: usize) -> Result<usize, String> {
+    let mut pos = skip_whitespace(bytes, eat(bytes, pos, b'[')?);
+    if bytes.get(pos) == Some(&b']') {
+        return Ok(pos + 1);
+    }
+    loop {
+        pos = skip_whitespace(bytes, json_value(bytes, skip_whitespace(bytes, pos))?);
+        match next_byte(bytes, pos)? {
+            (b',', next) => pos = next,
+            (b']', next) => return Ok(next),
+            _ => return Err(json_error("expected ',' or ']'", pos)),
+        }
+    }
+}
+
+/// Scans the object that starts at `pos`, calling `visit` with the decoded
+/// name and the value's start and end of each member, in order.
+fn json_object(
+    bytes: &[u8],
     pos: usize,
+    visit: &mut dyn FnMut(&str, usize, usize),
+) -> Result<usize, String> {
+    let mut pos = skip_whitespace(bytes, eat(bytes, pos, b'{')?);
+    if bytes.get(pos) == Some(&b'}') {
+        return Ok(pos + 1);
+    }
+    loop {
+        let (name, after_name) = json_string(bytes, skip_whitespace(bytes, pos))?;
+        let colon = skip_whitespace(bytes, after_name);
+        let start = skip_whitespace(bytes, eat(bytes, colon, b':')?);
+        let end = json_value(bytes, start)?;
+        visit(&name, start, end);
+        pos = skip_whitespace(bytes, end);
+        match next_byte(bytes, pos)? {
+            (b',', next) => pos = next,
+            (b'}', next) => return Ok(next),
+            _ => return Err(json_error("expected ',' or '}'", pos)),
+        }
+    }
 }
 
-impl JsonParser<'_> {
-    fn error(&self, what: &str) -> String {
-        format!("{what} at byte {}", self.pos)
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn next_byte(&mut self) -> Result<u8, String> {
-        let byte = self.peek().ok_or_else(|| self.error("unexpected end"))?;
-        self.pos += 1;
-        Ok(byte)
-    }
-
-    fn eat(&mut self, byte: u8) -> Result<(), String> {
-        if self.next_byte()? == byte {
-            Ok(())
-        } else {
-            Err(self.error(&format!("expected {:?}", char::from(byte))))
-        }
-    }
-
-    fn whitespace(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn value(&mut self) -> Result<Json, String> {
-        match self.peek() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
-            Some(b'"') => self.string().map(Json::Str),
-            Some(b't') => self.literal("true", Json::Bool(true)),
-            Some(b'f') => self.literal("false", Json::Bool(false)),
-            Some(b'n') => self.literal("null", Json::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            _ => Err(self.error("expected a value")),
-        }
-    }
-
-    fn literal(&mut self, word: &str, value: Json) -> Result<Json, String> {
-        for byte in word.bytes() {
-            self.eat(byte)?;
-        }
-        Ok(value)
-    }
-
-    /// Consumes one or more ASCII digits; false when there is none.
-    fn digits(&mut self) -> bool {
-        let first = self.pos;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        self.pos > first
-    }
-
-    fn number(&mut self) -> Result<Json, String> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        if !self.digits() {
-            return Err(self.error("expected digits"));
-        }
-        if self.peek() == Some(b'.') {
-            self.pos += 1;
-            if !self.digits() {
-                return Err(self.error("expected fraction digits"));
+/// Decodes the string that starts at `pos`, returning it with the position
+/// after its closing quote. Raw bytes are copied as they stand, and every
+/// delimiter is ASCII, so the UTF-8 of the input survives intact.
+fn json_string(bytes: &[u8], pos: usize) -> Result<(String, usize), String> {
+    let start = pos;
+    let mut pos = eat(bytes, pos, b'"')?;
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let (byte, next) = next_byte(bytes, pos)?;
+        match byte {
+            b'"' => {
+                let text =
+                    String::from_utf8(out).map_err(|_| json_error("string is not UTF-8", start))?;
+                return Ok((text, next));
             }
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.pos += 1;
+            b'\\' => {
+                let (escape, after) = next_byte(bytes, next)?;
+                let (c, after) = match escape {
+                    b'"' => ('"', after),
+                    b'\\' => ('\\', after),
+                    b'/' => ('/', after),
+                    b'b' => ('\u{8}', after),
+                    b'f' => ('\u{c}', after),
+                    b'n' => ('\n', after),
+                    b'r' => ('\r', after),
+                    b't' => ('\t', after),
+                    b'u' => unicode_escape(bytes, after)?,
+                    _ => return Err(json_error("unknown escape", next)),
+                };
+                let mut utf8 = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+                pos = after;
             }
-            if !self.digits() {
-                return Err(self.error("expected exponent digits"));
-            }
-        }
-        let text = self
-            .bytes
-            .get(start..self.pos)
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .ok_or_else(|| self.error("number out of range"))?;
-        Ok(Json::Num(text.to_string()))
-    }
-
-    fn array(&mut self) -> Result<Json, String> {
-        self.eat(b'[')?;
-        let mut items = Vec::new();
-        self.whitespace();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(Json::Arr(items));
-        }
-        loop {
-            self.whitespace();
-            items.push(self.value()?);
-            self.whitespace();
-            match self.next_byte()? {
-                b',' => {}
-                b']' => return Ok(Json::Arr(items)),
-                _ => return Err(self.error("expected ',' or ']'")),
+            byte if byte < 0x20 => return Err(json_error("unescaped control character", pos)),
+            byte => {
+                out.push(byte);
+                pos = next;
             }
         }
     }
+}
 
-    fn object(&mut self) -> Result<Json, String> {
-        self.eat(b'{')?;
-        let mut members = Vec::new();
-        self.whitespace();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(Json::Obj(members));
-        }
-        loop {
-            self.whitespace();
-            let key = self.string()?;
-            self.whitespace();
-            self.eat(b':')?;
-            self.whitespace();
-            members.push((key, self.value()?));
-            self.whitespace();
-            match self.next_byte()? {
-                b',' => {}
-                b'}' => return Ok(Json::Obj(members)),
-                _ => return Err(self.error("expected ',' or '}'")),
+/// The character of a four-hex-digit Unicode escape whose backslash and `u`
+/// end just before `pos`, reading the low half of a surrogate pair too, with
+/// the position after it.
+fn unicode_escape(bytes: &[u8], pos: usize) -> Result<(char, usize), String> {
+    let (first, mut next) = hex4(bytes, pos)?;
+    let code = match first {
+        0xD800..=0xDBFF => {
+            let low = eat(bytes, eat(bytes, next, b'\\')?, b'u')?;
+            let (second, after) = hex4(bytes, low)?;
+            if !(0xDC00..=0xDFFF).contains(&second) {
+                return Err(json_error("high surrogate without a low surrogate", low));
             }
+            next = after;
+            0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)
         }
-    }
+        0xDC00..=0xDFFF => return Err(json_error("unpaired low surrogate", pos)),
+        _ => first,
+    };
+    char::from_u32(code)
+        .map(|c| (c, next))
+        .ok_or_else(|| json_error("invalid code point", pos))
+}
 
-    /// Raw bytes are copied as they stand, and every delimiter is ASCII, so
-    /// the UTF-8 of the input survives intact.
-    fn string(&mut self) -> Result<String, String> {
-        self.eat(b'"')?;
-        let mut out: Vec<u8> = Vec::new();
-        loop {
-            match self.next_byte()? {
-                b'"' => {
-                    return String::from_utf8(out).map_err(|_| self.error("string is not UTF-8"));
-                }
-                b'\\' => {
-                    let c = match self.next_byte()? {
-                        b'"' => '"',
-                        b'\\' => '\\',
-                        b'/' => '/',
-                        b'b' => '\u{8}',
-                        b'f' => '\u{c}',
-                        b'n' => '\n',
-                        b'r' => '\r',
-                        b't' => '\t',
-                        b'u' => self.unicode()?,
-                        _ => return Err(self.error("unknown escape")),
-                    };
-                    let mut utf8 = [0u8; 4];
-                    out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
-                }
-                byte if byte < 0x20 => return Err(self.error("unescaped control character")),
-                byte => out.push(byte),
-            }
-        }
+fn hex4(bytes: &[u8], mut pos: usize) -> Result<(u32, usize), String> {
+    let mut code = 0u32;
+    for _ in 0..4 {
+        let (byte, next) = next_byte(bytes, pos)?;
+        let digit = char::from(byte)
+            .to_digit(16)
+            .ok_or_else(|| json_error("expected a hex digit", pos))?;
+        code = code * 16 + digit;
+        pos = next;
     }
-
-    /// The character of a `\uXXXX` escape whose `\u` is consumed, reading
-    /// the low half of a surrogate pair too.
-    fn unicode(&mut self) -> Result<char, String> {
-        let first = self.hex4()?;
-        let code = match first {
-            0xD800..=0xDBFF => {
-                self.eat(b'\\')?;
-                self.eat(b'u')?;
-                let second = self.hex4()?;
-                if !(0xDC00..=0xDFFF).contains(&second) {
-                    return Err(self.error("high surrogate without a low surrogate"));
-                }
-                0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)
-            }
-            0xDC00..=0xDFFF => return Err(self.error("unpaired low surrogate")),
-            _ => first,
-        };
-        char::from_u32(code).ok_or_else(|| self.error("invalid code point"))
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        let mut code = 0u32;
-        for _ in 0..4 {
-            let digit = char::from(self.next_byte()?)
-                .to_digit(16)
-                .ok_or_else(|| self.error("expected a hex digit"))?;
-            code = code * 16 + digit;
-        }
-        Ok(code)
-    }
+    Ok((code, pos))
 }
 
 /// `text` as a JSON string: `"` and `\` escaped, `\n`, `\r` and `\t` by
@@ -723,8 +725,9 @@ fn json_str(text: &str) -> String {
     encode_json_string(text, false)
 }
 
-/// [`json_str`] with every non-ASCII character also escaped, as `\uXXXX`
-/// or, beyond the Basic Multilingual Plane, as a surrogate pair.
+/// [`json_str`] with every non-ASCII character also escaped, as a
+/// four-hex-digit Unicode escape or, beyond the Basic Multilingual Plane, as
+/// a surrogate pair of them.
 fn json_str_ascii(text: &str) -> String {
     encode_json_string(text, true)
 }
@@ -770,89 +773,151 @@ fn body_for_ascii(inputs: &[String]) -> Vec<u8> {
     inputs_body(inputs, json_str_ascii)
 }
 
-/// `json` written back compactly, for failure messages.
-fn render(json: &Json) -> String {
-    match json {
-        Json::Null => "null".to_string(),
-        Json::Bool(value) => value.to_string(),
-        Json::Num(text) => text.clone(),
-        Json::Str(text) => json_str(text),
-        Json::Arr(items) => {
-            let items: Vec<String> = items.iter().map(render).collect();
-            format!("[{}]", items.join(","))
+/// The value of member `name` of the JSON object `json`, as the text it
+/// stands as in `json`; the first one when `name` repeats.
+fn member<'j>(json: &'j str, name: &str) -> Result<&'j str, String> {
+    let bytes = json.as_bytes();
+    let start = skip_whitespace(bytes, 0);
+    if bytes.get(start) != Some(&b'{') {
+        return Err(format!(
+            "member {name:?}: the value at byte {start} is not an object"
+        ));
+    }
+    let mut found: Option<(usize, usize)> = None;
+    json_object(bytes, start, &mut |key, value_start, value_end| {
+        if found.is_none() && key == name {
+            found = Some((value_start, value_end));
         }
-        Json::Obj(members) => {
-            let members: Vec<String> = members
-                .iter()
-                .map(|(key, value)| format!("{}:{}", json_str(key), render(value)))
-                .collect();
-            format!("{{{}}}", members.join(","))
-        }
-    }
+    })?;
+    let (value_start, value_end) = found.ok_or_else(|| format!("no member {name:?}"))?;
+    json.get(value_start..value_end)
+        .ok_or_else(|| format!("member {name:?}: bytes {value_start}..{value_end} out of range"))
 }
 
-/// The member `name` of the object `json`.
-fn field<'j>(json: &'j Json, name: &str) -> Result<&'j Json, String> {
-    let Json::Obj(members) = json else {
-        return Err(format!("{} is not an object", render(json)));
-    };
-    members
-        .iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value)
-        .ok_or_else(|| format!("{} has no member {name:?}", render(json)))
+/// The member `name` of `json` that is a string or `null`, decoded.
+fn optional_str_member(json: &str, name: &str) -> Result<Option<String>, String> {
+    let value = member(json, name)?;
+    if value == "null" {
+        return Ok(None);
+    }
+    if !value.starts_with('"') {
+        return Err(format!("member {name:?} is neither a string nor null"));
+    }
+    json_string(value.as_bytes(), 0)
+        .map(|(text, _)| Some(text))
+        .map_err(|e| format!("member {name:?}: {e}"))
 }
 
-/// The string member `name` of `json`.
-fn str_field<'j>(json: &'j Json, name: &str) -> Result<&'j str, String> {
-    match field(json, name)? {
-        Json::Str(text) => Ok(text),
-        other => Err(format!(
-            "member {name:?} is {}, not a string",
-            render(other)
-        )),
-    }
-}
-
-/// The member `name` of `json` that is a string or `null`.
-fn optional_str_field<'j>(json: &'j Json, name: &str) -> Result<Option<&'j str>, String> {
-    match field(json, name)? {
-        Json::Str(text) => Ok(Some(text)),
-        Json::Null => Ok(None),
-        other => Err(format!(
-            "member {name:?} is {}, not a string or null",
-            render(other)
-        )),
-    }
+/// The string member `name` of `json`, decoded.
+fn str_member(json: &str, name: &str) -> Result<String, String> {
+    optional_str_member(json, name)?.ok_or_else(|| format!("member {name:?} is null, not a string"))
 }
 
 /// The `transcript` and `returned` of one session object.
-fn session_of(json: &Json) -> Result<(String, Option<String>), String> {
-    let transcript = str_field(json, "transcript")?.to_string();
-    let returned = optional_str_field(json, "returned")?.map(str::to_string);
-    Ok((transcript, returned))
+fn session_of(json: &str) -> Result<(String, Option<String>), String> {
+    Ok((
+        str_member(json, "transcript")?,
+        optional_str_member(json, "returned")?,
+    ))
 }
 
 /// Asserts that `resp` has `status` and a JSON body `{"error": string}`, and
-/// returns the error text.
-fn expect_error(resp: &Resp, status: u16, context: &str) -> Result<String, String> {
-    assert_eq!(resp.status, status, "{context}: body {}", resp.text());
-    let json = resp.json().map_err(|e| format!("{context}: {e}"))?;
-    let error = str_field(&json, "error").map_err(|e| format!("{context}: {e}"))?;
-    Ok(error.to_string())
+/// returns the error text. Failures name `context`, never the body.
+fn expect_error(resp: &(u16, Vec<u8>), status: u16, context: &str) -> Result<String, String> {
+    let (actual, body) = resp;
+    assert_eq!(*actual, status, "{context}: status");
+    let json = json_body(body).map_err(|e| format!("{context}: {e}"))?;
+    str_member(json, "error").map_err(|e| format!("{context}: {e}"))
 }
 
-/// Starts a bridge over `dir` in `mode`, POSTs `inputs` to the mumps
-/// backend, stops the bridge, and returns the error text of the 502 answer.
-fn mumps_502(dir: &SyntheticDir, mode: MumpsMode, inputs: &[String]) -> Result<String, String> {
-    let server = Server::start(synthetic_store()?, mode)?;
-    let resp = post_session(server.addr, "mumps", &body_for(inputs))?;
-    assert_stopped(server);
-    expect_error(&resp, 502, &format!("mumps over {}", dir.root.display()))
+/// Starts a bridge in `mode` over a synthetic directory, POSTs `inputs` to
+/// the mumps backend, stops the bridge, and returns the error text of the
+/// 502 answer.
+fn mumps_502(mode: MumpsMode, inputs: &[String]) -> Result<String, String> {
+    let resp = with_server(synthetic_store()?, mode, |addr| {
+        post_session(addr, "mumps", &body_for(inputs))
+    })?;
+    expect_error(&resp, 502, "mumps backend over the synthetic directory")
+}
+
+/// Where `actual` first differs from `expected`: the 1-based line and the
+/// 1-based byte within it, with the byte offset and both lengths. Where one
+/// is a prefix of the other, the difference is just past the shorter one.
+fn first_difference(actual: &[u8], expected: &[u8]) -> String {
+    let offset = actual
+        .iter()
+        .zip(expected)
+        .position(|(a, e)| a != e)
+        .unwrap_or(actual.len().min(expected.len()));
+    let before = actual.get(..offset).unwrap_or(actual);
+    let line = before.iter().filter(|&&byte| byte == b'\n').count() + 1;
+    let line_start = before
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    format!(
+        "line {line} byte {} (offset {offset}; {} bytes, {} expected)",
+        offset - line_start + 1,
+        actual.len(),
+        expected.len()
+    )
+}
+
+/// Asserts that `actual` equals `expected` without printing either: a
+/// failure names `check` and the first differing position.
+fn assert_same(check: &str, actual: impl AsRef<[u8]>, expected: impl AsRef<[u8]>) {
+    let (actual, expected) = (actual.as_ref(), expected.as_ref());
+    assert!(
+        actual == expected,
+        "{check}: first difference at {}",
+        first_difference(actual, expected)
+    );
+}
+
+/// [`assert_same`] for a value that may be `null`.
+fn assert_same_optional(check: &str, actual: Option<&str>, expected: Option<&str>) {
+    let kind = |value: Option<&str>| if value.is_some() { "a string" } else { "null" };
+    assert!(
+        actual.is_some() == expected.is_some(),
+        "{check}: {} where {} is expected",
+        kind(actual),
+        kind(expected)
+    );
+    if let (Some(actual), Some(expected)) = (actual, expected) {
+        assert_same(check, actual, expected);
+    }
 }
 
 fn crate_dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// `path` relative to the crate, or its file name when it lies outside.
+fn crate_relative(path: &Path) -> String {
+    match path.strip_prefix(crate_dir()) {
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "a path outside the crate".to_string()),
+    }
+}
+
+/// The cause of a `StoreError`, from its fields: the crate-relative file and
+/// line of a malformed line, or the file that cannot be read. Never its
+/// message, which may quote fixture content.
+fn store_error_cause(e: &StoreError) -> String {
+    match e {
+        StoreError::Parse {
+            file: Some(file),
+            line,
+            ..
+        } => format!("{} line {line}: malformed", crate_relative(file)),
+        StoreError::Parse {
+            file: None, line, ..
+        } => format!("line {line}: malformed"),
+        StoreError::Io { file, .. } => format!("{}: unreadable", crate_relative(file)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -861,8 +926,6 @@ fn crate_dir() -> &'static Path {
 
 #[test]
 fn synthetic_static_paths_exact_match() -> Result<(), String> {
-    let dir = SyntheticDir::new("static")?;
-    let server = Server::start(synthetic_store()?, dir.replay())?;
     let frontend = crate_dir().join("frontend");
     let static_paths = [
         ("/", "index.html"),
@@ -870,53 +933,52 @@ fn synthetic_static_paths_exact_match() -> Result<(), String> {
         ("/style.css", "style.css"),
         ("/app.js", "app.js"),
     ];
-    for (target, file) in static_paths {
-        let path = frontend.join(file);
-        let expected = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let resp = http(server.addr, "GET", target, None)?;
-        assert_eq!(resp.status, 200, "GET {target}: body {}", resp.text());
-        assert!(
-            resp.body == expected,
-            "GET {target}: {} bytes served, frontend/{file} holds {} bytes or other bytes",
-            resp.body.len(),
-            expected.len()
-        );
-    }
-    for target in ["/../Cargo.toml", "/frontend/app.js"] {
-        let resp = http(server.addr, "GET", target, None)?;
-        expect_error(&resp, 404, &format!("GET {target}"))?;
-    }
-    assert_stopped(server);
-    Ok(())
+    with_synthetic_dir("static", |root| {
+        with_server(synthetic_store()?, replay(root), |addr| {
+            for (target, file) in static_paths {
+                let expected = fs::read(frontend.join(file))
+                    .map_err(|e| format!("reading frontend/{file}: {e}"))?;
+                let (status, body) = http(addr, "GET", target, None)?;
+                assert_eq!(status, 200, "GET {target}: status");
+                assert_same(
+                    &format!("GET {target} against frontend/{file}"),
+                    &body,
+                    &expected,
+                );
+            }
+            for target in ["/../Cargo.toml", "/frontend/app.js"] {
+                let resp = http(addr, "GET", target, None)?;
+                expect_error(&resp, 404, &format!("GET {target}"))?;
+            }
+            Ok(())
+        })
+    })
 }
 
 #[test]
 fn synthetic_rust_session_200() -> Result<(), String> {
     let store = synthetic_store()?;
-    let Some(case) = ok_case_or_not_run("synthetic_rust_session_200", &store) else {
+    let Some((inputs, transcript, returned)) =
+        ok_case_or_not_run("synthetic_rust_session_200", &store)
+    else {
         return Ok(());
     };
-    let dir = SyntheticDir::new("rust-200")?;
-    let server = Server::start(store, dir.replay())?;
-    let resp = post_session(server.addr, "rust", &body_for(&case.inputs))?;
-    assert_stopped(server);
-    assert_eq!(
-        resp.status,
-        200,
-        "rust {:?}: body {}",
-        case.inputs,
-        resp.text()
+    let (status, body) = with_synthetic_dir("rust-200", |root| {
+        with_server(store, replay(root), |addr| {
+            post_session(addr, "rust", &body_for(&inputs))
+        })
+    })?;
+    assert_eq!(status, 200, "rust backend: status");
+    let (rust_transcript, rust_returned) = session_of(json_body(&body)?)?;
+    assert_same(
+        "rust transcript against inquire",
+        &rust_transcript,
+        &transcript,
     );
-    let (transcript, returned) = session_of(&resp.json()?)?;
-    assert_eq!(
-        transcript, case.transcript,
-        "rust transcript of {:?}",
-        case.inputs
-    );
-    assert_eq!(
-        returned, case.returned,
-        "rust returned of {:?}",
-        case.inputs
+    assert_same_optional(
+        "rust returned against inquire",
+        rust_returned.as_deref(),
+        returned.as_deref(),
     );
     Ok(())
 }
@@ -924,29 +986,28 @@ fn synthetic_rust_session_200() -> Result<(), String> {
 #[test]
 fn synthetic_mumps_replay_200() -> Result<(), String> {
     let store = synthetic_store()?;
-    let Some(case) = ok_case_or_not_run("synthetic_mumps_replay_200", &store) else {
+    let Some((inputs, transcript, _)) = ok_case_or_not_run("synthetic_mumps_replay_200", &store)
+    else {
         return Ok(());
     };
-    let dir = SyntheticDir::new("mumps-200")?;
-    // A zero-byte returned.txt, which replay must answer as null.
-    write_case(&dir, &case.inputs, &case.transcript, None, "")?;
-    let server = Server::start(store, dir.replay())?;
-    let resp = post_session(server.addr, "mumps", &body_for(&case.inputs))?;
-    assert_stopped(server);
-    assert_eq!(
-        resp.status,
-        200,
-        "mumps {:?}: body {}",
-        case.inputs,
-        resp.text()
+    let (status, body) = with_synthetic_dir("mumps-200", |root| {
+        // A zero-byte returned.txt, which replay must answer as null.
+        write_case(root, &inputs, &transcript, None, "")?;
+        with_server(store, replay(root), |addr| {
+            post_session(addr, "mumps", &body_for(&inputs))
+        })
+    })?;
+    assert_eq!(status, 200, "mumps backend: status");
+    let json = json_body(&body)?;
+    let (replayed, _) = session_of(json)?;
+    assert_same(
+        "replayed transcript against transcript.txt",
+        &replayed,
+        &transcript,
     );
-    let json = resp.json()?;
-    let (transcript, _) = session_of(&json)?;
-    assert_eq!(transcript, case.transcript, "replayed transcript.txt");
-    assert_eq!(
-        field(&json, "returned")?,
-        &Json::Null,
-        "a zero-byte returned.txt replays as null"
+    assert!(
+        member(json, "returned")? == "null",
+        "a zero-byte returned.txt must replay as null"
     );
     Ok(())
 }
@@ -954,60 +1015,58 @@ fn synthetic_mumps_replay_200() -> Result<(), String> {
 #[test]
 fn synthetic_compare_match_true() -> Result<(), String> {
     let store = synthetic_store()?;
-    let Some(case) = ok_case_or_not_run("synthetic_compare_match_true", &store) else {
+    let Some((inputs, transcript, returned)) =
+        ok_case_or_not_run("synthetic_compare_match_true", &store)
+    else {
         return Ok(());
     };
-    let dir = SyntheticDir::new("compare-true")?;
-    write_case(
-        &dir,
-        &case.inputs,
-        &case.transcript,
-        case.returned.as_deref(),
-        "",
-    )?;
-    let server = Server::start(store, dir.replay())?;
-    let resp = post_session(server.addr, "compare", &body_for(&case.inputs))?;
-    assert_stopped(server);
-    assert_eq!(
-        resp.status,
-        200,
-        "compare {:?}: body {}",
-        case.inputs,
-        resp.text()
-    );
-    let json = resp.json()?;
-    let expected = (case.transcript.clone(), case.returned.clone());
-    assert_eq!(session_of(field(&json, "mumps")?)?, expected, "mumps side");
-    assert_eq!(session_of(field(&json, "rust")?)?, expected, "rust side");
-    assert_eq!(field(&json, "match")?, &Json::Bool(true), "match");
+    let (status, body) = with_synthetic_dir("compare-true", |root| {
+        write_case(root, &inputs, &transcript, returned.as_deref(), "")?;
+        with_server(store, replay(root), |addr| {
+            post_session(addr, "compare", &body_for(&inputs))
+        })
+    })?;
+    assert_eq!(status, 200, "compare backend: status");
+    let json = json_body(&body)?;
+    for side in ["mumps", "rust"] {
+        let (side_transcript, side_returned) = session_of(member(json, side)?)?;
+        assert_same(
+            &format!("{side} side transcript"),
+            &side_transcript,
+            &transcript,
+        );
+        assert_same_optional(
+            &format!("{side} side returned"),
+            side_returned.as_deref(),
+            returned.as_deref(),
+        );
+    }
+    assert!(member(json, "match")? == "true", "match must be true");
     Ok(())
 }
 
 #[test]
 fn synthetic_compare_match_false() -> Result<(), String> {
     let store = synthetic_store()?;
-    let Some(case) = ok_case_or_not_run("synthetic_compare_match_false", &store) else {
+    let Some((inputs, transcript, returned)) =
+        ok_case_or_not_run("synthetic_compare_match_false", &store)
+    else {
         return Ok(());
     };
-    let dir = SyntheticDir::new("compare-false")?;
-    let differing = format!("{}SYNTHETIC DIFFERENCE\n", case.transcript);
-    write_case(&dir, &case.inputs, &differing, case.returned.as_deref(), "")?;
-    let server = Server::start(store, dir.replay())?;
-    let resp = post_session(server.addr, "compare", &body_for(&case.inputs))?;
-    assert_stopped(server);
-    assert_eq!(
-        resp.status,
-        200,
-        "compare {:?}: body {}",
-        case.inputs,
-        resp.text()
-    );
-    let json = resp.json()?;
-    let (mumps_transcript, _) = session_of(field(&json, "mumps")?)?;
-    let (rust_transcript, _) = session_of(field(&json, "rust")?)?;
-    assert_eq!(mumps_transcript, differing, "mumps side is the capture");
-    assert_eq!(rust_transcript, case.transcript, "rust side is inquire");
-    assert_eq!(field(&json, "match")?, &Json::Bool(false), "match");
+    let differing = format!("{transcript}SYNTHETIC DIFFERENCE\n");
+    let (status, body) = with_synthetic_dir("compare-false", |root| {
+        write_case(root, &inputs, &differing, returned.as_deref(), "")?;
+        with_server(store, replay(root), |addr| {
+            post_session(addr, "compare", &body_for(&inputs))
+        })
+    })?;
+    assert_eq!(status, 200, "compare backend: status");
+    let json = json_body(&body)?;
+    let (mumps_transcript, _) = session_of(member(json, "mumps")?)?;
+    let (rust_transcript, _) = session_of(member(json, "rust")?)?;
+    assert_same("mumps side is the capture", &mumps_transcript, &differing);
+    assert_same("rust side is inquire", &rust_transcript, &transcript);
+    assert!(member(json, "match")? == "false", "match must be false");
     Ok(())
 }
 
@@ -1018,21 +1077,19 @@ fn synthetic_compare_match_false() -> Result<(), String> {
 /// Asserts that each of `bodies` is answered 400 with `{"error": string}`
 /// by the rust, mumps and compare backends alike.
 fn assert_400_on_every_backend(test: &str, bodies: &[Vec<u8>]) -> Result<(), String> {
-    let dir = SyntheticDir::new(test)?;
-    let server = Server::start(synthetic_store()?, dir.replay())?;
-    for backend in ["rust", "mumps", "compare"] {
-        for body in bodies {
-            let resp = post_session(server.addr, backend, body)?;
-            let context = format!(
-                "{test}: POST /api/{backend}/session {}",
-                String::from_utf8_lossy(body)
-            );
-            let error = expect_error(&resp, 400, &context)?;
-            assert!(!error.is_empty(), "{context}: empty error text");
-        }
-    }
-    assert_stopped(server);
-    Ok(())
+    with_synthetic_dir(test, |root| {
+        with_server(synthetic_store()?, replay(root), |addr| {
+            for backend in ["rust", "mumps", "compare"] {
+                for (number, body) in (1usize..).zip(bodies) {
+                    let resp = post_session(addr, backend, body)?;
+                    let context = format!("{test}: POST /api/{backend}/session body {number}");
+                    let error = expect_error(&resp, 400, &context)?;
+                    assert!(!error.is_empty(), "{context}: empty error text");
+                }
+            }
+            Ok(())
+        })
+    })
 }
 
 #[test]
@@ -1074,19 +1131,20 @@ fn synthetic_400_element_with_line_break() -> Result<(), String> {
 /// Asserts that each `(method, target)` is answered 404 with
 /// `{"error": string}`; POST and PUT carry a well-formed session body.
 fn assert_404(test: &str, requests: &[(&str, &str)]) -> Result<(), String> {
-    let dir = SyntheticDir::new(test)?;
-    let server = Server::start(synthetic_store()?, dir.replay())?;
     let body = body_for(&strings(&SESSION_INPUTS));
-    for (method, target) in requests {
-        let sent = match *method {
-            "POST" | "PUT" => Some(body.as_slice()),
-            _ => None,
-        };
-        let resp = http(server.addr, method, target, sent)?;
-        expect_error(&resp, 404, &format!("{test}: {method} {target}"))?;
-    }
-    assert_stopped(server);
-    Ok(())
+    with_synthetic_dir(test, |root| {
+        with_server(synthetic_store()?, replay(root), |addr| {
+            for (method, target) in requests {
+                let sent = match *method {
+                    "POST" | "PUT" => Some(body.as_slice()),
+                    _ => None,
+                };
+                let resp = http(addr, method, target, sent)?;
+                expect_error(&resp, 404, &format!("{test}: {method} {target}"))?;
+            }
+            Ok(())
+        })
+    })
 }
 
 #[test]
@@ -1125,48 +1183,46 @@ fn synthetic_422_unsupported_branch_end_to_end() -> Result<(), String> {
     let inputs = strings(&["", "?"]);
     let id = match inquire(&store, &inputs) {
         Err(InquiryError::UnsupportedBranch(id)) => id,
-        other => {
-            return Err(format!(
-                "inquire {inputs:?} must be UnsupportedBranch, got {other:?}"
-            ));
+        Err(InquiryError::CorruptStore(_)) => {
+            return Err(
+                "inquire on the help input must be UnsupportedBranch, got CorruptStore".to_string(),
+            );
+        }
+        Ok(_) => {
+            return Err("inquire on the help input must be UnsupportedBranch, got Ok".to_string());
         }
     };
     // PO-09.b4 is help at the order prompt; PO-05.b1 is station acceptance,
     // should SPEC.md block it.
     assert!(
         id == "PO-09.b4" || id == "PO-05.b1",
-        "inquire {inputs:?} gave UnsupportedBranch({id}), expected PO-09.b4 or PO-05.b1"
+        "inquire on the help input gave UnsupportedBranch({id}), expected PO-09.b4 or PO-05.b1"
     );
-    let dir = SyntheticDir::new("422")?;
-    write_case(
-        &dir,
-        &inputs,
-        "SYNTHETIC TRANSCRIPT: any text; the MUMPS side only has to succeed\n",
-        None,
-        "",
-    )?;
-    let server = Server::start(store, dir.replay())?;
     let body = body_for(&inputs);
-    let rust = post_session(server.addr, "rust", &body)?;
-    let mumps = post_session(server.addr, "mumps", &body)?;
-    let compare = post_session(server.addr, "compare", &body)?;
-    assert_stopped(server);
+    let (rust, mumps, compare) = with_synthetic_dir("422", |root| {
+        write_case(
+            root,
+            &inputs,
+            "SYNTHETIC TRANSCRIPT: any text; the MUMPS side only has to succeed\n",
+            None,
+            "",
+        )?;
+        with_server(store, replay(root), |addr| {
+            Ok((
+                post_session(addr, "rust", &body)?,
+                post_session(addr, "mumps", &body)?,
+                post_session(addr, "compare", &body)?,
+            ))
+        })
+    })?;
     let error = expect_error(&rust, 422, "rust")?;
-    assert!(
-        error.contains(&id),
-        "rust 422 error {error:?} must name {id}"
-    );
+    assert!(error.contains(&id), "rust 422 error text must name {id}");
     assert_eq!(
-        mumps.status,
-        200,
-        "the synthetic capture must replay, so that compare reaches the Rust side: {}",
-        mumps.text()
+        mumps.0, 200,
+        "the synthetic capture must replay, so that compare reaches the Rust side: status"
     );
     let error = expect_error(&compare, 422, "compare")?;
-    assert!(
-        error.contains(&id),
-        "compare 422 error {error:?} must name {id}"
-    );
+    assert!(error.contains(&id), "compare 422 error text must name {id}");
     Ok(())
 }
 
@@ -1176,122 +1232,149 @@ fn synthetic_422_unsupported_branch_end_to_end() -> Result<(), String> {
 
 #[test]
 fn synthetic_502_not_recorded() -> Result<(), String> {
-    let dir = SyntheticDir::new("502-not-recorded")?;
-    // A complete capture of another session, which must not match.
-    write_case(
-        &dir,
-        &strings(&["SYNTHETIC OTHER INPUT"]),
-        "SYNTHETIC TRANSCRIPT\n",
-        None,
-        "",
-    )?;
-    let error = mumps_502(&dir, dir.replay(), &strings(&SESSION_INPUTS))?;
-    assert_eq!(error, "NOT RECORDED");
-    Ok(())
+    with_synthetic_dir("502-not-recorded", |root| {
+        // A complete capture of another session, which must not match.
+        write_case(
+            root,
+            &strings(&["SYNTHETIC OTHER INPUT"]),
+            "SYNTHETIC TRANSCRIPT\n",
+            None,
+            "",
+        )?;
+        let error = mumps_502(replay(root), &strings(&SESSION_INPUTS))?;
+        assert_same("502 error text", &error, "NOT RECORDED");
+        Ok(())
+    })
 }
 
 #[test]
 fn synthetic_502_not_recorded_lists_unreadable_input() -> Result<(), String> {
-    let dir = SyntheticDir::new("502-unreadable-input")?;
-    let input = dir.write("GC-01/input.txt", &[0xFF, 0xFE, b'\n'])?;
-    let error = mumps_502(&dir, dir.replay(), &strings(&SESSION_INPUTS))?;
-    assert!(
-        error.starts_with("NOT RECORDED"),
-        "error {error:?} must be NOT RECORDED"
-    );
-    let path = input.display().to_string();
-    assert!(error.contains(&path), "error {error:?} must list {path}");
-    Ok(())
+    with_synthetic_dir("502-unreadable-input", |root| {
+        let input = write_file(root, "GC-01/input.txt", &[0xFF, 0xFE, b'\n'])?;
+        let error = mumps_502(replay(root), &strings(&SESSION_INPUTS))?;
+        assert!(
+            error.starts_with("NOT RECORDED"),
+            "502 error text must start with NOT RECORDED"
+        );
+        let path = input.display().to_string();
+        assert!(
+            error.contains(&path),
+            "502 error text must list the unreadable synthetic GC-01/input.txt"
+        );
+        Ok(())
+    })
 }
 
 #[test]
 fn synthetic_502_capture_file_missing() -> Result<(), String> {
-    let dir = SyntheticDir::new("502-missing")?;
     let inputs = strings(&SESSION_INPUTS);
-    write_inputs(&dir, &inputs)?;
-    dir.write("GC-01/returned.txt", b"")?;
-    dir.write("GC-01/normalisation.txt", b"")?;
-    let error = mumps_502(&dir, dir.replay(), &inputs)?;
-    let path = dir.case_file("transcript.txt");
-    assert_eq!(error, format!("CAPTURE FILE {}: MISSING", path.display()));
-    Ok(())
+    with_synthetic_dir("502-missing", |root| {
+        write_inputs(root, &inputs)?;
+        write_file(root, "GC-01/returned.txt", b"")?;
+        write_file(root, "GC-01/normalisation.txt", b"")?;
+        let error = mumps_502(replay(root), &inputs)?;
+        let path = case_file(root, "transcript.txt");
+        assert_same(
+            "502 error text",
+            &error,
+            format!("CAPTURE FILE {}: MISSING", path.display()),
+        );
+        Ok(())
+    })
 }
 
 #[test]
 fn synthetic_502_capture_file_unreadable() -> Result<(), String> {
-    let dir = SyntheticDir::new("502-unreadable")?;
     let inputs = strings(&SESSION_INPUTS);
-    write_case(&dir, &inputs, "", None, "")?;
-    // A directory in place of transcript.txt is present but unreadable.
-    let path = dir.case_file("transcript.txt");
-    fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
-    fs::create_dir(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
-    let error = mumps_502(&dir, dir.replay(), &inputs)?;
-    assert_eq!(
-        error,
-        format!("CAPTURE FILE {}: UNREADABLE", path.display())
-    );
-    Ok(())
+    with_synthetic_dir("502-unreadable", |root| {
+        write_case(root, &inputs, "", None, "")?;
+        // A directory in place of transcript.txt is present but unreadable.
+        let path = case_file(root, "transcript.txt");
+        fs::remove_file(&path)
+            .map_err(|e| format!("removing synthetic GC-01/transcript.txt: {e}"))?;
+        fs::create_dir(&path)
+            .map_err(|e| format!("creating the directory GC-01/transcript.txt: {e}"))?;
+        let error = mumps_502(replay(root), &inputs)?;
+        assert_same(
+            "502 error text",
+            &error,
+            format!("CAPTURE FILE {}: UNREADABLE", path.display()),
+        );
+        Ok(())
+    })
 }
 
 #[test]
 fn synthetic_502_capture_file_non_utf8() -> Result<(), String> {
-    let dir = SyntheticDir::new("502-non-utf8")?;
     let inputs = strings(&SESSION_INPUTS);
-    write_case(&dir, &inputs, "", None, "")?;
-    let path = dir.write("GC-01/transcript.txt", &[0xFF, 0xFE])?;
-    let error = mumps_502(&dir, dir.replay(), &inputs)?;
-    assert_eq!(error, format!("CAPTURE FILE {}: NON-UTF8", path.display()));
-    Ok(())
+    with_synthetic_dir("502-non-utf8", |root| {
+        write_case(root, &inputs, "", None, "")?;
+        let path = write_file(root, "GC-01/transcript.txt", &[0xFF, 0xFE])?;
+        let error = mumps_502(replay(root), &inputs)?;
+        assert_same(
+            "502 error text",
+            &error,
+            format!("CAPTURE FILE {}: NON-UTF8", path.display()),
+        );
+        Ok(())
+    })
 }
 
 #[test]
 fn synthetic_502_malformed_normalisation() -> Result<(), String> {
-    let dir = SyntheticDir::new("502-normalisation")?;
     let inputs = strings(&SESSION_INPUTS);
-    write_case(
-        &dir,
-        &inputs,
-        "SYNTHETIC TRANSCRIPT\n",
-        None,
-        "SYNTHETIC RULE WITHOUT A TAB\n",
-    )?;
-    let error = mumps_502(&dir, dir.replay(), &inputs)?;
-    let path = dir.case_file("normalisation.txt");
-    assert_eq!(
-        error,
-        format!("MALFORMED NORMALISATION {} line 1", path.display())
-    );
-    Ok(())
+    with_synthetic_dir("502-normalisation", |root| {
+        write_case(
+            root,
+            &inputs,
+            "SYNTHETIC TRANSCRIPT\n",
+            None,
+            "SYNTHETIC RULE WITHOUT A TAB\n",
+        )?;
+        let error = mumps_502(replay(root), &inputs)?;
+        let path = case_file(root, "normalisation.txt");
+        assert_same(
+            "502 error text",
+            &error,
+            format!("MALFORMED NORMALISATION {} line 1", path.display()),
+        );
+        Ok(())
+    })
 }
 
 #[test]
 fn synthetic_502_malformed_meta() -> Result<(), String> {
-    let dir = SyntheticDir::new("502-meta")?;
-    let meta = meta_text(SYNTHETIC_CONTEXT, "not-json");
-    let path = dir.write("GC-01/meta.txt", meta.as_bytes())?;
-    let error = mumps_502(&dir, dir.live(), &strings(&SESSION_INPUTS))?;
-    assert_eq!(error, format!("MALFORMED META {}", path.display()));
-    Ok(())
+    with_synthetic_dir("502-meta", |root| {
+        let meta = meta_text(SYNTHETIC_CONTEXT, "not-json");
+        let path = write_file(root, "GC-01/meta.txt", meta.as_bytes())?;
+        let error = mumps_502(live(root), &strings(&SESSION_INPUTS))?;
+        assert_same(
+            "502 error text",
+            &error,
+            format!("MALFORMED META {}", path.display()),
+        );
+        Ok(())
+    })
 }
 
 #[test]
 fn synthetic_502_context_mismatch() -> Result<(), String> {
-    let dir = SyntheticDir::new("502-context")?;
-    let meta = meta_text(SYNTHETIC_CONTEXT, r#"["synthetic-never-run"]"#);
-    dir.write("GC-01/meta.txt", meta.as_bytes())?;
-    let error = mumps_502(&dir, dir.live(), &strings(&SESSION_INPUTS))?;
-    // A context error, not a spawn error or an `EXIT` cause, proves the
-    // bridge stopped before it ran `docker`.
-    assert!(
-        error.starts_with("CONTEXT MISMATCH IOF: expected UNRESOLVED, actual #"),
-        "error {error:?} must be the IOF context mismatch"
-    );
-    assert!(
-        !error.contains("EXIT") && !error.contains("os error"),
-        "error {error:?} shows that docker ran"
-    );
-    Ok(())
+    with_synthetic_dir("502-context", |root| {
+        let meta = meta_text(SYNTHETIC_CONTEXT, r#"["synthetic-never-run"]"#);
+        write_file(root, "GC-01/meta.txt", meta.as_bytes())?;
+        let error = mumps_502(live(root), &strings(&SESSION_INPUTS))?;
+        // A context error, not a spawn error or an `EXIT` cause, proves the
+        // bridge stopped before it ran `docker`.
+        assert!(
+            error.starts_with("CONTEXT MISMATCH IOF: expected UNRESOLVED, actual #"),
+            "502 error text must be the IOF context mismatch"
+        );
+        assert!(
+            !error.contains("EXIT") && !error.contains("os error"),
+            "502 error text shows that docker ran"
+        );
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1306,17 +1389,17 @@ const PROBE: &str = "\"\\\u{e9}\u{20ac}\u{1f600}\u{1}";
 #[test]
 fn synthetic_json_escaping_round_trip() -> Result<(), String> {
     let store = synthetic_store()?;
-    let Some(case) = ok_case_or_not_run("synthetic_json_escaping_round_trip", &store) else {
+    let Some((case_inputs, case_transcript, _)) =
+        ok_case_or_not_run("synthetic_json_escaping_round_trip", &store)
+    else {
         return Ok(());
     };
-    let dir = SyntheticDir::new("json")?;
     // The probe rides as one extra input line, which the replay must match.
-    let mut inputs = case.inputs.clone();
+    let mut inputs = case_inputs;
     inputs.push(format!("SYNTHETIC PROBE {PROBE}"));
     // Synthetic: the inquire transcript, then the probe, a tab and BEL,
     // which the bridge must escape and this parser must decode.
-    let transcript = format!("{}{PROBE}\t\u{7}", case.transcript);
-    write_case(&dir, &inputs, &transcript, None, "")?;
+    let transcript = format!("{case_transcript}{PROBE}\t\u{7}");
     let body = body_for_ascii(&inputs);
     assert!(
         body.is_ascii(),
@@ -1331,39 +1414,115 @@ fn synthetic_json_escaping_round_trip() -> Result<(), String> {
         "\\ud83d\\ude00",
         "\\u0001",
     ] {
-        assert!(sent.contains(escape), "request {sent} lacks {escape}");
+        assert!(
+            sent.contains(escape),
+            "the request body lacks the escape {escape}"
+        );
     }
-    let server = Server::start(store, dir.replay())?;
-    let resp = post_session(server.addr, "mumps", &body)?;
-    assert_stopped(server);
-    assert_eq!(resp.status, 200, "mumps: body {}", resp.text());
-    let (decoded, _) = session_of(&resp.json()?)?;
-    let file = fs::read_to_string(dir.case_file("transcript.txt"))
-        .map_err(|e| format!("read the synthetic transcript.txt: {e}"))?;
-    assert_eq!(decoded, file, "decoded transcript against transcript.txt");
+    let ((status, response), file) = with_synthetic_dir("json", |root| {
+        write_case(root, &inputs, &transcript, None, "")?;
+        let resp = with_server(store, replay(root), |addr| {
+            post_session(addr, "mumps", &body)
+        })?;
+        let file = fs::read_to_string(case_file(root, "transcript.txt"))
+            .map_err(|e| format!("reading synthetic GC-01/transcript.txt: {e}"))?;
+        Ok((resp, file))
+    })?;
+    assert_eq!(status, 200, "mumps backend: status");
+    let (decoded, _) = session_of(json_body(&response)?)?;
+    assert_same("decoded transcript against transcript.txt", &decoded, &file);
     Ok(())
+}
+
+/// The interim response the bridge sends to `Expect: 100-continue`.
+const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+/// Reads `stream` until the peer closes it, and returns what arrived. A
+/// reset counts as a close; a read that times out is an error.
+fn read_until_closed(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut received = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return Ok(received),
+            Ok(n) => received.extend_from_slice(buf.get(..n).unwrap_or_default()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(received),
+            Err(e) => return Err(format!("still open after {} bytes: {e}", received.len())),
+        }
+    }
 }
 
 #[test]
 fn synthetic_shutdown_joins_within_bound() -> Result<(), String> {
-    let dir = SyntheticDir::new("shutdown")?;
-    let server = Server::start(synthetic_store()?, dir.replay())?;
-    // One answered request shows the accept loop was running.
-    let resp = http(server.addr, "GET", "/", None)?;
-    assert_eq!(resp.status, 200, "GET /: body {}", resp.text());
-    let started = Instant::now();
-    let stopped = server.stop_within(SHUTDOWN_BOUND);
-    let elapsed = started.elapsed();
-    assert!(
-        stopped.is_ok(),
-        "serve_until after the shutdown flag: {stopped:?}"
-    );
-    assert!(
-        elapsed < SHUTDOWN_BOUND,
-        "serve_until took {} ms to return",
-        elapsed.as_millis()
-    );
-    Ok(())
+    let inputs = strings(&SESSION_INPUTS);
+    let body = body_for(&inputs);
+    with_synthetic_dir("shutdown", |root| {
+        // A capture the in-flight session matches, so that a connection
+        // thread running on after shutdown would answer it.
+        write_case(root, &inputs, "SYNTHETIC TRANSCRIPT\n", None, "")?;
+        // The stop bound lies below the server's 5-second read timeout, so a
+        // connection thread blocked in a read must be woken, not waited out:
+        // `with_server_within` fails unless `serve_until` returns `Ok(())`
+        // within the bound.
+        let (mut idle, mut in_flight) =
+            with_server_within(SHUTDOWN_BOUND, synthetic_store()?, replay(root), |addr| {
+                // One answered request shows the accept loop was running.
+                let (status, _) = http(addr, "GET", "/", None)?;
+                assert_eq!(status, 200, "GET /: status");
+                // The idle connection sends nothing. Connections are accepted
+                // in arrival order, so once the in-flight one is answered
+                // below, the idle one has been accepted too.
+                let idle = connect(addr)?;
+                let mut in_flight = connect(addr)?;
+                let head = format!(
+                    "POST /api/mumps/session HTTP/1.1\r\nHost: {addr}\r\n\
+                     Content-Type: application/json\r\nContent-Length: {}\r\n\
+                     Expect: 100-continue\r\n\r\n",
+                    body.len()
+                );
+                in_flight
+                    .write_all(head.as_bytes())
+                    .map_err(|e| format!("in-flight connection: sending the head: {e}"))?;
+                // The interim response shows its connection thread is now
+                // blocked reading the body.
+                let mut interim = vec![0u8; CONTINUE.len()];
+                in_flight
+                    .read_exact(&mut interim)
+                    .map_err(|e| format!("in-flight connection: reading 100 Continue: {e}"))?;
+                assert_same("in-flight connection: interim response", &interim, CONTINUE);
+                Ok((idle, in_flight))
+            })?;
+        // The session's resources go, as a caller of `serve_until` may remove
+        // them once it has returned: a connection thread still running would
+        // now answer 502, or 200 had it read the capture first.
+        fs::remove_dir_all(root).map_err(|e| format!("removing the synthetic directory: {e}"))?;
+        // The server may have reset the connection already, so the send may
+        // fail; only an answer would be wrong.
+        let _ = in_flight.write_all(&body);
+        let in_flight_rest =
+            read_until_closed(&mut in_flight).map_err(|e| format!("in-flight connection: {e}"))?;
+        let started = Instant::now();
+        let idle_rest = read_until_closed(&mut idle);
+        let idle_wait = started.elapsed();
+        assert!(
+            in_flight_rest.is_empty(),
+            "in-flight connection: {} response bytes after shutdown, none expected",
+            in_flight_rest.len()
+        );
+        let idle_rest = idle_rest.map_err(|e| format!("idle connection: {e}"))?;
+        assert!(
+            idle_rest.is_empty(),
+            "idle connection: {} bytes after shutdown, none expected",
+            idle_rest.len()
+        );
+        assert!(
+            idle_wait < SHUTDOWN_BOUND,
+            "idle connection: closed {} ms after serve_until returned",
+            idle_wait.as_millis()
+        );
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,16 +1561,20 @@ const FIXTURE_FILES: [&str; 13] = [
 #[test]
 fn gc_02_end_to_end_compare() -> Result<(), String> {
     const LABEL: &str = "gc_02_end_to_end_compare (not synthetic)";
-    let golden = crate_dir().join("tests").join("golden").join("ifcap");
-    let case = golden.join("GC-02");
-    let fixtures = crate_dir().join("tests").join("fixtures").join("ifcap");
+    const GOLDEN: &str = "tests/golden/ifcap";
+    const CASE: &str = "tests/golden/ifcap/GC-02";
+    const FIXTURES: &str = "tests/fixtures/ifcap";
+    // Every path is named relative to the crate.
     let required = CAPTURE_FILES
         .iter()
-        .map(|name| case.join(name))
-        .chain(FIXTURE_FILES.iter().map(|name| fixtures.join(name)));
+        .map(|name| format!("{CASE}/{name}"))
+        .chain(
+            FIXTURE_FILES
+                .iter()
+                .map(|name| format!("{FIXTURES}/{name}")),
+        );
     let missing: Vec<String> = required
-        .filter(|path| !path.exists())
-        .map(|path| path.display().to_string())
+        .filter(|relative| !crate_dir().join(relative).exists())
         .collect();
     if !missing.is_empty() {
         println!("{LABEL}: NOT COMPARED, missing: {}", missing.join(", "));
@@ -1419,47 +1582,40 @@ fn gc_02_end_to_end_compare() -> Result<(), String> {
     }
     let fail = |step: &str, detail: String| format!("{LABEL}: FAIL at {step}: {detail}");
     let read = |name: &str| {
-        let path = case.join(name);
-        fs::read_to_string(&path)
-            .map_err(|e| fail("reading the capture", format!("{}: {e}", path.display())))
+        fs::read_to_string(crate_dir().join(CASE).join(name))
+            .map_err(|e| fail("reading the capture", format!("{CASE}/{name}: {e}")))
     };
-    let store = load_fixtures(&fixtures).map_err(|e| fail("load_fixtures", e.to_string()))?;
+    let store = load_fixtures(&crate_dir().join(FIXTURES))
+        .map_err(|e| fail("load_fixtures", store_error_cause(&e)))?;
     let inputs = split_input_lines(&read("input.txt")?);
     let captured_transcript = read("transcript.txt")?;
     let captured_returned = read("returned.txt")?;
     let normalisation = read("normalisation.txt")?;
 
-    let server = Server::start(
-        store,
-        MumpsMode::Replay {
-            golden_dir: golden.clone(),
-        },
-    )?;
-    let resp = post_session(server.addr, "compare", &body_for(&inputs))?;
-    assert_stopped(server);
+    let mode = MumpsMode::Replay {
+        golden_dir: crate_dir().join(GOLDEN),
+    };
+    let (status, body) = with_server(store, mode, |addr| {
+        post_session(addr, "compare", &body_for(&inputs))
+    })?;
 
-    assert_eq!(
-        resp.status,
-        200,
-        "{LABEL}: FAIL at status 200: body {}",
-        resp.text()
-    );
-    let json = resp.json().map_err(|e| fail("the response body", e))?;
-    let matched = field(&json, "match").map_err(|e| fail("match", e))?;
-    assert_eq!(matched, &Json::Bool(true), "{LABEL}: FAIL at match == true");
+    assert_eq!(status, 200, "{LABEL}: FAIL at status 200");
+    let json = json_body(&body).map_err(|e| fail("the response body", e))?;
+    let matched = member(json, "match").map_err(|e| fail("match", e))?;
+    assert!(matched == "true", "{LABEL}: FAIL at match == true");
     let rules = parse_normalisation(&normalisation).map_err(|line| {
         fail(
             "parse_normalisation",
             format!("normalisation.txt line {line}"),
         )
     })?;
-    let rust = field(&json, "rust").map_err(|e| fail("the rust side", e))?;
+    let rust = member(json, "rust").map_err(|e| fail("the rust side", e))?;
     let (rust_transcript, rust_returned) =
         session_of(rust).map_err(|e| fail("the rust side", e))?;
-    assert_eq!(
+    assert_same(
+        &format!("{LABEL}: FAIL at the normalised transcript"),
         normalise(&rust_transcript, &rules),
         normalise(&captured_transcript, &rules),
-        "{LABEL}: FAIL at the normalised transcript"
     );
     // returned.txt: zero bytes is null, otherwise one trailing newline is
     // not part of the value.
@@ -1473,9 +1629,10 @@ fn gc_02_end_to_end_compare() -> Result<(), String> {
                 .to_string(),
         )
     };
-    assert_eq!(
-        rust_returned, expected_returned,
-        "{LABEL}: FAIL at returned against returned.txt"
+    assert_same_optional(
+        &format!("{LABEL}: FAIL at returned against returned.txt"),
+        rust_returned.as_deref(),
+        expected_returned.as_deref(),
     );
     println!("{LABEL}: PASS");
     Ok(())
