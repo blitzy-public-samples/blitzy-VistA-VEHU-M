@@ -107,6 +107,11 @@ pub(crate) fn cmp_numbers(a: &str, b: &str) -> Ordering {
 ///
 /// The empty string, which no exported subscript holds, falls among the
 /// strings, first.
+///
+/// Test-only: production code orders keys through `Sub` in `store.rs`,
+/// which applies this rule to classified subscripts, so nothing outside the
+/// tests compares raw subscript texts.
+#[cfg(test)]
 pub(crate) fn collate(a: &str, b: &str) -> Ordering {
     match (is_canonical(a), is_canonical(b)) {
         (true, true) => cmp_numbers(a, b),
@@ -597,7 +602,9 @@ impl<'a> Session<'a> {
         self.y
     }
 
-    /// Everything written so far.
+    /// Everything written so far. Test-only: a session's transcript leaves
+    /// production code once, through [`Session::into_transcript`].
+    #[cfg(test)]
     pub(crate) fn transcript(&self) -> &str {
         &self.out
     }
