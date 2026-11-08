@@ -26,11 +26,13 @@ use crate::mumps;
 ///
 /// Invariant: `Num` holds the canonical text of a number (`.5`, `500`,
 /// `10000000044`; never `0.5`, `01` or `1.0`), and `Str` holds text that is
-/// not a canonical number. [`Sub::from_text`] and the loader keep it; a
-/// caller that builds `Num` from non-canonical text, or `Str` from canonical
-/// text, gets a key that matches no loaded node. Under the invariant, equal
-/// values always have equal text, so the derived equality agrees with the
-/// collation order.
+/// not a canonical number. [`Sub::from_text`] and the loader keep it, and
+/// callers must construct subscripts through them unless the text is a
+/// literal already known to meet it. A `Num` built from non-canonical text,
+/// or a `Str` from canonical text, violates the invariant and is not the
+/// subscript M names for that text. The order stays consistent with the
+/// derived `Eq` and `Hash` for every value, because a numeric tie is broken
+/// on the raw text.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Sub {
     /// A canonical number, as its canonical text.
@@ -71,9 +73,16 @@ impl Ord for Sub {
     /// IENs before `"AC"` and `"B"` in this order, and the item loop
     /// `Q:PRCHDI'>0` at PRCHDP2.m:11 relies on numeric items preceding
     /// the `"B"` subscript.
+    ///
+    /// Two numbers of equal value are then ordered by the bytes of their
+    /// text. Canonical texts of equal value are identical, so this never
+    /// reorders loaded keys; it keeps the order total and consistent with
+    /// the derived `Eq` for a `Num` built from non-canonical text.
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
-            (Sub::Num(a), Sub::Num(b)) => mumps::cmp_numbers(a, b),
+            (Sub::Num(a), Sub::Num(b)) => {
+                mumps::cmp_numbers(a, b).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+            }
             (Sub::Num(_), Sub::Str(_)) => Ordering::Less,
             (Sub::Str(_), Sub::Num(_)) => Ordering::Greater,
             (Sub::Str(a), Sub::Str(b)) => a.as_bytes().cmp(b.as_bytes()),
@@ -84,6 +93,15 @@ impl Ord for Sub {
 impl PartialOrd for Sub {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl Default for Sub {
+    /// The null subscript `""`, M's `$ORDER` seed and end value.
+    /// [`Store::order`] starts at the first child from it and never returns
+    /// it.
+    fn default() -> Sub {
+        Sub::Str(String::new())
     }
 }
 
@@ -191,7 +209,9 @@ impl Store {
 
     /// M forward `$ORDER`: the next child subscript of `parent` after
     /// `after` in collation order, or `None` when there is none. `after` of
-    /// `None` is the `""` seed and gives the first child.
+    /// `None` or of the null subscript `""` is the seed and gives the first
+    /// child. Null subscripts are invisible to it, as to M's `$ORDER`; a
+    /// null node is still read through [`Store::get`] and [`Store::data`].
     pub fn order(&self, parent: &[Sub], after: Option<&Sub>) -> Option<Sub> {
         mumps::order(&self.nodes, parent, after)
     }
@@ -306,82 +326,82 @@ pub fn load_fixtures(dir: &Path) -> Result<Store, StoreError> {
     Ok(store)
 }
 
-/// A left-to-right scanner over one ZWR data line. Quoted strings may hold
-/// `,`, `)`, `=` and doubled quotes, so the line is never split on them.
-struct Cursor<'a> {
-    rest: &'a str,
+// One ZWR data line is scanned left to right. The scanner state is `rest`,
+// the unconsumed text of the line, and each function below consumes from
+// its front. Quoted strings may hold `,`, `)`, `=` and doubled quotes, so
+// the line is never split on them.
+
+/// The next unconsumed character, without consuming it.
+fn peek(rest: &str) -> Option<char> {
+    rest.chars().next()
 }
 
-impl<'a> Cursor<'a> {
-    fn peek(&self) -> Option<char> {
-        self.rest.chars().next()
-    }
-
-    /// Consumes `c` when it is the next character.
-    fn eat(&mut self, c: char) -> bool {
-        match self.rest.strip_prefix(c) {
-            Some(tail) => {
-                self.rest = tail;
-                true
-            }
-            None => false,
+/// Consumes `c` when it is the next character.
+fn eat(rest: &mut &str, c: char) -> bool {
+    match rest.strip_prefix(c) {
+        Some(tail) => {
+            *rest = tail;
+            true
         }
+        None => false,
     }
+}
 
-    /// Consumes and returns the longest prefix whose characters satisfy
-    /// `keep`.
-    fn take_while(&mut self, keep: impl Fn(char) -> bool) -> &'a str {
-        let end = self
-            .rest
-            .find(|c: char| !keep(c))
-            .unwrap_or(self.rest.len());
-        let (head, tail) = self.rest.split_at_checked(end).unwrap_or((self.rest, ""));
-        self.rest = tail;
-        head
-    }
+/// Consumes and returns the longest prefix whose characters satisfy
+/// `keep`.
+fn take_while<'a>(rest: &mut &'a str, keep: impl Fn(char) -> bool) -> &'a str {
+    let text: &'a str = rest;
+    let end = text.find(|c: char| !keep(c)).unwrap_or(text.len());
+    let (head, tail) = text.split_at_checked(end).unwrap_or((text, ""));
+    *rest = tail;
+    head
+}
 
-    /// Consumes a quoted string whose opening quote has been consumed,
-    /// through its closing quote, turning each `""` into one `"`.
-    fn quoted(&mut self) -> Result<String, String> {
-        let mut out = String::new();
-        loop {
-            let Some((chunk, after)) = self.rest.split_once('"') else {
-                return Err("unterminated string".to_string());
-            };
-            out.push_str(chunk);
-            match after.strip_prefix('"') {
-                Some(next) => {
-                    out.push('"');
-                    self.rest = next;
-                }
-                None => {
-                    self.rest = after;
-                    return Ok(out);
-                }
+/// Consumes a quoted string whose opening quote has been consumed,
+/// through its closing quote, turning each `""` into one `"`.
+fn quoted(rest: &mut &str) -> Result<String, String> {
+    let mut out = String::new();
+    loop {
+        let Some((chunk, after)) = rest.split_once('"') else {
+            return Err("unterminated string".to_string());
+        };
+        out.push_str(chunk);
+        match after.strip_prefix('"') {
+            Some(next) => {
+                out.push('"');
+                *rest = next;
+            }
+            None => {
+                *rest = after;
+                return Ok(out);
             }
         }
     }
+}
 
-    /// Consumes an unquoted number token: digits, letters (so that
-    /// exponent forms are caught as non-canonical), `.`, `+` and `-`.
-    fn number_token(&mut self) -> &'a str {
-        self.take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
-    }
+/// Consumes an unquoted number token: digits, letters (so that
+/// exponent forms are caught as non-canonical), `.`, `+` and `-`.
+fn number_token<'a>(rest: &mut &'a str) -> &'a str {
+    take_while(rest, |c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-')
+    })
 }
 
 /// The message for a value this loader declines to evaluate.
 const DOLLAR_C_MESSAGE: &str = "$C() values are not supported";
 
 /// Parses one data line into its key and value, or a message naming what
-/// was expected.
+/// was expected. No message quotes text from the line, because a malformed
+/// fixture line can hold a person's or vendor's name and the message
+/// reaches the bridge's startup error.
 fn parse_line(line: &str) -> Result<(Vec<Sub>, String), String> {
-    let mut cur = Cursor { rest: line };
-    if !cur.eat('^') {
+    let mut rest = line;
+    if !eat(&mut rest, '^') {
         return Err("expected '^' at the start of a data line".to_string());
     }
-    let percent = cur.eat('%');
-    let name_starts_with_letter = cur.peek().is_some_and(|c| c.is_ascii_alphabetic());
-    let name = cur.take_while(|c| c.is_ascii_alphanumeric());
+    let percent = eat(&mut rest, '%');
+    let name_starts_with_letter = peek(rest).is_some_and(|c| c.is_ascii_alphabetic());
+    let name = take_while(&mut rest, |c| c.is_ascii_alphanumeric());
     if !percent && !name_starts_with_letter {
         return Err("expected a global name after '^'".to_string());
     }
@@ -389,63 +409,61 @@ fn parse_line(line: &str) -> Result<(Vec<Sub>, String), String> {
         "{}{name}",
         if percent { "%" } else { "" }
     ))];
-    if !cur.eat('(') {
+    if !eat(&mut rest, '(') {
         return Err("expected '(' after global name".to_string());
     }
     loop {
-        key.push(parse_subscript(&mut cur)?);
-        if cur.eat(',') {
+        key.push(parse_subscript(&mut rest)?);
+        if eat(&mut rest, ',') {
             continue;
         }
-        if cur.eat(')') {
+        if eat(&mut rest, ')') {
             break;
         }
         return Err("expected ',' or ')' after subscript".to_string());
     }
-    if !cur.eat('=') {
+    if !eat(&mut rest, '=') {
         return Err("expected '=' after subscripts".to_string());
     }
-    let value = parse_value(&mut cur)?;
+    let value = parse_value(&mut rest)?;
     Ok((key, value))
 }
 
 /// One subscript: a quoted string, stored through [`Sub::from_text`], or an
 /// unquoted canonical number.
-fn parse_subscript(cur: &mut Cursor<'_>) -> Result<Sub, String> {
-    if cur.eat('"') {
-        return cur.quoted().map(|text| Sub::from_text(&text));
+fn parse_subscript(rest: &mut &str) -> Result<Sub, String> {
+    if eat(rest, '"') {
+        return quoted(rest).map(|text| Sub::from_text(&text));
     }
-    let token = cur.number_token();
+    let token = number_token(rest);
     if token.is_empty() {
         return Err("expected a subscript".to_string());
     }
     if mumps::is_canonical(token) {
         Ok(Sub::Num(token.to_string()))
     } else {
-        Err(format!(
-            "unquoted subscript {token} is not a canonical number"
-        ))
+        Err("unquoted subscript is not a canonical number".to_string())
     }
 }
 
 /// The value after `=`: a quoted string or a canonical number, and nothing
 /// after it.
-fn parse_value(cur: &mut Cursor<'_>) -> Result<String, String> {
-    let value = if cur.eat('"') {
-        cur.quoted()?
-    } else if cur.peek() == Some('$') {
+fn parse_value(rest: &mut &str) -> Result<String, String> {
+    let value = if eat(rest, '"') {
+        quoted(rest)?
+    } else if peek(rest) == Some('$') {
         return Err(DOLLAR_C_MESSAGE.to_string());
     } else {
-        let token = cur.number_token();
+        let token = number_token(rest);
         if token.is_empty() {
             return Err("expected a quoted string or a number after '='".to_string());
         }
         if !mumps::is_canonical(token) {
-            return Err(format!("unquoted value {token} is not a canonical number"));
+            return Err("unquoted value is not a canonical number".to_string());
         }
         token.to_string()
     };
-    match cur.peek() {
+    match peek(rest) {
         None => Ok(value),
         Some('_') => Err(format!("{DOLLAR_C_MESSAGE} ('_' concatenation)")),
         Some(_) => Err("unexpected text after the value".to_string()),
@@ -455,6 +473,7 @@ fn parse_value(cur: &mut Cursor<'_>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn num(text: &str) -> Sub {
@@ -476,15 +495,30 @@ mod tests {
         Store::from_zwr(text).map_err(|e| e.to_string())
     }
 
-    /// A fresh directory under the system temporary directory, unique to
-    /// this process and call.
+    /// A new directory under the system temporary directory, created by this
+    /// call and therefore owned by it. Each attempt takes the next name
+    /// `ifcap-store-unit-<pid>-<n>` and creates it with `fs::create_dir`,
+    /// which fails on any existing entry, a symbolic link included, without
+    /// following it. An existing entry is never removed or reused: the next
+    /// name is tried instead, up to `ATTEMPTS` names. Callers remove only the
+    /// directory returned here.
     fn scratch_dir() -> Result<PathBuf, String> {
+        const ATTEMPTS: usize = 64;
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ifcap-store-unit-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        Ok(dir)
+        let base = std::env::temp_dir();
+        for _ in 0..ATTEMPTS {
+            let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+            let dir = base.join(format!("ifcap-store-unit-{}-{n}", std::process::id()));
+            match fs::create_dir(&dir) {
+                Ok(()) => return Ok(dir),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("cannot create {}: {e}", dir.display())),
+            }
+        }
+        Err(format!(
+            "no unused scratch directory name under {} after {ATTEMPTS} attempts",
+            base.display()
+        ))
     }
 
     fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
@@ -566,6 +600,49 @@ mod tests {
                 "{line:?} should be rejected on line 2"
             );
         }
+        // The message gives the line and the cause, and never the line's
+        // data, which can hold a person's or vendor's name.
+        let value_cause = "unquoted value is not a canonical number";
+        let subscript_cause = "unquoted subscript is not a canonical number";
+        for (line, data, cause) in [
+            ("^X(1)=SMITHJOHN", "SMITHJOHN", value_cause),
+            ("^X(1)=7ACMECORP", "7ACMECORP", value_cause),
+            ("^X(JONESMARY)=1", "JONESMARY", subscript_cause),
+            ("^X(1,DOEJANE)=\"a\"", "DOEJANE", subscript_cause),
+            ("^X(00417)=\"a\"", "00417", subscript_cause),
+            (
+                "^X(1)=\"a\"WILSONPAT",
+                "WILSONPAT",
+                "unexpected text after the value",
+            ),
+            (
+                "^X(1)=\"a\"_BROWNKIM",
+                "BROWNKIM",
+                "$C() values are not supported ('_' concatenation)",
+            ),
+            ("^X(\"TAYLORANN)=1", "TAYLORANN", "unterminated string"),
+            (
+                "^GARCIALUIS=1",
+                "GARCIALUIS",
+                "expected '(' after global name",
+            ),
+        ] {
+            let outcome = Store::from_zwr(&format!("^X(0)=1\n{line}\n"));
+            assert!(
+                matches!(
+                    outcome,
+                    Err(StoreError::Parse {
+                        file: None,
+                        line: 2,
+                        ..
+                    })
+                ),
+                "{line:?} should be rejected on line 2"
+            );
+            let shown = outcome.err().map(|e| e.to_string()).unwrap_or_default();
+            assert_eq!(shown, format!("line 2: {cause}"), "{line:?}");
+            assert!(!shown.contains(data), "{line:?} gave {shown:?}");
+        }
     }
 
     #[test]
@@ -590,12 +667,15 @@ mod tests {
     fn non_canonical_unquoted_subscript_rejected() -> Result<(), String> {
         for sub in ["01", "1.0", "+1", "-0", "0.5", "1."] {
             let text = format!("^X({sub})=\"a\"\n");
+            let outcome = Store::from_zwr(&text);
             assert!(
-                matches!(
-                    Store::from_zwr(&text),
-                    Err(StoreError::Parse { line: 1, .. })
-                ),
+                matches!(outcome, Err(StoreError::Parse { line: 1, .. })),
                 "unquoted subscript {sub:?} should be rejected"
+            );
+            let shown = outcome.err().map(|e| e.to_string()).unwrap_or_default();
+            assert_eq!(
+                shown, "line 1: unquoted subscript is not a canonical number",
+                "unquoted subscript {sub:?}"
             );
         }
         let store = load("^X(.11,1.1,10000000044,-5)=\"a\"\n")?;
@@ -695,15 +775,14 @@ mod tests {
             }
             other => return Err(format!("expected an Io error, got {other:?}")),
         }
-        let missing = scratch_dir()?.join("absent");
+        let scratch = scratch_dir()?;
+        let missing = scratch.join("absent");
         let message = load_fixtures(&missing)
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
+        let _ = fs::remove_dir_all(&scratch);
         assert!(message.contains("absent"), "message was {message:?}");
-        if let Some(parent) = missing.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
         Ok(())
     }
 
@@ -793,6 +872,39 @@ mod tests {
             "iter must follow collation order"
         );
         assert!(num("999") < string("A") && num("-1") < num(".5") && string("Z") < string("a"));
+
+        // The order is total and agrees with the derived equality even for a
+        // `Num` built directly from non-canonical text.
+        let sample = [
+            num("1"),
+            num("01"),
+            num("1.0"),
+            num(".5"),
+            num("0.5"),
+            num("2"),
+            string("1"),
+            string("01"),
+            string("B"),
+        ];
+        for a in &sample {
+            for b in &sample {
+                assert_eq!(a.cmp(b) == Ordering::Equal, a == b, "{a:?} vs {b:?}");
+                assert_eq!(a.cmp(b), b.cmp(a).reverse(), "{a:?} vs {b:?}");
+                for c in sample.iter().filter(|c| a <= b && b <= *c) {
+                    assert!(a <= c, "{a:?}, {b:?}, {c:?}");
+                }
+            }
+        }
+        for odd in [num("01"), num("1.0")] {
+            assert_ne!(odd, num("1"));
+            assert_ne!(odd.cmp(&num("1")), Ordering::Equal, "{odd:?}");
+            assert!(num(".5") < odd && odd < num("2"), "{odd:?}");
+            assert!(odd < string("01") && odd < string("B"), "{odd:?}");
+        }
+        let store = load("^X(1)=\"a\"\n")?;
+        assert_eq!(store.get(&[string("X"), num("1")]), Some("a"));
+        assert_eq!(store.get(&[string("X"), num("01")]), None);
+        assert_eq!(store.data(&[string("X"), num("01")]), 0);
         Ok(())
     }
 
@@ -807,6 +919,27 @@ mod tests {
         assert_eq!(store.get(&key("X", &["3"])), None);
         assert_eq!(store.get_or_empty(&key("X", &["3"])), "");
         assert_eq!(store.get_or_empty(&key("X", &["1", "2"])), "b");
+        Ok(())
+    }
+
+    #[test]
+    fn null_subscript_loaded_and_invisible_to_order() -> Result<(), String> {
+        let text = "^X(\"\")=\"v\"\n^X(\"B\")=\"w\"\n";
+        let parent = key("X", &[]);
+        let store = load(text)?;
+        assert_eq!(store.order(&parent, None), Some(string("B")));
+
+        let store = load(&format!("{text}^X(1)=\"n\"\n"))?;
+        let mut walked = Vec::new();
+        let mut current = store.order(&parent, None);
+        while let Some(sub) = current {
+            walked.push(sub.clone());
+            current = store.order(&parent, Some(&sub));
+        }
+        assert_eq!(walked, vec![num("1"), string("B")]);
+        assert_eq!(store.order(&parent, Some(&Sub::default())), Some(num("1")));
+        assert_eq!(store.get(&key("X", &[""])), Some("v"));
+        assert_eq!(store.data(&key("X", &[""])), 1);
         Ok(())
     }
 

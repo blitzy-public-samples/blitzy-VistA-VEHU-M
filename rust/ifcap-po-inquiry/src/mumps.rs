@@ -150,19 +150,24 @@ fn digit_run(text: &str) -> usize {
 }
 
 /// M unary `+`: the numeric value of the leading numeric prefix of `text`,
-/// in canonical form. The prefix is any run of `+` and `-` signs (an odd
-/// number of `-` negates), then digits, then an optional `.` and digits.
-/// Text with no such prefix is `0`. Exponent notation is not modelled
-/// (FileMan guards it with `$P(X,"E")` at DIC.m:48), so `1E5` gives `1`.
+/// in canonical form. The prefix is one optional sign (`+` or `-`) as the
+/// first character, then digits, then an optional `.` and digits. A sign
+/// after the first character ends the prefix, so `--5`, `+-5` and `-+5`
+/// are all `0`: YottaDB string-to-number conversion accepts a plus or minus
+/// sign only as the first character of the string (YottaDB Programmer's
+/// Guide, docs.yottadb.com/ProgrammersGuide/langfeat.html, Numeric
+/// Expressions). Text with no such prefix is `0`. Exponent notation is not
+/// modelled (FileMan guards it with `$P(X,"E")` at DIC.m:48), so `1E5`
+/// gives `1`.
 ///
 /// Uses: `+$G(^PRC(442,D0,7))` at PRCHDP1.m:15 (PO-10), `+$P(PRCHDI0,U,1)`
 /// at PRCHDP2.m:49 (PO-27), `+Y` and `+$G(^PRC(442,DA,7))` at PRCHPAT.m:83
 /// (PO-08).
 pub(crate) fn num(text: &str) -> String {
-    let unsigned = text.trim_start_matches(['+', '-']);
-    let sign_count = text.len() - unsigned.len();
-    let minus_signs = text.bytes().take(sign_count).filter(|&b| b == b'-').count();
-    let negative = minus_signs % 2 == 1;
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(after_sign) => (true, after_sign),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
     let (int, rest) = unsigned
         .split_at_checked(digit_run(unsigned))
         .unwrap_or((unsigned, ""));
@@ -480,21 +485,33 @@ pub(crate) fn data<S: Ord>(map: &BTreeMap<Vec<S>, String>, key: &[S]) -> u8 {
 
 /// M forward `$ORDER(parent(after))`: the next child subscript of `parent`
 /// strictly after `after`, at depth `parent.len() + 1`, in collation order.
-/// `after` of `None` stands for the `""` seed and gives the first child;
 /// `None` as the result stands for M's `""` (no further child). Keys under
 /// the current child are skipped, and the walk stops at the first key that
 /// no longer starts with `parent`. Reverse `$ORDER` is not used on the
 /// path.
 ///
+/// The null subscript `""` is `S::default()`, and it is both the seed and
+/// invisible. An `after` of `None` or of the null subscript is the seed and
+/// gives the first child, as `$ORDER(x(""))` does, and a stored null child
+/// is never returned. YottaDB documents null subscripts as "invisible" in a
+/// `$ORDER()` loop, to be tested separately with `$DATA()`, and
+/// `$ORDER(x(""))` as returning the first node rather than the null one,
+/// which would loop forever (Programmer's Guide, Functions, `$ORDER()`,
+/// docs.yottadb.com/ProgrammersGuide/functions.html). A null node stays
+/// readable through [`get`] and [`data`]. Collation is unchanged, so where
+/// the null subscript sorts is never observable here.
+///
 /// Uses: the item loop `$O(^PRC(442,D0,2,PRCHDI))` at PRCHDP2.m:11
 /// (PO-25), the authority loop over node 14 at PRCHDP1.m:56 (PO-13), the
 /// item index `AC` at PRCHDP1.m:61 (PO-20), and the index walks of the
 /// lookup (PO-09).
-pub(crate) fn order<S: Ord + Clone>(
+pub(crate) fn order<S: Ord + Clone + Default>(
     map: &BTreeMap<Vec<S>, String>,
     parent: &[S],
     after: Option<&S>,
 ) -> Option<S> {
+    let null = S::default();
+    let after = after.filter(|current| **current != null);
     let mut start = parent.to_vec();
     if let Some(current) = after {
         start.push(current.clone());
@@ -504,7 +521,7 @@ pub(crate) fn order<S: Ord + Clone>(
         .map(|(key, _)| key)
         .take_while(|key| key.starts_with(parent))
         .filter_map(|key| key.get(depth))
-        .find(|child| after.is_none_or(|current| *child != current))
+        .find(|child| **child != null && after.is_none_or(|current| *child != current))
         .cloned()
 }
 
@@ -618,28 +635,14 @@ impl<'a> Session<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Sub;
 
-    /// A test subscript whose order is M collation.
-    #[derive(Clone, PartialEq, Eq, Debug)]
-    struct T(String);
-
-    impl Ord for T {
-        fn cmp(&self, other: &Self) -> Ordering {
-            collate(&self.0, &other.0)
-        }
+    /// A key of subscripts, each classified by its text as M does.
+    fn key(subs: &[&str]) -> Vec<Sub> {
+        subs.iter().map(|sub| Sub::from_text(sub)).collect()
     }
 
-    impl PartialOrd for T {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
-    fn key(subs: &[&str]) -> Vec<T> {
-        subs.iter().map(|sub| T((*sub).to_string())).collect()
-    }
-
-    fn map(nodes: &[(&[&str], &str)]) -> BTreeMap<Vec<T>, String> {
+    fn map(nodes: &[(&[&str], &str)]) -> BTreeMap<Vec<Sub>, String> {
         nodes
             .iter()
             .map(|(subs, value)| (key(subs), (*value).to_string()))
@@ -671,6 +674,11 @@ mod tests {
         ];
         for (a, b, expected) in cases {
             assert_eq!(collate(a, b), expected, "collate({a:?}, {b:?})");
+            assert_eq!(
+                Sub::from_text(a).cmp(&Sub::from_text(b)),
+                collate(a, b),
+                "Sub order of {a:?} and {b:?}"
+            );
         }
     }
 
@@ -686,6 +694,13 @@ mod tests {
         for (a, b) in cases {
             assert_eq!(collate(a, b), Ordering::Less, "collate({a:?}, {b:?})");
             assert_eq!(collate(b, a), Ordering::Greater, "collate({b:?}, {a:?})");
+            for (x, y) in [(a, b), (b, a)] {
+                assert_eq!(
+                    Sub::from_text(x).cmp(&Sub::from_text(y)),
+                    collate(x, y),
+                    "Sub order of {x:?} and {y:?}"
+                );
+            }
         }
     }
 
@@ -761,20 +776,60 @@ mod tests {
         let mut walked = Vec::new();
         let mut current = order(&nodes, &parent, None);
         while let Some(child) = current {
-            walked.push(child.0.clone());
+            walked.push(child.text().to_string());
             current = order(&nodes, &parent, Some(&child));
         }
         assert_eq!(walked, vec!["1", "2", "10", "AC", "B"]);
 
         let top = key(&["PRC", "442"]);
-        assert_eq!(order(&nodes, &top, None), Some(T("1".to_string())));
+        assert_eq!(order(&nodes, &top, None), Some(Sub::from_text("1")));
         assert_eq!(
-            order(&nodes, &top, Some(&T("1".to_string()))),
-            Some(T("2".to_string()))
+            order(&nodes, &top, Some(&Sub::from_text("1"))),
+            Some(Sub::from_text("2"))
         );
-        assert_eq!(order(&nodes, &top, Some(&T("2".to_string()))), None);
+        assert_eq!(order(&nodes, &top, Some(&Sub::from_text("2"))), None);
         assert_eq!(order(&nodes, &key(&["PRC", "442", "9"]), None), None);
-        assert_eq!(order(&nodes, &parent, Some(&T("C".to_string()))), None);
+        assert_eq!(order(&nodes, &parent, Some(&Sub::from_text("C"))), None);
+    }
+
+    #[test]
+    fn order_skips_null_subscripts() {
+        let null = Sub::from_text("");
+        let parent = key(&["X"]);
+        let null_node = key(&["X", ""]);
+
+        let only_null = map(&[(&["X", ""], "v"), (&["X", "", "1"], "w")]);
+        assert_eq!(order(&only_null, &parent, None), None);
+        assert_eq!(order(&only_null, &parent, Some(&null)), None);
+        assert_eq!(get(&only_null, &null_node), "v");
+        assert_eq!(data(&only_null, &null_node), 11);
+
+        let mixed = map(&[
+            (&["X", "1"], "a"),
+            (&["X", "10"], "b"),
+            (&["X", ""], "v"),
+            (&["X", "", "2"], "w"),
+            (&["X", "AC"], "c"),
+            (&["X", "B"], "d"),
+        ]);
+        let mut walked = Vec::new();
+        let mut current = order(&mixed, &parent, None);
+        while let Some(child) = current {
+            walked.push(child.text().to_string());
+            current = order(&mixed, &parent, Some(&child));
+        }
+        assert_eq!(walked, vec!["1", "10", "AC", "B"]);
+        assert_eq!(
+            order(&mixed, &parent, Some(&null)),
+            Some(Sub::from_text("1"))
+        );
+        assert_eq!(
+            order(&mixed, &parent, Some(&Sub::from_text("10"))),
+            Some(Sub::from_text("AC"))
+        );
+        assert_eq!(order(&mixed, &parent, Some(&Sub::from_text("B"))), None);
+        assert_eq!(get(&mixed, &null_node), "v");
+        assert_eq!(data(&mixed, &null_node), 11);
     }
 
     #[test]
@@ -791,8 +846,12 @@ mod tests {
             ("0.5", ".5"),
             ("1.", "1"),
             ("-", "0"),
-            ("--5", "5"),
-            ("+-5", "-5"),
+            ("+5", "5"),
+            ("-5", "-5"),
+            ("+.5", ".5"),
+            ("--5", "0"),
+            ("+-5", "0"),
+            ("-+5", "0"),
             ("-.250", "-.25"),
             (" 5", "0"),
             ("N/C", "0"),

@@ -221,7 +221,7 @@ The stub reads each of the two only when `$O(^PRC(442,0))` and `$O(^PRC(442,inde
 
 ## Contracts
 
-One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at commit `dd3fd0f3124c8178657d9fff4173c324da30f7ae` (written `@dd3fd0f3` below). IDs are stable identifiers, not call order; section "Original structure" gives the call order. Kinds: **Ported** (logic converted), **Stub** (an out-of-slice dependency reproduced only for the fixed context and the exercised outcomes), **Repro** (a generic FileMan or Kernel utility reproduced only for the forms the cases exercise). Every Rust item except `inquire` is a private function in `src/inquiry.rs`, and every private signature is `fn name(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>` unless stated. No contract on this path has a return value: each is called by `DO`. Branch IDs are defined in section "Unexercised and BLOCKED branches"; every n/e or BLOCKED branch returns `Halt::Error(InquiryError::UnsupportedBranch("<branch ID>"))` and writes nothing further. No contract writes business data, and none writes `Store`.
+One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at commit `dd3fd0f3124c8178657d9fff4173c324da30f7ae` (written `@dd3fd0f3` below). IDs are stable identifiers, not call order; section "Original structure" gives the call order. Kinds: **Ported** (logic converted), **Stub** (an out-of-slice dependency reproduced only for the fixed context and the exercised outcomes), **Repro** (a generic FileMan or Kernel utility reproduced only for the forms the cases exercise). Every Rust item except `inquire` is a private function in `src/inquiry.rs`, and every private signature is `fn name(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>` unless stated. Each **Rust item** gives the function's path and its declaration exactly as `src/inquiry.rs` writes it; a parameter whose name begins with `_` is one that function does not use, and it keeps the type and position this convention, or the contract's formal arguments, give it. No contract on this path has a return value: each is called by `DO`. Branch IDs are defined in section "Unexercised and BLOCKED branches"; every n/e or BLOCKED branch returns `Halt::Error(InquiryError::UnsupportedBranch("<branch ID>"))` and writes nothing further. No contract writes business data, and none writes `Store`.
 
 **Test names.** T-SESSION: `input_exhaustion_returns_partial_transcript`, `leftover_input_ignored`, `store_unchanged_after_session`. T-LOOKUP: `help_at_order_prompt_is_unsupported_branch`, `absent_identifiers_follow_no_match_path`, `numeric_value_naming_no_ien_follows_no_match_path`, `lowercase_value_whose_retry_fails_follows_no_match_path`, `candidates_all_rejected_by_screen_follow_no_match_path`, `unreferenced_vendor_with_matching_name_is_not_a_candidate`, `referenced_vendor_whose_orders_fail_screen_is_not_a_candidate`, `referenced_vendor_with_qualifying_order_is_unsupported_branch`. T-DEVICE: `found_order_stops_at_device_gate`. T-EST: `estimated_flag_decides_est_branch`. GC-FOUND: `gc_01_standard_order`, `gc_02_multiple_lines_and_decimals`, `gc_05_cancelled_order`. GC-MISS: `gc_03_missing_order`, `gc_04_invalid_input`. All unit tests are in `src/inquiry.rs`; the GC tests are in `tests/equivalence.rs`.
 
@@ -234,7 +234,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   EN3 ;DISPLAY P.O.
    D ST
   ```
-- **Rust item:** `pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, InquiryError>`; Ported.
+- **Rust item:** `crate::inquiry::inquire`, `pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, InquiryError>`; Ported.
 - **Inputs:** `store`, borrowed immutably; `inputs`, one typed line each without its terminator, consumed in order by READs. Precondition, as at option entry: every M local the path uses is undefined (`PRC`, `PRCF`, `PRCHPO`, `DIC`, `DO`, `DST`); context is `STUB_CONTEXT` only.
 - **Reads:** none itself.
 - **Branches:** PO-01.b1 (`D ST`, then fall into `EN30`).
@@ -250,7 +250,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    D ^PRCFSITE
    Q
   ```
-- **Rust item:** `st_prchrpt`; Ported.
+- **Rust item:** `crate::inquiry::st_prchrpt`, `fn st_prchrpt(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** none. **Reads:** none.
 - **Branches:** PO-02.b1 (set `PRCF("X")="SP"`, call `^PRCFSITE`).
 - **Outputs:** none itself. **Side effects:** `PRCF("X")="SP"`, killed again at `OUT^PRCFSITE` [PRCFSITE.m:29].
@@ -263,7 +263,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   DIVFY ;CHECK FOR STATION AND FY
    D DUZ G:'% Q
   ```
-- **Rust item:** `prcfsite`; Stub.
+- **Rust item:** `crate::inquiry::prcfsite`, `fn prcfsite(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Stub.
 - **Inputs:** `PRCF("X")="SP"` from PO-02; `DT`, `U` and `DTIME` are capture-command preconditions; `PRC` undefined.
 - **Reads (original):** `^PRC(411,0)` piece 4 = 6 [PRCFSITE.m:8-9] [411 export:3]; `$O(^PRC(411,"AC","Y",0))` = 500 [PRCFSITE.m:14] [411 export:290]; `^VA(200,.5,400)` [PRCFSITE.m:12]; `^PRC(411,500,0)` [PRCFSITE.m:26] [411 export:4]. **The stub reads nothing from `Store`:** it fixes the snapshot's site context.
 - **Branches:** PO-03.b1 to PO-03.b9. Exercised: b4 (no output) and b6 (RETURN accepts 500). b5 and b8 are unreachable because `PRCF("X")="SP"` has no `A`, `F` or `Q`; b1, b2, b3, b7 and b9 are n/e.
@@ -277,9 +277,9 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
   DUZ K PRCFDEL,PRC("PER") S %=1 I $D(DUZ)#2,+DUZ>0 S PRC("PER")=+DUZ
   ```
-- **Rust item:** `duz_prcfsite`; Stub.
+- **Rust item:** `crate::inquiry::duz_prcfsite`, `fn duz_prcfsite(_s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt>`; Stub.
 - **Inputs:** `DUZ` = `.5` from `STUB_CONTEXT`.
-- **Reads (original):** `^VA(200,.5,20)` = `64659^POSTMASTER^^123456` [PRCFSITE.m:37] [200+NEW PERSON.zwr:12], piece 2 (field 20.2 [DD.zwr:350238]) present, so `D A` never writes [PRCFSITE.m:38]; `^VA(200,.5,.13)` [PRCFSITE.m:39]. The stub reads nothing from `Store`.
+- **Reads (original):** `^VA(200,.5,20)` [PRCFSITE.m:37] piece 2 (field 20.2 [DD.zwr:350238]) = `POSTMASTER` [200+NEW PERSON.zwr:12], present, so `D A` never writes [PRCFSITE.m:38]; piece 3 (field 20.3 [DD.zwr:350250]) empty; pieces 2 and 3 are copied into `PRC("PER")` [PRCFSITE.m:39]. The node's other pieces, including the confidential electronic signature code (field 20.4 [DD.zwr:350262, 350284]), decide nothing on this path and are not reproduced. `^VA(200,.5,.13)` [PRCFSITE.m:39]. A missing node 20 makes `X` empty through `$S('$D(^VA(200,+PRC("PER"),20)):"",1:^VA(200,+PRC("PER"),20))` [PRCFSITE.m:37], so piece 2 is empty and `D A` runs (PO-04.b3, n/e) [PRCFSITE.m:38]; a missing `.13` node makes piece 4 of `PRC("PER")` empty instead of `.13` piece 2 (field .132 [DD.zwr:349644]) through `$S($D(^VA(200,+PRC("PER"),.13)):$P(^(.13),"^",2),1:"")` [PRCFSITE.m:39]. The stub reads nothing from `Store`.
 - **Branches:** PO-04.b1 (exercised), b2 and b3 (n/e).
 - **Outputs:** none. **Side effects:** `%=1`; `PRC("PER")` is not modelled because no output on the path reads it (its only other reader, `^VA(200,+PRC("PER"),400)` [PRCFSITE.m:12], sets `PRC("SP")`, which only the unreachable `A` flag reads [PRCFSITE.m:16, 19]).
 - **Dependencies and coverage:** called at [PRCFSITE.m:5]. All five. Tests: T-SESSION. SOURCE-RESOLVED.
@@ -290,7 +290,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
   SI I $D(PRC("MDIV")),PRCF("X")["S"!(PRCF("X")["B") W ! S DIC("A")="Select STATION NUMBER ('^' TO EXIT): ",DIC("B")=PRC("SITE"),DIC=411,DIC(0)="AEQMZ",DIC("S")="I +Y<1000000" D ^DIC K DIC G:+Y<0 Q S PRC("SITE")=+Y
   ```
-- **Rust item:** `dic`; Stub.
+- **Rust item:** `crate::inquiry::dic`, `fn dic(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>`; Stub.
 - **Inputs:** `DIC=411`, `DIC(0)="AEQMZ"`, `DIC("A")`, `DIC("B")=500`, `DIC("S")="I +Y<1000000"` [PRCFSITE.m:18].
 - **Reads (original):** `^PRC(411,0)` (file attributes `411I`) [411 export:3]; `^DD(411,0,"ID",.1)` [DD.zwr:488724]; `^PRC(411,"B",500,500)` [411 export:292]; `^PRC(411,500,0)` piece 10 [411 export:4]; `^DIC(4,500,0)` piece 1 [4+INSTITUTION.zwr:494]; `^DD(4,.01,0)` piece 2 [DD.zwr:38111]. The stub reads nothing from `Store`.
 - **Branches:** PO-05.b1 (RETURN, exercised), PO-05.b2 (any other answer, n/e).
@@ -306,7 +306,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    I X<10 W $C(7)," >>> Status makes this record non-specifiable here."
    S D0=PRCHPO D ^PRCHDP1,K
   ```
-- **Rust item:** `en30_prchrpt`; Ported. The `G EN30` [PRCHRPT.m:75] is a loop.
+- **Rust item:** `crate::inquiry::en30_prchrpt`, `fn en30_prchrpt(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported. The `G EN30` [PRCHRPT.m:75] is a loop.
 - **Inputs:** `X` and `PRCHPO` from PO-08.
 - **Reads:** none itself.
 - **Branches:** PO-06.b1 (`PRCHPO` undefined: return), PO-06.b2 (selection: message when `X<10`, display, `K`, loop).
@@ -322,7 +322,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    I $G(PRCHPC) S PRCHP("S")="$P(^(0),U,2)=25" ; <<< Patch 72
    I $G(PRCHDELV) S PRCHP("S")="$P($G(^(23)),U,11)=""D"""
   ```
-- **Rust item:** `po_prchrpt`; Ported.
+- **Rust item:** `crate::inquiry::po_prchrpt`, `fn po_prchrpt(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** `PRCHPC` and `PRCHDELV` undefined on this option (empty entry action [19+OPTION.zwr:14690]), so their SETs never fire.
 - **Reads:** `^PRC(442,+PRCHPO,0)` piece 2 (field .02 [DD.zwr:514331]), guarded by `$D` [PRCHRPT.m:14].
 - **Branches:** PO-07.b1.
@@ -337,7 +337,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    K PRCHPO,PRCHNEW,DA,DIC,D0,DQ Q:'$D(PRC("SITE"))  S DIC="^PRC(442,",DIC(0)="QEAMZ"
    S D=$S($G(PRCHPC)=1:"APCS",$G(PRCHPC)=2:"APCP",$G(PRCHDELV):"APCD",1:"C")
   ```
-- **Rust item:** `en3_prchpat`; Ported.
+- **Rust item:** `crate::inquiry::en3_prchpat`, `fn en3_prchpat(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** `PRC("SITE")=500`; `PRCHP("A")`, `PRCHP("S")` from PO-07.
 - **Reads:** `^PRC(442,DA,7)` and `^PRCD(442.3,status,0)` piece 2 (field .02 [DD.zwr:518035]) through `$G` [PRCHPAT.m:83].
 - **Branches:** PO-08.b1 (n/e), PO-08.b2 (no selection: quit), PO-08.b3 (selection).
@@ -353,13 +353,13 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    S (DF,DINDEX,DINDEX("START"))=D
    G EN
   ```
-- **Rust item:** `ix_dic`; Stub over `Store` (lookup rules over fixture data, never a list of known identifiers).
+- **Rust item:** `crate::inquiry::ix_dic`, `fn ix_dic(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Stub over `Store` (lookup rules over fixture data, never a list of known identifiers).
 - **Inputs:** `DIC="^PRC(442,"`, `DIC(0)="QEAMZ"`, `D="C"`, `DIC("A")`, `DIC("S")` from PO-08; `PRC("SITE")=500`.
 - **Reads:** `^PRC(442,0)` piece 2 = `442I` [442 export:3] [DIC1.m:41-46]; `^DD(442,0,"ID","Z.01")`-`("Z.03")` [DD.zwr:514202-514204]; `^PRC(442,"C",X,ien)` and later `^PRC(442)` subscripts; `^PRC(442,ien,0)` pieces 1-3, 15 (screen and identifiers); `^PRC(442,ien,1)` piece 15; `^PRC(442,ien,7)`; `^PRCD(442.5,mop,0)` piece 2; `^PRCD(442.3,s,0)` piece 1; for the pointer rule (R6), `$O(^PRC(442,0))` and, for each pointer index D, F, G, M, MCH and ST in turn, `$O(^PRC(442,index,0))` [DICM0.m:26, 32], the pointed-to root's `B` index (`^PRC(440,`, `^PRCD(442.5,`, `^PRCP(445,`, `^PRC(440.5,`, `^VA(200,`, `^PRCD(442.3,` respectively), `$D` of each matching entry's zero and `-9` nodes and the zero node's value [DIC3.m:94, 110], then `^PRC(442,index,e,parent)` and the parent's zero node [DICM0.m:32, 36]; files 445 and 440.5 are cited in the source-correction supplement of section "FileMan definitions read". Every read is guarded.
 - **Branches:** PO-09.b1 to PO-09.b16 (b15 and b16 appended by this document). Exercised: b3 (all five), b8 (GC-01, 02, 05), b14 (GC-03, 04, BLOCKED by O-03). b7 and b12 are unreachable.
 - **Outputs:** `\n` [DIC.m:25]; `P.O./REQ.NO.: ` [DIC11.m:15-17]; one READ (no input left: `Halt::InputExhausted`); then the branch's output (b3: nothing; b8: the order echo of R2; b14: `UnsupportedBranch("PO-09.b14")` while BLOCKED, otherwise the bytes of R3).
 - **Side effects (original, not reproduced):** `^DISV(DUZ,"^PRC(442,")` [DIC2.m:65]; `Y`, `Y(0)`, `Y(0,0)` [DIC2.m:53, 64].
-- **Dependencies and coverage:** called from PO-08 [PRCHPAT.m:83]. Tests: T-LOOKUP (`help_at_order_prompt_is_unsupported_branch` gives PO-09.b4), GC-FOUND, GC-MISS; `tests/bridge.rs` `synthetic_422_unsupported_branch_end_to_end`. Status: b3 and b8 SOURCE-RESOLVED (R2); b14 BLOCKED (O-03, R3-R4). Binding rules: R2 to R8.
+- **Dependencies and coverage:** called from PO-08 [PRCHPAT.m:83]. Tests: T-LOOKUP (`help_at_order_prompt_is_unsupported_branch` gives PO-09.b4), GC-FOUND, GC-MISS; `tests/bridge.rs` `synthetic_422_unsupported_branch_end_to_end`. Status: b3 and b8 SOURCE-RESOLVED (R2); b14 BLOCKED (O-03, R3-R4). Binding rules: R2 to R6.
 
 ### PO-10 ^PRCHDP1
 
@@ -369,7 +369,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    N PRCHSIT1
    S PRCHDSIT=$P(PRCHD0,"-",1)
   ```
-- **Rust item:** `prchdp1`; Ported. The `G ^PRCHDP2` at the end of PO-20 [PRCHDP1.m:64] is a tail call.
+- **Rust item:** `crate::inquiry::prchdp1`, `fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported. The `G ^PRCHDP2` at the end of PO-20 [PRCHDP1.m:64] is a tail call.
 - **Inputs:** `D0`, `PRCHPO`, `PRCHNRQ` (MOP 8, from PO-07).
 - **Reads:** 442 node 0 (`PRCHD0`), node 1 (`PRCHD1`), node 7 piece 1 (status), node 11 (partials), node 12 pieces 14 and 16, node 23 pieces 7 and 11, node 24 pieces 2 and 3; 411 `^PRC(411,site,0)` (piece 19 [DD.zwr:488925]), node 3, and `^PRC(411,site,1,shipto,0)` pieces 1-8 [DD.zwr:489297-489333]; 440 node 0 pieces 1-8 and 10, node 2 piece 1, node 3 pieces 2, 4, 5 [DD.zwr:510047-510481]; 440.2 node 0 and `^DPT(patient,0)` piece 1 when field 5.3 is set [PRCHDP1.m:11]; 5 piece 2 [DD.zwr:44198]; 49 piece 1 [DD.zwr:88181]; 442.5 piece 1; 442.3 piece 1. All guarded by `$G` or `$D`.
 - **Branches:** PO-10.b1 (node 0 empty: quit), b2 (node 1 empty, comments present: `EN^DIQ`), b3 (node 1 empty: quit), b4 (the page-1 header, BLOCKED by O-01 at line 12), b5 (node 11 partials), b6 (EDI block), b7 (prosthetics block).
@@ -390,7 +390,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   FTYP ; RETURN FACILITY TYPE IN 'PRCHFTYP'
    N PRCSUB
   ```
-- **Rust item:** `ftyp_prchfpnt`; Ported.
+- **Rust item:** `crate::inquiry::ftyp_prchfpnt`, `fn ftyp_prchfpnt(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** `PRC("SITE")` (reset at [PRCHDP1.m:24]), `D0`; `PRCHFTP2` undefined on this path.
 - **Reads:** `^PRC(411,site,0)` piece 7 (field .5 [DD.zwr:488809]), default 1; node 23 piece 7 (field 31 [DD.zwr:514881]); `^PRC(411.2,code,0)` piece 2 (field 1 [DD.zwr:489640]); all through `$G`.
 - **Branches:** PO-11.b1 (exercised), PO-11.b2 (substation, n/e).
@@ -403,7 +403,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
    I $D(IOP),IOP=$I!(IOP="HOME")!(0[IOP),$D(^XUTL("XQ",$J,"IO")) D HOME K %IS,%Y,%ZIS,%ZISB,%ZISV,IOP Q
   ```
-- **Rust item:** `pct_zis`; Stub.
+- **Rust item:** `crate::inquiry::pct_zis`, `fn pct_zis(_s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt>`; Stub.
 - **Inputs:** `IOP="HOME"`, `%ZIS=""`.
 - **Reads (original):** `^XUTL("XQ",$J,"IO")` [ZIS.m:28]; the device and terminal-type entries that set `IOF`, `IOSL` [ZIS1.m:103-106, 113].
 - **Branches:** PO-12.b1, BLOCKED (O-01).
@@ -417,7 +417,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
   FOB W !,"FOB POINT: ",$S("O"=$E($P(PRCHD1,U,6)):"ORIGIN","D"=$E($P(PRCHD1,U,6)):"DESTINATION",1:""),?29,"|","PROPOSAL: " S DIWL=1,DIWR=16,DIWF="",X=$P(PRCHD1,U,8) K ^UTILITY($J,"W") D DIWP^PRCUTL($G(DA))
   ```
-- **Rust item:** `fob_prchdp1`; Ported.
+- **Rust item:** `crate::inquiry::fob_prchdp1`, `fn fob_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** `PRCHD0`, `PRCHD1`, `D0`, `DA`.
 - **Reads:** node 1 pieces 6, 8, 14 (fields 6.4, 8.2, 8.1); node 14 entries and `^PRC(442.4,auth,0)` piece 2 [DD.zwr:517623, 518097]; node 0 piece 5 (field 2); node 23 piece 11 (field 48). `^(Y,0)` under node 14 is an unguarded read and a `CorruptStore` site [PRCHDP1.m:56].
 - **Branches:** PO-13.b1 (the authority loop only formats, so it is not a decision).
@@ -433,7 +433,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    D ^DIWP
    QUIT
   ```
-- **Rust item:** `fn diwp_prcutl(s: &mut Session, st: &Store, v: &mut Locals, da: &str) -> Result<(), Halt>`; Ported. Called as `D DIWP^PRCUTL($G(DA))` [PRCHDP1.m:53] [PRCHDP2.m:47]; `da` is by value, and the caller's `DA` is unchanged after the call.
+- **Rust item:** `crate::inquiry::diwp_prcutl`, `fn diwp_prcutl(s: &mut Session, st: &Store, v: &mut Locals, da: &str) -> Result<(), Halt>`; Ported. Called as `D DIWP^PRCUTL($G(DA))` [PRCHDP1.m:53] [PRCHDP2.m:47]; `da` is by value, and the caller's `DA` is unchanged after the call.
 - **Inputs:** `X`, `DIWL`, `DIWR`, `DIWF`. **Reads:** none.
 - **Branches:** PO-14.b1.
 - **Outputs:** none. **Side effects:** through PO-15.
@@ -446,7 +446,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    S:'$L(X) X=" "
    S DIWTC=X[($C(124)_"TAB") S:'$D(DN) DN=1
   ```
-- **Rust item:** `diwp`; Repro.
+- **Rust item:** `crate::inquiry::diwp`, `fn diwp(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>`; Repro.
 - **Inputs:** `X` (one text line), `DIWL=1`, `DIWR` (16 or 33), `DIWF=""`; the scratch `^UTILITY($J,"W",DIWL)` (count) and `^UTILITY($J,"W",DIWL,n,0)` (lines) held in `Locals`.
 - **Reads:** none from `Store`.
 - **Branches:** PO-15.b1 (plain text, no `|`, no `TAB`), b2 (`|` window evaluation through `RCR^DIWW`, n/e), b3 (other `DIWF` letters and `TAB`, n/e).
@@ -468,7 +468,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    N %A,%B,%Q,%Z
    S %A=$$R(%X),%Q=""""""
   ```
-- **Rust item:** `pct_xy_pct_rcr`; Repro.
+- **Rust item:** `crate::inquiry::pct_xy_pct_rcr`, `fn pct_xy_pct_rcr(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>`; Repro.
 - **Inputs:** literal `%X="^UTILITY($J,""W"","` and `%Y="^TMP($J,""W"","` [PRCHDP1.m:54] [PRCHDP2.m:48].
 - **Reads:** none from `Store`.
 - **Branches:** PO-16.b1 (copy every descendant node of `^UTILITY($J,"W")` to the same subscripts under `^TMP($J,"W")`, after the caller's `K ^TMP($J,"W")`) [DIRCR.m:29].
@@ -482,10 +482,11 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   TY S X=+$P(PRCHD1,U,7),X=$P($G(^PRCD(420.8,X,0)),U,1),X=$S(X=2:"PURCHASE ORDER",X="B":"DELIVERY & PURCHASE ORDER",X="":"",1:"DELIVERY ORDER")
    Q
   ```
-- **Rust item:** `ty_prchdp1`; Ported.
+- **Rust item:** `crate::inquiry::ty_prchdp1`, `fn ty_prchdp1(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** `PRCHD1`. **Reads:** node 1 piece 7 (field 8 [DD.zwr:514659]); `^PRCD(420.8,code,0)` piece 1 [DD.zwr:496661].
 - **Branches:** PO-17.b1 (`$SELECT` arms are not decisions).
-- **Outputs:** none; sets `X` to the label, written by the caller [PRCHDP1.m:57]. `X=2` is a numeric comparison.
+- **Outputs:** none; sets `X` to the label, written by the caller [PRCHDP1.m:57]. `X=2` is a text comparison (M `=` compares strings), so it holds only when the code is the text `2` [PRCHDP1.m:71].
+- **Side effects:** local `X` is overwritten three times: `+$P(PRCHD1,U,7)`, then piece 1 of the 420.8 entry, then the label [PRCHDP1.m:71]; `ty_prchdp1` sets the `Locals` field `x` to the label. Scratch and business data: none.
 - **Dependencies and coverage:** called at [PRCHDP1.m:57]. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-18 DIS^PRCHDP1
@@ -495,7 +496,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   DIS W !,"DELIVER ON/BEFORE " S Y=$P(PRCHD0,U,10) D DT W ?29,"|","CONTRACT: "
    S Y=+$P(PRCHD1,U,10),Y=$P($G(^VA(200,Y,0)),U,1) W ?57,"|  ",$P(Y,",",2)," ",$P(Y,",",1)
   ```
-- **Rust item:** `dis_prchdp1`; Ported.
+- **Rust item:** `crate::inquiry::dis_prchdp1`, `fn dis_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** `PRCHD0`, `PRCHD1`, `D0`.
 - **Reads:** node 0 piece 10 (field 7 [DD.zwr:514650]); node 1 piece 10 (field 16 [DD.zwr:514742]); `^VA(200,buyer,0)` piece 1 [DD.zwr:349371] through `$G`; `$D(^PRC(442,D0,5,0))` (field 9.2 [DD.zwr:514680]).
 - **Branches:** PO-18.b1 (no node 5), PO-18.b2 (discount terms, n/e).
@@ -509,10 +510,11 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   DT I Y W Y\100#100,"/",Y#100\1,"/",Y\10000+1700
    Q
   ```
-- **Rust item:** `dt_prchdp1`; Ported.
+- **Rust item:** `crate::inquiry::dt_prchdp1`, `fn dt_prchdp1(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** `Y` (a FileMan date). **Reads:** none.
 - **Branches:** PO-19.b1 (the `IF` governs only a WRITE).
 - **Outputs:** when `Y` is non-zero, `month/day/year` unpadded, evaluated strictly left to right (`(Y\100)#100`, `(Y#100)\1`, `(Y\10000)+1700`); `3261028` gives `10/28/2026`.
+- **Side effects:** none: `DT` only tests `Y` and writes the date, and sets no local and no scratch [PRCHDP1.m:69-70]; `dt_prchdp1` reads the `Locals` field `y` and changes no field. Business data: none.
 - **Dependencies and coverage:** called at [PRCHDP1.m:58, 66]. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-20 CON^PRCHDP1
@@ -523,11 +525,12 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    .S:$D(^(X)) Y=$O(^(X,0))
    F I=1:1:80 W "-"
   ```
-- **Rust item:** `con_prchdp1`; Ported. `G ^PRCHDP2` [PRCHDP1.m:64] is a tail call to `prchdp2`.
+- **Rust item:** `crate::inquiry::con_prchdp1`, `fn con_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported. `G ^PRCHDP2` [PRCHDP1.m:64] is a tail call to `prchdp2`.
 - **Inputs:** `D0`, `PRCHD0`, `PRCHD1`.
 - **Reads:** the item index `^PRC(442,D0,2,"AC",contract,item)` (442.01 field 4 [DD.zwr:516134]).
 - **Branches:** PO-20.b1 (a contract number found: its count and number on the row, n/e), PO-20.b2 (none further, in each of the three rows).
 - **Outputs on b2:** three rows: row 1 column 29 `|`, column 57 `|`, `DATE: ` and the order date (PO-22); row 2 `APP: …` (PO-21), column 29 `|`, column 57 `|`, the estimated flag (PO-23); row 3 column 29 `|`, column 57 `|`, `TOTAL: ` (PO-24); each row ends `\n`; then 80 dashes [PRCHDP1.m:61-63].
+- **Side effects:** `K Y` before the rows and again at the end of each row, so the `Y` that `DAT` (PO-22) and `EST` (PO-23) set is killed [PRCHDP1.m:61]; `X` is set to 0, then to `$O(^PRC(442,D0,2,"AC",X))`, which is `""` on b2 [PRCHDP1.m:61]; the loop counter `I` runs 1 to 3, then 1 to 80 for the dashes, and is left at 80 [PRCHDP1.m:61, 63]. `con_prchdp1` sets the `Locals` field `y` to `None` before the rows and after each row, and `x` to `"0"` and then `""`; `I` is a Rust loop counter and is not kept. Scratch and business data: none.
 - **Dependencies and coverage:** falls in from PO-18; calls PO-21 to PO-24; jumps to PO-25. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-21 APP^PRCHDP1
@@ -536,8 +539,10 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
   APP W "APP: ",$P(PRCHD0,U,4),"-",$P($P(PRCHD0,U,3)," ",1) Q
   ```
-- **Rust item:** `app_prchdp1`; Ported. **Inputs:** `PRCHD0`. **Reads:** node 0 pieces 4 and 3 (fields 1.4, 1 [DD.zwr:514551, 514505]).
+- **Rust item:** `crate::inquiry::app_prchdp1`, `fn app_prchdp1(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** `PRCHD0`. **Reads:** node 0 pieces 4 and 3 (fields 1.4, 1 [DD.zwr:514551, 514505]).
 - **Branches:** PO-21.b1. **Outputs:** `APP: `, appropriation, `-`, first word of the FCP.
+- **Side effects:** none: `APP` only writes [PRCHDP1.m:65]; `app_prchdp1` reads the `Locals` field `prchd0` and changes no field. Scratch and business data: none.
 - **Dependencies and coverage:** called at [PRCHDP1.m:61] for row 2. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-22 DAT^PRCHDP1
@@ -546,7 +551,8 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
   DAT W "DATE: " S Y=$P(PRCHD1,U,15) D DT Q
   ```
-- **Rust item:** `dat_prchdp1`; Ported. **Inputs:** `PRCHD1`. **Reads:** node 1 piece 15 (field .1 [DD.zwr:514394]).
+- **Rust item:** `crate::inquiry::dat_prchdp1`, `fn dat_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** `PRCHD1`. **Reads:** node 1 piece 15 (field .1 [DD.zwr:514394]).
 - **Branches:** PO-22.b1. **Outputs:** `DATE: ` and the date (PO-19). **Side effects:** `Y`.
 - **Dependencies and coverage:** called at [PRCHDP1.m:61] for row 1. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
@@ -556,7 +562,8 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
   EST S Y=$S($D(^PRC(442,D0,7)):$P(^(7),U,3),1:"") Q:Y'="Y"  W "ESTIMATED" Q
   ```
-- **Rust item:** `est_prchdp1`; Ported. **Inputs:** `D0`. **Reads:** node 7 piece 3 (field .08 [DD.zwr:514379]).
+- **Rust item:** `crate::inquiry::est_prchdp1`, `fn est_prchdp1(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** `D0`. **Reads:** node 7 piece 3 (field .08 [DD.zwr:514379]).
 - **Branches:** PO-23.b1 (not `Y`: quit, nothing written), PO-23.b2 (`Y`: `ESTIMATED`, n/e).
 - **Outputs:** none on b1. **Side effects:** `Y`.
 - **Dependencies and coverage:** called at [PRCHDP1.m:61] for row 2. GC-01, 02, 05. Tests: T-EST (field .08 `Y` gives `UnsupportedBranch("PO-23.b2")`; any other value writes nothing and returns `Ok`), GC-FOUND. SOURCE-RESOLVED.
@@ -567,8 +574,10 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
   TOT W "TOTAL: ",$J($P(PRCHD0,U,15),8,2) Q
   ```
-- **Rust item:** `tot_prchdp1`; Ported. **Inputs:** `PRCHD0`. **Reads:** node 0 piece 15 (field 91 [DD.zwr:515190]).
+- **Rust item:** `crate::inquiry::tot_prchdp1`, `fn tot_prchdp1(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** `PRCHD0`. **Reads:** node 0 piece 15 (field 91 [DD.zwr:515190]).
 - **Branches:** PO-24.b1. **Outputs:** `TOTAL: ` and `$J(total,8,2)`.
+- **Side effects:** none: `TOT` only writes [PRCHDP1.m:67]; `tot_prchdp1` reads the `Locals` field `prchd0` and changes no field. Scratch and business data: none.
 - **Dependencies and coverage:** called at [PRCHDP1.m:61] for row 3. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-25 ^PRCHDP2
@@ -578,7 +587,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    N PRCHAMNT,PRCHAMCT S PRCHAMNT=0 I $D(^PRC(442,D0,6,0)) S PRCHAMCT=$P(^PRC(442,D0,6,0),U,3),PRCHAMNT=1    ;PRC*5.1*221
    W !?8,"ENTER '^' TO HALT: " S PRCHDQ=0 R X:DTIME S:X["^" PRCHDQ=1 G ASK2:PRCHDQ D HDR
   ```
-- **Rust item:** `prchdp2`; Ported. `G ASK2` and `G COM` are calls to `ask2_prchdp2` and `com_prchdp2` that end this function.
+- **Rust item:** `crate::inquiry::prchdp2`, `fn prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported. `G ASK2` and `G COM` are calls to `ask2_prchdp2` and `com_prchdp2` that end this function.
 - **Inputs:** `D0`, `PRCHD0`.
 - **Reads:** `^PRC(442,D0,6,0)` piece 3 (guarded); items `$O(^PRC(442,D0,2,n))`, stopping at the first non-positive subscript, each `^(n,0)` (unguarded: `CorruptStore` site) and `^(n,2)` (guarded) [PRCHDP2.m:11]; node 3 (field 14 [DD.zwr:514730]); node 0 piece 13 (field 13); `$D(^PRC(442,D0,15,0))` (field 24 [DD.zwr:514843]).
 - **Branches:** PO-25.b1 (`^` anywhere in the halt answer: `G ASK2`, n/e), b2 (otherwise: `HDR`, then `ITEM` once per item), b3 (no line item, n/e), b4 (`PRCHDQ` set after an item, n/e), b5 (discount entries, n/e), b6 (estimated-shipping line when field 13 > 0, then no node 15: `G COM`), b7 (certifications, n/e).
@@ -593,10 +602,11 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   HDR W:$Y>0 @IOF,!!?55,"UNIT",?70,"TOTAL",!,"ITEM",?15,"DESCRIPTION",?42,"QTY",?46,"UNIT",?55,"COST",?70,"COST",! F I=1:1:80 W "-"
    Q
   ```
-- **Rust item:** `hdr_prchdp2`; Ported.
+- **Rust item:** `crate::inquiry::hdr_prchdp2`, `fn hdr_prchdp2(s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** `$Y`, `IOF`. **Reads:** none.
 - **Branches:** PO-26.b1, BLOCKED (O-01): `@IOF` is unresolved, and the postcondition `$Y>0` governs every argument of the WRITE, so the column header is written only when `$Y>0`; `$Y` after a form feed is part of O-01.
-- **Outputs (original):** form feed, `\n\n`, column 55 `UNIT`, column 70 `TOTAL`, `\n`, `ITEM`, column 15 `DESCRIPTION`, column 42 `QTY`, column 46 `UNIT`, column 55 `COST`, column 70 `COST`, `\n`, then 80 dashes unconditionally. `hdr_prchdp2` returns `UnsupportedBranch("PO-26.b1")`.
+- **Outputs (original):** form feed, `\n\n`, column 55 `UNIT`, column 70 `TOTAL`, `\n`, `ITEM`, column 15 `DESCRIPTION`, column 42 `QTY`, column 46 `UNIT`, column 55 `COST`, column 70 `COST`, `\n`, then 80 dashes unconditionally. When `$Y>0`, `hdr_prchdp2` returns `UnsupportedBranch("PO-26.b1")` before writing anything; when `$Y=0` it writes the 80 dashes and returns `Ok`. In the port `$Y>0` always holds when it is called: its one caller, `prchdp2`, first writes the `!` of [PRCHDP2.m:10], and `Session` never resets `$Y`; the other call site, [PRCHDP2.m:31], is on the n/e PO-30.b2, which `ask_prchdp2` never runs.
+- **Side effects:** the loop counter `I` of the dashes, left at 80 [PRCHDP2.m:42]. `hdr_prchdp2` changes no `Locals` field: through `form_feed` it returns `UnsupportedBranch("PO-26.b1")` before writing anything when `$Y>0`. Scratch and business data: none.
 - **Dependencies and coverage:** called at [PRCHDP2.m:10, 31]. GC-01, 02, 05. Tests: GC-FOUND. BLOCKED.
 
 ### PO-27 ITEM^PRCHDP2
@@ -607,7 +617,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    N PURCTYPE,PURPIPE,PRCHI,PRCHJ S:$P($G(^PRC(442,D0,23)),"^",11)="S" PURCTYPE=1   ;PRC*5.1*221  
    D PIPECK S PRCHDIW=0   ;PRC*5.1*221
   ```
-- **Rust item:** `item_prchdp2`; Ported.
+- **Rust item:** `crate::inquiry::item_prchdp2`, `fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** `D0`, `PRCHDI` (item IEN), `PRCHDI0` (item node 0), `PRCHDI2` (item node 2), `PRCHDQ`, `IOSL`.
 - **Reads:** description lines `^PRC(442,D0,2,PRCHDI,1,k,0)` (guarded) [PRCHDP2.m:47]; `^PRCD(420.5,unit,0)` piece 1 [PRCHDP2.m:51, 59]; item node 4 piece 12 [PRCHDP2.m:56]; `$D(^PRC(442,D0,2,PRCHDI,3,"AC"))` [PRCHDP2.m:57]; `$O(^PRC(442,D0,22,"B",boc,0))` and `^PRC(442,D0,22,n,0)` piece 3 [PRCHDP2.m:62-63]; node 23 pieces 8 and 11. Field lines: section "FileMan definitions read", 442.01 row.
 - **Branches:** PO-27.b1 (a regular item), b2 (no description line, n/e), b3 (continuation description lines, `PRCHDCNT>1`, n/e), b4 (`PRCHDQ` set, n/e), b5 (partial receipts, n/e). Calls `PIPECK` (PO-28), `DIWP` per description line (PO-14), the copy (PO-16), `EDISTAT` (PO-29), and `ASK` (PO-30, BLOCKED) unconditionally [PRCHDP2.m:60].
@@ -623,7 +633,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    S PURPIPE=0,PRCH=0
    F PRCHI=1:1 S PRCH=$O(^PRC(442,D0,2,PRCH)),PRCHDIW=0 Q:'PRCH  D  Q:PURPIPE
   ```
-- **Rust item:** `pipeck_prchdp2`; Ported.
+- **Rust item:** `crate::inquiry::pipeck_prchdp2`, `fn pipeck_prchdp2(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** `D0`. **Reads:** every item's description lines `^PRC(442,D0,2,n,1,k,0)` (guarded), for every item of the order, not only the current one [PRCHDP2.m:98-99].
 - **Branches:** PO-28.b1 (no line contains the literal `| IN `, a pipe, space, `IN`, space), b2 (one does: `Q:PURPIPE`, n/e), b3 (an item with no description line, n/e). The outer loop's "no item" outcome is unreachable from the only call site, `ITEM`.
 - **Outputs:** none. **Side effects:** `PURPIPE`, `PRCH`, `PRCHI`, `PRCHJ`, `PRCHDIW`, and `X` (left as the last line scanned, overwritten by `ITEM` before use [PRCHDP2.m:47]).
@@ -635,10 +645,11 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
   EDISTAT(D0,D1,LINECNT) ;DISPLAY P.O.'S EDI STATUS & QUANTITY
   ```
-- **Rust item:** `fn edistat_prchutl(s: &mut Session, st: &Store, v: &mut Locals, d0: &str, d1: &str, linecnt: &mut String) -> Result<(), Halt>`; Ported. Called as `D EDISTAT^PRCHUTL(D0,PRCHDI,.ZZ)` [PRCHDP2.m:58]: `d0` and `d1` by value, `linecnt` by reference (`ZZ`, set to 0 by the caller).
+- **Rust item:** `crate::inquiry::edistat_prchutl`, `fn edistat_prchutl(_s: &mut Session, st: &Store, _v: &mut Locals, d0: &str, d1: &str, _linecnt: &mut String) -> Result<(), Halt>`; Ported. Called as `D EDISTAT^PRCHUTL(D0,PRCHDI,.ZZ)` [PRCHDP2.m:58]: `d0` and `d1` by value, `_linecnt` by reference (`ZZ`, set to 0 by the caller); `_linecnt` is unused because only the n/e status lines (PO-29.b3) count into it [PRCHUTL.m:76-78].
+- **Inputs:** formals `D0` and `D1` by value, bound to the caller's `D0` and `PRCHDI`, which `item_prchdp2` passes from the `Locals` fields `d0` and `prchdi` [PRCHDP2.m:58]; `LINECNT` by reference to the caller's `ZZ`, which `N ZZ S ZZ=0` defines first [PRCHDP2.m:58], so the default `S:'$D(LINECNT) LINECNT=0` never fires [PRCHUTL.m:72]. No inherited local is read. Precondition: `D0` is an order and `D1` one of its items [PRCHUTL.m:66-67].
 - **Reads:** `$D(^PRC(442,D0,2,D1,2))` and its pieces 9-12 (fields 12, 13 [DD.zwr:516265, 516276]).
 - **Branches:** PO-29.b1 (item node 2 absent, n/e), b2 (node 2 present, both EDI codes empty: quit), b3 (EDI status lines through `Y^DIQ`, n/e).
-- **Outputs:** none on b2. **Side effects:** `X`, `Y`, `C` are NEWed [PRCHUTL.m:71]; `linecnt` unchanged on b2.
+- **Outputs:** none on b2. **Side effects:** `X`, `Y`, `C` are NEWed [PRCHUTL.m:71]; `LINECNT` (`_linecnt`) unchanged on b2.
 - **Dependencies and coverage:** GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-30 ASK^PRCHDP2
@@ -648,9 +659,11 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ASK I $Y+5>IOSL W !?8,"ENTER '^' TO HALT: " R X:DTIME S:X["^" PRCHDQ=1 D:'PRCHDQ HDR Q
    Q
   ```
-- **Rust item:** `ask_prchdp2`; Ported.
+- **Rust item:** `crate::inquiry::ask_prchdp2`, `fn ask_prchdp2(s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt>`; Ported.
 - **Inputs:** `$Y`, `IOSL`. **Reads:** none.
 - **Branches:** PO-30.b1 (`$Y+5'>IOSL`: no prompt), BLOCKED (O-01, `IOSL` unresolved); PO-30.b2 (paging prompt and `HDR`, n/e). `ask_prchdp2` returns `UnsupportedBranch("PO-30.b1")` while `IOSL` is unresolved.
+- **Outputs:** `ask_prchdp2` writes nothing. While `IOSL` is unresolved in `STUB_CONTEXT` it returns `UnsupportedBranch("PO-30.b1")` (BLOCKED, O-01); were `IOSL` resolved, it would return `Ok` on b1 and `UnsupportedBranch("PO-30.b2")` when `$Y+5>IOSL`. In the original, b1 writes nothing, and the n/e b2 writes `\n`, column 8 `ENTER '^' TO HALT: `, reads one line, and runs `HDR` (PO-26) unless the answer contains `^` [PRCHDP2.m:31]. That READ lies only on the n/e b2, so `ask_prchdp2` never reads and never meets input exhaustion. Return value: none (called by `DO`). No `CorruptStore` site.
+- **Side effects:** none on b1. The n/e b2 sets `X` to the answer and `PRCHDQ=1` when it contains `^` [PRCHDP2.m:31]. `ask_prchdp2` changes no `Locals` field. Scratch and business data: none.
 - **Dependencies and coverage:** called at [PRCHDP2.m:60] (and on n/e paths at 18, 21, 54, 71, 76). GC-01, 02, 05. Tests: GC-FOUND. BLOCKED.
 
 ### PO-31 COM^PRCHDP2
@@ -659,8 +672,10 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
   COM G:'$D(^PRC(442,D0,4,0)) PT K ^UTILITY($J,"W") S DIWL=1,DIWR=60,PRCHJ=0 F  S PRCHJ=$O(^PRC(442,D0,4,PRCHJ)) Q:PRCHJ=""  S X=^(PRCHJ,0) D DIWP^PRCUTL($G(DA))
   ```
-- **Rust item:** `com_prchdp2`; Ported. **Reads:** `$D(^PRC(442,D0,4,0))` (field 20 [DD.zwr:514819]).
+- **Rust item:** `crate::inquiry::com_prchdp2`, `fn com_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** `D0`, the order on display, set at [PRCHRPT.m:74]; `com_prchdp2` takes it from the `Locals` field `d0`. The n/e b2 also passes `$G(DA)` [PRCHDP2.m:19]. Precondition: entered by `G COM` from PO-25 [PRCHDP2.m:14]. **Reads:** `$D(^PRC(442,D0,4,0))` (field 20 [DD.zwr:514819]).
 - **Branches:** PO-31.b1 (no node 4: `G PT`), PO-31.b2 (comments, n/e). **Outputs:** none on b1.
+- **Side effects:** none on b1: `G PT` is taken before the `K ^UTILITY($J,"W")` and the `DIWL`, `DIWR`, `PRCHJ` and `X` SETs, which belong with the `^TMP($J,"W")` copy to the n/e b2 [PRCHDP2.m:19-20]. `com_prchdp2` changes no `Locals` field. Scratch and business data: none.
 - **Dependencies and coverage:** reached by `G COM` [PRCHDP2.m:14]; jumps to PO-32. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-32 PT^PRCHDP2
@@ -670,7 +685,8 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   PT I $O(^PRC(442,D0,13,0)) W !!?8,"V.A. TRANSACTION NUMBERS: " F PRCHI=0:0 S PRCHI=$O(^PRC(442,D0,13,PRCHI)) Q:'PRCHI  I $D(^PRCS(410,PRCHI,0)) W !?14,$P(^(0),U,1)
    D AMENDS^PRCHDP6
   ```
-- **Rust item:** `pt_prchdp2`; Ported. **Reads:** `$O(^PRC(442,D0,13,0))` (field .05 [DD.zwr:514364]); `$D(^PRC(442,D0,6,0))` (field 50 [DD.zwr:514981]).
+- **Rust item:** `crate::inquiry::pt_prchdp2`, `fn pt_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** `D0`, which `pt_prchdp2` takes from the `Locals` field `d0`; the n/e b3 also reads `PRCHDQ` [PRCHDP2.m:24]. Precondition: entered by `G PT` from PO-31 [PRCHDP2.m:19]. **Reads:** `$O(^PRC(442,D0,13,0))` (field .05 [DD.zwr:514364]); `$D(^PRC(442,D0,6,0))` (field 50 [DD.zwr:514981]).
 - **Branches:** PO-32.b1 (no node 13; `AMENDS`; no node 6; `K ^TMP($J,"PRCHDP6")`), b2 (transaction numbers, n/e), b3 (amendment lines, n/e).
 - **Outputs:** none on b1. **Side effects:** kills the `^TMP($J,"PRCHDP6")` scratch [PRCHDP2.m:25].
 - **Dependencies and coverage:** reached from PO-31; calls PO-33; falls into PO-34. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
@@ -682,9 +698,12 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   AMENDS ;SET UP AMENDMENT HISTORY
    Q:'$D(^PRC(442,D0,6))
   ```
-- **Rust item:** `amends_prchdp6`; Ported. **Reads:** `$D(^PRC(442,D0,6))`.
+- **Rust item:** `crate::inquiry::amends_prchdp6`, `fn amends_prchdp6(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** `D0`, inherited from the caller, not a formal [PRCHDP6.m:126-127]; `amends_prchdp6` takes it from the `Locals` field `d0`. **Reads:** `$D(^PRC(442,D0,6))`.
 - **Branches:** PO-33.b1 (no node 6: quit), PO-33.b2 (amendment history, which begins `K ^TMP($J,"PRCHDP6")` [PRCHDP6.m:129], n/e).
-- **Outputs:** none. **Dependencies and coverage:** called at [PRCHDP2.m:23]. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
+- **Outputs:** none.
+- **Side effects:** none on b1: `Q:'$D(^PRC(442,D0,6))` quits before the `NEW` and the `K ^TMP($J,"PRCHDP6")`, which belong to the n/e b2 [PRCHDP6.m:127-129]. `amends_prchdp6` changes no `Locals` field. Scratch and business data: none.
+- **Dependencies and coverage:** called at [PRCHDP2.m:23]. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-34 ASK2^PRCHDP2
 
@@ -692,9 +711,12 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
   ASK2 D:'PRCHDQ EN^PRCHDP4 G:'$O(^PRC(442,D0,11,0)) ASK1 W ! S %A="   Review a Receiving Report ",%B="",%=2 D ^PRCFYN G:%'=1 Q
   ```
-- **Rust item:** `ask2_prchdp2`; Ported. **Reads:** `$O(^PRC(442,D0,11,0))` (field .6 [DD.zwr:514467]).
+- **Rust item:** `crate::inquiry::ask2_prchdp2`, `fn ask2_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** `PRCHDQ`, set to 0 at [PRCHDP2.m:10] and not set again on the exercised path, and `D0`; `ask2_prchdp2` reads the `Locals` fields `prchdq` and `d0`. Precondition: entered by fall-through from PO-32 [PRCHDP2.m:25-26]. **Reads:** `$O(^PRC(442,D0,11,0))` (field .6 [DD.zwr:514467]).
 - **Branches:** PO-34.b1 (`PRCHDQ` clear: `EN^PRCHDP4`; no node 11: `G ASK1`), b2 (receiving-report review, n/e), b3 (`PRCHDQ` set: `EN^PRCHDP4` skipped, n/e).
-- **Outputs:** through PO-35 to PO-37. **Dependencies and coverage:** falls in from PO-32; calls PO-35; jumps to PO-38. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
+- **Outputs:** through PO-35 to PO-37.
+- **Side effects:** none of its own on b1; what `EN^PRCHDP4` changes is under PO-35 to PO-37. The n/e b2 sets `%A`, `%B` and `%` [PRCHDP2.m:26]. `ask2_prchdp2` changes no `Locals` field itself. Scratch and business data: none.
+- **Dependencies and coverage:** falls in from PO-32; calls PO-35; jumps to PO-38. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-35 EN^PRCHDP4
 
@@ -703,7 +725,11 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   EN ;ONLINE DISPLAY OF DELIVERY SCHEDULE
    S PRCHONL=1,PRCHQUIT=0
   ```
-- **Rust item:** `en_prchdp4`; Ported. **Branches:** PO-35.b1 (sets `PRCHONL=1`, `PRCHQUIT=0`, falls into `EN2`).
+- **Rust item:** `crate::inquiry::en_prchdp4`, `fn en_prchdp4(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** none of its own: `EN` reads no local [PRCHDP4.m:4-5]; `D0` passes through to `EN2` (PO-36). Precondition: called only with `PRCHDQ` clear [PRCHDP2.m:26]. **Reads:** none: `EN` reads no global, no local input and no scratch [PRCHDP4.m:4-5].
+- **Branches:** PO-35.b1 (sets `PRCHONL=1`, `PRCHQUIT=0`, falls into `EN2`).
+- **Outputs:** none of its own; the fall-through into `EN2` (PO-36) reaches `EXDELV` (PO-37), which writes `\n`. No READ and no `CorruptStore` site of its own; `en_prchdp4` returns whatever `en2_prchdp4` returns. Return value: none (called by `DO`).
+- **Side effects:** sets `PRCHONL=1` and `PRCHQUIT=0` [PRCHDP4.m:5]; `EN2` resets `PRCHQUIT` to `""` [PRCHDP4.m:8], and `EXDELV` kills both [PRCHDP4.m:13]. Neither is modelled in Rust: their only readers, `PAUSE` [PRCHDP4.m:41] and the schedule print [PRCHDP4.m:11, 25, 29], lie on the n/e PO-36.b3. `en_prchdp4` changes no `Locals` field. Scratch and business data: none.
 - **Dependencies and coverage:** called at [PRCHDP2.m:26]. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-36 EN2^PRCHDP4
@@ -713,7 +739,8 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   EN2 ;ENTRY POINT USED TO EITHER PRINT OR DISPLAY DELIVERY SCHEDULE
    Q:'$D(D0)  S PRCHPONO=$P(^PRC(442,D0,0),U,1),PRCHQUIT="" G:PRCHPONO="" EXDELV K ^TMP($J,"MDEL")
   ```
-- **Rust item:** `en2_prchdp4`; Ported.
+- **Rust item:** `crate::inquiry::en2_prchdp4`, `fn en2_prchdp4(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** `D0`, set at [PRCHRPT.m:74], so `Q:'$D(D0)` never quits; `en2_prchdp4` takes it from the `Locals` field `d0`. `PRCHQUIT` and `PRCHPONO` are set here before any read [PRCHDP4.m:8]. Precondition: `^PRC(442,D0,0)` exists; otherwise `en2_prchdp4` returns `CorruptStore` [PRCHDP4.m:8].
 - **Reads:** `^PRC(442,D0,0)` piece 1, unguarded (`CorruptStore` site); `^PRC(442.8,"B",PONO,n)` [DD.zwr:518518].
 - **Branches:** PO-36.b1 (`D0` undefined, n/e unreachable: `D0` is set at [PRCHRPT.m:74]), b2 (empty PO number: `G EXDELV`, n/e), b3 (delivery-schedule entries: `BLD`, then print, n/e), b4 (`K ^TMP($J,"MDEL")`; no `B` entry, so no `^TMP($J,"MDEL")`: `G EXDELV`).
 - **Outputs:** none on b4. **Side effects:** `PRCHPONO`, `PRCHQUIT`; kills the `MDEL` scratch.
@@ -726,7 +753,9 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   EXDELV W ! K ^TMP($J,"MDEL"),PRCHI,PRCHONL,PRCHPONO,PRCHQUIT,PRCHX,PRCHY,PRCHZ,I,J,K,X,Y,Z,L
    Q
   ```
-- **Rust item:** `exdelv_prchdp4`; Ported. **Branches:** PO-37.b1.
+- **Rust item:** `crate::inquiry::exdelv_prchdp4`, `fn exdelv_prchdp4(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** none: `EXDELV` reads no local; it writes `\n` and kills [PRCHDP4.m:13]. Precondition: reached by `G EXDELV` from PO-36 [PRCHDP4.m:10]. **Reads:** none: no global is read, and the `^TMP($J,"MDEL")` scratch is killed, not read [PRCHDP4.m:13].
+- **Branches:** PO-37.b1.
 - **Outputs:** `\n`. **Side effects:** kills the listed locals (including `X`, `Y`, `I`, `J`, `K`) and the `MDEL` scratch.
 - **Dependencies and coverage:** reached from PO-36 [PRCHDP4.m:10]. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
@@ -736,9 +765,11 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
    W !,$C(7) G:PRCHDQ Q W "END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: " R X:DTIME G Q
   ```
-- **Rust item:** `ask1_prchdp2`; Ported. **Inputs:** `PRCHAMNT` (NEWed in PO-25), `PRCHDQ`.
+- **Rust item:** `crate::inquiry::ask1_prchdp2`, `fn ask1_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** `PRCHAMNT` (NEWed in PO-25), `PRCHDQ`. **Reads:** none from globals or scratch: `$G(PRCHAMNT)` [PRCHDP2.m:33] and `PRCHDQ` [PRCHDP2.m:41] are local inputs, which `ask1_prchdp2` reads from the `Locals` fields `prchamnt` and `prchdq`.
 - **Branches:** PO-38.b1 (`PRCHAMNT=2`: the amendment warning, n/e), b2 (`PRCHDQ` set: `G Q`, n/e), b3 (the `END OF DISPLAY` read, then `G Q`). `PRCHAMNT=2` is set only inside the amendment code [PRCHDP6.m:121].
 - **Outputs on b3:** `\n<BEL>END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: `; one READ (no input left: `Halt::InputExhausted`); its value is not used.
+- **Side effects:** `X` receives the READ answer [PRCHDP2.m:41]; `ask1_prchdp2` sets the `Locals` field `x` to it. The n/e b1 only writes [PRCHDP2.m:34-39]. Scratch and business data: none.
 - **Dependencies and coverage:** reached from PO-34; jumps to PO-39. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-39 Q^PRCHDP2
@@ -748,7 +779,11 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   Q ;W @IOF  ;REMOVE IF PROBLEM WITH KERNEL V6.5
    K I,J,K,N,DIC,DIWF,DIWL,DIWR,IOP,PRCHDI,PRCHD0,PRCHD1,PRCHFTYP,PRCHDSIT,PRCHDHSP,PRCHDSHP,PRCHDST,PRCHDS,PRCHDV,PRCHDQ,PRCHDI0,PRCHDI2,PRCHDIW,PRCHDCNT,PRCHI,PRCHJ,PRCHK,S,V,^TMP($J,"W"),^UTILITY($J,"W"),KK,JJ Q
   ```
-- **Rust item:** `q_prchdp2`; Ported. **Branches:** PO-39.b1 (kills locals and scratch; no output; the `W @IOF` is a comment).
+- **Rust item:** `crate::inquiry::q_prchdp2`, `fn q_prchdp2(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** none: `Q` reads no local; it only kills [PRCHDP2.m:95]. Precondition: reached by `G Q` from PO-38 [PRCHDP2.m:41]. **Reads:** none: no global is read, and the `^TMP($J,"W")` and `^UTILITY($J,"W")` scratch is killed, not read [PRCHDP2.m:95].
+- **Branches:** PO-39.b1 (kills locals and scratch; no output; the `W @IOF` is a comment).
+- **Outputs:** none: the `W @IOF` is a comment [PRCHDP2.m:94]. No READ, so no input exhaustion, and no `CorruptStore` site; `q_prchdp2` returns `Ok(())`. Return value: none; `Q` ends the `D ^PRCHDP1` that PO-06 made [PRCHRPT.m:74].
+- **Side effects:** kills the locals `I`, `J`, `K`, `N`, `DIC`, `DIWF`, `DIWL`, `DIWR`, `IOP`, `PRCHDI`, `PRCHD0`, `PRCHD1`, `PRCHFTYP`, `PRCHDSIT`, `PRCHDHSP`, `PRCHDSHP`, `PRCHDST`, `PRCHDS`, `PRCHDV`, `PRCHDQ`, `PRCHDI0`, `PRCHDI2`, `PRCHDIW`, `PRCHDCNT`, `PRCHI`, `PRCHJ`, `PRCHK`, `S`, `V`, `KK` and `JJ`, and the scratch `^TMP($J,"W")` and `^UTILITY($J,"W")` [PRCHDP2.m:95]. `q_prchdp2` clears their `Locals` counterparts: `n`; `dic_a`, `dic_b` and `dic_s` (the `DIC` subscripts); `diwf`, `diwl`, `diwr`; `prchdi`, `prchd0`, `prchd1`, `prchftyp`, `prchdsit`, `prchdshp`, `prchdst`, `prchds`, `prchdv`, `prchdq`, `prchdi0`, `prchdi2`, `prchdcnt`; `s_rows`, `v_rows`; and the wrap scratch `tmp_w` and `utility_w`. The other killed locals have no `Locals` field. Business data: none.
 - **Dependencies and coverage:** reached from PO-38 [PRCHDP2.m:41]; returns to PO-06. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-40 K^PRCHRPT
@@ -759,7 +794,11 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
    K X,Y,I
    Q
   ```
-- **Rust item:** `k_prchrpt`; Ported. **Branches:** PO-40.b1 (kills, including `PRCHNRQ`, so the next order's label is decided afresh).
+- **Rust item:** `crate::inquiry::k_prchrpt`, `fn k_prchrpt(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>`; Ported.
+- **Inputs:** none: `K` reads no local [PRCHRPT.m:106-107]. Precondition: called after `D ^PRCHDP1` returns [PRCHRPT.m:74]. **Reads:** none: no global, no local input and no scratch is read [PRCHRPT.m:106-107].
+- **Branches:** PO-40.b1 (kills, including `PRCHNRQ`, so the next order's label is decided afresh).
+- **Outputs:** none: `K` writes nothing. No READ, so no input exhaustion, and no `CorruptStore` site; `k_prchrpt` returns `Ok(())`. Return value: none (called by `DO`).
+- **Side effects:** kills the locals `DEFPNT`, `ZTSK`, `ZTSAVE`, `ZTDTH`, `ZTRTN`, `PRCHREPR`, `PRCHNRQ`, `OK`, `PL` and `PRCHQ`, then `X`, `Y` and `I` [PRCHRPT.m:106-107]. `k_prchrpt` clears the `Locals` fields `prchnrq`, `x` and `y`; the other killed locals have no `Locals` field. Scratch and business data: none.
 - **Dependencies and coverage:** called at [PRCHRPT.m:74]; then `G EN30` [PRCHRPT.m:75]. GC-01, 02, 05. Tests: GC-FOUND. SOURCE-RESOLVED.
 
 ### PO-41 ^%DT
@@ -768,7 +807,7 @@ One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at 
   ```text
    I '$D(PRC("FY")) S %DT="",X="T" D ^%DT S A=$E(Y,2,3),B=$E(Y,4,5),PRC("FY")=$E(100+$S(+B>9:A+1,1:A),2,3),PRC("QTR")=$S(B<4:2,B<7:3,B<10:4,1:1) S X=""
   ```
-- **Rust item:** `pct_dt`; Stub; no formal arguments (it reads the inherited `%DT` and `X`).
+- **Rust item:** `crate::inquiry::pct_dt`, `fn pct_dt(_s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt>`; Stub; no formal arguments (it reads the inherited `%DT` and `X`).
 - **Inputs:** `%DT=""`, `X="T"`. **Reads:** none.
 - **Branches:** PO-41.b1: `%DT` has no `A` or `E` flag, so there is no prompt and no output [DIDT.m:11-12, 63, 67, 92] [ZTDT.m:3-4, 43, 46, 55]; `Y` receives today's date, which no output uses.
 - **Outputs:** none. **Side effects:** none modelled (section "Stubs").
