@@ -1,0 +1,231 @@
+/* Retro terminal screen for the purchase-order display bridge: green on
+   black, square corners, the system monospace font, no images. Every
+   reaction lives in the last block and applies in RUST mode only. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+:root {
+  --fg: #33FF33;
+  --bg: #000000;
+  --lh: 1.25rem;
+  --glow: #99FF99;
+  --red: #FF3333;
+  /* Start colour of the new-line highlight; #33FF33 text on it is 5.2:1
+     (WCAG AA). */
+  --hl: #1A661A;
+}
+
+html {
+  background-color: var(--bg);
+  color: var(--fg);
+}
+
+body {
+  margin: 0;
+  font-family: ui-monospace, monospace;
+  font-size: 1rem;
+  line-height: var(--lh);
+}
+
+.terminal {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1ch;
+  padding-block: 1ch;
+  padding-inline: 2ch;
+}
+
+.title,
+.pane h2 {
+  margin: 0;
+  font-size: inherit;
+  font-weight: normal;
+}
+
+.controls,
+.entry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1ch;
+}
+
+input,
+select,
+button {
+  margin: 0;
+  padding-block: 0;
+  padding-inline: 1ch;
+  border: 1px solid var(--fg);
+  border-radius: 0;
+  appearance: none;
+  font: inherit;
+  line-height: var(--lh);
+  color: var(--fg);
+  background-color: var(--bg);
+}
+
+.entry input {
+  inline-size: 40ch;
+  caret-color: var(--fg);
+}
+
+/* No outline at rest: a transparent solid one would be painted on every
+   control in forced-colours mode. Rings use :focus-visible, so a mouse
+   click on a button draws none. */
+input,
+select,
+button,
+.screen {
+  outline: 2px none transparent;
+  outline-offset: 2px;
+}
+
+:is(input, select, button, .screen):focus-visible {
+  outline-style: solid;
+  outline-color: var(--fg);
+}
+
+/* 80 columns by 24 rows. The single 80ch grid column sizes the box and the
+   stable gutter is added beside it, so a vertical scrollbar never narrows
+   the visible text below 80 columns. Lines are never wrapped. */
+.screen {
+  display: grid;
+  grid-template-columns: 80ch;
+  grid-auto-rows: var(--lh);
+  align-content: start;
+  box-sizing: content-box;
+  inline-size: max-content;
+  block-size: calc(24 * var(--lh));
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  scrollbar-color: var(--fg) var(--bg);
+  border: 1px solid var(--fg);
+  white-space: pre;
+}
+
+.ln {
+  min-block-size: var(--lh);
+  line-height: var(--lh);
+}
+
+.cursor {
+  flex: none;
+  inline-size: 1ch;
+  block-size: var(--lh);
+  background-color: var(--fg);
+}
+
+.status {
+  min-block-size: var(--lh);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+::selection {
+  background-color: var(--fg);
+  color: var(--bg);
+}
+
+/* Mode layout. Structural selectors stand in for the IDs app.js uses: the
+   single-backend transcript is the screen directly inside .terminal, and
+   the match status is the status line right after .compare. */
+.compare {
+  display: none;
+  gap: 2ch;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  gap: 1ch;
+}
+
+.compare + .status {
+  display: none;
+}
+
+[data-mode="compare"] .compare {
+  display: flex;
+}
+
+[data-mode="compare"] .compare + .status {
+  display: block;
+}
+
+[data-mode="compare"] .terminal > .screen {
+  display: none;
+}
+
+/* RUST-only reactions. Every selector pairs [data-mode="rust"] with focus,
+   hover or a class app.js sets while something happens, so nothing here
+   matches an idle screen, and MUMPS, COMPARE and reduced-motion users get
+   none of them. */
+@media (prefers-reduced-motion: no-preference) {
+  /* Focus glow, by outline colour. */
+  [data-mode="rust"] :is(input, select, button):focus-visible {
+    outline-color: var(--glow);
+    transition: outline-color 150ms ease-out;
+  }
+
+  /* Row hover inversion. */
+  @media (hover: hover) {
+    [data-mode="rust"] .ln:hover {
+      background-color: var(--fg);
+      color: var(--bg);
+    }
+  }
+
+  /* SEND working state while a request is in flight: reverse video, label
+     unchanged. A dashed border would not show against the same-colour
+     fill, so none is set. */
+  [data-mode="rust"] .busy {
+    background-color: var(--fg);
+    color: var(--bg);
+  }
+
+  /* New-line slide-in and highlight. */
+  @keyframes ln-in {
+    from {
+      transform: translateX(-2ch);
+      background-color: var(--hl);
+    }
+
+    to {
+      transform: translateX(0);
+      background-color: transparent;
+    }
+  }
+
+  [data-mode="rust"] .ln.new {
+    animation: ln-in 300ms ease-out;
+  }
+
+  /* Rejection shake and red outline. */
+  @keyframes reject-shake {
+    0%,
+    100% {
+      transform: translateX(0);
+    }
+
+    20%,
+    60% {
+      transform: translateX(-1ch);
+    }
+
+    40%,
+    80% {
+      transform: translateX(1ch);
+    }
+  }
+
+  [data-mode="rust"] .screen.reject {
+    outline: 2px solid var(--red);
+    animation: reject-shake 300ms linear;
+  }
+}
