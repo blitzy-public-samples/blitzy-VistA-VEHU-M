@@ -144,7 +144,6 @@ fn canonical(negative: bool, int: &str, frac: &str) -> String {
     out
 }
 
-/// Length of the run of ASCII digits that starts `text`.
 fn digit_run(text: &str) -> usize {
     text.bytes().take_while(u8::is_ascii_digit).count()
 }
@@ -637,7 +636,6 @@ mod tests {
     use super::*;
     use crate::store::Sub;
 
-    /// A key of subscripts, each classified by its text as M does.
     fn key(subs: &[&str]) -> Vec<Sub> {
         subs.iter().map(|sub| Sub::from_text(sub)).collect()
     }

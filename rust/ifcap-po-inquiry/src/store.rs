@@ -161,7 +161,10 @@ impl Store {
     /// one `"`), and a quoted canonical number is stored as a number, as M
     /// does. Values are quoted strings or canonical numbers. `$C(n)` and
     /// `_` concatenation are rejected rather than evaluated, because no
-    /// fixture holds them; any other form is an error, never a guess.
+    /// fixture holds them; any other form is an error, never a guess. A
+    /// malformed data line is a [`StoreError::Parse`] whose `line` is
+    /// 1-based and counts every line of `text`, header lines included, and
+    /// whose `file` is `None`.
     pub fn from_zwr(text: &str) -> Result<Store, StoreError> {
         let mut store = Store::default();
         let mut in_data = false;
@@ -331,12 +334,10 @@ pub fn load_fixtures(dir: &Path) -> Result<Store, StoreError> {
 // its front. Quoted strings may hold `,`, `)`, `=` and doubled quotes, so
 // the line is never split on them.
 
-/// The next unconsumed character, without consuming it.
 fn peek(rest: &str) -> Option<char> {
     rest.chars().next()
 }
 
-/// Consumes `c` when it is the next character.
 fn eat(rest: &mut &str, c: char) -> bool {
     match rest.strip_prefix(c) {
         Some(tail) => {
@@ -387,7 +388,6 @@ fn number_token<'a>(rest: &mut &'a str) -> &'a str {
     })
 }
 
-/// The message for a value this loader declines to evaluate.
 const DOLLAR_C_MESSAGE: &str = "$C() values are not supported";
 
 /// Parses one data line into its key and value, or a message naming what
@@ -484,7 +484,6 @@ mod tests {
         Sub::Str(text.to_string())
     }
 
-    /// A key under global `name`, each subscript classified by its text.
     fn key(name: &str, subs: &[&str]) -> Vec<Sub> {
         let mut key = vec![string(name)];
         key.extend(subs.iter().map(|sub| Sub::from_text(sub)));

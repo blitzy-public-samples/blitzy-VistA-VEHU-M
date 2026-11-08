@@ -17,7 +17,6 @@ use std::process::ExitCode;
 
 use ifcap_po_inquiry::bridge::{MumpsMode, serve};
 
-/// The fixed listener address, on loopback only.
 const ADDRESS: &str = "127.0.0.1:8080";
 
 fn main() -> ExitCode {
