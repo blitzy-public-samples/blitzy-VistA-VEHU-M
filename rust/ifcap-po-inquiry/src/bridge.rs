@@ -42,8 +42,12 @@ use crate::store::{Store, load_fixtures};
 /// polls its child, and how long a `run_command` stream worker blocks
 /// before it checks for cancellation.
 const POLL: Duration = Duration::from_millis(10);
-/// Read and write timeout of one client connection.
+/// How long a client connection may stay silent before the first byte of its
+/// request, and the write timeout of a response.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a request may take from its first byte to the end of its body.
+/// It is one deadline, which bytes trickled in one at a time do not renew.
+const REQUEST_TIME: Duration = Duration::from_secs(5);
 /// The longest request line plus headers accepted.
 const MAX_HEAD: usize = 16 * 1024;
 /// The longest request body accepted.
@@ -285,44 +289,67 @@ fn handle_connection(mut stream: TcpStream, store: &Store, mumps: &MumpsMode) ->
 }
 
 /// The one request and response of [`handle_connection`]. A connection that
-/// cannot be made blocking with [`IO_TIMEOUT`] for reads and writes is
-/// closed without a response, and that failure is returned, naming the
-/// stage. Every other outcome is `Ok`.
+/// cannot be made blocking with [`IO_TIMEOUT`] for writes, or whose read
+/// timeout cannot be set, is closed without a response, and that failure is
+/// returned, naming the stage. Every other outcome is `Ok`.
 fn exchange(stream: &mut TcpStream, store: &Store, mumps: &MumpsMode) -> io::Result<()> {
     let configured = stream
         .set_nonblocking(false)
-        .and_then(|()| stream.set_read_timeout(Some(IO_TIMEOUT)))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)));
     if let Err(e) = configured {
         return Err(abandon(stream, "configuring a connection", e));
     }
-    let response = match read_request(stream) {
-        Ok(Some(request)) => route(&request, store, mumps),
-        // The peer closed before sending anything: there is no one to answer.
-        Ok(None) => return Ok(()),
-        Err(cause) => error_response(400, &cause),
+    let mut received: Vec<u8> = Vec::new();
+    let response = match read_request(stream, &mut received, IO_TIMEOUT, REQUEST_TIME) {
+        Err(e) => return Err(abandon(stream, "configuring a connection", e)),
+        Ok(Ok(Some(request))) => route(&request, store, mumps),
+        // Nothing to answer: the peer sent nothing, or cannot be written to.
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Err(cause)) => error_response(400, &cause),
     };
+    // Method tokens are case-sensitive, so only `HEAD` itself is a HEAD
+    // request, rejected or not.
+    let head_request = received.starts_with(b"HEAD ");
     // A response that cannot be written means the client has gone, or has
     // not read it within `IO_TIMEOUT`: an outcome of that client, which ends
     // only this connection, shut down by `handle_connection`.
-    if write_response(stream, &response).is_ok() {
+    if write_response(stream, &response, head_request).is_ok() {
         drain(stream, DRAIN_TIME);
     }
     Ok(())
 }
 
-/// Ends the write side, then discards what the client still sends, for at
-/// most `limit` and [`DRAIN_BYTES`], so the close is orderly.
-fn drain(stream: &mut TcpStream, limit: Duration) {
-    if stream.shutdown(Shutdown::Write).is_err() || stream.set_read_timeout(Some(limit)).is_err() {
-        return;
+/// Ends the write side, then discards what the client still sends, so the
+/// close is orderly, and returns how many bytes it discarded. Each read waits
+/// only for the time left and takes only the bytes left, so the drain lasts
+/// at most `limit`, up to the granularity of the socket's read timer, and
+/// discards at most [`DRAIN_BYTES`]. The end of input, a read error, or a
+/// read timeout that cannot be set ends it sooner; a write side that cannot
+/// be shut down ends it before any read.
+fn drain(stream: &mut TcpStream, limit: Duration) -> usize {
+    let mut discarded = 0usize;
+    if stream.shutdown(Shutdown::Write).is_err() {
+        return discarded;
     }
     let started = Instant::now();
-    let mut discarded = 0usize;
     let mut buf = [0u8; 8192];
-    while started.elapsed() < limit && discarded < DRAIN_BYTES {
-        match stream.read(&mut buf) {
-            Ok(0) | Err(_) => return,
+    loop {
+        let time_left = limit.saturating_sub(started.elapsed());
+        let bytes_left = DRAIN_BYTES.saturating_sub(discarded);
+        // A spent budget ends the drain before `set_read_timeout`, which
+        // rejects a zero timeout.
+        if time_left.is_zero()
+            || bytes_left == 0
+            || stream.set_read_timeout(Some(time_left)).is_err()
+        {
+            return discarded;
+        }
+        let take = bytes_left.min(buf.len());
+        let Some(window) = buf.get_mut(..take) else {
+            return discarded;
+        };
+        match stream.read(window) {
+            Ok(0) | Err(_) => return discarded,
             Ok(n) => discarded = discarded.saturating_add(n),
         }
     }
@@ -332,7 +359,9 @@ fn drain(stream: &mut TcpStream, limit: Duration) {
 // HTTP/1.1
 // ---------------------------------------------------------------------------
 
-/// The 400 cause for a request whose head cannot be read or parsed.
+/// The prefix of every 400 cause of the request framing, followed by `: `
+/// and the fixed name of the rule the request broke. No cause repeats
+/// request bytes.
 const BAD_REQUEST: &str = "BAD REQUEST";
 
 /// One request, as far as routing needs it: the method, the target, and the
@@ -340,54 +369,91 @@ const BAD_REQUEST: &str = "BAD REQUEST";
 /// `Content-Length`.
 type HttpRequest = (String, String, Option<Vec<u8>>);
 
-/// Reads the request line and headers up to the blank line, then the body by
-/// `Content-Length`. `Ok(None)` means the peer closed before sending a byte;
-/// `Err` carries the 400 cause. Chunked bodies are not supported.
-fn read_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, String> {
-    let mut received: Vec<u8> = Vec::new();
+/// Reads the request line and headers up to the blank line into `received`,
+/// then the body by `Content-Length`. `received` keeps every byte read while
+/// the head arrived, so the caller can tell a rejected request's method.
+/// The connection may stay silent for `idle` before its first byte. From that
+/// byte the whole request, body included, must arrive within `request_time`,
+/// one deadline that later bytes do not renew.
+///
+/// `Ok(Ok(None))` means there is nothing to answer: no byte arrived before
+/// the end of input, a read error or `idle`, or the interim `100 Continue`
+/// could not be written. `Ok(Err)` carries the 400 cause. `Err` is a read
+/// timeout that cannot be set. Chunked bodies are not supported.
+fn read_request(
+    stream: &mut TcpStream,
+    received: &mut Vec<u8>,
+    idle: Duration,
+    request_time: Duration,
+) -> io::Result<Result<Option<HttpRequest>, String>> {
+    let bad = |cause: &str| format!("{BAD_REQUEST}: {cause}");
     let mut buf = [0u8; 4096];
+    // The idle clock until the first byte arrives, then the request's.
+    let mut started = Instant::now();
     let head_end = loop {
-        if let Some(end) = find_head_end(&received) {
+        if let Some(end) = find_head_end(received) {
             break end;
         }
         if received.len() > MAX_HEAD {
-            return Err(BAD_REQUEST.to_string());
+            return Ok(Err(bad("HEAD TOO LARGE")));
         }
-        match stream.read(&mut buf) {
-            Ok(0) if received.is_empty() => return Ok(None),
-            Ok(0) => return Err(BAD_REQUEST.to_string()),
-            Ok(n) => received.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+        let budget = if received.is_empty() {
+            idle
+        } else {
+            request_time
+        };
+        match read_within(stream, &mut buf, started, budget)? {
+            // No byte arrived, so there is no request: a browser's idle
+            // spare connection ends here unanswered.
+            Ok(0) if received.is_empty() => return Ok(Ok(None)),
+            Ok(0) => return Ok(Err(bad("INCOMPLETE HEAD"))),
+            Ok(n) => {
+                if received.is_empty() {
+                    started = Instant::now();
+                }
+                received.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            // A read timeout before the head is complete is answered as a
-            // bad request, best effort.
-            Err(_) => return Err(BAD_REQUEST.to_string()),
+            Err(_) if received.is_empty() => return Ok(Ok(None)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(Err(bad("READ TIMEOUT")));
+            }
+            Err(_) => return Ok(Err(bad("INCOMPLETE HEAD"))),
         }
     };
     if head_end > MAX_HEAD {
-        return Err(BAD_REQUEST.to_string());
+        return Ok(Err(bad("HEAD TOO LARGE")));
     }
-    let (head, rest) = received
-        .split_at_checked(head_end)
-        .ok_or_else(|| BAD_REQUEST.to_string())?;
-    let (method, target, content_length, expect_continue) = parse_head(head)?;
+    let Some((head, rest)) = received.split_at_checked(head_end) else {
+        return Ok(Err(bad("INCOMPLETE HEAD")));
+    };
+    let (method, target, content_length, expect_continue) = match parse_head(head) {
+        Ok(parsed) => parsed,
+        Err(cause) => return Ok(Err(cause)),
+    };
     let body = match content_length {
         None => None,
-        Some(length) if length > MAX_BODY => {
-            return Err(format!("{BAD_REQUEST}: BODY TOO LARGE"));
-        }
+        Some(length) if length > MAX_BODY => return Ok(Err(bad("BODY TOO LARGE"))),
         Some(length) => {
             let mut body = rest.to_vec();
-            if expect_continue && body.len() < length {
-                stream
-                    .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-                    .map_err(|_| BAD_REQUEST.to_string())?;
+            // A client that cannot be written to cannot be answered either.
+            if expect_continue
+                && body.len() < length
+                && stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").is_err()
+            {
+                return Ok(Ok(None));
             }
             while body.len() < length {
-                match stream.read(&mut buf) {
-                    Ok(0) => return Err(format!("{BAD_REQUEST}: INCOMPLETE BODY")),
+                match read_within(stream, &mut buf, started, request_time)? {
+                    Ok(0) => return Ok(Err(bad("INCOMPLETE BODY"))),
                     Ok(n) => body.extend_from_slice(buf.get(..n).unwrap_or(&[])),
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => return Err(format!("{BAD_REQUEST}: INCOMPLETE BODY")),
+                    Err(_) => return Ok(Err(bad("INCOMPLETE BODY"))),
                 }
             }
             // Bytes past the declared length (a pipelined request) are not
@@ -396,7 +462,27 @@ fn read_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, String> {
             Some(body)
         }
     };
-    Ok(Some((method.to_string(), target.to_string(), body)))
+    Ok(Ok(Some((method.to_string(), target, body))))
+}
+
+/// One read of `stream` into `buf` that waits at most what is left of
+/// `budget` since `started`. The inner result is the read's; a budget
+/// already spent gives `TimedOut` without reading, and a read that waits it
+/// out gives `WouldBlock` or `TimedOut`. The outer `Err` is a read timeout
+/// that cannot be set.
+fn read_within(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    started: Instant,
+    budget: Duration,
+) -> io::Result<io::Result<usize>> {
+    let left = budget.saturating_sub(started.elapsed());
+    // `set_read_timeout` rejects a zero timeout, so a spent budget ends here.
+    if left.is_zero() {
+        return Ok(Err(io::ErrorKind::TimedOut.into()));
+    }
+    stream.set_read_timeout(Some(left))?;
+    Ok(stream.read(buf))
 }
 
 /// The offset just past the first `\r\n\r\n`, if the head is complete.
@@ -408,31 +494,41 @@ fn find_head_end(received: &[u8]) -> Option<usize> {
 }
 
 /// Parses `head`, which ends with the blank line, into the request line and
-/// the headers routing needs: the method, the target, the `Content-Length`
-/// and whether `Expect: 100-continue` was sent. Errors are 400 causes.
-fn parse_head(head: &[u8]) -> Result<(&str, &str, Option<usize>, bool), String> {
-    let bad = || BAD_REQUEST.to_string();
-    let text = std::str::from_utf8(head).map_err(|_| bad())?;
-    let text = text.strip_suffix("\r\n\r\n").ok_or_else(bad)?;
+/// the headers routing needs: the method, the target in origin-form (see
+/// [`origin_form`]), the `Content-Length` and whether `Expect: 100-continue`
+/// was sent. Errors are 400 causes, each naming the rule the head broke.
+fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String> {
+    let bad = |cause: &str| format!("{BAD_REQUEST}: {cause}");
+    let malformed_line = || bad("MALFORMED REQUEST LINE");
+    let text = std::str::from_utf8(head).map_err(|_| bad("HEAD NOT UTF-8"))?;
+    let text = text
+        .strip_suffix("\r\n\r\n")
+        .ok_or_else(|| bad("INCOMPLETE HEAD"))?;
     let mut lines = text.split("\r\n");
-    let request_line = lines.next().ok_or_else(bad)?;
+    let request_line = lines.next().ok_or_else(malformed_line)?;
+    // Exactly three parts, each separated by one space and none empty.
     let mut parts = request_line.split(' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
-        return Err(bad());
+        return Err(malformed_line());
     };
-    if !is_token(method) || !target.starts_with('/') || !matches!(version, "HTTP/1.1" | "HTTP/1.0")
-    {
-        return Err(bad());
+    if !is_token(method) || target.is_empty() || version.is_empty() {
+        return Err(malformed_line());
     }
+    if !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
+        return Err(bad("UNSUPPORTED HTTP VERSION"));
+    }
+    let target = origin_form(target).ok_or_else(|| bad("INVALID REQUEST TARGET"))?;
     let mut content_length: Option<usize> = None;
     let mut expect_continue = false;
     for line in lines {
-        let (name, value) = line.split_once(':').ok_or_else(bad)?;
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| bad("MALFORMED HEADER"))?;
         // A name must be a token; this also rejects obsolete line folding.
         if !is_token(name) {
-            return Err(bad());
+            return Err(bad("MALFORMED HEADER"));
         }
         let value = value.trim_matches(|c| c == ' ' || c == '\t');
         if name.eq_ignore_ascii_case("content-length") {
@@ -450,6 +546,33 @@ fn parse_head(head: &[u8]) -> Result<(&str, &str, Option<usize>, bool), String> 
         }
     }
     Ok((method, target, content_length, expect_continue))
+}
+
+/// The origin-form of a request target (RFC 9112 3.2): an origin-form
+/// target as sent, or an `http` absolute-form target reduced to its path
+/// and query, an empty path becoming `/` (RFC 9112 3.2.2). The scheme is
+/// matched without regard to case. The authority ends at the first `/`, `?`
+/// or `#` (RFC 3986 3.2) and takes no part in routing, but it must not be
+/// empty (RFC 9110 4.2.1) or carry userinfo (RFC 9110 4.2.4). `None` for
+/// any other target, such as `*` or another scheme.
+fn origin_form(target: &str) -> Option<String> {
+    if target.starts_with('/') {
+        return Some(target.to_string());
+    }
+    let (scheme, rest) = target.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path_and_query) = rest.split_at_checked(authority_end)?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    if path_and_query.starts_with('/') {
+        Some(path_and_query.to_string())
+    } else {
+        Some(format!("/{path_and_query}"))
+    }
 }
 
 /// An HTTP token: one or more `tchar`s (RFC 9110 5.6.2).
@@ -474,20 +597,34 @@ fn error_response(status: u16, cause: &str) -> (u16, &'static str, Vec<u8>) {
     (status, JSON_TYPE, error_body(cause).into_bytes())
 }
 
-/// Writes `response`, `(status, content type, body)`; every response closes
-/// its connection.
+/// The headers every response carries besides its type, length and close:
+/// no content-type sniffing, no stored copy of a response, and no rendering
+/// inside a frame of another page.
+const HARDENING_HEADERS: &str = "X-Content-Type-Options: nosniff\r\n\
+    Cache-Control: no-store\r\n\
+    X-Frame-Options: DENY\r\n\
+    Content-Security-Policy: frame-ancestors 'none'\r\n";
+
+/// Writes `response`, `(status, content type, body)`, with
+/// [`HARDENING_HEADERS`]; every response closes its connection. The answer
+/// to a `HEAD` request, `head_request`, carries no content (RFC 9110 9.3.2),
+/// but its `Content-Length` is still that of the body a `GET` would get
+/// (RFC 9110 8.6).
 fn write_response(
     stream: &mut impl Write,
     response: &(u16, &'static str, Vec<u8>),
+    head_request: bool,
 ) -> io::Result<()> {
     let (status, content_type, body) = response;
     let reason = reason_phrase(*status);
     let length = body.len();
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\n{HARDENING_HEADERS}Connection: close\r\n\r\n"
     );
     stream.write_all(head.as_bytes())?;
-    stream.write_all(body)?;
+    if !head_request {
+        stream.write_all(body)?;
+    }
     stream.flush()
 }
 
@@ -523,11 +660,15 @@ const POST_REQUIRED: &str = "NOT FOUND: POST REQUIRED";
 const GET_REQUIRED: &str = "NOT FOUND: GET REQUIRED";
 
 /// Answers `request` with `(status, content type, body)`: a static path, an
-/// API path, or 404.
+/// API path, or 404. A `HEAD` request is answered as a `GET` of the same
+/// target would be, so its headers, `Content-Length` included, are those of
+/// the `GET` (RFC 9110 9.3.2): a static path serves its file, and an API
+/// path, which serves only `POST`, gives the 404 of any other method.
+/// [`write_response`] leaves the content out.
 fn route(request: &HttpRequest, store: &Store, mumps: &MumpsMode) -> (u16, &'static str, Vec<u8>) {
     let (method, target, body) = request;
     if let Some((file, content_type)) = static_file(target) {
-        if method == "GET" {
+        if method == "GET" || method == "HEAD" {
             return serve_static(file, content_type);
         }
         return error_response(404, GET_REQUIRED);
@@ -3393,29 +3534,231 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
     fn request_head_parsing() {
         assert_eq!(
             parse_head(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
-            Ok(("GET", "/", None, false))
+            Ok(("GET", "/".to_string(), None, false))
         );
         assert_eq!(
             parse_head(
                 b"POST /api/rust/session HTTP/1.0\r\ncontent-length: 12\r\nContent-Length:12\r\nExpect: 100-continue\r\n\r\n"
             ),
-            Ok(("POST", "/api/rust/session", Some(12), true))
+            Ok(("POST", "/api/rust/session".to_string(), Some(12), true))
         );
-        let malformed: [&[u8]; 10] = [
-            b"GET /\r\n\r\n",
-            b"GET  / HTTP/1.1\r\n\r\n",
-            b"GET x HTTP/1.1\r\n\r\n",
-            b"GET / HTTP/2\r\n\r\n",
-            b"GET / HTTP/1.1\r\nNoColon\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n",
-            b"POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
-            b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
-            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: \xff\r\n\r\n",
+        // Each absolute-form target, and the origin-form it is routed by.
+        let absolute: [(&str, &str); 7] = [
+            ("http://127.0.0.1:18221/", "/"),
+            ("http://h", "/"),
+            ("http://h?x", "/?x"),
+            ("HTTP://h/app.js", "/app.js"),
+            ("hTtP://h:1/api/rust/session?q=1", "/api/rust/session?q=1"),
+            ("http://h/a@b", "/a@b"),
+            ("http://h#f", "/#f"),
         ];
-        for head in malformed {
-            assert!(parse_head(head).is_err(), "accepted {head:?}");
+        for (target, origin) in absolute {
+            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            assert_eq!(
+                parse_head(head.as_bytes()),
+                Ok(("GET", origin.to_string(), None, false)),
+                "for {target}"
+            );
         }
+        // Each rejected head, and the rule its 400 cause names.
+        let rejected: [(&[u8], &str); 26] = [
+            (b"GET /\r\n\r\n", "MALFORMED REQUEST LINE"),
+            (b"GET / HTTP/1.1 x\r\n\r\n", "MALFORMED REQUEST LINE"),
+            (b"GET  / HTTP/1.1\r\n\r\n", "MALFORMED REQUEST LINE"),
+            (b"GET / \r\n\r\n", "MALFORMED REQUEST LINE"),
+            (b"\r\n\r\n", "MALFORMED REQUEST LINE"),
+            (b"G/T / HTTP/1.1\r\n\r\n", "MALFORMED REQUEST LINE"),
+            (b"GET / HTTP/2\r\n\r\n", "UNSUPPORTED HTTP VERSION"),
+            (b"GET / HTTP/2.0\r\n\r\n", "UNSUPPORTED HTTP VERSION"),
+            (b"GET / http/1.1\r\n\r\n", "UNSUPPORTED HTTP VERSION"),
+            (b"GET x HTTP/1.1\r\n\r\n", "INVALID REQUEST TARGET"),
+            (b"OPTIONS * HTTP/1.1\r\n\r\n", "INVALID REQUEST TARGET"),
+            (b"GET ftp://x/ HTTP/1.1\r\n\r\n", "INVALID REQUEST TARGET"),
+            (b"GET https://x/ HTTP/1.1\r\n\r\n", "INVALID REQUEST TARGET"),
+            (b"GET http:///x HTTP/1.1\r\n\r\n", "INVALID REQUEST TARGET"),
+            (b"GET http://?x HTTP/1.1\r\n\r\n", "INVALID REQUEST TARGET"),
+            (
+                b"GET http://u@x/ HTTP/1.1\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (b"GET http:/x HTTP/1.1\r\n\r\n", "INVALID REQUEST TARGET"),
+            (b"GET / HTTP/1.1\r\nNoColon\r\n\r\n", "MALFORMED HEADER"),
+            (b"GET / HTTP/1.1\r\nBad Name: x\r\n\r\n", "MALFORMED HEADER"),
+            (
+                b"GET / HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n",
+                "MALFORMED HEADER",
+            ),
+            (b"GET /\xff HTTP/1.1\r\n\r\n", "HEAD NOT UTF-8"),
+            (b"GET / HTTP/1.1\r\nHost: \xff\r\n\r\n", "HEAD NOT UTF-8"),
+            (b"GET / HTTP/1.1\r\n", "INCOMPLETE HEAD"),
+            (
+                b"POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
+                "INVALID CONTENT-LENGTH",
+            ),
+            (
+                b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+                "INVALID CONTENT-LENGTH",
+            ),
+            (
+                b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "TRANSFER-ENCODING NOT SUPPORTED",
+            ),
+        ];
+        for (head, cause) in rejected {
+            assert_eq!(
+                parse_head(head),
+                Err(format!("{BAD_REQUEST}: {cause}")),
+                "for {}",
+                String::from_utf8_lossy(head)
+            );
+        }
+    }
+
+    /// Sends each chunk of `chunks` after its delay, then ends the output
+    /// when `close` is set, and keeps `client` open until the server end
+    /// closes or the client's read timeout passes.
+    fn send_chunks(
+        mut client: TcpStream,
+        chunks: Vec<(Duration, Vec<u8>)>,
+        close: bool,
+    ) -> io::Result<()> {
+        for (delay, chunk) in chunks {
+            thread::sleep(delay);
+            client.write_all(&chunk)?;
+        }
+        if close {
+            client.shutdown(Shutdown::Write)?;
+        }
+        let mut byte = [0u8; 1];
+        client.read(&mut byte).map(|_| ())
+    }
+
+    #[test]
+    fn read_request_bounds_idle_and_request_time() -> Result<(), String> {
+        let idle = Duration::from_millis(300);
+        let request_time = Duration::from_millis(400);
+        // Every case ends long before a trickle of 100 bytes, one per tick,
+        // would; the margin allows for a loaded host.
+        let tick = Duration::from_millis(50);
+        let bound = idle
+            .saturating_add(request_time)
+            .saturating_add(Duration::from_millis(1500));
+        let now = |bytes: &[u8]| vec![(Duration::ZERO, bytes.to_vec())];
+        let trickle = |bytes: &[u8]| -> Vec<(Duration, Vec<u8>)> {
+            bytes.iter().map(|byte| (tick, vec![*byte])).collect()
+        };
+        let head = b"POST /api/rust/session HTTP/1.1\r\nContent-Length: 100\r\n\r\n";
+        let mut trickled_body = now(head);
+        trickled_body.extend(trickle(&[b'x'; 100]));
+        let oversized = |end: &[u8], filler: usize| {
+            let mut bytes = b"GET / HTTP/1.1\r\nX-Big: ".to_vec();
+            bytes.resize(bytes.len().saturating_add(filler), b'a');
+            bytes.extend_from_slice(end);
+            vec![(Duration::ZERO, bytes)]
+        };
+        let bad = |cause: &str| Err(format!("{BAD_REQUEST}: {cause}"));
+        let answered = Ok(Some((
+            "POST".to_string(),
+            "/api/rust/session".to_string(),
+            Some(b"{}".to_vec()),
+        )));
+        let request_then_body = vec![
+            (
+                Duration::ZERO,
+                b"POST /api/rust/session HTTP/1.1\r\nContent-Length: 2\r\n\r\n".to_vec(),
+            ),
+            (Duration::from_millis(100), b"{}".to_vec()),
+        ];
+        // (case, what the client sends, whether it then ends its output,
+        // the outcome, the least time the outcome takes)
+        let cases = [
+            ("nothing sent", Vec::new(), false, Ok(None), idle),
+            (
+                "closed before a byte",
+                Vec::new(),
+                true,
+                Ok(None),
+                Duration::ZERO,
+            ),
+            (
+                "head trickled",
+                trickle(&[b'G'; 100]),
+                false,
+                bad("READ TIMEOUT"),
+                request_time,
+            ),
+            (
+                "partial head, then silence",
+                now(b"POST /api/rust/session HTTP/1.1\r\nHost: x\r\n"),
+                false,
+                bad("READ TIMEOUT"),
+                request_time,
+            ),
+            (
+                "closed mid-head",
+                now(b"GET / HTTP/1.1\r\nHost: x\r\n"),
+                true,
+                bad("INCOMPLETE HEAD"),
+                Duration::ZERO,
+            ),
+            (
+                "body trickled",
+                trickled_body,
+                false,
+                bad("INCOMPLETE BODY"),
+                request_time,
+            ),
+            (
+                "unterminated head over the limit",
+                oversized(b"", MAX_HEAD + 4096),
+                false,
+                bad("HEAD TOO LARGE"),
+                Duration::ZERO,
+            ),
+            (
+                "terminated head over the limit",
+                oversized(b"\r\n\r\n", MAX_HEAD),
+                false,
+                bad("HEAD TOO LARGE"),
+                Duration::ZERO,
+            ),
+            (
+                "body within the deadline",
+                request_then_body,
+                false,
+                answered,
+                Duration::ZERO,
+            ),
+        ];
+        for (case, chunks, close, expected, least) in cases {
+            let (client, mut server) = loopback_pair()?;
+            let sent: Vec<u8> = chunks
+                .iter()
+                .flat_map(|(_, chunk)| chunk.iter().copied())
+                .collect();
+            let client = thread::Builder::new()
+                .spawn(move || send_chunks(client, chunks, close))
+                .map_err(io_text)?;
+            let mut received = Vec::new();
+            let started = Instant::now();
+            let outcome = read_request(&mut server, &mut received, idle, request_time);
+            let took = started.elapsed();
+            drop(server);
+            // A client still sending fails once the server end closes; only
+            // the server's outcome counts.
+            let _ = client
+                .join()
+                .map_err(|_| format!("{case}: the client panicked"))?;
+            let outcome = outcome.map_err(|e| format!("{case}: read timeout not set: {e}"))?;
+            println!("read_request, {case}: {outcome:?} after {took:?}");
+            assert_eq!(outcome, expected, "{case}");
+            assert!(sent.starts_with(&received), "{case}: received out of order");
+            assert!(
+                took >= least && took < bound,
+                "{case}: returned after {took:?}, expected from {least:?} to {bound:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -3483,6 +3826,141 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             "no unused directory name under {} in {ATTEMPTS} attempts",
             base.display()
         ))
+    }
+
+    #[test]
+    fn every_status_written_with_hardening_headers() -> Result<(), String> {
+        let statuses = [
+            (200, "OK"),
+            (400, "Bad Request"),
+            (404, "Not Found"),
+            (422, "Unprocessable Content"),
+            (500, "Internal Server Error"),
+            (502, "Bad Gateway"),
+        ];
+        for (status, reason) in statuses {
+            let response = (status, JSON_TYPE, br#"{"error":"X"}"#.to_vec());
+            for head_request in [false, true] {
+                let mut written: Vec<u8> = Vec::new();
+                write_response(&mut written, &response, head_request).map_err(io_text)?;
+                let expected_content: &[u8] = if head_request {
+                    b""
+                } else {
+                    br#"{"error":"X"}"#
+                };
+                let mut expected = format!(
+                    "HTTP/1.1 {status} {reason}\r\n\
+                     Content-Type: application/json; charset=utf-8\r\n\
+                     Content-Length: 13\r\n\
+                     X-Content-Type-Options: nosniff\r\n\
+                     Cache-Control: no-store\r\n\
+                     X-Frame-Options: DENY\r\n\
+                     Content-Security-Policy: frame-ancestors 'none'\r\n\
+                     Connection: close\r\n\r\n"
+                )
+                .into_bytes();
+                expected.extend_from_slice(expected_content);
+                assert_eq!(
+                    String::from_utf8_lossy(&written),
+                    String::from_utf8_lossy(&expected),
+                    "status {status}, HEAD {head_request}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn head_requests_answered_as_get_without_content() -> Result<(), String> {
+        let store = Store::from_zwr("").map_err(|e| e.to_string())?;
+        // No case reaches a backend, so no capture is read.
+        let mumps = MumpsMode::Replay {
+            golden_dir: PathBuf::new(),
+        };
+        let app_js = fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("frontend")
+                .join("app.js"),
+        )
+        .map_err(io_text)?;
+        let js_type = "text/javascript; charset=utf-8";
+        let get_required = error_body(GET_REQUIRED).into_bytes();
+        let post_required = error_body(POST_REQUIRED).into_bytes();
+        let malformed = error_body(&format!("{BAD_REQUEST}: MALFORMED REQUEST LINE")).into_bytes();
+        let request = |line: &str| format!("{line} HTTP/1.1\r\nHost: h\r\n\r\n");
+        // (request, status line, content type, the body a GET gets, whether
+        // the answer leaves that body out)
+        let cases = [
+            (request("GET /app.js"), "200 OK", js_type, &app_js, false),
+            (request("HEAD /app.js"), "200 OK", js_type, &app_js, true),
+            (
+                request("HEAD http://h/app.js"),
+                "200 OK",
+                js_type,
+                &app_js,
+                true,
+            ),
+            (
+                request("HEAD /api/rust/session"),
+                "404 Not Found",
+                JSON_TYPE,
+                &post_required,
+                true,
+            ),
+            // Method tokens are case-sensitive: `head` is not `HEAD`.
+            (
+                request("head /app.js"),
+                "404 Not Found",
+                JSON_TYPE,
+                &get_required,
+                false,
+            ),
+            (
+                "HEAD /\r\n\r\n".to_string(),
+                "400 Bad Request",
+                JSON_TYPE,
+                &malformed,
+                true,
+            ),
+        ];
+        for (request, status_line, content_type, body, head_request) in cases {
+            let (mut client, mut server) = loopback_pair()?;
+            let request_line = request.lines().next().unwrap_or_default().to_string();
+            client
+                .write_all(request.as_bytes())
+                .and_then(|()| client.shutdown(Shutdown::Write))
+                .map_err(io_text)?;
+            let (store, mumps) = (store.clone(), mumps.clone());
+            // The server end answers on its own thread, so a response larger
+            // than the socket buffers cannot block the test.
+            let server_side = thread::Builder::new()
+                .spawn(move || exchange(&mut server, &store, &mumps))
+                .map_err(io_text)?;
+            let mut response = Vec::new();
+            let read = client.read_to_end(&mut response);
+            let exchanged = server_side
+                .join()
+                .map_err(|_| format!("{request_line}: the server end panicked"))?;
+            exchanged.map_err(io_text)?;
+            read.map_err(io_text)?;
+            let length = body.len();
+            let mut expected = format!(
+                "HTTP/1.1 {status_line}\r\n\
+                 Content-Type: {content_type}\r\n\
+                 Content-Length: {length}\r\n\
+                 {HARDENING_HEADERS}Connection: close\r\n\r\n"
+            )
+            .into_bytes();
+            if !head_request {
+                expected.extend_from_slice(body);
+            }
+            assert_eq!(
+                String::from_utf8_lossy(&response),
+                String::from_utf8_lossy(&expected),
+                "for {request_line}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -3644,6 +4122,87 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             returned.to_string(),
             format!("handling a connection failed: {text}")
         );
+        Ok(())
+    }
+
+    /// A connected loopback pair, the client end first, each end with
+    /// `IO_TIMEOUT` for reads and writes so that no step can hang a test.
+    fn loopback_pair() -> Result<(TcpStream, TcpStream), String> {
+        let fail = |what: &str, e: io::Error| format!("{what}: {e}");
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| fail("bind", e))?;
+        let addr = listener.local_addr().map_err(|e| fail("local_addr", e))?;
+        let client = TcpStream::connect(addr).map_err(|e| fail("connect", e))?;
+        let (server, _) = listener.accept().map_err(|e| fail("accept", e))?;
+        for end in [&client, &server] {
+            end.set_read_timeout(Some(IO_TIMEOUT))
+                .and_then(|()| end.set_write_timeout(Some(IO_TIMEOUT)))
+                .map_err(|e| fail("set timeouts", e))?;
+        }
+        Ok((client, server))
+    }
+
+    #[test]
+    fn drain_ends_within_its_time_budget() -> Result<(), String> {
+        let (mut client, mut server) = loopback_pair()?;
+        let mut late = client.try_clone().map_err(io_text)?;
+        client.write_all(b"a").map_err(io_text)?;
+        // A second byte late in the budget, then silence with the client
+        // still open: only the time budget can end the drain.
+        let writer = thread::Builder::new()
+            .spawn(move || {
+                thread::sleep(Duration::from_millis(600));
+                late.write_all(b"b")
+            })
+            .map_err(io_text)?;
+        let limit = Duration::from_secs(1);
+        let started = Instant::now();
+        let discarded = drain(&mut server, limit);
+        let took = started.elapsed();
+        let written = writer
+            .join()
+            .map_err(|_| "the late writer panicked".to_string())?;
+        drop(client);
+        written.map_err(io_text)?;
+        println!("drain with a {limit:?} limit returned after {took:?}");
+        assert_eq!(discarded, 2, "both bytes discarded");
+        // A read that kept the whole limit as its timeout would return
+        // near 1.6 s; the margin allows for a loaded host.
+        assert!(
+            took >= Duration::from_millis(900) && took < limit + Duration::from_millis(400),
+            "drain with a {limit:?} limit returned after {took:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn drain_discards_exactly_its_byte_budget() -> Result<(), String> {
+        let (mut client, mut server) = loopback_pair()?;
+        // One byte read alone first, so that later reads of the full buffer
+        // do not end on the budget by alignment.
+        let writer = thread::Builder::new()
+            .spawn(move || {
+                client.write_all(b"x")?;
+                thread::sleep(Duration::from_millis(100));
+                let payload = vec![0u8; DRAIN_BYTES + 3 * 8192];
+                client.write_all(&payload)
+            })
+            .map_err(io_text)?;
+        let limit = IO_TIMEOUT * 2;
+        let started = Instant::now();
+        let discarded = drain(&mut server, limit);
+        let took = started.elapsed();
+        // Closing the server end with input unread ends a write still
+        // blocked on full buffers, with an error the test tolerates.
+        drop(server);
+        let written = writer
+            .join()
+            .map_err(|_| "the writer panicked".to_string())?;
+        if let Err(e) = written {
+            println!("the writer ended once the server closed: {e}");
+        }
+        println!("drain discarded {discarded} bytes in {took:?}");
+        assert_eq!(discarded, DRAIN_BYTES, "the byte budget, exactly");
+        assert!(took < limit, "the byte budget, not the time, ended it");
         Ok(())
     }
 
