@@ -249,80 +249,30 @@ const LOOKUP_LENGTH: usize = 30;
 /// The tab stops `^DIWP` sets when `DIWT` is undefined [DIWP.m:31].
 const DEFAULT_TAB_STOPS: &str = "5,10,15,20,25";
 
-/// A pointer-field cross-reference of file 442 that collates after `C`,
-/// with the global root of the file it points to [DD.zwr:514219-514231].
-/// Every other index after `C` is on a free-text or numeric field and is
-/// searched on the raw value.
-struct PointerIndex {
-    index: &'static str,
-    global: &'static str,
-    file: &'static str,
-}
-
-/// The pointer indexes of file 442 after `C`, in `^DD(442,0,"IX")` order.
-const POINTER_INDEXES: [PointerIndex; 6] = [
+/// The pointer-field cross-references of file 442 that collate after `C`,
+/// in `^DD(442,0,"IX")` order [DD.zwr:514219-514231], each the tuple (index
+/// name, global root of the file it points to, that file's number). Every
+/// other index after `C` is on a free-text or numeric field and is searched
+/// on the raw value.
+const POINTER_INDEXES: [(&str, &str, &str); 6] = [
     // field 5 VENDOR
-    PointerIndex {
-        index: "D",
-        global: "PRC",
-        file: "440",
-    },
+    ("D", "PRC", "440"),
     // field .02 METHOD OF PROCESSING
-    PointerIndex {
-        index: "F",
-        global: "PRCD",
-        file: "442.5",
-    },
+    ("F", "PRCD", "442.5"),
     // subfile 442.14 field 11
-    PointerIndex {
-        index: "G",
-        global: "PRCP",
-        file: "445",
-    },
+    ("G", "PRCP", "445"),
     // field 46 PURCHASE CARD NUMBER
-    PointerIndex {
-        index: "M",
-        global: "PRC",
-        file: "440.5",
-    },
+    ("M", "PRC", "440.5"),
     // field 61
-    PointerIndex {
-        index: "MCH",
-        global: "VA",
-        file: "200",
-    },
+    ("MCH", "VA", "200"),
     // field .5 SUPPLY STATUS
-    PointerIndex {
-        index: "ST",
-        global: "PRCD",
-        file: "442.3",
-    },
+    ("ST", "PRCD", "442.3"),
 ];
 
-/// `DIC("S")` of the order lookup, as the fixed rule its literal text
-/// resolves to: `I +$P(^(0),U,1)=PRC("SITE")`, followed by `PRCHP("S")`
-/// when that is defined [PRCHPAT.m:81].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScreenRule {
-    /// The station test only.
-    Site,
-    /// The station test, then [`MOP_SCREEN`].
-    SiteAndMop,
-}
-
-/// The word-wrap scratch `^UTILITY($J,"W")` or `^TMP($J,"W")`: per left
-/// margin `DIWL`, the line count node `(DIWL)` and the lines `(DIWL,n,0)`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct WrapScratch {
-    counts: BTreeMap<i64, i64>,
-    lines: BTreeMap<(i64, i64), String>,
-}
-
-impl WrapScratch {
-    /// `$G(^(DIWL,n,0))`.
-    fn line(&self, diwl: i64, n: i64) -> String {
-        self.lines.get(&(diwl, n)).cloned().unwrap_or_default()
-    }
+/// `$G(^(DIWL,n,0))` of the word-wrap scratch lines `lines`
+/// ([`Locals`] `utility_w_lines` or `tmp_w_lines`).
+fn wrap_line(lines: &BTreeMap<(i64, i64), String>, diwl: i64, n: i64) -> String {
+    lines.get(&(diwl, n)).cloned().unwrap_or_default()
 }
 
 /// The MUMPS locals of one session that one tag sets and another reads,
@@ -343,8 +293,12 @@ struct Locals {
     dic_a: Option<String>,
     /// `DIC("B")`, the station lookup's default.
     dic_b: Option<String>,
-    /// `DIC("S")` of the order lookup.
-    dic_s: Option<ScreenRule>,
+    /// `DIC("S")` of the order lookup, as the fixed rule its literal text
+    /// resolves to: `I +$P(^(0),U,1)=PRC("SITE")`, followed by `PRCHP("S")`
+    /// when that is defined [PRCHPAT.m:81]. `Some(false)` is the station test
+    /// only, `Some(true)` the station test, then [`MOP_SCREEN`]; with `None`
+    /// (undefined) every entry passes.
+    dic_s: Option<bool>,
     /// `D`, the index the order lookup starts on.
     d: Option<String>,
     /// `PRCHP("A")`.
@@ -411,10 +365,15 @@ struct Locals {
     diwt: Option<String>,
     /// `DN`, which `^DIWP` leaves defined.
     dn: Option<String>,
-    /// `^UTILITY($J,"W")`.
-    utility_w: WrapScratch,
-    /// `^TMP($J,"W")`.
-    tmp_w: WrapScratch,
+    /// `^UTILITY($J,"W",DIWL)`, the word-wrap scratch's line count per left
+    /// margin `DIWL`.
+    utility_w_counts: BTreeMap<i64, i64>,
+    /// `^UTILITY($J,"W",DIWL,n,0)`, the word-wrap scratch's lines.
+    utility_w_lines: BTreeMap<(i64, i64), String>,
+    /// `^TMP($J,"W",DIWL)`, the copy `%XY^%RCR` makes of the line counts.
+    tmp_w_counts: BTreeMap<i64, i64>,
+    /// `^TMP($J,"W",DIWL,n,0)`, the copy `%XY^%RCR` makes of the lines.
+    tmp_w_lines: BTreeMap<(i64, i64), String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -599,11 +558,7 @@ fn en3_prchpat(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
             .clone()
             .unwrap_or_else(|| DEFAULT_ORDER_PROMPT.to_string()),
     );
-    v.dic_s = Some(if v.prchp_s.is_some() {
-        ScreenRule::SiteAndMop
-    } else {
-        ScreenRule::Site
-    });
+    v.dic_s = Some(v.prchp_s.is_some());
     //  W !! D IX^DIC K DIC,PRCHP S X="" Q:+Y<0
     s.nl();
     s.nl();
@@ -682,13 +637,13 @@ fn ix_dic(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     v.x = Some(x.clone());
     // RTN: no IEN attempt, because IX^DIC defines DF [DIC.m:48, 84-85] [DIC5.m:22]
     // F ... D SEARCH^DIC3   [DIC.m:56]
-    let found = search(st, v, &x)?;
-    if let Some(ien) = found.candidates.first() {
+    let (candidates, exact_on_start) = search(st, v, &x)?;
+    if let Some(ien) = candidates.first() {
         // I DS=1 S DS("DD")=1 D G^DIC2 Q  /  I DS D Y^DIC1 ...   [DIC3.m:71-72]
-        if found.candidates.len() > 1 {
+        if candidates.len() > 1 {
             return Err(unsupported("PO-09.b10"));
         }
-        if found.exact_on_start != 1 {
+        if exact_on_start != 1 {
             return Err(unsupported("PO-09.b9"));
         }
         let node0 = write_order_echo(s, st, ien)?;
@@ -702,7 +657,8 @@ fn ix_dic(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     }
     if x.chars().any(|c| c.is_ascii_lowercase()) {
         let upper = x.to_ascii_uppercase();
-        if !search(st, v, &upper)?.candidates.is_empty() || pointer_candidate(st, v, &upper)? {
+        let (upper_candidates, _) = search(st, v, &upper)?;
+        if !upper_candidates.is_empty() || pointer_candidate(st, v, &upper)? {
             return Err(unsupported("PO-09.b13"));
         }
     }
@@ -754,11 +710,11 @@ fn screen_passes(v: &Locals, node0: &str) -> bool {
         .as_deref()
         .is_some_and(|station| num(piece(node0, "^", 1)) == station);
     match v.dic_s {
-        Some(ScreenRule::SiteAndMop) => {
+        Some(true) => {
             let mop = piece(node0, "^", 2);
             site && (num_cmp(mop, "10") == Ordering::Less || mop == "25")
         }
-        Some(ScreenRule::Site) => site,
+        Some(false) => site,
         None => true,
     }
 }
@@ -786,6 +742,8 @@ fn qualifies(st: &Store, v: &Locals, ien: &Sub) -> Result<bool, Halt> {
 /// `MOREX` [DIC3.m:82-87]: the entries filed under one index value `entry`,
 /// in collation order up to the first subscript whose numeric value is 0
 /// (`I 'Y S Y=-1 Q`), each added once when it qualifies [DIC3.m:142].
+/// The "added once" test runs over the entries found so far one by one, as
+/// the loop of `K^DIC3` over `DS` does [DIC3.m:141-142].
 fn collect_iens(st: &Store, v: &Locals, entry: &[Sub], found: &mut Vec<Sub>) -> Result<(), Halt> {
     let mut next = first_after_zero(st, entry);
     while let Some(ien) = next {
@@ -830,26 +788,18 @@ fn partial_keys(st: &Store, root: &[Sub], x: &str) -> Vec<Sub> {
     keys
 }
 
-/// What `SEARCH^DIC3` found for one lookup value.
-struct Search {
-    /// Every qualifying entry, in discovery order, without repeats.
-    candidates: Vec<Sub>,
-    /// How many came from the exact match on the starting index.
-    exact_on_start: usize,
-}
-
 /// `SEARCH^DIC3` [DIC3.m:8-79] for `x`: exact then partial matches on the
 /// starting index `D`, then on every later subscript of `^PRC(442)` whose
 /// `$D` is 10, searched on the raw value. A pointer-field index is skipped
 /// when `x` is numeric (`+$P(X,"E")=X`) [DIC4.m:84-86]. A value longer than
 /// the index skips the search [DIC3.m:13].
-fn search(st: &Store, v: &Locals, x: &str) -> Result<Search, Halt> {
+///
+/// Returns every qualifying entry, in discovery order without repeats, and
+/// how many of them came from the exact match on the starting index.
+fn search(st: &Store, v: &Locals, x: &str) -> Result<(Vec<Sub>, usize), Halt> {
     let mut candidates = Vec::new();
     if x.chars().count() > LOOKUP_LENGTH {
-        return Ok(Search {
-            candidates,
-            exact_on_start: 0,
-        });
+        return Ok((candidates, 0));
     }
     let file = key("PRC", &["442"]);
     let start = Sub::from_text(v.d.as_deref().unwrap_or(""));
@@ -873,7 +823,11 @@ fn search(st: &Store, v: &Locals, x: &str) -> Result<Search, Halt> {
         if st.data(&root) != 10 {
             continue;
         }
-        if numeric && POINTER_INDEXES.iter().any(|p| p.index == index.text()) {
+        if numeric
+            && POINTER_INDEXES
+                .iter()
+                .any(|(name, _, _)| *name == index.text())
+        {
             continue;
         }
         collect_iens(st, v, &child(&root, &Sub::from_text(x)), &mut candidates)?;
@@ -881,10 +835,7 @@ fn search(st: &Store, v: &Locals, x: &str) -> Result<Search, Halt> {
             collect_iens(st, v, &child(&root, &value), &mut candidates)?;
         }
     }
-    Ok(Search {
-        candidates,
-        exact_on_start,
-    })
+    Ok((candidates, exact_on_start))
 }
 
 /// The pointer-candidate rule (`SPEC.md` R6), from `P^DICM0` [DICM0.m:8-41]:
@@ -899,13 +850,13 @@ fn pointer_candidate(st: &Store, v: &Locals, x: &str) -> Result<bool, Halt> {
     if !first_after_zero(st, &file).is_some_and(|sub| positive(sub.text())) {
         return Ok(false);
     }
-    for pointer in &POINTER_INDEXES {
-        let parents = child(&file, &Sub::from_text(pointer.index));
+    for (name, global, number) in POINTER_INDEXES {
+        let parents = child(&file, &Sub::from_text(name));
         //  I @("$O"_Y_%_",0))>0") ...   [DICM0.m:32]: nothing filed, no screen
         if !first_after_zero(st, &parents).is_some_and(|sub| positive(sub.text())) {
             continue;
         }
-        let target = key(pointer.global, &[pointer.file]);
+        let target = key(global, &[number]);
         let b_index = child(&target, &Sub::from_text("B"));
         let mut values = vec![Sub::from_text(x)];
         values.extend(partial_keys(st, &b_index, x));
@@ -1373,16 +1324,18 @@ fn fob_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     v.diwr = Some(16);
     v.diwf = Some(String::new());
     v.x = Some(piece(&prchd1, "^", 8).to_string());
-    v.utility_w = WrapScratch::default();
+    v.utility_w_counts.clear();
+    v.utility_w_lines.clear();
     let da = v.da.clone().unwrap_or_default();
     diwp_prcutl(s, st, v, &da)?;
     // K ^TMP($J,"W") S %X="^UTILITY($J,""W"",",%Y="^TMP($J,""W""," D %XY^%RCR   [54]
-    v.tmp_w = WrapScratch::default();
+    v.tmp_w_counts.clear();
+    v.tmp_w_lines.clear();
     pct_xy_pct_rcr(s, st, v)?;
     // W ?40,$G(^TMP($J,"W",1,1,0)),?57,"|AUTHORITY: ",!,"COST CENTER: ",$P(PRCHD0,U,5),
     //  ?29,"|",?40,$G(^TMP($J,"W",1,2,0)),?57,"|  "   [55]
     s.tab(40);
-    s.write(&v.tmp_w.line(1, 1));
+    s.write(&wrap_line(&v.tmp_w_lines, 1, 1));
     s.tab(57);
     s.write("|AUTHORITY: ");
     s.nl();
@@ -1391,7 +1344,7 @@ fn fob_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     s.tab(29);
     s.write("|");
     s.tab(40);
-    s.write(&v.tmp_w.line(1, 2));
+    s.write(&wrap_line(&v.tmp_w_lines, 1, 2));
     s.tab(57);
     s.write("|  ");
     // S Y=0 F I=1:1 S Y=$O(^PRC(442,D0,14,Y)) Q:'Y  W:I>1 "," W $P($G(^PRC(442.4,+^(Y,0),0)),U,2)   [56]
@@ -1430,7 +1383,7 @@ fn fob_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     s.tab(29);
     s.write("|");
     s.tab(40);
-    s.write(&v.tmp_w.line(1, 3));
+    s.write(&wrap_line(&v.tmp_w_lines, 1, 3));
     s.tab(57);
     let node23 = st.get_or_empty(&key("PRC", &["442", &d0, "23"]));
     let role = if piece(&node23, "^", 11).is_empty() {
@@ -1461,37 +1414,32 @@ fn char_len(text: &str) -> i64 {
 }
 
 /// `PUT^DIWP` [DIWP.m:49]: `S I=^UTILITY($J,"W",DIWL),^(DIWL,I,0)=DIWI`.
-fn wrap_put(scratch: &mut WrapScratch, diwl: i64, diwi: &str) {
-    let count = scratch.counts.get(&diwl).copied().unwrap_or_default();
-    scratch.lines.insert((diwl, count), diwi.to_string());
+fn wrap_put(v: &mut Locals, diwl: i64, diwi: &str) {
+    let count = v.utility_w_counts.get(&diwl).copied().unwrap_or_default();
+    v.utility_w_lines.insert((diwl, count), diwi.to_string());
 }
 
 /// `NEW^DIWP` [DIWP.m:67-70] with `DIWF` empty: `D DIWI` empties the line
 /// in progress, and `PRE` adds an empty line,
 /// `S I=^UTILITY($J,"W",DIWL),^(DIWL)=I+1,^(DIWL,I+1,0)=""`.
-fn wrap_new(scratch: &mut WrapScratch, diwl: i64, diwi: &mut String) {
+fn wrap_new(v: &mut Locals, diwl: i64, diwi: &mut String) {
     diwi.clear();
-    wrap_pre(scratch, diwl);
+    wrap_pre(v, diwl);
 }
 
-/// `PRE^DIWP` [DIWP.m:68-70] with `DIWF` empty: adds an empty line.
-fn wrap_pre(scratch: &mut WrapScratch, diwl: i64) {
-    let count = scratch.counts.get(&diwl).copied().unwrap_or_default() + 1;
-    scratch.counts.insert(diwl, count);
-    scratch.lines.insert((diwl, count), String::new());
+/// `PRE^DIWP` [DIWP.m:68-70] with `DIWF` empty: adds an empty line to
+/// `^UTILITY($J,"W",DIWL)`.
+fn wrap_pre(v: &mut Locals, diwl: i64) {
+    let count = v.utility_w_counts.get(&diwl).copied().unwrap_or_default() + 1;
+    v.utility_w_counts.insert(diwl, count);
+    v.utility_w_lines.insert((diwl, count), String::new());
 }
 
 /// `C` and `B^DIWP` [DIWP.m:58-62] with `DIWF` empty: appends the text `x`
-/// to the line in progress `diwi`, storing each full line and starting the
-/// next. In line mode (`DIWTC`) the text is appended whole.
-fn wrap_text(
-    scratch: &mut WrapScratch,
-    diwl: i64,
-    diwr: i64,
-    diwi: &mut String,
-    diwtc: bool,
-    mut x: String,
-) {
+/// to the line in progress `diwi`, storing each full line in
+/// `^UTILITY($J,"W",DIWL)` and starting the next. In line mode (`DIWTC`)
+/// the text is appended whole.
+fn wrap_text(v: &mut Locals, diwl: i64, diwr: i64, diwi: &mut String, diwtc: bool, mut x: String) {
     // C K DIWP I DIWTC S DIWI=DIWI_X Q
     if diwtc {
         diwi.push_str(&x);
@@ -1528,8 +1476,8 @@ fn wrap_text(
                     return;
                 }
                 // S D PUT,NEW G B:X]""
-                wrap_put(scratch, diwl, diwi);
-                wrap_new(scratch, diwl, diwi);
+                wrap_put(v, diwl, diwi);
+                wrap_new(v, diwl, diwi);
                 continue;
             }
             // An empty Z ends the IF of that line, and control runs on into FULL.
@@ -1540,8 +1488,8 @@ fn wrap_text(
             x = piece_range(&x, " ", 2, 9999);
         }
         // S D PUT,NEW G B:X]"" Q
-        wrap_put(scratch, diwl, diwi);
-        wrap_new(scratch, diwl, diwi);
+        wrap_put(v, diwl, diwi);
+        wrap_new(v, diwl, diwi);
         if x.is_empty() {
             return;
         }
@@ -1582,32 +1530,32 @@ fn diwp(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // I '$D(^UTILITY($J,"W",DIWL)) S ^(DIWL)=1 K DIWFU,DIWFWU,DIWLL D DIWI
     //  S:'$D(DIWT) DIWT="5,10,15,20,25" G DIW   [31]
     let mut diwi = String::new();
-    if let Some(&count) = v.utility_w.counts.get(&diwl) {
+    if let Some(&count) = v.utility_w_counts.get(&diwl) {
         // S I=^(DIWL),DIWI=^(DIWL,I,0) I DIWI="" D DIWI G Z   [32]
         // D NEW:DIWTC   [33]: DIWTC is 0 here
-        diwi = v.utility_w.line(diwl, count);
+        diwi = wrap_line(&v.utility_w_lines, diwl, count);
         // Z S Z=X?.P!DIWTC I X?1" ".E!Z S DIWTC=1 D NEW:DIWI]"" S DIWTC=Z   [34]
         let z = x.chars().all(m_punctuation) || diwtc;
         if x.starts_with(' ') || z {
             if follows(&diwi, "") {
-                wrap_new(&mut v.utility_w, diwl, &mut diwi);
+                wrap_new(v, diwl, &mut diwi);
             }
             diwtc = z;
         }
     } else {
-        v.utility_w.counts.insert(diwl, 1);
+        v.utility_w_counts.insert(diwl, 1);
         if v.diwt.is_none() {
             v.diwt = Some(DEFAULT_TAB_STOPS.to_string());
         }
     }
     // DIW I DIWF contains "X" ...   [36]: no X flag
     //  S X=$P(DIWX,DIW,1) D C:X]"" S X=$P(DIWX,DIW,1),DIWX=$P(DIWX,DIW,2,9999) G D:DIWX=""   [37]
-    wrap_text(&mut v.utility_w, diwl, diwr, &mut diwi, diwtc, x);
+    wrap_text(v, diwl, diwr, &mut diwi, diwtc, x);
     v.x = Some(diwx);
     // D K DIWP D PUT,PRE:DIWTC S:DIWTC DIWI="" Q   [43]
-    wrap_put(&mut v.utility_w, diwl, &diwi);
+    wrap_put(v, diwl, &diwi);
     if diwtc {
-        wrap_pre(&mut v.utility_w, diwl);
+        wrap_pre(v, diwl);
     }
     Ok(())
 }
@@ -1618,9 +1566,12 @@ fn diwp(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
 /// scratch to the same subscripts of the `^TMP` scratch.
 fn pct_xy_pct_rcr(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // F  S %Z=$Q(@%Z) Q:$P(%Z,%A)]""!(%Z="")  S @(%Y_$E(%Z,%B,255))=@%Z   [DIRCR.m:29]
-    let source = v.utility_w.clone();
-    v.tmp_w.counts.extend(source.counts);
-    v.tmp_w.lines.extend(source.lines);
+    v.tmp_w_counts.extend(&v.utility_w_counts);
+    v.tmp_w_lines.extend(
+        v.utility_w_lines
+            .iter()
+            .map(|(at, line)| (*at, line.clone())),
+    );
     Ok(())
 }
 
@@ -1901,7 +1852,8 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
     v.diwl = Some(1);
     v.diwr = Some(33);
     v.diwf = Some(String::new());
-    v.utility_w = WrapScratch::default();
+    v.utility_w_counts.clear();
+    v.utility_w_lines.clear();
     //  N PURCTYPE,PURPIPE,PRCHI,PRCHJ S:$P($G(^PRC(442,D0,23)),"^",11)="S" PURCTYPE=1   [45]
     let caller_purpipe = v.purpipe.take();
     let node23 = st.get_or_empty(&key("PRC", &["442", &d0, "23"]));
@@ -1933,12 +1885,12 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
         return Err(unsupported("PO-27.b2"));
     }
     //  K ^TMP($J,"W") S %X="^UTILITY($J,""W"",",%Y="^TMP($J,""W""," D %XY^%RCR   [48]
-    v.tmp_w = WrapScratch::default();
+    v.tmp_w_counts.clear();
+    v.tmp_w_lines.clear();
     pct_xy_pct_rcr(s, st, v)?;
     //  S PRCHDCNT=$S($D(^TMP($J,"W",1)):^(1),1:"") W ! I $G(PURCTYPE)="" W ?2,$J(+$P(PRCHDI0,U,1),3)   [49]
     let count = v
-        .tmp_w
-        .counts
+        .tmp_w_counts
         .get(&1)
         .map(i64::to_string)
         .unwrap_or_default();
@@ -1950,7 +1902,7 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
     }
     //  W ?7,$S($D(^(1,1,0)):^(0),1:"")   [50]; ^(1,1,0) is ^TMP($J,"W",1,1,0)
     s.tab(7);
-    s.write(&v.tmp_w.line(1, 1));
+    s.write(&wrap_line(&v.tmp_w_lines, 1, 1));
     //  I $G(PURCTYPE)="" W ?40,$J($P(PRCHDI0,U,2),5),?47,$S($D(^PRCD(420.5,+$P(PRCHDI0,U,3),0)):$P(^(0),U,1),1:"")   [51]
     let unit = key("PRCD", &["420.5", &num(piece(&item0, "^", 3)), "0"]);
     if !purchase_card {
@@ -2077,7 +2029,8 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
 
 /// PO-28 `PIPECK^PRCHDP2` [PRCHDP2.m:96-102]: scans the description lines
 /// of every item of the order, not only the current one, for the literal
-/// `| IN ` (pipe, space, `IN`, space).
+/// `| IN ` (pipe, space, `IN`, space). `ITEM` runs it for every item, so each
+/// item's call scans the whole order again, as in the original [PRCHDP2.m:46].
 fn pipeck_prchdp2(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     let d0 = v.d0.clone().unwrap_or_default();
     // PIPECK S PURPIPE=0,PRCH=0
@@ -2310,8 +2263,10 @@ fn q_prchdp2(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> 
     v.prchdcnt = None;
     v.s_rows.clear();
     v.v_rows.clear();
-    v.tmp_w = WrapScratch::default();
-    v.utility_w = WrapScratch::default();
+    v.tmp_w_counts.clear();
+    v.tmp_w_lines.clear();
+    v.utility_w_counts.clear();
+    v.utility_w_lines.clear();
     Ok(())
 }
 
@@ -2581,6 +2536,20 @@ mod tests {
     }
 
     #[test]
+    fn order_filed_under_two_indexes_is_one_candidate() -> Result<(), String> {
+        // Order 1 is the exact match on `C` and is filed again under `E`, a
+        // later index that is not a pointer index: it stays one candidate,
+        // selected (PO-09.b8), so the session reaches the device gate rather
+        // than the choose list (PO-09.b10).
+        let store = order_store("^PRC(442,\"E\",\"A12345\",1)=\"\"\n")?;
+        assert_eq!(
+            inquire(&store, &inputs(&["", "A12345", "", "", "^"])),
+            unsupported_branch(DEVICE_GATE)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unreferenced_vendor_with_matching_name_is_not_a_candidate() -> Result<(), String> {
         let store = order_store(VENDORS)?;
         assert_eq!(
@@ -2725,8 +2694,10 @@ mod tests {
                 v.x = Some((*line).to_string());
                 assert_eq!(diwp_prcutl(&mut s, &store, &mut v, "1"), Ok(()));
             }
-            let count = v.utility_w.counts.get(&1).copied().unwrap_or_default();
-            let wrapped: Vec<String> = (1..=count).map(|n| v.utility_w.line(1, n)).collect();
+            let count = v.utility_w_counts.get(&1).copied().unwrap_or_default();
+            let wrapped: Vec<String> = (1..=count)
+                .map(|n| wrap_line(&v.utility_w_lines, 1, n))
+                .collect();
             assert_eq!(wrapped, expected, "width {width}, lines {lines:?}");
             assert_eq!(v.da, None, "DIWP^PRCUTL restores the caller's DA");
             assert_eq!(s.transcript(), "");

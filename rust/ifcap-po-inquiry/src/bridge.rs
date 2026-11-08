@@ -21,6 +21,7 @@
 //! [`validate_context`]. Only the MUMPS adapters, compare routing and these
 //! helpers touch capture content.
 
+use std::collections::HashSet;
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -146,9 +147,9 @@ fn handle_connection(mut stream: TcpStream, store: &Store, mumps: &MumpsMode) {
         Ok(Some(request)) => route(&request, store, mumps),
         // The peer closed before sending anything: there is no one to answer.
         Ok(None) => return,
-        Err(cause) => Response::error(400, &cause),
+        Err(cause) => error_response(400, &cause),
     };
-    if response.write_to(&mut stream).is_ok() {
+    if write_response(&mut stream, &response).is_ok() {
         drain(&mut stream);
     }
 }
@@ -179,19 +180,15 @@ fn drain(stream: &mut TcpStream) {
 /// The 400 cause for a request whose head cannot be read or parsed.
 const BAD_REQUEST: &str = "BAD REQUEST";
 
-/// One request, as far as routing needs it.
-struct Request {
-    method: String,
-    target: String,
-    /// The body read by `Content-Length`, or `None` when the request carried
-    /// no `Content-Length`.
-    body: Option<Vec<u8>>,
-}
+/// One request, as far as routing needs it: the method, the target, and the
+/// body read by `Content-Length`, or `None` when the request carried no
+/// `Content-Length`.
+type HttpRequest = (String, String, Option<Vec<u8>>);
 
 /// Reads the request line and headers up to the blank line, then the body by
 /// `Content-Length`. `Ok(None)` means the peer closed before sending a byte;
 /// `Err` carries the 400 cause. Chunked bodies are not supported.
-fn read_request(stream: &mut TcpStream) -> Result<Option<Request>, String> {
+fn read_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, String> {
     let mut received: Vec<u8> = Vec::new();
     let mut buf = [0u8; 4096];
     let head_end = loop {
@@ -217,15 +214,15 @@ fn read_request(stream: &mut TcpStream) -> Result<Option<Request>, String> {
     let (head, rest) = received
         .split_at_checked(head_end)
         .ok_or_else(|| BAD_REQUEST.to_string())?;
-    let head = parse_head(head)?;
-    let body = match head.content_length {
+    let (method, target, content_length, expect_continue) = parse_head(head)?;
+    let body = match content_length {
         None => None,
         Some(length) if length > MAX_BODY => {
             return Err(format!("{BAD_REQUEST}: BODY TOO LARGE"));
         }
         Some(length) => {
             let mut body = rest.to_vec();
-            if head.expect_continue && body.len() < length {
+            if expect_continue && body.len() < length {
                 stream
                     .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
                     .map_err(|_| BAD_REQUEST.to_string())?;
@@ -244,11 +241,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Option<Request>, String> {
             Some(body)
         }
     };
-    Ok(Some(Request {
-        method: head.method,
-        target: head.target,
-        body,
-    }))
+    Ok(Some((method.to_string(), target.to_string(), body)))
 }
 
 /// The offset just past the first `\r\n\r\n`, if the head is complete.
@@ -259,17 +252,10 @@ fn find_head_end(received: &[u8]) -> Option<usize> {
         .map(|start| start.saturating_add(4))
 }
 
-/// The parsed request line and the headers routing needs.
-#[derive(Debug, PartialEq, Eq)]
-struct Head {
-    method: String,
-    target: String,
-    content_length: Option<usize>,
-    expect_continue: bool,
-}
-
-/// Parses `head`, which ends with the blank line. Errors are 400 causes.
-fn parse_head(head: &[u8]) -> Result<Head, String> {
+/// Parses `head`, which ends with the blank line, into the request line and
+/// the headers routing needs: the method, the target, the `Content-Length`
+/// and whether `Expect: 100-continue` was sent. Errors are 400 causes.
+fn parse_head(head: &[u8]) -> Result<(&str, &str, Option<usize>, bool), String> {
     let bad = || BAD_REQUEST.to_string();
     let text = std::str::from_utf8(head).map_err(|_| bad())?;
     let text = text.strip_suffix("\r\n\r\n").ok_or_else(bad)?;
@@ -308,12 +294,7 @@ fn parse_head(head: &[u8]) -> Result<Head, String> {
             expect_continue = true;
         }
     }
-    Ok(Head {
-        method: method.to_string(),
-        target: target.to_string(),
-        content_length,
-        expect_continue,
-    })
+    Ok((method, target, content_length, expect_continue))
 }
 
 /// An HTTP token: one or more `tchar`s (RFC 9110 5.6.2).
@@ -332,39 +313,27 @@ fn parse_content_length(value: &str) -> Option<usize> {
     value.parse().ok()
 }
 
-/// One response; every response closes its connection.
-struct Response {
-    status: u16,
-    content_type: &'static str,
-    body: Vec<u8>,
+/// `{"error": cause}` with `status`, as a response: `(status, content type,
+/// body)`.
+fn error_response(status: u16, cause: &str) -> (u16, &'static str, Vec<u8>) {
+    (status, JSON_TYPE, error_body(cause).into_bytes())
 }
 
-impl Response {
-    fn json(status: u16, body: String) -> Response {
-        Response {
-            status,
-            content_type: JSON_TYPE,
-            body: body.into_bytes(),
-        }
-    }
-
-    /// `{"error": cause}` with `status`.
-    fn error(status: u16, cause: &str) -> Response {
-        Response::json(status, error_body(cause))
-    }
-
-    fn write_to(&self, stream: &mut impl Write) -> io::Result<()> {
-        let head = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            self.status,
-            reason_phrase(self.status),
-            self.content_type,
-            self.body.len()
-        );
-        stream.write_all(head.as_bytes())?;
-        stream.write_all(&self.body)?;
-        stream.flush()
-    }
+/// Writes `response`, `(status, content type, body)`; every response closes
+/// its connection.
+fn write_response(
+    stream: &mut impl Write,
+    response: &(u16, &'static str, Vec<u8>),
+) -> io::Result<()> {
+    let (status, content_type, body) = response;
+    let reason = reason_phrase(*status);
+    let length = body.len();
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
 }
 
 fn reason_phrase(status: u16) -> &'static str {
@@ -391,28 +360,28 @@ fn error_body(cause: &str) -> String {
 // Routing
 // ---------------------------------------------------------------------------
 
-/// The three session backends of `/api/{backend}/session`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Backend {
-    Mumps,
-    Rust,
-    Compare,
-}
+/// The 404 causes of routing. Each is fixed text: no cause repeats the
+/// request's method, target, query or backend name.
+const NOT_FOUND: &str = "NOT FOUND";
+const UNKNOWN_BACKEND: &str = "UNKNOWN BACKEND";
+const POST_REQUIRED: &str = "NOT FOUND: POST REQUIRED";
+const GET_REQUIRED: &str = "NOT FOUND: GET REQUIRED";
 
-fn route(request: &Request, store: &Store, mumps: &MumpsMode) -> Response {
-    if let Some((file, content_type)) = static_file(&request.target) {
-        if request.method == "GET" {
+/// Answers `request` with `(status, content type, body)`: a static path, an
+/// API path, or 404.
+fn route(request: &HttpRequest, store: &Store, mumps: &MumpsMode) -> (u16, &'static str, Vec<u8>) {
+    let (method, target, body) = request;
+    if let Some((file, content_type)) = static_file(target) {
+        if method == "GET" {
             return serve_static(file, content_type);
         }
-        return Response::error(
-            404,
-            &format!("NOT FOUND {} {}", request.method, request.target),
-        );
+        return error_response(404, GET_REQUIRED);
     }
-    if let Some(rest) = request.target.strip_prefix("/api/") {
-        return route_api(request, rest, store, mumps);
+    if let Some(rest) = target.strip_prefix("/api/") {
+        let (status, json) = route_api(method, rest, body.as_deref(), store, mumps);
+        return (status, JSON_TYPE, json.into_bytes());
     }
-    Response::error(404, &format!("NOT FOUND {}", request.target))
+    error_response(404, NOT_FOUND)
 }
 
 /// The four static paths, matched exactly on the full request target, so a
@@ -428,53 +397,51 @@ fn static_file(target: &str) -> Option<(&'static str, &'static str)> {
 
 /// Reads `frontend/<file>` at request time; a file that cannot be read is
 /// a 404.
-fn serve_static(file: &str, content_type: &'static str) -> Response {
+fn serve_static(file: &str, content_type: &'static str) -> (u16, &'static str, Vec<u8>) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("frontend")
         .join(file);
     match fs::read(&path) {
-        Ok(body) => Response {
-            status: 200,
-            content_type,
-            body,
-        },
-        Err(_) => Response::error(404, &format!("NOT FOUND /{file}")),
+        Ok(body) => (200, content_type, body),
+        Err(_) => error_response(404, &format!("NOT FOUND /{file}")),
     }
 }
 
 /// `rest` is the target after `/api/`. Unknown backends and paths, and any
 /// method but POST, are 404; the body is checked only for a known route.
-fn route_api(request: &Request, rest: &str, store: &Store, mumps: &MumpsMode) -> Response {
-    let not_found = || Response::error(404, &format!("NOT FOUND {}", request.target));
+/// The answer is `(status, JSON body)`.
+fn route_api(
+    method: &str,
+    rest: &str,
+    body: Option<&[u8]>,
+    store: &Store,
+    mumps: &MumpsMode,
+) -> (u16, String) {
+    let not_found = || (404, error_body(NOT_FOUND));
     let Some((name, tail)) = rest.split_once('/') else {
         return not_found();
     };
     if tail != "session" {
         return not_found();
     }
-    let backend = match name {
-        "mumps" => Backend::Mumps,
-        "rust" => Backend::Rust,
-        "compare" => Backend::Compare,
-        other => return Response::error(404, &format!("UNKNOWN BACKEND {other}")),
+    let session: fn(&Store, &MumpsMode, &[String]) -> (u16, String) = match name {
+        "mumps" => |_, mode, inputs| mumps_session(mode, inputs),
+        "rust" => |fixtures, _, inputs| rust_session(fixtures, inputs),
+        "compare" => compare_session,
+        _ => return (404, error_body(UNKNOWN_BACKEND)),
     };
-    if request.method != "POST" {
-        return Response::error(
-            404,
-            &format!("NOT FOUND {} {}", request.method, request.target),
-        );
+    if method != "POST" {
+        return (404, error_body(POST_REQUIRED));
     }
-    let Some(body) = &request.body else {
-        return Response::error(400, &format!("{BAD_REQUEST}: CONTENT-LENGTH REQUIRED"));
+    let Some(body) = body else {
+        return (
+            400,
+            error_body(&format!("{BAD_REQUEST}: CONTENT-LENGTH REQUIRED")),
+        );
     };
-    let inputs = match parse_session_request(body) {
-        Ok(inputs) => inputs,
-        Err(cause) => return Response::error(400, &cause),
-    };
-    match backend {
-        Backend::Rust => rust_session(store, &inputs),
-        Backend::Mumps => mumps_session(mumps, &inputs),
-        Backend::Compare => compare_session(store, mumps, &inputs),
+    match parse_session_request(body) {
+        Ok(inputs) => session(store, mumps, &inputs),
+        Err(cause) => (400, error_body(&cause)),
     }
 }
 
@@ -484,29 +451,29 @@ fn route_api(request: &Request, rest: &str, store: &Store, mumps: &MumpsMode) ->
 /// and of live standard input. Other members of the object are ignored.
 fn parse_session_request(body: &[u8]) -> Result<Vec<String>, String> {
     let text = std::str::from_utf8(body).map_err(|_| "MALFORMED JSON".to_string())?;
-    let Ok(json) = parse_json(text) else {
+    let Some(json) = parse_json(text) else {
         return Err("MALFORMED JSON".to_string());
     };
-    let Json::Obj(members) = json else {
+    let Some(members) = json_members(json) else {
         return Err("BODY IS NOT A JSON OBJECT".to_string());
     };
     let mut found = members.into_iter().filter(|(key, _)| key == "inputs");
     let (Some((_, inputs)), None) = (found.next(), found.next()) else {
         return Err("INPUTS MISSING OR REPEATED".to_string());
     };
-    let Json::Arr(elements) = inputs else {
+    let Some(elements) = json_elements(inputs) else {
         return Err("INPUTS IS NOT AN ARRAY".to_string());
     };
     elements
         .into_iter()
         .enumerate()
-        .map(|(position, element)| match element {
-            Json::Str(text) if text.contains(['\r', '\n']) => Err(format!(
+        .map(|(position, element)| match json_string(element) {
+            Some(text) if text.contains(['\r', '\n']) => Err(format!(
                 "INPUT {} CONTAINS A CARRIAGE RETURN OR LINE FEED",
                 position.saturating_add(1)
             )),
-            Json::Str(text) => Ok(text),
-            _ => Err(format!(
+            Some(text) => Ok(text),
+            None => Err(format!(
                 "INPUT {} IS NOT A STRING",
                 position.saturating_add(1)
             )),
@@ -518,247 +485,271 @@ fn parse_session_request(body: &[u8]) -> Result<Vec<String>, String> {
 // JSON reader and writer (private, minimal)
 // ---------------------------------------------------------------------------
 
-/// A parsed JSON value. Numbers keep their text: nothing here computes with
-/// them. Object members keep document order, duplicates included, so each
-/// caller decides what a repeated key means.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Json {
-    Null,
-    Bool(bool),
-    Num(String),
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(Vec<(String, Json)>),
-}
-
-/// The text is not one well-formed JSON value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Malformed;
-
 /// Parses `text` as exactly one JSON value with optional surrounding
-/// whitespace; anything after it is malformed.
-fn parse_json(text: &str) -> Result<Json, Malformed> {
-    let mut parser = JsonParser { text, pos: 0 };
-    parser.skip_whitespace();
-    let value = parser.value(0)?;
-    parser.skip_whitespace();
-    if parser.pos == text.len() {
-        Ok(value)
+/// whitespace, anything after it being malformed, and returns the value's
+/// own text without that whitespace.
+///
+/// A value is kept as its text, not as a tree: [`json_members`],
+/// [`json_elements`] and [`json_string`] read from it the kind a caller
+/// expects. Numbers keep their text, since nothing here computes with them.
+/// Throughout this reader, `None` means malformed.
+fn parse_json(text: &str) -> Option<&str> {
+    let mut pos = 0;
+    skip_whitespace(text, &mut pos);
+    let value = value_text(text, &mut pos, 0)?;
+    skip_whitespace(text, &mut pos);
+    if pos == text.len() { Some(value) } else { None }
+}
+
+/// The members of `value`, the text of exactly one JSON object: keys and
+/// value texts in document order, duplicates included, so each caller
+/// decides what a repeated key means.
+fn json_members(value: &str) -> Option<Vec<(String, &str)>> {
+    let mut pos = 0;
+    let members = read_object(value, &mut pos, 0)?;
+    if pos == value.len() {
+        Some(members)
     } else {
-        Err(Malformed)
+        None
     }
 }
 
-/// A recursive-descent parser over the bytes of `text`. `pos` is always a
+/// The element texts of `value`, the text of exactly one JSON array, in
+/// order.
+fn json_elements(value: &str) -> Option<Vec<&str>> {
+    let mut pos = 0;
+    let elements = read_array(value, &mut pos, 0)?;
+    if pos == value.len() {
+        Some(elements)
+    } else {
+        None
+    }
+}
+
+/// The unescaped content of `value`, the text of exactly one JSON string.
+fn json_string(value: &str) -> Option<String> {
+    let mut pos = 0;
+    let text = read_string(value, &mut pos)?;
+    if pos == value.len() { Some(text) } else { None }
+}
+
+/// The byte of `text` at `pos`, if any.
+fn peek(text: &str, pos: usize) -> Option<u8> {
+    text.as_bytes().get(pos).copied()
+}
+
+/// The byte of `text` at `*pos`, moving past it.
+fn bump(text: &str, pos: &mut usize) -> Option<u8> {
+    let byte = peek(text, *pos)?;
+    *pos = pos.saturating_add(1);
+    Some(byte)
+}
+
+/// Moves past `byte`, which must come next.
+fn eat(text: &str, pos: &mut usize, byte: u8) -> Option<()> {
+    if bump(text, pos) == Some(byte) {
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// Moves past `literal`, which must come next.
+fn eat_literal(text: &str, pos: &mut usize, literal: &str) -> Option<()> {
+    literal.bytes().try_for_each(|byte| eat(text, pos, byte))
+}
+
+/// Moves past any JSON whitespace.
+fn skip_whitespace(text: &str, pos: &mut usize) {
+    while matches!(peek(text, *pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        *pos = pos.saturating_add(1);
+    }
+}
+
+/// The text of the value at `*pos`, moving past it as [`skip_value`] does.
+fn value_text<'t>(text: &'t str, pos: &mut usize, depth: usize) -> Option<&'t str> {
+    let start = *pos;
+    skip_value(text, pos, depth)?;
+    text.get(start..*pos)
+}
+
+/// Checks the value at `*pos`, nested `depth` levels deep, and moves past
+/// it; a value nested deeper than `MAX_JSON_DEPTH` is malformed. This is
+/// recursive descent over the bytes of `text`, and a position is always a
 /// char boundary between tokens, because every token delimiter is ASCII.
-struct JsonParser<'a> {
-    text: &'a str,
-    pos: usize,
+fn skip_value(text: &str, pos: &mut usize, depth: usize) -> Option<()> {
+    if depth > MAX_JSON_DEPTH {
+        return None;
+    }
+    match peek(text, *pos) {
+        Some(b'{') => read_object(text, pos, depth).map(|_| ()),
+        Some(b'[') => read_array(text, pos, depth).map(|_| ()),
+        Some(b'"') => read_string(text, pos).map(|_| ()),
+        Some(b't') => eat_literal(text, pos, "true"),
+        Some(b'f') => eat_literal(text, pos, "false"),
+        Some(b'n') => eat_literal(text, pos, "null"),
+        Some(b'-' | b'0'..=b'9') => skip_number(text, pos),
+        _ => None,
+    }
 }
 
-impl JsonParser<'_> {
-    fn peek(&self) -> Option<u8> {
-        self.text.as_bytes().get(self.pos).copied()
+/// The object at `*pos`, nested `depth` levels deep, moving past it: its
+/// keys and value texts in document order, duplicates included.
+fn read_object<'t>(text: &'t str, pos: &mut usize, depth: usize) -> Option<Vec<(String, &'t str)>> {
+    eat(text, pos, b'{')?;
+    let mut members = Vec::new();
+    skip_whitespace(text, pos);
+    if peek(text, *pos) == Some(b'}') {
+        *pos = pos.saturating_add(1);
+        return Some(members);
     }
-
-    fn bump(&mut self) -> Option<u8> {
-        let byte = self.peek()?;
-        self.pos = self.pos.saturating_add(1);
-        Some(byte)
-    }
-
-    fn eat(&mut self, byte: u8) -> Result<(), Malformed> {
-        if self.bump() == Some(byte) {
-            Ok(())
-        } else {
-            Err(Malformed)
+    loop {
+        skip_whitespace(text, pos);
+        let key = read_string(text, pos)?;
+        skip_whitespace(text, pos);
+        eat(text, pos, b':')?;
+        skip_whitespace(text, pos);
+        let value = value_text(text, pos, depth.saturating_add(1))?;
+        members.push((key, value));
+        skip_whitespace(text, pos);
+        match bump(text, pos) {
+            Some(b',') => {}
+            Some(b'}') => return Some(members),
+            _ => return None,
         }
     }
+}
 
-    fn eat_literal(&mut self, literal: &str) -> Result<(), Malformed> {
-        literal.bytes().try_for_each(|byte| self.eat(byte))
+/// The array at `*pos`, nested `depth` levels deep, moving past it: its
+/// element texts in order.
+fn read_array<'t>(text: &'t str, pos: &mut usize, depth: usize) -> Option<Vec<&'t str>> {
+    eat(text, pos, b'[')?;
+    let mut elements = Vec::new();
+    skip_whitespace(text, pos);
+    if peek(text, *pos) == Some(b']') {
+        *pos = pos.saturating_add(1);
+        return Some(elements);
     }
-
-    fn skip_whitespace(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos = self.pos.saturating_add(1);
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<Json, Malformed> {
-        if depth > MAX_JSON_DEPTH {
-            return Err(Malformed);
-        }
-        match self.peek() {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => self.string().map(Json::Str),
-            Some(b't') => self.eat_literal("true").map(|()| Json::Bool(true)),
-            Some(b'f') => self.eat_literal("false").map(|()| Json::Bool(false)),
-            Some(b'n') => self.eat_literal("null").map(|()| Json::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            _ => Err(Malformed),
+    loop {
+        skip_whitespace(text, pos);
+        elements.push(value_text(text, pos, depth.saturating_add(1))?);
+        skip_whitespace(text, pos);
+        match bump(text, pos) {
+            Some(b',') => {}
+            Some(b']') => return Some(elements),
+            _ => return None,
         }
     }
+}
 
-    fn object(&mut self, depth: usize) -> Result<Json, Malformed> {
-        self.eat(b'{')?;
-        let mut members = Vec::new();
-        self.skip_whitespace();
-        if self.peek() == Some(b'}') {
-            self.pos = self.pos.saturating_add(1);
-            return Ok(Json::Obj(members));
-        }
-        loop {
-            self.skip_whitespace();
-            let key = self.string()?;
-            self.skip_whitespace();
-            self.eat(b':')?;
-            self.skip_whitespace();
-            let value = self.value(depth.saturating_add(1))?;
-            members.push((key, value));
-            self.skip_whitespace();
-            match self.bump() {
-                Some(b',') => {}
-                Some(b'}') => return Ok(Json::Obj(members)),
-                _ => return Err(Malformed),
+/// The string at `*pos`, unescaped, moving past it. The escapes are `\"`,
+/// `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\u` followed by four
+/// hexadecimal digits. A high-surrogate `\u` escape must be followed by a
+/// low-surrogate `\u` escape; an unpaired surrogate, an unknown escape or
+/// an unescaped control character is malformed.
+fn read_string(text: &str, pos: &mut usize) -> Option<String> {
+    eat(text, pos, b'"')?;
+    let mut out = String::new();
+    let mut run_start = *pos;
+    loop {
+        match peek(text, *pos) {
+            None => return None,
+            Some(b'"') => {
+                out.push_str(text.get(run_start..*pos)?);
+                *pos = pos.saturating_add(1);
+                return Some(out);
             }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Result<Json, Malformed> {
-        self.eat(b'[')?;
-        let mut elements = Vec::new();
-        self.skip_whitespace();
-        if self.peek() == Some(b']') {
-            self.pos = self.pos.saturating_add(1);
-            return Ok(Json::Arr(elements));
-        }
-        loop {
-            self.skip_whitespace();
-            elements.push(self.value(depth.saturating_add(1))?);
-            self.skip_whitespace();
-            match self.bump() {
-                Some(b',') => {}
-                Some(b']') => return Ok(Json::Arr(elements)),
-                _ => return Err(Malformed),
+            Some(b'\\') => {
+                out.push_str(text.get(run_start..*pos)?);
+                *pos = pos.saturating_add(1);
+                let unescaped = match bump(text, pos) {
+                    Some(b'"') => '"',
+                    Some(b'\\') => '\\',
+                    Some(b'/') => '/',
+                    Some(b'b') => '\u{8}',
+                    Some(b'f') => '\u{c}',
+                    Some(b'n') => '\n',
+                    Some(b'r') => '\r',
+                    Some(b't') => '\t',
+                    Some(b'u') => read_unicode_escape(text, pos)?,
+                    _ => return None,
+                };
+                out.push(unescaped);
+                run_start = *pos;
             }
+            Some(byte) if byte < 0x20 => return None,
+            Some(_) => *pos = pos.saturating_add(1),
         }
     }
+}
 
-    /// A string with the escapes `\" \\ \/ \b \f \n \r \t \uXXXX`. A
-    /// `\uXXXX` high surrogate must be followed by a `\uXXXX` low
-    /// surrogate; an unpaired surrogate, an unknown escape or an unescaped
-    /// control character is malformed.
-    fn string(&mut self) -> Result<String, Malformed> {
-        self.eat(b'"')?;
-        let mut out = String::new();
-        let mut run_start = self.pos;
-        loop {
-            match self.peek() {
-                None => return Err(Malformed),
-                Some(b'"') => {
-                    out.push_str(self.text.get(run_start..self.pos).ok_or(Malformed)?);
-                    self.pos = self.pos.saturating_add(1);
-                    return Ok(out);
-                }
-                Some(b'\\') => {
-                    out.push_str(self.text.get(run_start..self.pos).ok_or(Malformed)?);
-                    self.pos = self.pos.saturating_add(1);
-                    let unescaped = match self.bump() {
-                        Some(b'"') => '"',
-                        Some(b'\\') => '\\',
-                        Some(b'/') => '/',
-                        Some(b'b') => '\u{8}',
-                        Some(b'f') => '\u{c}',
-                        Some(b'n') => '\n',
-                        Some(b'r') => '\r',
-                        Some(b't') => '\t',
-                        Some(b'u') => self.unicode_escape()?,
-                        _ => return Err(Malformed),
-                    };
-                    out.push(unescaped);
-                    run_start = self.pos;
-                }
-                Some(byte) if byte < 0x20 => return Err(Malformed),
-                Some(_) => self.pos = self.pos.saturating_add(1),
+/// The character of a `\u` escape whose `\u` is already consumed: four
+/// hexadecimal digits, a surrogate pair being combined into one character.
+fn read_unicode_escape(text: &str, pos: &mut usize) -> Option<char> {
+    let first = read_hex4(text, pos)?;
+    match first {
+        0xD800..=0xDBFF => {
+            eat(text, pos, b'\\')?;
+            eat(text, pos, b'u')?;
+            let second = read_hex4(text, pos)?;
+            if !(0xDC00..=0xDFFF).contains(&second) {
+                return None;
             }
+            let code = 0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00);
+            char::from_u32(code)
         }
+        0xDC00..=0xDFFF => None,
+        _ => char::from_u32(first),
     }
+}
 
-    /// The character of a `\uXXXX` escape whose `\u` is already consumed,
-    /// combining a surrogate pair into one character.
-    fn unicode_escape(&mut self) -> Result<char, Malformed> {
-        let first = self.hex4()?;
-        match first {
-            0xD800..=0xDBFF => {
-                self.eat(b'\\')?;
-                self.eat(b'u')?;
-                let second = self.hex4()?;
-                if !(0xDC00..=0xDFFF).contains(&second) {
-                    return Err(Malformed);
-                }
-                let code = 0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00);
-                char::from_u32(code).ok_or(Malformed)
-            }
-            0xDC00..=0xDFFF => Err(Malformed),
-            _ => char::from_u32(first).ok_or(Malformed),
-        }
+/// Four hexadecimal digits at `*pos` as one code unit, moving past them.
+fn read_hex4(text: &str, pos: &mut usize) -> Option<u32> {
+    let mut code = 0u32;
+    for _ in 0..4 {
+        let digit = bump(text, pos).and_then(|byte| char::from(byte).to_digit(16))?;
+        code = code * 16 + digit;
     }
+    Some(code)
+}
 
-    fn hex4(&mut self) -> Result<u32, Malformed> {
-        let mut code = 0u32;
-        for _ in 0..4 {
-            let digit = self
-                .bump()
-                .and_then(|byte| char::from(byte).to_digit(16))
-                .ok_or(Malformed)?;
-            code = code * 16 + digit;
-        }
-        Ok(code)
+/// Moves past the number at `*pos`:
+/// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`
+fn skip_number(text: &str, pos: &mut usize) -> Option<()> {
+    if peek(text, *pos) == Some(b'-') {
+        *pos = pos.saturating_add(1);
     }
+    match peek(text, *pos) {
+        Some(b'0') => *pos = pos.saturating_add(1),
+        Some(b'1'..=b'9') => skip_digits(text, pos),
+        _ => return None,
+    }
+    if peek(text, *pos) == Some(b'.') {
+        *pos = pos.saturating_add(1);
+        skip_required_digits(text, pos)?;
+    }
+    if matches!(peek(text, *pos), Some(b'e' | b'E')) {
+        *pos = pos.saturating_add(1);
+        if matches!(peek(text, *pos), Some(b'+' | b'-')) {
+            *pos = pos.saturating_add(1);
+        }
+        skip_required_digits(text, pos)?;
+    }
+    Some(())
+}
 
-    /// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`
-    fn number(&mut self) -> Result<Json, Malformed> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos = self.pos.saturating_add(1);
-        }
-        match self.peek() {
-            Some(b'0') => self.pos = self.pos.saturating_add(1),
-            Some(b'1'..=b'9') => self.digits(),
-            _ => return Err(Malformed),
-        }
-        if self.peek() == Some(b'.') {
-            self.pos = self.pos.saturating_add(1);
-            self.required_digits()?;
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.pos = self.pos.saturating_add(1);
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.pos = self.pos.saturating_add(1);
-            }
-            self.required_digits()?;
-        }
-        let text = self.text.get(start..self.pos).ok_or(Malformed)?;
-        Ok(Json::Num(text.to_string()))
+/// Moves past any ASCII digits.
+fn skip_digits(text: &str, pos: &mut usize) {
+    while matches!(peek(text, *pos), Some(b'0'..=b'9')) {
+        *pos = pos.saturating_add(1);
     }
+}
 
-    fn digits(&mut self) {
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos = self.pos.saturating_add(1);
-        }
-    }
-
-    fn required_digits(&mut self) -> Result<(), Malformed> {
-        let start = self.pos;
-        self.digits();
-        if self.pos > start {
-            Ok(())
-        } else {
-            Err(Malformed)
-        }
-    }
+/// Moves past one or more ASCII digits, which must come next.
+fn skip_required_digits(text: &str, pos: &mut usize) -> Option<()> {
+    let start = *pos;
+    skip_digits(text, pos);
+    if *pos > start { Some(()) } else { None }
 }
 
 /// Appends `text` as a JSON string: `"` and `\` escaped, `\n \r \t \b \f`
@@ -807,32 +798,13 @@ const RETURNED_FILE: &str = "returned.txt";
 const NORMALISATION_FILE: &str = "normalisation.txt";
 const META_FILE: &str = "meta.txt";
 
-/// What the original's entry point returned, as far as the MUMPS side knows.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum MumpsReturned {
-    /// Read from a capture: zero bytes is `None`.
-    Recorded(Option<String>),
-    /// Live mode cannot obtain the return value (open item O-06).
-    Unavailable,
-}
-
-/// One MUMPS-side session result, with the normalisation rules of the
-/// capture whose inputs equal the session's (none in live mode).
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct MumpsOutput {
-    transcript: String,
-    returned: MumpsReturned,
-    rules: Vec<(String, String)>,
-}
-
-impl MumpsOutput {
-    fn returned_text(&self) -> Option<&str> {
-        match &self.returned {
-            MumpsReturned::Recorded(value) => value.as_deref(),
-            MumpsReturned::Unavailable => None,
-        }
-    }
-}
+/// One MUMPS-side session result: the transcript; what the original's entry
+/// point returned, as far as the MUMPS side knows; and the normalisation
+/// rules of the capture whose inputs equal the session's (none in live
+/// mode). The return value is `None` when live mode cannot obtain it (open
+/// item O-06), and otherwise `Some` of the recorded value, zero bytes being
+/// `Some(None)`.
+type MumpsSide = (String, Option<Option<String>>, Vec<(String, String)>);
 
 /// `{"transcript": ..., "returned": ...}`.
 fn write_session(out: &mut String, transcript: &str, returned: Option<&str>) {
@@ -849,45 +821,47 @@ fn session_body(transcript: &str, returned: Option<&str>) -> String {
     out
 }
 
-fn rust_session(store: &Store, inputs: &[String]) -> Response {
+/// `(status, JSON body)` of a Rust-side session.
+fn rust_session(store: &Store, inputs: &[String]) -> (u16, String) {
     match inquire(store, inputs) {
-        Ok(output) => Response::json(
+        Ok(output) => (
             200,
             session_body(&output.transcript, output.returned.as_deref()),
         ),
-        Err(error) => {
-            let (status, body) = inquiry_error_to_response(&error);
-            Response::json(status, body)
-        }
+        Err(error) => inquiry_error_to_response(&error),
     }
 }
 
-fn mumps_session(mumps: &MumpsMode, inputs: &[String]) -> Response {
+/// `(status, JSON body)` of a MUMPS-side session; its failure is 502.
+fn mumps_session(mumps: &MumpsMode, inputs: &[String]) -> (u16, String) {
     match run_mumps(mumps, inputs) {
-        Ok(output) => Response::json(
+        Ok((transcript, returned, _)) => (
             200,
-            session_body(&output.transcript, output.returned_text()),
+            session_body(&transcript, returned.flatten().as_deref()),
         ),
-        Err(cause) => Response::error(502, &cause),
+        Err(cause) => (502, error_body(&cause)),
     }
 }
 
-/// The MUMPS side first, whose failure is 502; then the Rust side, whose
-/// `CorruptStore` is 500 and `UnsupportedBranch` 422; only then 200.
-fn compare_session(store: &Store, mumps: &MumpsMode, inputs: &[String]) -> Response {
+/// `(status, JSON body)` of a compare session: the MUMPS side first, whose
+/// failure is 502; then the Rust side, whose `CorruptStore` is 500 and
+/// `UnsupportedBranch` 422; only then 200.
+fn compare_session(store: &Store, mumps: &MumpsMode, inputs: &[String]) -> (u16, String) {
     let original = match run_mumps(mumps, inputs) {
         Ok(output) => output,
-        Err(cause) => return Response::error(502, &cause),
+        Err(cause) => return (502, error_body(&cause)),
     };
     let port = match inquire(store, inputs) {
         Ok(output) => output,
-        Err(error) => {
-            let (status, body) = inquiry_error_to_response(&error);
-            return Response::json(status, body);
-        }
+        Err(error) => return inquiry_error_to_response(&error),
     };
+    let (transcript, returned, _) = &original;
     let mut out = String::from("{\"mumps\":");
-    write_session(&mut out, &original.transcript, original.returned_text());
+    write_session(
+        &mut out,
+        transcript,
+        returned.as_ref().and_then(Option::as_deref),
+    );
     out.push_str(",\"rust\":");
     write_session(&mut out, &port.transcript, port.returned.as_deref());
     out.push_str(",\"match\":");
@@ -897,20 +871,18 @@ fn compare_session(store: &Store, mumps: &MumpsMode, inputs: &[String]) -> Respo
         None => "null",
     });
     out.push('}');
-    Response::json(200, out)
+    (200, out)
 }
 
 /// `match` of a compare response. `None` when the MUMPS return value is
 /// unavailable. Otherwise `true` only when both the transcripts and the
 /// return values are equal after normalising both sides with the capture's
 /// rules: transcript-only agreement is never a match.
-fn decide_match(original: &MumpsOutput, port: &InquiryOutput) -> Option<bool> {
-    let MumpsReturned::Recorded(expected) = &original.returned else {
-        return None;
-    };
-    let rules = original.rules.as_slice();
-    let transcripts_equal =
-        normalise(&original.transcript, rules) == normalise(&port.transcript, rules);
+fn decide_match(original: &MumpsSide, port: &InquiryOutput) -> Option<bool> {
+    let (transcript, returned, rules) = original;
+    let expected = returned.as_ref()?;
+    let rules = rules.as_slice();
+    let transcripts_equal = normalise(transcript, rules) == normalise(&port.transcript, rules);
     let returns_equal = expected.as_deref().map(|value| normalise(value, rules))
         == port
             .returned
@@ -919,7 +891,7 @@ fn decide_match(original: &MumpsOutput, port: &InquiryOutput) -> Option<bool> {
     Some(transcripts_equal && returns_equal)
 }
 
-fn run_mumps(mumps: &MumpsMode, inputs: &[String]) -> Result<MumpsOutput, String> {
+fn run_mumps(mumps: &MumpsMode, inputs: &[String]) -> Result<MumpsSide, String> {
     match mumps {
         MumpsMode::Replay { golden_dir } => replay(golden_dir, inputs),
         MumpsMode::Live {
@@ -929,51 +901,42 @@ fn run_mumps(mumps: &MumpsMode, inputs: &[String]) -> Result<MumpsOutput, String
     }
 }
 
-/// How one capture file read ended.
-enum CaptureFile {
-    Text(String),
-    Missing,
-    /// Present but not readable; a directory in its place counts here.
-    Unreadable,
-    NonUtf8,
-}
+/// Why a capture file gave no text: it is absent; it is present but not
+/// readable, a directory in its place counting here; or it is not UTF-8.
+const CAPTURE_MISSING: &str = "MISSING";
+const CAPTURE_UNREADABLE: &str = "UNREADABLE";
+const CAPTURE_NON_UTF8: &str = "NON-UTF8";
 
-fn read_capture_file(path: &Path) -> CaptureFile {
+/// The text of one capture file, or which of `CAPTURE_MISSING`,
+/// `CAPTURE_UNREADABLE` and `CAPTURE_NON_UTF8` it is.
+fn read_capture_file(path: &Path) -> Result<String, &'static str> {
     match fs::read(path) {
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(text) => CaptureFile::Text(text),
-            Err(_) => CaptureFile::NonUtf8,
-        },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => CaptureFile::Missing,
-        Err(_) => CaptureFile::Unreadable,
+        Ok(bytes) => String::from_utf8(bytes).map_err(|_| CAPTURE_NON_UTF8),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(CAPTURE_MISSING),
+        Err(_) => Err(CAPTURE_UNREADABLE),
     }
 }
 
 /// A capture file that must be present, readable and UTF-8.
 fn required_capture_file(path: &Path) -> Result<String, String> {
-    let problem = match read_capture_file(path) {
-        CaptureFile::Text(text) => return Ok(text),
-        CaptureFile::Missing => "MISSING",
-        CaptureFile::Unreadable => "UNREADABLE",
-        CaptureFile::NonUtf8 => "NON-UTF8",
-    };
-    Err(format!("CAPTURE FILE {}: {problem}", path.display()))
+    read_capture_file(path).map_err(|problem| format!("CAPTURE FILE {}: {problem}", path.display()))
 }
 
 /// The first capture under `golden_dir` whose input lines equal `inputs`,
 /// used whole or not at all. A directory with no readable UTF-8 input file
 /// does not match, and its path is listed when nothing matches.
-fn replay(golden_dir: &Path, inputs: &[String]) -> Result<MumpsOutput, String> {
+fn replay(golden_dir: &Path, inputs: &[String]) -> Result<MumpsSide, String> {
     let mut unreadable: Vec<String> = Vec::new();
     for case in CASE_DIRS {
         let dir = golden_dir.join(case);
         let input_path = dir.join(INPUT_FILE);
         match read_capture_file(&input_path) {
-            CaptureFile::Text(text) if split_input_lines(&text) == inputs => {
+            Ok(text) if split_input_lines(&text) == inputs => {
                 return read_capture(&dir);
             }
-            CaptureFile::Text(_) | CaptureFile::Missing => {}
-            CaptureFile::Unreadable | CaptureFile::NonUtf8 => {
+            Ok(_) | Err(CAPTURE_MISSING) => {}
+            // CAPTURE_UNREADABLE or CAPTURE_NON_UTF8.
+            Err(_) => {
                 unreadable.push(input_path.display().to_string());
             }
         }
@@ -991,7 +954,7 @@ fn replay(golden_dir: &Path, inputs: &[String]) -> Result<MumpsOutput, String> {
 /// The transcript, return value and normalisation rules of the matching
 /// capture in `dir`. An empty return-value or normalisation file is valid;
 /// a non-empty return value loses one trailing newline.
-fn read_capture(dir: &Path) -> Result<MumpsOutput, String> {
+fn read_capture(dir: &Path) -> Result<MumpsSide, String> {
     let transcript = required_capture_file(&dir.join(TRANSCRIPT_FILE))?;
     let returned = required_capture_file(&dir.join(RETURNED_FILE))?;
     let normalisation_path = dir.join(NORMALISATION_FILE);
@@ -1007,11 +970,7 @@ fn read_capture(dir: &Path) -> Result<MumpsOutput, String> {
     } else {
         Some(returned.strip_suffix('\n').unwrap_or(&returned).to_string())
     };
-    Ok(MumpsOutput {
-        transcript,
-        returned: MumpsReturned::Recorded(returned),
-        rules,
-    })
+    Ok((transcript, Some(returned), rules))
 }
 
 /// Runs the original live: the capture command and context come from the
@@ -1020,7 +979,7 @@ fn read_capture(dir: &Path) -> Result<MumpsOutput, String> {
 /// the bridge's own configuration. Standard input is each input followed by
 /// one `\n`, the form of a captured input file. Output is used only when
 /// the run succeeded, and the return value is unavailable.
-fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<MumpsOutput, String> {
+fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<MumpsSide, String> {
     let meta = live_meta(golden_dir)?;
     validate_context(&meta.context)?;
     let mut args = vec!["exec".to_string(), "-i".to_string(), container.to_string()];
@@ -1038,11 +997,7 @@ fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<MumpsOu
         LIVE_OUTPUT_LIMIT,
     );
     let transcript = decide_live_result(&result).map_err(|failure| failure.to_string())?;
-    Ok(MumpsOutput {
-        transcript,
-        returned: MumpsReturned::Unavailable,
-        rules: Vec::new(),
-    })
+    Ok((transcript, None, Vec::new()))
 }
 
 /// The parsed meta file of the first capture directory that has one. With
@@ -1052,9 +1007,10 @@ fn live_meta(golden_dir: &Path) -> Result<Meta, String> {
         let path = golden_dir.join(case).join(META_FILE);
         let malformed = || format!("MALFORMED META {}", path.display());
         match read_capture_file(&path) {
-            CaptureFile::Missing => {}
-            CaptureFile::Text(text) => return parse_meta(&text).map_err(|_| malformed()),
-            CaptureFile::Unreadable | CaptureFile::NonUtf8 => return Err(malformed()),
+            Err(CAPTURE_MISSING) => {}
+            Ok(text) => return parse_meta(&text).map_err(|_| malformed()),
+            // CAPTURE_UNREADABLE or CAPTURE_NON_UTF8.
+            Err(_) => return Err(malformed()),
         }
     }
     let first = golden_dir
@@ -1219,33 +1175,31 @@ fn meta_value<'t>(values: &[(&str, &'t str)], key: &str) -> Result<&'t str, Stri
 
 fn parse_context(value: &str) -> Result<Vec<(String, String)>, String> {
     let not_object = || "context: not a JSON object of strings".to_string();
-    let Ok(Json::Obj(members)) = parse_json(value) else {
+    let Some(members) = parse_json(value).and_then(json_members) else {
         return Err(not_object());
     };
-    let mut context: Vec<(String, String)> = Vec::new();
-    for (key, member) in members {
-        let Json::Str(text) = member else {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(members.len());
+    let mut context: Vec<(String, String)> = Vec::with_capacity(members.len());
+    for (key, member) in &members {
+        let Some(text) = json_string(member) else {
             return Err(not_object());
         };
-        if context.iter().any(|(seen, _)| *seen == key) {
+        if !seen.insert(key.as_str()) {
             return Err(format!("context: repeated key {key}"));
         }
-        context.push((key, text));
+        context.push((key.clone(), text));
     }
     Ok(context)
 }
 
 fn parse_exec_args(value: &str) -> Result<Vec<String>, String> {
     let not_array = || "docker_exec_args: not a JSON array of strings".to_string();
-    let Ok(Json::Arr(elements)) = parse_json(value) else {
+    let Some(elements) = parse_json(value).and_then(json_elements) else {
         return Err(not_array());
     };
     elements
         .into_iter()
-        .map(|element| match element {
-            Json::Str(text) => Ok(text),
-            _ => Err(not_array()),
-        })
+        .map(|element| json_string(element).ok_or_else(not_array))
         .collect()
 }
 
@@ -1588,23 +1542,34 @@ mod tests {
     fn json_reads_escapes_and_surrogate_pairs() -> Result<(), String> {
         let text = r#" {"s":"q\" b\\ s\/ \b\f\n\r\t \u0041\u00e9\u20ac \ud83d\ude00 \u0007",
             "n":-1.5e3, "z":0, "a":[true,false,null], "o":{}} "#;
-        let parsed = parse_json(text).map_err(|_| "rejected well-formed JSON".to_string())?;
-        let expected = Json::Obj(vec![
-            (
-                "s".to_string(),
-                Json::Str(
-                    "q\" b\\ s/ \u{8}\u{c}\n\r\t A\u{e9}\u{20ac} \u{1f600} \u{7}".to_string(),
-                ),
-            ),
-            ("n".to_string(), Json::Num("-1.5e3".to_string())),
-            ("z".to_string(), Json::Num("0".to_string())),
-            (
-                "a".to_string(),
-                Json::Arr(vec![Json::Bool(true), Json::Bool(false), Json::Null]),
-            ),
-            ("o".to_string(), Json::Obj(Vec::new())),
-        ]);
-        assert_eq!(parsed, expected);
+        let rejected = || "rejected well-formed JSON".to_string();
+        let value = parse_json(text).ok_or_else(rejected)?;
+        assert_eq!(value, text.trim());
+        let members = json_members(value).ok_or_else(rejected)?;
+        let keys: Vec<&str> = members.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["s", "n", "z", "a", "o"]);
+        let member = |key: &str| {
+            members
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, member)| *member)
+        };
+        assert_eq!(
+            member("s").and_then(json_string),
+            Some("q\" b\\ s/ \u{8}\u{c}\n\r\t A\u{e9}\u{20ac} \u{1f600} \u{7}".to_string())
+        );
+        assert_eq!(member("n"), Some("-1.5e3"));
+        assert_eq!(member("z"), Some("0"));
+        assert_eq!(
+            member("a").and_then(json_elements),
+            Some(vec!["true", "false", "null"])
+        );
+        assert_eq!(member("o").and_then(json_members), Some(Vec::new()));
+        // Each reader takes exactly one value of its own kind.
+        assert_eq!(member("n").and_then(json_string), None);
+        assert_eq!(member("a").and_then(json_members), None);
+        assert_eq!(member("o").and_then(json_elements), None);
+        assert_eq!(json_string(r#""a" "#), None);
         let malformed = [
             r#""\ud83d""#,
             r#""\ude00""#,
@@ -1628,11 +1593,11 @@ mod tests {
             "{} {}",
         ];
         for text in malformed {
-            assert!(parse_json(text).is_err(), "accepted {text:?}");
+            assert!(parse_json(text).is_none(), "accepted {text:?}");
         }
         let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
-        assert!(parse_json(&nested(MAX_JSON_DEPTH)).is_ok());
-        assert!(parse_json(&nested(MAX_JSON_DEPTH.saturating_add(2))).is_err());
+        assert!(parse_json(&nested(MAX_JSON_DEPTH)).is_some());
+        assert!(parse_json(&nested(MAX_JSON_DEPTH.saturating_add(2))).is_none());
         Ok(())
     }
 
@@ -1642,8 +1607,10 @@ mod tests {
         let mut out = String::new();
         write_json_string(&mut out, original);
         assert_eq!(out, r#""q\" b\\ \n\r\t\b\f\u0007\u001f\u0000 é€😀 /""#);
-        let read_back = parse_json(&out).map_err(|_| "writer output does not parse".to_string())?;
-        assert_eq!(read_back, Json::Str(original.to_string()));
+        let read_back = parse_json(&out)
+            .and_then(json_string)
+            .ok_or_else(|| "writer output does not parse".to_string())?;
+        assert_eq!(read_back, original);
         assert_eq!(error_body("NOT RECORDED"), r#"{"error":"NOT RECORDED"}"#);
         assert_eq!(
             session_body("a\u{7}\n", None),
@@ -1915,12 +1882,12 @@ mod tests {
         }
     }
 
-    fn recorded(transcript: &str, returned: Option<&str>, rules: &[(&str, &str)]) -> MumpsOutput {
-        MumpsOutput {
-            transcript: transcript.to_string(),
-            returned: MumpsReturned::Recorded(returned.map(str::to_string)),
-            rules: pairs(rules),
-        }
+    fn recorded(transcript: &str, returned: Option<&str>, rules: &[(&str, &str)]) -> MumpsSide {
+        (
+            transcript.to_string(),
+            Some(returned.map(str::to_string)),
+            pairs(rules),
+        )
     }
 
     fn port(transcript: &str, returned: Option<&str>) -> InquiryOutput {
@@ -1932,11 +1899,7 @@ mod tests {
 
     #[test]
     fn compare_match_null_when_mumps_returned_unavailable() {
-        let live = MumpsOutput {
-            transcript: "T".to_string(),
-            returned: MumpsReturned::Unavailable,
-            rules: Vec::new(),
-        };
+        let live: MumpsSide = ("T".to_string(), None, Vec::new());
         assert_eq!(decide_match(&live, &port("T", None)), None);
         assert_eq!(decide_match(&live, &port("other", Some("x"))), None);
     }
@@ -2044,6 +2007,29 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
     }
 
     #[test]
+    fn context_duplicates_found_with_a_set() {
+        let expected: Vec<(String, String)> = (0..10_000)
+            .map(|n| (format!("K{n}"), format!("v{n}")))
+            .collect();
+        let members: Vec<String> = expected
+            .iter()
+            .map(|(key, value)| format!("\"{key}\":\"{value}\""))
+            .collect();
+        let object = format!("{{{}}}", members.join(","));
+        assert_eq!(parse_context(&object), Ok(expected));
+        let repeated = format!("{{{},\"K0\":\"again\"}}", members.join(","));
+        assert_eq!(
+            parse_context(&repeated),
+            Err("context: repeated key K0".to_string())
+        );
+        // A value that is not a string is found before the key's repetition.
+        assert_eq!(
+            parse_context(r#"{"A":"1","A":2}"#),
+            Err("context: not a JSON object of strings".to_string())
+        );
+    }
+
+    #[test]
     fn validate_context_messages() {
         let resolved = pairs(&[
             ("DUZ", ".5"),
@@ -2123,23 +2109,13 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
     fn request_head_parsing() {
         assert_eq!(
             parse_head(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
-            Ok(Head {
-                method: "GET".to_string(),
-                target: "/".to_string(),
-                content_length: None,
-                expect_continue: false,
-            })
+            Ok(("GET", "/", None, false))
         );
         assert_eq!(
             parse_head(
                 b"POST /api/rust/session HTTP/1.0\r\ncontent-length: 12\r\nContent-Length:12\r\nExpect: 100-continue\r\n\r\n"
             ),
-            Ok(Head {
-                method: "POST".to_string(),
-                target: "/api/rust/session".to_string(),
-                content_length: Some(12),
-                expect_continue: true,
-            })
+            Ok(("POST", "/api/rust/session", Some(12), true))
         );
         let malformed: [&[u8]; 10] = [
             b"GET /\r\n\r\n",
@@ -2156,6 +2132,46 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         for head in malformed {
             assert!(parse_head(head).is_err(), "accepted {head:?}");
         }
+    }
+
+    #[test]
+    fn route_errors_repeat_no_request_data() -> Result<(), String> {
+        let store = Store::from_zwr("").map_err(|e| e.to_string())?;
+        // Every case is answered before a backend runs, so no capture is read.
+        let mumps = MumpsMode::Replay {
+            golden_dir: PathBuf::new(),
+        };
+        // `NAME` marks request data that no 404 body may repeat.
+        let cases: [(&str, &str, &str); 12] = [
+            ("GET", "/missing?patient=NAME", NOT_FOUND),
+            ("POST", "/NAME", NOT_FOUND),
+            ("POST", "/api/NAME/session", UNKNOWN_BACKEND),
+            ("GET", "/api/rust/session", POST_REQUIRED),
+            ("PUT", "/api/rust/session", POST_REQUIRED),
+            ("NAME", "/api/compare/session", POST_REQUIRED),
+            ("GET", "/api/rust/session?patient=NAME", NOT_FOUND),
+            ("POST", "/api/rust/session/NAME", NOT_FOUND),
+            ("POST", "/api/rust/NAME", NOT_FOUND),
+            ("POST", "/api/NAME", NOT_FOUND),
+            ("POST", "/style.css", GET_REQUIRED),
+            ("NAME", "/", GET_REQUIRED),
+        ];
+        for (method, target, cause) in cases {
+            let request = (
+                method.to_string(),
+                target.to_string(),
+                Some(br#"{"inputs":["NAME"]}"#.to_vec()),
+            );
+            let (status, content_type, body) = route(&request, &store, &mumps);
+            let body = String::from_utf8(body).map_err(|e| e.to_string())?;
+            assert_eq!(
+                (status, content_type, body.as_str()),
+                (404, JSON_TYPE, error_body(cause).as_str()),
+                "for {method} {target}"
+            );
+            assert!(!body.contains("NAME"), "{method} {target} gave {body}");
+        }
+        Ok(())
     }
 
     #[test]
