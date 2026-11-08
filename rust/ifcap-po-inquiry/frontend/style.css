@@ -231,13 +231,12 @@ button,
    matches an idle screen, and MUMPS, COMPARE and reduced-motion users get
    none of them. */
 @media (prefers-reduced-motion: no-preference) {
-  /* Focus glow, by outline colour. */
+  /* Use an outline rather than a shadow to preserve the terminal look (C14). */
   [data-mode="rust"] :is(input, select, button):focus-visible {
     outline-color: var(--glow);
     transition: outline-color 150ms ease-out;
   }
 
-  /* Row hover inversion. */
   @media (hover: hover) {
     [data-mode="rust"] .ln:hover {
       background-color: var(--fg);
@@ -253,7 +252,6 @@ button,
     color: var(--bg);
   }
 
-  /* New-line slide-in and highlight. */
   @keyframes ln-in {
     from {
       transform: translateX(-2ch);

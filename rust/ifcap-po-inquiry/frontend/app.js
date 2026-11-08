@@ -292,7 +292,7 @@ exitButton.addEventListener("click", () => {
 
 // A new backend never shows another backend's transcript or verdict: any
 // request in flight is superseded, every pane is emptied, and the current
-// sequence is sent again to the new backend.
+// sequence, an empty one included, is always sent again to the new backend.
 backendSelect.addEventListener("change", () => {
   root.dataset.mode = backendSelect.value;
   requestSeq += 1;
@@ -303,9 +303,7 @@ backendSelect.addEventListener("change", () => {
   mumpsPane.replaceChildren();
   rustPane.replaceChildren();
   matchStatus.textContent = NOT_COMPARED;
-  if (inputs.length) {
-    send();
-  }
+  send();
 });
 
 // Nothing is sent on load: an empty sequence matches no capture, so MUMPS

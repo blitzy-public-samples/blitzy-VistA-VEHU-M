@@ -25,22 +25,23 @@ use std::collections::HashSet;
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Ipv6Addr, Shutdown, TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::inquiry::{InquiryError, InquiryOutput, STUB_CONTEXT, inquire};
 use crate::store::{Store, load_fixtures};
 
-/// How often the accept loop polls its shutdown flag and `run_command`
-/// polls its child, and how long a `run_command` stream worker blocks
-/// before it checks for cancellation.
+/// How often the accept loop polls its shutdown flag, a live request tries
+/// the busy [`LIVE_ADMISSION`] slots again and `run_command` polls its
+/// child, and how long a `run_command` stream worker blocks before it checks
+/// for cancellation.
 const POLL: Duration = Duration::from_millis(10);
 /// How long a client connection may stay silent before the first byte of its
 /// request, and the write timeout of a response.
@@ -52,6 +53,14 @@ const REQUEST_TIME: Duration = Duration::from_secs(5);
 const MAX_HEAD: usize = 16 * 1024;
 /// The longest request body accepted.
 const MAX_BODY: usize = 1024 * 1024;
+/// The most connections served at once. Each holds a thread, two descriptors
+/// (the stream and the clone that wakes it at shutdown) and request buffers
+/// of about [`MAX_HEAD`] plus [`MAX_BODY`] at most, so this bounds what
+/// clients can make the bridge hold, far below a 1024-descriptor limit, and
+/// well above the few connections a browser opens to one host. At the bound
+/// no connection is taken: further ones wait in the listener's kernel
+/// backlog.
+const MAX_CONNECTIONS: usize = 64;
 /// How long, and how much, unread client data is discarded after a response,
 /// so that closing a socket with unread input does not reset the connection
 /// and destroy the response before the client reads it.
@@ -70,8 +79,9 @@ const LIVE_SLOTS: usize = 4;
 /// The longest a live request waits, in all, for one of the `LIVE_SLOTS`;
 /// a request that gets none in that time starts nothing.
 const LIVE_ADMISSION_WAIT: Duration = LIVE_TIMEOUT;
-/// The one bound on live runs, shared by every connection thread.
-static LIVE_ADMISSION: Admission = Admission::new(LIVE_SLOTS);
+/// The one bound on live runs, shared by every connection thread: a run
+/// holds the lock of one slot for as long as it lasts.
+static LIVE_ADMISSION: [Mutex<()>; LIVE_SLOTS] = [const { Mutex::new(()) }; LIVE_SLOTS];
 
 const JSON_TYPE: &str = "application/json; charset=utf-8";
 
@@ -98,9 +108,12 @@ pub enum MumpsMode {
     },
 }
 
-/// Serves until the process ends. Loads the fixture store once from
-/// `tests/fixtures/ifcap/` of this crate; a fixture that cannot be loaded is
-/// an `InvalidData` error naming it.
+/// Serves `listener` until serving fails. Loads the fixture store once from
+/// `tests/fixtures/ifcap/` of this crate, before anything is served; a
+/// fixture that cannot be loaded is an `InvalidData` error naming it. Then
+/// hands `listener` to [`serve_until`] with a shutdown flag that is never
+/// set, so this returns only with a serving error of `serve_until`,
+/// unchanged.
 pub fn serve(listener: TcpListener, mumps: MumpsMode) -> io::Result<()> {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -114,15 +127,25 @@ pub fn serve(listener: TcpListener, mumps: MumpsMode) -> io::Result<()> {
 /// Serves `listener` until `shutdown` is set, then returns `Ok(())`. Public
 /// only as the test hook behind [`serve`].
 ///
-/// Each connection is handled on its own thread, so an idle browser
-/// connection never blocks another. Serving fails when `accept` fails in a
-/// way no retry mends, or when a connection cannot be given its own thread
-/// or configured; that connection is closed without a response. Once the
-/// flag is set, or serving fails, every connection still open is shut down,
-/// which wakes a thread waiting to read or write, and every connection
-/// thread is joined before this returns: none runs on afterwards, and a
-/// request still being answered gets no response. The first failure is the
-/// error returned, keeping its kind and naming its stage.
+/// The listener is made non-blocking first; a failure to do so is returned
+/// as it is, before anything is served. `shutdown` is polled about every
+/// 10 ms: between attempts to accept while no connection is pending, and
+/// while `MAX_CONNECTIONS` connections are open. At that bound no connection
+/// is accepted, so further ones wait in the listener's kernel backlog, given
+/// no status, until an open one ends. Each connection is handled on its own
+/// thread, so an idle one never blocks another.
+///
+/// Serving fails when `accept` fails in a way no retry mends, when a
+/// connection cannot be given its socket clone or its thread, which closes
+/// that connection without a response, or with the failure a finished
+/// connection thread returned because its socket could not be configured.
+/// Once the flag is set or serving fails, every connection still open is
+/// shut down, which wakes a thread waiting to read or write and cuts off a
+/// response not yet fully written, though bytes already written stay sent,
+/// and every connection thread is joined before this returns. The error
+/// returned is the serving failure; otherwise the first failure to shut a
+/// connection down, other than `NotConnected`; otherwise the first failure
+/// a connection thread returned. Each keeps its kind and names its stage.
 pub fn serve_until(
     listener: TcpListener,
     store: Store,
@@ -133,24 +156,34 @@ pub fn serve_until(
     let store = Arc::new(store);
     let mumps = Arc::new(mumps);
     let mut workers: Vec<(JoinHandle<io::Result<()>>, TcpStream)> = Vec::new();
-    let served = accept_until(&listener, &store, &mumps, &shutdown, &mut workers);
+    let served = accept_until(
+        &listener,
+        &store,
+        &mumps,
+        &shutdown,
+        &mut workers,
+        MAX_CONNECTIONS,
+    );
     let stopped = stop_workers(workers);
     served.and(stopped)
 }
 
 /// The accept loop of [`serve_until`]. It polls `shutdown` about every
-/// [`POLL`], starts one worker per connection, and joins the workers that
-/// have finished, so that `workers` holds only open connections. `Ok` once
-/// the flag is set. `Err` when `accept` fails in a way no retry mends, when
-/// a connection cannot be given its worker, or with the first failure of
-/// the finished workers, once all of them are joined; the workers still
-/// open stay in `workers`.
+/// [`POLL`], joins the workers that have finished, so that `workers` holds
+/// only open connections, and starts one worker per connection while fewer
+/// than `limit` are open. At `limit` it does not accept, so further
+/// connections wait in the listener's backlog, untouched, until a worker
+/// finishes. `Ok` once the flag is set. `Err` when `accept` fails in a way no
+/// retry mends, when a connection cannot be given its worker, or with the
+/// first failure of the finished workers, once all of them are joined; the
+/// workers still open stay in `workers`.
 fn accept_until(
     listener: &TcpListener,
     store: &Arc<Store>,
     mumps: &Arc<MumpsMode>,
     shutdown: &AtomicBool,
     workers: &mut Vec<(JoinHandle<io::Result<()>>, TcpStream)>,
+    limit: usize,
 ) -> io::Result<()> {
     while !shutdown.load(Ordering::SeqCst) {
         let mut joined = Ok(());
@@ -158,6 +191,10 @@ fn accept_until(
             joined = joined.and(join_worker(finished));
         }
         joined?;
+        if workers.len() >= limit {
+            thread::sleep(POLL);
+            continue;
+        }
         match listener.accept() {
             Ok((stream, _)) => workers.push(start_worker(stream, store, mumps)?),
             Err(e) => {
@@ -291,7 +328,9 @@ fn handle_connection(mut stream: TcpStream, store: &Store, mumps: &MumpsMode) ->
 /// The one request and response of [`handle_connection`]. A connection that
 /// cannot be made blocking with [`IO_TIMEOUT`] for writes, or whose read
 /// timeout cannot be set, is closed without a response, and that failure is
-/// returned, naming the stage. Every other outcome is `Ok`.
+/// returned, naming the stage. Every other outcome is `Ok`. The answer to a
+/// `HEAD` request, accepted or rejected, carries no content; its method is
+/// read after any empty-line prelude (see [`skip_prelude`]).
 fn exchange(stream: &mut TcpStream, store: &Store, mumps: &MumpsMode) -> io::Result<()> {
     let configured = stream
         .set_nonblocking(false)
@@ -309,7 +348,7 @@ fn exchange(stream: &mut TcpStream, store: &Store, mumps: &MumpsMode) -> io::Res
     };
     // Method tokens are case-sensitive, so only `HEAD` itself is a HEAD
     // request, rejected or not.
-    let head_request = received.starts_with(b"HEAD ");
+    let head_request = skip_prelude(&received).starts_with(b"HEAD ");
     // A response that cannot be written means the client has gone, or has
     // not read it within `IO_TIMEOUT`: an outcome of that client, which ends
     // only this connection, shut down by `handle_connection`.
@@ -323,34 +362,51 @@ fn exchange(stream: &mut TcpStream, store: &Store, mumps: &MumpsMode) -> io::Res
 /// close is orderly, and returns how many bytes it discarded. Each read waits
 /// only for the time left and takes only the bytes left, so the drain lasts
 /// at most `limit`, up to the granularity of the socket's read timer, and
-/// discards at most [`DRAIN_BYTES`]. The end of input, a read error, or a
-/// read timeout that cannot be set ends it sooner; a write side that cannot
+/// discards at most [`DRAIN_BYTES`]. A read interrupted by a signal is
+/// retried within those budgets. The end of input, any other read error, or
+/// a read timeout that cannot be set ends it sooner; a write side that cannot
 /// be shut down ends it before any read.
 fn drain(stream: &mut TcpStream, limit: Duration) -> usize {
-    let mut discarded = 0usize;
     if stream.shutdown(Shutdown::Write).is_err() {
-        return discarded;
+        return 0;
     }
+    drain_reads(limit, |window, time_left| {
+        stream.set_read_timeout(Some(time_left))?;
+        Ok(stream.read(window))
+    })
+}
+
+/// The reads of [`drain`], timed from this call: each one is `read` into a
+/// window of at most the bytes left of [`DRAIN_BYTES`], waiting at most the
+/// time left of `limit`. The outer `Err` of `read` is a read timeout that
+/// cannot be set, and the inner result is the read's own. Returns how many
+/// bytes were discarded once a budget is spent, the input ends, the timeout
+/// cannot be set, or a read fails other than by `Interrupted`, which is
+/// retried.
+fn drain_reads(
+    limit: Duration,
+    mut read: impl FnMut(&mut [u8], Duration) -> io::Result<io::Result<usize>>,
+) -> usize {
     let started = Instant::now();
+    let mut discarded = 0usize;
     let mut buf = [0u8; 8192];
     loop {
         let time_left = limit.saturating_sub(started.elapsed());
         let bytes_left = DRAIN_BYTES.saturating_sub(discarded);
-        // A spent budget ends the drain before `set_read_timeout`, which
-        // rejects a zero timeout.
-        if time_left.is_zero()
-            || bytes_left == 0
-            || stream.set_read_timeout(Some(time_left)).is_err()
-        {
+        // A spent budget ends the drain before `read`, whose
+        // `set_read_timeout` rejects a zero timeout.
+        if time_left.is_zero() || bytes_left == 0 {
             return discarded;
         }
         let take = bytes_left.min(buf.len());
         let Some(window) = buf.get_mut(..take) else {
             return discarded;
         };
-        match stream.read(window) {
-            Ok(0) | Err(_) => return discarded,
-            Ok(n) => discarded = discarded.saturating_add(n),
+        match read(window, time_left) {
+            Ok(Ok(0)) | Err(_) => return discarded,
+            Ok(Ok(n)) => discarded = discarded.saturating_add(n),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {}
+            Ok(Err(_)) => return discarded,
         }
     }
 }
@@ -370,11 +426,14 @@ const BAD_REQUEST: &str = "BAD REQUEST";
 type HttpRequest = (String, String, Option<Vec<u8>>);
 
 /// Reads the request line and headers up to the blank line into `received`,
-/// then the body by `Content-Length`. `received` keeps every byte read while
-/// the head arrived, so the caller can tell a rejected request's method.
-/// The connection may stay silent for `idle` before its first byte. From that
-/// byte the whole request, body included, must arrive within `request_time`,
-/// one deadline that later bytes do not renew.
+/// then the body by `Content-Length`. Empty lines before the request line
+/// are read with the head and ignored (see [`skip_prelude`]); they count
+/// towards [`MAX_HEAD`] like every other byte of the head. `received` keeps
+/// every byte read while the head arrived, so the caller can tell a rejected
+/// request's method. The connection may stay silent for `idle` before its
+/// first byte. From that byte, a prelude byte included, the whole request,
+/// body included, must arrive within `request_time`, one deadline that later
+/// bytes do not renew.
 ///
 /// `Ok(Ok(None))` means there is nothing to answer: no byte arrived before
 /// the end of input, a read error or `idle`, or the interim `100 Continue`
@@ -485,22 +544,42 @@ fn read_within(
     Ok(stream.read(buf))
 }
 
-/// The offset just past the first `\r\n\r\n`, if the head is complete.
+/// The offset in `received` just past the first `\r\n\r\n` after the
+/// empty-line prelude (see [`skip_prelude`]), if the head is complete. The
+/// offset counts the prelude.
 fn find_head_end(received: &[u8]) -> Option<usize> {
-    received
+    let request = skip_prelude(received);
+    let prelude = received.len().saturating_sub(request.len());
+    request
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .map(|start| start.saturating_add(4))
+        .map(|start| prelude.saturating_add(start).saturating_add(4))
+}
+
+/// `bytes` without the empty lines, each a bare `\r\n`, before the request
+/// line, which a server ignores (RFC 9112 2.2).
+fn skip_prelude(bytes: &[u8]) -> &[u8] {
+    let mut rest = bytes;
+    while let Some(after) = rest.strip_prefix(b"\r\n") {
+        rest = after;
+    }
+    rest
 }
 
 /// Parses `head`, which ends with the blank line, into the request line and
 /// the headers routing needs: the method, the target in origin-form (see
 /// [`origin_form`]), the `Content-Length` and whether `Expect: 100-continue`
-/// was sent. Errors are 400 causes, each naming the rule the head broke.
+/// was sent. Empty lines before the request line are ignored (see
+/// [`skip_prelude`]). Every header value, those of ignored headers included,
+/// must be free of control bytes other than HTAB (see [`is_field_value`]).
+/// A request carries at most one `Host`, whose value must be a host (see
+/// [`is_host`]), and an HTTP/1.1 request must carry one (RFC 9112 3.2).
+/// Errors are 400 causes, each naming the rule the head broke: the request
+/// line's first, then each header line's in order, then a missing `Host`.
 fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String> {
     let bad = |cause: &str| format!("{BAD_REQUEST}: {cause}");
     let malformed_line = || bad("MALFORMED REQUEST LINE");
-    let text = std::str::from_utf8(head).map_err(|_| bad("HEAD NOT UTF-8"))?;
+    let text = std::str::from_utf8(skip_prelude(head)).map_err(|_| bad("HEAD NOT UTF-8"))?;
     let text = text
         .strip_suffix("\r\n\r\n")
         .ok_or_else(|| bad("INCOMPLETE HEAD"))?;
@@ -522,6 +601,7 @@ fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String
     let target = origin_form(target).ok_or_else(|| bad("INVALID REQUEST TARGET"))?;
     let mut content_length: Option<usize> = None;
     let mut expect_continue = false;
+    let mut host_seen = false;
     for line in lines {
         let (name, value) = line
             .split_once(':')
@@ -531,7 +611,18 @@ fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String
             return Err(bad("MALFORMED HEADER"));
         }
         let value = value.trim_matches(|c| c == ' ' || c == '\t');
-        if name.eq_ignore_ascii_case("content-length") {
+        if !is_field_value(value) {
+            return Err(bad("INVALID HEADER VALUE"));
+        }
+        if name.eq_ignore_ascii_case("host") {
+            if host_seen {
+                return Err(bad("REPEATED HOST"));
+            }
+            if !is_host(value) {
+                return Err(bad("INVALID HOST"));
+            }
+            host_seen = true;
+        } else if name.eq_ignore_ascii_case("content-length") {
             let length = parse_content_length(value)
                 .ok_or_else(|| format!("{BAD_REQUEST}: INVALID CONTENT-LENGTH"))?;
             if content_length.is_some_and(|earlier| earlier != length) {
@@ -544,6 +635,9 @@ fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String
         {
             expect_continue = true;
         }
+    }
+    if version == "HTTP/1.1" && !host_seen {
+        return Err(bad("MISSING HOST"));
     }
     Ok((method, target, content_length, expect_continue))
 }
@@ -581,6 +675,83 @@ fn is_token(text: &str) -> bool {
         && text
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// A header value, stripped of its surrounding whitespace, that holds no
+/// control byte other than HTAB: only SP, HTAB, visible ASCII and bytes from
+/// 0x80 up (RFC 9110 5.5).
+fn is_field_value(value: &str) -> bool {
+    value.bytes().all(|b| b == b'\t' || !b.is_ascii_control())
+}
+
+/// A `Host` value, `uri-host [ ":" port ]` (RFC 9110 7.2), whose host is not
+/// empty (RFC 9110 4.2.1). The host is an IPv6 address or an IPvFuture
+/// between brackets, or a reg-name, which also covers an IPv4 address
+/// (RFC 3986 3.2.2); the port is digits, possibly none (RFC 3986 3.2.3).
+/// Any host of this form is accepted, since the value takes no part in
+/// routing.
+fn is_host(value: &str) -> bool {
+    let (host_valid, port) = if let Some(literal) = value.strip_prefix('[') {
+        let Some((address, after)) = literal.split_once(']') else {
+            return false;
+        };
+        let port = match after.strip_prefix(':') {
+            Some(port) => port,
+            None if after.is_empty() => after,
+            None => return false,
+        };
+        (
+            address.parse::<Ipv6Addr>().is_ok() || is_ip_future(address),
+            port,
+        )
+    } else {
+        let (name, port) = value.split_once(':').unwrap_or((value, ""));
+        (!name.is_empty() && is_reg_name(name), port)
+    };
+    host_valid && port.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// An IPvFuture address: `v` in either case, one or more hex digits, `.`,
+/// then one or more unreserved, sub-delims or `:` characters (RFC 3986
+/// 3.2.2).
+fn is_ip_future(address: &str) -> bool {
+    let Some((version, rest)) = address
+        .strip_prefix(['v', 'V'])
+        .and_then(|after| after.split_once('.'))
+    else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|b| b.is_ascii_hexdigit())
+        && !rest.is_empty()
+        && rest
+            .bytes()
+            .all(|b| b == b':' || is_unreserved_or_sub_delim(b))
+}
+
+/// A reg-name: unreserved characters, sub-delims and percent-encoded octets,
+/// each `%` followed by two hex digits (RFC 3986 3.2.2).
+fn is_reg_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    while let Some(b) = bytes.next() {
+        let valid = if b == b'%' {
+            matches!(
+                (bytes.next(), bytes.next()),
+                (Some(high), Some(low)) if high.is_ascii_hexdigit() && low.is_ascii_hexdigit()
+            )
+        } else {
+            is_unreserved_or_sub_delim(b)
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
+}
+
+/// An unreserved character or a sub-delim (RFC 3986 2.2, 2.3).
+fn is_unreserved_or_sub_delim(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&b)
 }
 
 /// A `Content-Length` value: one or more ASCII digits that fit `usize`.
@@ -829,19 +1000,16 @@ fn json_string(value: &str) -> Option<String> {
     if pos == value.len() { Some(text) } else { None }
 }
 
-/// The byte of `text` at `pos`, if any.
 fn peek(text: &str, pos: usize) -> Option<u8> {
     text.as_bytes().get(pos).copied()
 }
 
-/// The byte of `text` at `*pos`, moving past it.
 fn bump(text: &str, pos: &mut usize) -> Option<u8> {
     let byte = peek(text, *pos)?;
     *pos = pos.saturating_add(1);
     Some(byte)
 }
 
-/// Moves past `byte`, which must come next.
 fn eat(text: &str, pos: &mut usize, byte: u8) -> Option<()> {
     if bump(text, pos) == Some(byte) {
         Some(())
@@ -850,12 +1018,10 @@ fn eat(text: &str, pos: &mut usize, byte: u8) -> Option<()> {
     }
 }
 
-/// Moves past `literal`, which must come next.
 fn eat_literal(text: &str, pos: &mut usize, literal: &str) -> Option<()> {
     literal.bytes().try_for_each(|byte| eat(text, pos, byte))
 }
 
-/// Moves past any JSON whitespace.
 fn skip_whitespace(text: &str, pos: &mut usize) {
     while matches!(peek(text, *pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
         *pos = pos.saturating_add(1);
@@ -1034,14 +1200,12 @@ fn skip_number(text: &str, pos: &mut usize) -> Option<()> {
     Some(())
 }
 
-/// Moves past any ASCII digits.
 fn skip_digits(text: &str, pos: &mut usize) {
     while matches!(peek(text, *pos), Some(b'0'..=b'9')) {
         *pos = pos.saturating_add(1);
     }
 }
 
-/// Moves past one or more ASCII digits, which must come next.
 fn skip_required_digits(text: &str, pos: &mut usize) -> Option<()> {
     let start = *pos;
     skip_digits(text, pos);
@@ -1302,83 +1466,46 @@ fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<MumpsSi
 }
 
 /// [`run_command`] of `program` with the live limits, decided by
-/// [`decide_live_result`], once `admission` has a slot free. The slot is
-/// held until the run is over. When no slot frees within `wait`, nothing
-/// starts.
+/// [`decide_live_result`], once one of `slots` is free. The slot is held
+/// until the run is over, and freed as well when the run unwinds. When no
+/// slot frees within `wait`, nothing starts.
 fn run_admitted(
-    admission: &Admission,
+    slots: &[Mutex<()>],
     wait: Duration,
     program: &str,
     args: &[String],
     stdin: &[u8],
 ) -> Result<String, LiveFailure> {
-    let Some(permit) = admission.admit(wait) else {
+    let Some(slot) = admit(slots, wait) else {
         // The request could not complete within its time budget. A live
         // failure reports only the fixed 502 causes, and this is the one
         // that names it, so there is no status or cause of its own.
         return Err(LiveFailure::Timeout);
     };
     let result = run_command(program, args, stdin, LIVE_TIMEOUT, LIVE_OUTPUT_LIMIT);
-    drop(permit);
+    drop(slot);
     decide_live_result(&result)
 }
 
-/// A bound on how many holders of a [`Permit`] there are at once, shared by
-/// every thread that admits through it.
-struct Admission {
-    /// How many permits are held.
-    running: Mutex<usize>,
-    /// Signalled each time a permit is given back.
-    freed: Condvar,
-    /// The most permits held at once.
-    slots: usize,
-}
-
-impl Admission {
-    const fn new(slots: usize) -> Admission {
-        Admission {
-            running: Mutex::new(0),
-            freed: Condvar::new(),
-            slots,
+/// The lock of the first of `slots` found free, or `None` when none frees
+/// within `wait`, counted in all rather than per attempt. A busy slot is
+/// tried again every [`POLL`]. A slot poisoned by a run that panicked is
+/// free once that run has unwound, so its lock is taken all the same.
+fn admit(slots: &[Mutex<()>], wait: Duration) -> Option<MutexGuard<'_, ()>> {
+    let started = Instant::now();
+    loop {
+        for slot in slots {
+            match slot.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => {}
+            }
         }
-    }
-
-    /// A permit as soon as fewer than `slots` are held, or `None` when none
-    /// frees within `wait`, counted in all rather than per wake-up. The
-    /// count is only ever changed whole while it is locked, so a lock
-    /// poisoned by a panic elsewhere still holds a true count, and is used.
-    fn admit(&self, wait: Duration) -> Option<Permit<'_>> {
-        let running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        let (mut running, _) = self
-            .freed
-            .wait_timeout_while(running, wait, |running| *running >= self.slots)
-            .unwrap_or_else(PoisonError::into_inner);
-        // Decided by the count itself rather than by the timeout flag, so
-        // the answer is right even after a poisoned wait.
-        if *running >= self.slots {
+        let left = wait.saturating_sub(started.elapsed());
+        if left.is_zero() {
             return None;
         }
-        *running += 1;
-        Some(Permit { admission: self })
-    }
-}
-
-/// One slot of an [`Admission`], given back, waking one waiting thread,
-/// when it is dropped.
-struct Permit<'a> {
-    admission: &'a Admission,
-}
-
-impl Drop for Permit<'_> {
-    fn drop(&mut self) {
-        let mut running = self
-            .admission
-            .running
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *running = running.saturating_sub(1);
-        drop(running);
-        self.admission.freed.notify_one();
+        thread::sleep(left.min(POLL));
     }
 }
 
@@ -1801,14 +1928,12 @@ fn stream_pairs() -> io::Result<(StdStreams, StdStreams)> {
 /// other I/O error.
 type PipeOutcome = (Vec<u8>, Result<bool, String>);
 
-/// The work of one stream worker.
 type Worker = Box<dyn FnOnce() -> PipeOutcome + Send>;
 
 /// Starts a named stream worker on a thread of its own; [`start_thread`]
 /// in every real run.
 type StartWorker = dyn FnMut(&'static str, Worker) -> io::Result<JoinHandle<PipeOutcome>>;
 
-/// Starts `work` on a new thread named `name`.
 fn start_thread(name: &'static str, work: Worker) -> io::Result<JoinHandle<PipeOutcome>> {
     thread::Builder::new().name(name.to_string()).spawn(work)
 }
@@ -2531,7 +2656,6 @@ mod tests {
         Ok(())
     }
 
-    /// The text of an I/O error.
     fn io_text(e: io::Error) -> String {
         e.to_string()
     }
@@ -3063,17 +3187,16 @@ mod tests {
         Ok(())
     }
 
-    /// How many permits of `admission` are held.
-    fn held_permits(admission: &Admission) -> usize {
-        *admission
-            .running
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn held_slots(slots: &[Mutex<()>]) -> usize {
+        slots
+            .iter()
+            .filter(|slot| matches!(slot.try_lock(), Err(TryLockError::WouldBlock)))
+            .count()
     }
 
     #[test]
     fn live_admission_bounds_concurrent_runs() -> Result<(), String> {
-        let admission = Admission::new(2);
+        let slots = [const { Mutex::new(()) }; 2];
         let inside = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
         let admitted = AtomicUsize::new(0);
@@ -3082,7 +3205,7 @@ mod tests {
             for number in 0..8 {
                 let worker = thread::Builder::new()
                     .spawn_scoped(scope, || {
-                        let Some(permit) = admission.admit(Duration::from_secs(30)) else {
+                        let Some(slot) = admit(&slots, Duration::from_secs(30)) else {
                             return;
                         };
                         let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3090,7 +3213,7 @@ mod tests {
                         thread::sleep(Duration::from_millis(50));
                         inside.fetch_sub(1, Ordering::SeqCst);
                         admitted.fetch_add(1, Ordering::SeqCst);
-                        drop(permit);
+                        drop(slot);
                     })
                     .map_err(|e| format!("starting thread {number}: {e}"))?;
                 workers.push(worker);
@@ -3105,35 +3228,34 @@ mod tests {
         let peak = peak.load(Ordering::SeqCst);
         assert!((1..=2).contains(&peak), "{peak} ran at once in two slots");
         assert_eq!(admitted.load(Ordering::SeqCst), 8, "a thread was refused");
-        assert_eq!(held_permits(&admission), 0, "a permit was not given back");
+        assert_eq!(held_slots(&slots), 0, "a slot was not freed");
         Ok(())
     }
 
     #[test]
     fn live_admission_wait_is_bounded() -> Result<(), String> {
-        let admission = Admission::new(1);
-        let held = admission
-            .admit(Duration::ZERO)
-            .ok_or_else(|| "a free slot was refused".to_string())?;
+        let slots = [const { Mutex::new(()) }; 1];
+        let held =
+            admit(&slots, Duration::ZERO).ok_or_else(|| "a free slot was refused".to_string())?;
         assert!(
-            admission.admit(Duration::ZERO).is_none(),
+            admit(&slots, Duration::ZERO).is_none(),
             "admitted past the bound"
         );
         let wait = Duration::from_millis(200);
         let started = Instant::now();
-        let refused = admission.admit(wait).is_none();
+        let refused = admit(&slots, wait).is_none();
         let elapsed = started.elapsed();
         assert!(refused, "admitted past the bound");
         assert!(elapsed >= wait, "gave up after {elapsed:?}");
         assert!(elapsed < Duration::from_secs(3), "waited {elapsed:?}");
-        // A permit given back lets a waiting thread in, and only then.
+        // A slot freed lets a waiting thread in, and only then.
         let released = AtomicBool::new(false);
         let after_release = thread::scope(|scope| -> Result<Option<bool>, String> {
             let waiter = thread::Builder::new()
                 .spawn_scoped(scope, || {
-                    let permit = admission.admit(Duration::from_secs(30))?;
+                    let slot = admit(&slots, Duration::from_secs(30))?;
                     let after = released.load(Ordering::SeqCst);
-                    drop(permit);
+                    drop(slot);
                     Some(after)
                 })
                 .map_err(io_text)?;
@@ -3145,7 +3267,7 @@ mod tests {
                 .map_err(|_| "the waiting thread panicked".to_string())
         })?;
         assert_eq!(after_release, Some(true), "admitted before the release");
-        assert_eq!(held_permits(&admission), 0, "a permit was not given back");
+        assert_eq!(held_slots(&slots), 0, "a slot was not freed");
         Ok(())
     }
 
@@ -3162,7 +3284,7 @@ mod tests {
             return Ok(());
         }
         // Six runs of 0.3 s through two slots take three turns at least.
-        let admission = Admission::new(2);
+        let slots = [const { Mutex::new(()) }; 2];
         let args = strings(&["0.3"]);
         let started = Instant::now();
         let results = thread::scope(|scope| -> Result<Vec<_>, String> {
@@ -3170,7 +3292,7 @@ mod tests {
             for number in 0..6 {
                 let run = thread::Builder::new()
                     .spawn_scoped(scope, || {
-                        run_admitted(&admission, Duration::from_secs(60), "sleep", &args, b"")
+                        run_admitted(&slots, Duration::from_secs(60), "sleep", &args, b"")
                     })
                     .map_err(|e| format!("starting run {number}: {e}"))?;
                 runs.push(run);
@@ -3185,22 +3307,21 @@ mod tests {
             elapsed >= Duration::from_millis(900),
             "more than two ran at once: {elapsed:?}"
         );
-        assert_eq!(held_permits(&admission), 0, "a permit was not given back");
+        assert_eq!(held_slots(&slots), 0, "a slot was not freed");
         Ok(())
     }
 
     #[test]
     fn live_admission_expiry_starts_nothing() -> Result<(), String> {
         let absent = "/nonexistent/ifcap-po-inquiry-no-such-program";
-        let admission = Admission::new(1);
-        let held = admission
-            .admit(Duration::ZERO)
-            .ok_or_else(|| "a free slot was refused".to_string())?;
+        let slots = [const { Mutex::new(()) }; 1];
+        let held =
+            admit(&slots, Duration::ZERO).ok_or_else(|| "a free slot was refused".to_string())?;
         // Starting the absent program would be `Spawn`; with no slot free it
         // is never tried.
         let wait = Duration::from_millis(200);
         let started = Instant::now();
-        let expired = run_admitted(&admission, wait, absent, &[], b"");
+        let expired = run_admitted(&slots, wait, absent, &[], b"");
         let elapsed = started.elapsed();
         assert_eq!(expired, Err(LiveFailure::Timeout));
         assert_eq!(
@@ -3210,12 +3331,12 @@ mod tests {
         assert!(elapsed >= wait, "gave up after {elapsed:?}");
         assert!(elapsed < Duration::from_secs(3), "waited {elapsed:?}");
         drop(held);
-        let attempted = run_admitted(&admission, wait, absent, &[], b"");
+        let attempted = run_admitted(&slots, wait, absent, &[], b"");
         assert!(
             matches!(&attempted, Err(LiveFailure::Spawn(_))),
             "{attempted:?}"
         );
-        assert_eq!(held_permits(&admission), 0, "a permit was not given back");
+        assert_eq!(held_slots(&slots), 0, "a slot was not freed");
         Ok(())
     }
 
@@ -3538,12 +3659,35 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             parse_head(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
             Ok(("GET", "/".to_string(), None, false))
         );
+        // An HTTP/1.0 request needs no `Host`.
         assert_eq!(
             parse_head(
                 b"POST /api/rust/session HTTP/1.0\r\ncontent-length: 12\r\nContent-Length:12\r\nExpect: 100-continue\r\n\r\n"
             ),
             Ok(("POST", "/api/rust/session".to_string(), Some(12), true))
         );
+        // Each head accepted as `GET /`: an empty-line prelude, `Host` values
+        // of every form, any host name included, and a value with an HTAB
+        // and a byte from 0x80.
+        let accepted: [&[u8]; 9] = [
+            b"\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n",
+            b"\r\n\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: h:8080\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: [v1.a:b]\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: %41-b~!$&'()*+,;=\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: h:\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\tb \xc3\xa9\r\n\r\n",
+        ];
+        for head in accepted {
+            assert_eq!(
+                parse_head(head),
+                Ok(("GET", "/".to_string(), None, false)),
+                "for {}",
+                String::from_utf8_lossy(head)
+            );
+        }
         // Each absolute-form target, and the origin-form it is routed by.
         let absolute: [(&str, &str); 7] = [
             ("http://127.0.0.1:18221/", "/"),
@@ -3563,12 +3707,16 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             );
         }
         // Each rejected head, and the rule its 400 cause names.
-        let rejected: [(&[u8], &str); 26] = [
+        let rejected: [(&[u8], &str); 43] = [
             (b"GET /\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET / HTTP/1.1 x\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET  / HTTP/1.1\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET / \r\n\r\n", "MALFORMED REQUEST LINE"),
-            (b"\r\n\r\n", "MALFORMED REQUEST LINE"),
+            (b"\r\n\r\n", "INCOMPLETE HEAD"),
+            (
+                b"\r\n \r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n",
+                "MALFORMED REQUEST LINE",
+            ),
             (b"G/T / HTTP/1.1\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET / HTTP/2\r\n\r\n", "UNSUPPORTED HTTP VERSION"),
             (b"GET / HTTP/2.0\r\n\r\n", "UNSUPPORTED HTTP VERSION"),
@@ -3604,6 +3752,40 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             (
                 b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
                 "TRANSFER-ENCODING NOT SUPPORTED",
+            ),
+            (b"GET / HTTP/1.1\r\n\r\n", "MISSING HOST"),
+            (b"GET http://h/ HTTP/1.1\r\n\r\n", "MISSING HOST"),
+            (
+                b"GET / HTTP/1.1\r\nHost: h\r\nhost: h\r\n\r\n",
+                "REPEATED HOST",
+            ),
+            (
+                b"GET / HTTP/1.0\r\nHost: h\r\nHost: h\r\n\r\n",
+                "REPEATED HOST",
+            ),
+            (b"GET / HTTP/1.1\r\nHost: a b\r\n\r\n", "INVALID HOST"),
+            (b"GET / HTTP/1.1\r\nHost: a/b\r\n\r\n", "INVALID HOST"),
+            (b"GET / HTTP/1.1\r\nHost: h:x\r\n\r\n", "INVALID HOST"),
+            (b"GET / HTTP/1.1\r\nHost: [zz]\r\n\r\n", "INVALID HOST"),
+            (b"GET / HTTP/1.1\r\nHost:\r\n\r\n", "INVALID HOST"),
+            (b"GET / HTTP/1.1\r\nHost: u@h\r\n\r\n", "INVALID HOST"),
+            (b"GET / HTTP/1.1\r\nHost: [::1\r\n\r\n", "INVALID HOST"),
+            (b"GET / HTTP/1.1\r\nHost: %4g\r\n\r\n", "INVALID HOST"),
+            (
+                b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\x00b\r\n\r\n",
+                "INVALID HEADER VALUE",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\rb\r\n\r\n",
+                "INVALID HEADER VALUE",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\x7fb\r\n\r\n",
+                "INVALID HEADER VALUE",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nX-Test: \x00\r\nHost: a b\r\n\r\n",
+                "INVALID HEADER VALUE",
             ),
         ];
         for (head, cause) in rejected {
@@ -3649,7 +3831,7 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         let trickle = |bytes: &[u8]| -> Vec<(Duration, Vec<u8>)> {
             bytes.iter().map(|byte| (tick, vec![*byte])).collect()
         };
-        let head = b"POST /api/rust/session HTTP/1.1\r\nContent-Length: 100\r\n\r\n";
+        let head = b"POST /api/rust/session HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\n\r\n";
         let mut trickled_body = now(head);
         trickled_body.extend(trickle(&[b'x'; 100]));
         let oversized = |end: &[u8], filler: usize| {
@@ -3667,7 +3849,7 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         let request_then_body = vec![
             (
                 Duration::ZERO,
-                b"POST /api/rust/session HTTP/1.1\r\nContent-Length: 2\r\n\r\n".to_vec(),
+                b"POST /api/rust/session HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n".to_vec(),
             ),
             (Duration::from_millis(100), b"{}".to_vec()),
         ];
@@ -3722,6 +3904,27 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 oversized(b"\r\n\r\n", MAX_HEAD),
                 false,
                 bad("HEAD TOO LARGE"),
+                Duration::ZERO,
+            ),
+            (
+                "empty-line prelude trickled",
+                trickle(&b"\r\n".repeat(50)),
+                false,
+                bad("READ TIMEOUT"),
+                request_time,
+            ),
+            (
+                "empty-line prelude over the limit",
+                now(&b"\r\n".repeat(MAX_HEAD / 2 + 2048)),
+                false,
+                bad("HEAD TOO LARGE"),
+                Duration::ZERO,
+            ),
+            (
+                "empty-line prelude, then a request",
+                now(b"\r\n\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n"),
+                false,
+                Ok(Some(("GET".to_string(), "/".to_string(), None))),
                 Duration::ZERO,
             ),
             (
@@ -3862,6 +4065,7 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         let get_required = error_body(GET_REQUIRED).into_bytes();
         let post_required = error_body(POST_REQUIRED).into_bytes();
         let malformed = error_body(&format!("{BAD_REQUEST}: MALFORMED REQUEST LINE")).into_bytes();
+        let missing_host = error_body(&format!("{BAD_REQUEST}: MISSING HOST")).into_bytes();
         let request = |line: &str| format!("{line} HTTP/1.1\r\nHost: h\r\n\r\n");
         // (request, status line, content type, the body a GET gets, whether
         // the answer leaves that body out)
@@ -3897,10 +4101,30 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 &malformed,
                 true,
             ),
+            // A `HEAD` after an empty-line prelude, accepted or rejected.
+            (
+                format!("\r\n{}", request("HEAD /app.js")),
+                "200 OK",
+                js_type,
+                &app_js,
+                true,
+            ),
+            (
+                "\r\n\r\nHEAD / HTTP/1.1\r\n\r\n".to_string(),
+                "400 Bad Request",
+                JSON_TYPE,
+                &missing_host,
+                true,
+            ),
         ];
         for (request, status_line, content_type, body, head_request) in cases {
             let (mut client, mut server) = loopback_pair()?;
-            let request_line = request.lines().next().unwrap_or_default().to_string();
+            let request_line = request
+                .trim_start()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
             client
                 .write_all(request.as_bytes())
                 .and_then(|()| client.shutdown(Shutdown::Write))
@@ -4085,6 +4309,131 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         Ok(())
     }
 
+    /// One scripted read of a drain: `Ok(Ok(n))` delivers `n` bytes, or as
+    /// many as the window holds; `Ok(Err(kind))` is a read that fails with
+    /// `kind`; `Err(kind)` is a read timeout that cannot be set.
+    type DrainStep = Result<Result<usize, io::ErrorKind>, io::ErrorKind>;
+
+    /// A `drain_reads` case: its name, the time limit and the scripted
+    /// reads, then the bytes discarded, how many reads were made and whether
+    /// the time budget ended it. A read past the script waits out the time
+    /// left and is then interrupted.
+    type DrainCase = (&'static str, Duration, Vec<DrainStep>, usize, usize, bool);
+
+    #[test]
+    fn drain_retries_interrupted_reads_within_its_budgets() {
+        use io::ErrorKind::{ConnectionReset, Interrupted, InvalidInput, WouldBlock};
+        let cases: Vec<DrainCase> = vec![
+            (
+                "interrupted between data reads, then the end of input",
+                IO_TIMEOUT,
+                vec![
+                    Ok(Ok(3)),
+                    Ok(Err(Interrupted)),
+                    Ok(Ok(5)),
+                    Ok(Err(Interrupted)),
+                    Ok(Err(Interrupted)),
+                    Ok(Ok(7)),
+                    Ok(Ok(0)),
+                    Ok(Ok(11)),
+                ],
+                15,
+                7,
+                false,
+            ),
+            (
+                "interrupted, then a reset",
+                IO_TIMEOUT,
+                vec![
+                    Ok(Ok(4)),
+                    Ok(Err(Interrupted)),
+                    Ok(Err(ConnectionReset)),
+                    Ok(Ok(9)),
+                ],
+                4,
+                3,
+                false,
+            ),
+            (
+                "interrupted, then a read that times out",
+                IO_TIMEOUT,
+                vec![
+                    Ok(Err(Interrupted)),
+                    Ok(Ok(2)),
+                    Ok(Err(WouldBlock)),
+                    Ok(Ok(9)),
+                ],
+                2,
+                3,
+                false,
+            ),
+            (
+                "interrupted, then a read timeout that cannot be set",
+                IO_TIMEOUT,
+                vec![
+                    Ok(Ok(6)),
+                    Ok(Err(Interrupted)),
+                    Err(InvalidInput),
+                    Ok(Ok(9)),
+                ],
+                6,
+                3,
+                false,
+            ),
+            // One byte first, so that the last window holds only the bytes
+            // left: 255 full windows, then one a byte short.
+            (
+                "the byte budget, with every other read interrupted",
+                IO_TIMEOUT,
+                std::iter::once(Ok(Ok(1)))
+                    .chain((0..300).flat_map(|_| [Ok(Err(Interrupted)), Ok(Ok(usize::MAX))]))
+                    .collect(),
+                DRAIN_BYTES,
+                1 + 2 * (DRAIN_BYTES / 8192),
+                false,
+            ),
+            (
+                "the time budget, with the last read interrupted",
+                Duration::from_millis(50),
+                vec![Ok(Ok(1)), Ok(Err(Interrupted)), Ok(Ok(1))],
+                2,
+                4,
+                true,
+            ),
+        ];
+        for (name, limit, script, expected, reads, timed_out) in cases {
+            let mut steps = script.into_iter();
+            let mut made = 0usize;
+            let mut within = true;
+            let started = Instant::now();
+            let discarded = drain_reads(limit, |window, time_left| {
+                made += 1;
+                within &= !window.is_empty()
+                    && window.len() <= 8192
+                    && !time_left.is_zero()
+                    && time_left <= limit;
+                match steps.next() {
+                    Some(step) => step
+                        .map(|read| read.map(|n| n.min(window.len())).map_err(io::Error::from))
+                        .map_err(io::Error::from),
+                    None => {
+                        thread::sleep(time_left);
+                        Ok(Err(io::Error::from(Interrupted)))
+                    }
+                }
+            });
+            let took = started.elapsed();
+            assert_eq!(discarded, expected, "{name}: bytes discarded");
+            assert_eq!(made, reads, "{name}: reads made");
+            assert!(within, "{name}: every read within the budgets left");
+            assert_eq!(
+                took >= limit,
+                timed_out,
+                "{name}: the time budget ended it, after {took:?}"
+            );
+        }
+    }
+
     #[test]
     fn worker_failures_returned_once_every_worker_is_joined() -> Result<(), String> {
         /// Waits up to `IO_TIMEOUT` for `release`. When it never comes, sets
@@ -4153,7 +4502,14 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         let mumps = Arc::new(MumpsMode::Replay {
             golden_dir: PathBuf::new(),
         });
-        let served = accept_until(&listener, &store, &mumps, &shutdown, &mut workers);
+        let served = accept_until(
+            &listener,
+            &store,
+            &mumps,
+            &shutdown,
+            &mut workers,
+            MAX_CONNECTIONS,
+        );
         let still_open = workers.len();
         release.store(true, Ordering::SeqCst);
         let stopped = stop_workers(workers);
@@ -4172,6 +4528,108 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         );
         assert!(last_joined.load(Ordering::SeqCst), "every worker joined");
         drop(clients);
+        Ok(())
+    }
+
+    #[test]
+    fn connections_past_the_bound_wait_unanswered_until_a_worker_finishes() -> Result<(), String> {
+        /// Sends a request on a connection past the bound, which `idle`
+        /// fills, and checks that it is not answered while the bound holds.
+        /// Then closes one idle connection and gives the status line of the
+        /// response, with how long after the close it began.
+        fn answered_once_a_slot_frees(
+            addr: std::net::SocketAddr,
+            idle: &mut Vec<TcpStream>,
+        ) -> Result<(String, Duration), String> {
+            let fail = |what: &str, e: io::Error| format!("{what}: {e}");
+            let mut waiting = TcpStream::connect(addr).map_err(|e| fail("connect", e))?;
+            waiting
+                .write_all(b"GET /no-such-path HTTP/1.1\r\nHost: x\r\n\r\n")
+                .and_then(|()| waiting.set_read_timeout(Some(Duration::from_millis(500))))
+                .map_err(|e| fail("send the request", e))?;
+            let mut buf = [0u8; 4096];
+            match waiting.read(&mut buf) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Ok(0) => return Err("closed past the bound".to_string()),
+                Ok(n) => return Err(format!("answered past the bound: {n} bytes")),
+                Err(e) => return Err(fail("read past the bound", e)),
+            }
+            waiting
+                .set_read_timeout(Some(IO_TIMEOUT))
+                .map_err(|e| fail("set read timeout", e))?;
+            drop(idle.pop());
+            let freed = Instant::now();
+            let mut received = Vec::new();
+            while !received.windows(2).any(|pair| pair == b"\r\n") {
+                let n = waiting
+                    .read(&mut buf)
+                    .map_err(|e| fail("read the response", e))?;
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+            }
+            let took = freed.elapsed();
+            let text = String::from_utf8_lossy(&received);
+            Ok((text.lines().next().unwrap_or_default().to_string(), took))
+        }
+        const LIMIT: usize = 2;
+        let fail = |what: &str, e: io::Error| format!("{what}: {e}");
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| fail("bind", e))?;
+        let addr = listener.local_addr().map_err(|e| fail("local_addr", e))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| fail("set nonblocking", e))?;
+        // Queued before the connection past the bound, so they are accepted
+        // first; they send nothing, so their workers stay open.
+        let mut idle = Vec::new();
+        for _ in 0..LIMIT {
+            idle.push(TcpStream::connect(addr).map_err(|e| fail("connect", e))?);
+        }
+        let store = Arc::new(Store::from_zwr("").map_err(|e| e.to_string())?);
+        let mumps = Arc::new(MumpsMode::Replay {
+            golden_dir: PathBuf::new(),
+        });
+        let shutdown = AtomicBool::new(false);
+        let mut workers = Vec::new();
+        let (answered, served) = thread::scope(|scope| -> Result<_, String> {
+            let serving = thread::Builder::new()
+                .spawn_scoped(scope, || {
+                    accept_until(&listener, &store, &mumps, &shutdown, &mut workers, LIMIT)
+                })
+                .map_err(io_text)?;
+            let answered = answered_once_a_slot_frees(addr, &mut idle);
+            shutdown.store(true, Ordering::SeqCst);
+            let served = serving
+                .join()
+                .map_err(|_| "the accept loop panicked".to_string())?;
+            Ok((answered, served))
+        })?;
+        let still_open = workers.len();
+        let stopped = stop_workers(workers);
+        drop(idle);
+        let (status_line, took) = answered?;
+        println!("answered {took:?} after a slot freed: {status_line}");
+        served.map_err(io_text)?;
+        stopped.map_err(io_text)?;
+        assert!(
+            status_line.starts_with("HTTP/1.1 404 "),
+            "status line {status_line:?}"
+        );
+        // The idle connection left open would end its worker only after
+        // `IO_TIMEOUT`; the margin allows for a loaded host.
+        assert!(
+            took < IO_TIMEOUT / 2,
+            "answered {took:?} after a slot freed"
+        );
+        assert!(
+            still_open <= LIMIT,
+            "{still_open} workers open past the bound"
+        );
         Ok(())
     }
 }
