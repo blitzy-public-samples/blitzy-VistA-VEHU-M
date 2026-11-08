@@ -1263,7 +1263,7 @@ Run for this document from `rust/ifcap-po-inquiry/` by shell redirection into `t
 | `git -C ../.. status --porcelain -- . ':(exclude)rust/ifcap-po-inquiry'` | none | 0 |
 | `git -C ../.. diff --quiet dd3fd0f3124c8178657d9fff4173c324da30f7ae HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION` (supplementary: unchanged since the baseline commit) | none | 0 |
 
-Result: A7 holds at the time of this document. The planning-time run gave the same result (first command exit 0, second printed nothing); that was planning, not run evidence. `REPORT.md`'s evidence run appends an end-of-run A7 block to the same file, and that block decides A7 for the run.
+Result: A7 holds at the time of this document. The planning-time run gave the same result (first command exit 0, second printed nothing); that was planning, not run evidence. `REPORT.md`'s evidence run saves an end-of-run A7 block, `# A7 (end of run)`, in the `source-unchanged.txt` of its own `test-results/<run-id>/`, and that block decides A7 for the run.
 
 ## Front-end checklist
 

@@ -37,12 +37,14 @@ function reactionsOn() {
   return root.dataset.mode === "rust" && !reduceMotion.matches;
 }
 
-// One row per "\n"-separated line, text set verbatim (BEL and other control
-// bytes included), so the screen shows exactly what the backend returned.
-function render(container, transcript, key, animate) {
+// Rendering, step one: one row per "\n"-separated line, text set verbatim
+// (BEL and other control bytes included), built into a detached fragment.
+// No pane is touched, so every pane of an answer is built before any is shown.
+function prepareRows(container, transcript, key, animate) {
   const lines = transcript.split("\n");
   const prev = previousLineCount.get(key) ?? 0;
-  const rows = lines.map((text, i) => {
+  const fragment = document.createDocumentFragment();
+  lines.forEach((text, i) => {
     const row = document.createElement("div");
     row.className = "ln";
     row.textContent = text;
@@ -50,11 +52,18 @@ function render(container, transcript, key, animate) {
       row.classList.add("new");
       row.addEventListener("animationend", () => row.classList.remove("new"), { once: true });
     }
-    return row;
+    fragment.append(row);
   });
-  container.replaceChildren(...rows);
-  previousLineCount.set(key, lines.length);
-  container.scrollTop = container.scrollHeight;
+  return { container: container, key: key, fragment: fragment, count: lines.length };
+}
+
+// Rendering, step two: the pane's rows are swapped for the prepared fragment
+// in one call, however many lines it holds, so the screen shows exactly what
+// the backend returned.
+function commitRows(prepared) {
+  prepared.container.replaceChildren(prepared.fragment);
+  previousLineCount.set(prepared.key, prepared.count);
+  prepared.container.scrollTop = prepared.container.scrollHeight;
 }
 
 // The transcript of one 200 body side. Anything else throws before any pane
@@ -68,7 +77,9 @@ function transcriptOf(side) {
 }
 
 // The shake and red outline. The class is removed and a reflow forced first,
-// so a second rejection in a row replays the animation.
+// so a second rejection in a row replays the animation. One shared listener
+// ends every shake, so a shake cancelled before it finishes leaves nothing
+// behind.
 function reject() {
   if (!reactionsOn()) {
     return;
@@ -76,10 +87,16 @@ function reject() {
   transcriptEl.classList.remove("reject");
   void transcriptEl.offsetWidth;
   transcriptEl.classList.add("reject");
-  transcriptEl.addEventListener("animationend", () => transcriptEl.classList.remove("reject"), {
-    once: true,
-  });
 }
+
+// Registered once for the life of the page. Row slide-ins bubble their
+// animationend up to the transcript, so only the transcript's own shake
+// ending removes the class.
+transcriptEl.addEventListener("animationend", (event) => {
+  if (event.target === transcriptEl) {
+    transcriptEl.classList.remove("reject");
+  }
+});
 
 // A request that never reached a 2xx answer: the error is shown, the
 // transcripts stay as last rendered, and COMPARE has no result to show.
@@ -91,6 +108,9 @@ function showFailure(backend, message) {
   reject();
 }
 
+// A 2xx answer: every pane it names is prepared before any is committed, so
+// either every pane and the verdict change together or, for a body that
+// cannot be shown, only the error line does.
 function showSuccess(backend, text) {
   errorStatus.textContent = "";
   try {
@@ -98,16 +118,17 @@ function showSuccess(backend, text) {
     if (backend === "compare") {
       const mumpsText = transcriptOf(body.mumps);
       const rustText = transcriptOf(body.rust);
-      // Bracket access keeps the front-end's static no-validation search
-      // free of hits. Only the bridge's verdict is shown; transcripts are
-      // never compared here.
+      // Only the bridge decides the comparison verdict: the status line shows
+      // its match field, and transcripts are never compared here.
       const verdict = body["match"];
-      render(mumpsPane, mumpsText, "compare:mumps", false);
-      render(rustPane, rustText, "compare:rust", false);
+      const mumpsRows = prepareRows(mumpsPane, mumpsText, "compare:mumps", false);
+      const rustRows = prepareRows(rustPane, rustText, "compare:rust", false);
+      commitRows(mumpsRows);
+      commitRows(rustRows);
       matchStatus.textContent =
         verdict === true ? "MATCH" : verdict === false ? "MISMATCH" : NOT_COMPARED;
     } else {
-      render(transcriptEl, transcriptOf(body), backend, reactionsOn());
+      commitRows(prepareRows(transcriptEl, transcriptOf(body), backend, reactionsOn()));
     }
   } catch (err) {
     // A 200 is never a rejection, so no shake here.
