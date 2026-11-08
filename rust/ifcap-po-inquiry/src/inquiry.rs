@@ -2550,6 +2550,72 @@ mod tests {
     }
 
     #[test]
+    fn later_index_candidate_is_counted() -> Result<(), String> {
+        // `SPEC.md` R5 step 5: after `C`, every later subscript of `^PRC(442)`
+        // whose `$D` is 10 is searched, exact then partial [DIC3.m:61-69].
+        // Order 5 passes the screen and is filed only under `E`, the FCP
+        // index. Found there beside order 1, the exact `C` match, it makes two
+        // candidates (PO-09.b10); found there alone, by its exact or a partial
+        // value, it is one candidate not from `C` (PO-09.b9).
+        for (filed, value, expected) in [
+            ("A12345", "A12345", "PO-09.b10"),
+            ("Z55555", "Z55555", "PO-09.b9"),
+            ("Z55555", "Z555", "PO-09.b9"),
+        ] {
+            let store = order_store(&format!(
+                r#"^PRC(442,5,0)="500-Z55555^2^101 GENERAL"
+^PRC(442,"E","{filed}",5)=""
+"#
+            ))?;
+            assert_eq!(
+                inquire(&store, &inputs(&["", value, "^"])),
+                unsupported_branch(expected),
+                "order 5 under E as {filed:?}, value {value:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pointer_index_is_skipped_for_numeric_value() -> Result<(), String> {
+        // `SPEC.md` R5 step 5: a later index on a pointer field (D, F, G, M,
+        // MCH, ST) is skipped when the value is numeric, `+$P(X,"E")=X`
+        // [DIC4.m:84-86]; every other later index, and a pointer index for any
+        // other value, is searched on the raw value. Order 5 passes the screen
+        // and is filed only under the index node given. Skipped, it leaves no
+        // candidate, and with no pointed-to `B` entry the pointer-candidate
+        // rule (R6) finds none either: the no-match path. Searched, it is one
+        // candidate not from `C` (PO-09.b9). `G` files the order before its
+        // 442.14 subrecord.
+        for (node, value, expected) in [
+            (r#""D","77",5"#, "77", NO_MATCH),
+            (r#""F","77",5"#, "77", NO_MATCH),
+            (r#""G","77",5,1"#, "77", NO_MATCH),
+            (r#""M","77",5"#, "77", NO_MATCH),
+            (r#""MCH","77",5"#, "77", NO_MATCH),
+            (r#""ST","77",5"#, "77", NO_MATCH),
+            // Not numeric: text, and digits that are not a canonical number.
+            (r#""D","Z55555",5"#, "Z55555", "PO-09.b9"),
+            (r#""D","077",5"#, "077", "PO-09.b9"),
+            // Not pointer indexes: E (free text) and MAPP (numeric field).
+            (r#""E","77",5"#, "77", "PO-09.b9"),
+            (r#""MAPP","77",5"#, "77", "PO-09.b9"),
+        ] {
+            let store = order_store(&format!(
+                r#"^PRC(442,5,0)="500-Z55555^2^101 GENERAL"
+^PRC(442,{node})=""
+"#
+            ))?;
+            assert_eq!(
+                inquire(&store, &inputs(&["", value, "^"])),
+                unsupported_branch(expected),
+                "order 5 filed as ^PRC(442,{node}), value {value:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn unreferenced_vendor_with_matching_name_is_not_a_candidate() -> Result<(), String> {
         let store = order_store(VENDORS)?;
         assert_eq!(
@@ -2731,6 +2797,41 @@ mod tests {
     }
 
     #[test]
+    fn word_wrap_wrapper_restores_caller_da() {
+        let cases = [
+            (None, "WIDGET, BLUE", Ok(())),
+            (None, "A |TAB| B", Err(unsupported("PO-15.b3"))),
+            (None, "A |WINDOW| B", Err(unsupported("PO-15.b2"))),
+            (Some("42"), "WIDGET, BLUE", Ok(())),
+            (Some("42"), "A |TAB| B", Err(unsupported("PO-15.b3"))),
+            (Some("42"), "A |WINDOW| B", Err(unsupported("PO-15.b2"))),
+        ];
+        let store = Store::default();
+        let no_input: Vec<String> = Vec::new();
+        for (caller_da, text, outcome) in cases {
+            let mut s = Session::new(&no_input);
+            let mut v = Locals {
+                diwl: Some(1),
+                diwr: Some(33),
+                diwf: Some(String::new()),
+                da: caller_da.map(str::to_string),
+                x: Some(text.to_string()),
+                ..Locals::default()
+            };
+            assert_eq!(
+                diwp_prcutl(&mut s, &store, &mut v, "1"),
+                outcome,
+                "caller DA {caller_da:?}, text {text:?}"
+            );
+            assert_eq!(
+                v.da.as_deref(),
+                caller_da,
+                "DIWP^PRCUTL restores the caller's DA {caller_da:?}, text {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn date_prints_month_day_year_unpadded() {
         let store = Store::default();
         let no_input: Vec<String> = Vec::new();
@@ -2799,20 +2900,22 @@ mod tests {
 
     #[test]
     fn item_line_runs_to_paging_gate() -> Result<(), String> {
+        // Item IEN 7 holds line number 3 in piece 1 of its zero node, so the
+        // printed number shows which of the two the line was built from.
         let store = order_store(
-            r#"^PRC(442,1,2,0)="^442.01IA^1^1"
-^PRC(442,1,2,1,0)="1^2^1^2696 SUPPLIES^^STK-9^^^125.5"
-^PRC(442,1,2,1,1,0)="^^1^1^3261028^"
-^PRC(442,1,2,1,1,1,0)="WIDGET, BLUE"
-^PRC(442,1,2,1,2)="251"
+            r#"^PRC(442,1,2,0)="^442.01IA^7^1"
+^PRC(442,1,2,7,0)="3^2^1^2696 SUPPLIES^^STK-9^^^125.5"
+^PRC(442,1,2,7,1,0)="^^1^1^3261028^"
+^PRC(442,1,2,7,1,1,0)="WIDGET, BLUE"
+^PRC(442,1,2,7,2)="251"
 ^PRCD(420.5,1,0)="EACH"
 "#,
         )?;
         let no_input: Vec<String> = Vec::new();
         let mut s = Session::new(&no_input);
         let mut v = Locals {
-            prchdi: Some("1".to_string()),
-            prchdi0: Some(store.get_or_empty(&key("PRC", &["442", "1", "2", "1", "0"]))),
+            prchdi: Some("7".to_string()),
+            prchdi0: Some(store.get_or_empty(&key("PRC", &["442", "1", "2", "7", "0"]))),
             prchdi2: Some("251".to_string()),
             prchdq: Some("0".to_string()),
             ..order_locals(&store)
@@ -2823,12 +2926,20 @@ mod tests {
         );
         let sp = |n: usize| " ".repeat(n);
         let expected = format!(
-            "\n    1  WIDGET, BLUE {}    2  EACH  125.50{} 251.00\n{}STK#: STK-9",
+            "\n    3  WIDGET, BLUE {}    2  EACH  125.50{} 251.00\n{}STK#: STK-9",
             sp(20),
             sp(8),
             sp(8)
         );
         assert_eq!(s.transcript(), expected);
+        let line = s
+            .transcript()
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
+        // $J(+$P(PRCHDI0,U,1),3) at column 2 fills columns 3-5.
+        assert_eq!(extract(&line, 3, 5), "  3", "line number, not IEN 7");
         assert_eq!(v.prchdcnt.as_deref(), Some("1"));
         Ok(())
     }
@@ -2840,6 +2951,9 @@ mod tests {
             (".99", "   0.99"),
             // $J(x,6,3) is one column narrower; the seventh is the pad before column 67.
             ("1.125", " 1.125 "),
+            // $J(x,5,4) pads to five columns only: a six-character value gets no
+            // leading pad, and the seventh column is the pad before column 67.
+            ("1.2345", "1.2345 "),
             ("12.3456", "12.3456"),
             ("N/C", "    N/C"),
         ];

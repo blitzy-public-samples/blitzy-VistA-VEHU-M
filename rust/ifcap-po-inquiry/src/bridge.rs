@@ -2109,39 +2109,53 @@ mod tests {
 
     #[test]
     fn decide_live_result_non_zero_exit() {
-        // 250 bytes of standard error, the first not UTF-8: only the first
-        // 200 are kept, decoded lossily.
-        let mut stderr = vec![0xFF];
-        stderr.extend(std::iter::repeat_n(b'e', 249));
-        let head = format!("\u{fffd}{}", "e".repeat(199));
-        for (code, label) in [(Some(3), "3"), (None, "NONE")] {
-            let result = ExecResult {
-                exit_code: code,
-                stderr: stderr.clone(),
-                ..exited_ok()
-            };
-            let failure = decide_live_result(&result);
-            assert_eq!(
-                failure,
-                Err(LiveFailure::NonZeroExit {
-                    code,
-                    stderr_head: head.clone(),
-                })
-            );
-            assert_eq!(
-                failure.map_err(|f| f.to_string()),
-                Err(format!("EXIT {label}: {head}"))
-            );
+        // 251 bytes of standard error: 199 ASCII bytes, then `é` (0xC3 0xA9)
+        // as bytes 200 and 201. The 200-byte cut keeps only 0xC3, which
+        // decodes lossily to U+FFFD; a 200-character cut would keep the
+        // whole `é`.
+        let mut crossing = vec![b'a'; 199];
+        crossing.extend("é".bytes());
+        crossing.extend(std::iter::repeat_n(b'z', 50));
+        assert_eq!(crossing.get(199..201), Some([0xC3, 0xA9].as_slice()));
+        // 250 bytes of standard error, the first not UTF-8.
+        let mut invalid_first = vec![0xFF];
+        invalid_first.extend(std::iter::repeat_n(b'e', 249));
+        let stderrs = [
+            (crossing, format!("{}\u{fffd}", "a".repeat(199))),
+            (invalid_first, format!("\u{fffd}{}", "e".repeat(199))),
+            (
+                b"no such container".to_vec(),
+                "no such container".to_string(),
+            ),
+        ];
+        // Standard output is not UTF-8 either: the exit code is decided
+        // first, so every row is `NonZeroExit`, never `NonUtf8`.
+        for (code, label) in [(Some(3), "3"), (None, "NONE"), (Some(1), "1")] {
+            for (number, (stderr, head)) in stderrs.iter().enumerate() {
+                let result = ExecResult {
+                    spawn_error: None,
+                    exit_code: code,
+                    timed_out: false,
+                    output_limit_exceeded: false,
+                    stdout: vec![b'T', 0xFF],
+                    stderr: stderr.clone(),
+                };
+                let failure = decide_live_result(&result);
+                assert_eq!(
+                    failure,
+                    Err(LiveFailure::NonZeroExit {
+                        code,
+                        stderr_head: head.clone(),
+                    }),
+                    "exit {label}, stderr {number}"
+                );
+                assert_eq!(
+                    failure.map_err(|f| f.to_string()),
+                    Err(format!("EXIT {label}: {head}")),
+                    "exit {label}, stderr {number}"
+                );
+            }
         }
-        let short = ExecResult {
-            exit_code: Some(1),
-            stderr: b"no such container".to_vec(),
-            ..exited_ok()
-        };
-        assert_eq!(
-            decide_live_result(&short).map_err(|f| f.to_string()),
-            Err("EXIT 1: no such container".to_string())
-        );
     }
 
     #[test]
@@ -2352,7 +2366,7 @@ mod tests {
             Ok(n) => return Err(format!("read {n} bytes from a write-only file")),
             Err(e) => e.to_string(),
         };
-        let failing = (&b"ab"[..]).chain(write_only()?);
+        let failing = b"ab".as_slice().chain(write_only()?);
         assert_eq!(
             read_bounded(failing, 16, None, &cancel),
             (b"ab".to_vec(), Err(refused))
@@ -3063,10 +3077,26 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 pairs(&[("DUZ", ".5"), ("STATION", "500")]),
                 "CONTEXT MISMATCH IOF: expected UNRESOLVED, actual MISSING",
             ),
+            (
+                pairs(&[
+                    ("DUZ", ".5"),
+                    ("IOF", "UNRESOLVED"),
+                    ("IOSL", "UNRESOLVED"),
+                    ("STATION", "500"),
+                ]),
+                "CONTEXT MISMATCH IOF: expected UNRESOLVED, actual UNRESOLVED",
+            ),
         ];
         for (context, message) in cases {
             assert_eq!(validate_context(&context), Err(message.to_string()));
         }
+        // An unresolved constant matches nothing, its sentinel spelling included.
+        let partial = [("DUZ", Some(".5")), ("IOSL", None)];
+        let sentinel = pairs(&[("DUZ", ".5"), ("IOSL", "UNRESOLVED")]);
+        assert_eq!(
+            validate_against(&partial, &sentinel),
+            Err("CONTEXT MISMATCH IOSL: expected UNRESOLVED, actual UNRESOLVED".to_string())
+        );
         // With every constant resolved, the extra-key rule is reachable.
         let constants = [("DUZ", Some(".5")), ("STATION", Some("500"))];
         let exact = pairs(&[("STATION", "500"), ("DUZ", ".5")]);
@@ -3179,27 +3209,69 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         Ok(())
     }
 
+    /// A new, empty directory under the temporary directory, created by this
+    /// call for the caller alone. Its name carries the process id, the
+    /// attempt number and the clock's nanoseconds. A name already present is
+    /// never adopted: the next one is tried, up to a fixed number of attempts.
+    fn owned_empty_dir() -> Result<PathBuf, String> {
+        const ATTEMPTS: u32 = 64;
+        let base = std::env::temp_dir();
+        for attempt in 0..ATTEMPTS {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos());
+            let dir = base.join(format!(
+                "ifcap-po-inquiry-unit-no-captures-{}-{attempt}-{nanos}",
+                std::process::id()
+            ));
+            match fs::create_dir(&dir) {
+                Ok(()) => return Ok(dir),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("creating {}: {e}", dir.display())),
+            }
+        }
+        Err(format!(
+            "no unused directory name under {} in {ATTEMPTS} attempts",
+            base.display()
+        ))
+    }
+
     #[test]
-    fn mumps_side_without_captures() {
-        let golden_dir = std::env::temp_dir().join("ifcap-po-inquiry-unit-no-such-captures");
-        let replay = MumpsMode::Replay {
-            golden_dir: golden_dir.clone(),
-        };
-        assert_eq!(
-            run_mumps(&replay, &strings(&["", "^"])),
-            Err("NOT RECORDED".to_string())
-        );
-        // Live mode stops at the absent meta file, before any process runs.
-        let live = MumpsMode::Live {
-            container: "unit-test-never-run".to_string(),
-            golden_dir: golden_dir.clone(),
-        };
+    fn mumps_side_without_captures() -> Result<(), String> {
+        let owned = owned_empty_dir()?;
         let first_case = CASE_DIRS.first().copied().unwrap_or_default();
-        let expected = golden_dir.join(first_case).join(META_FILE);
-        assert_eq!(
-            run_mumps(&live, &[]),
-            Err(format!("MALFORMED META {}", expected.display()))
-        );
+        // An empty captures directory, and one that was never created. Only
+        // this test owns the parent, so nothing else can populate either.
+        let absent = owned.join("absent");
+        // Every mode is run before any assertion, so the directory is removed
+        // whatever the results.
+        let outcomes = [&owned, &absent].map(|golden_dir| {
+            let replay = MumpsMode::Replay {
+                golden_dir: golden_dir.clone(),
+            };
+            // Live mode stops at the absent meta file, before any process runs.
+            let live = MumpsMode::Live {
+                container: "unit-test-never-run".to_string(),
+                golden_dir: golden_dir.clone(),
+            };
+            let meta = golden_dir.join(first_case).join(META_FILE);
+            [
+                (
+                    run_mumps(&replay, &strings(&["", "^"])),
+                    "NOT RECORDED".to_string(),
+                ),
+                (
+                    run_mumps(&live, &[]),
+                    format!("MALFORMED META {}", meta.display()),
+                ),
+            ]
+        });
+        let removed = fs::remove_dir_all(&owned);
+        removed.map_err(|e| format!("removing {}: {e}", owned.display()))?;
+        for (outcome, expected) in outcomes.into_iter().flatten() {
+            assert_eq!(outcome, Err(expected));
+        }
+        Ok(())
     }
 
     #[test]
@@ -3208,10 +3280,9 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             (Some(first), Some(second)) => (*first, *second),
             _ => return Err("fewer than two capture directories".to_string()),
         };
-        let root = std::env::temp_dir().join(format!(
-            "ifcap-po-inquiry-unit-live-meta-{}",
-            std::process::id()
-        ));
+        // Every layout sits inside a directory this test created, so no
+        // directory another process made is adopted, populated or removed.
+        let root = owned_empty_dir()?;
         let live = |golden_dir: &Path| MumpsMode::Live {
             container: "unit-test-never-run".to_string(),
             golden_dir: golden_dir.to_path_buf(),

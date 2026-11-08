@@ -1,12 +1,13 @@
 # Golden captures: PRCH DISPLAY PO (EN3^PRCHRPT)
 
-This folder holds the golden captures of OPTION `PRCH DISPLAY PO` (IEN 1901, action `EN3^PRCHRPT`) recorded on `worldvista/vehu:202609`, one directory per case, `GC-01/` to `GC-05/`. This README is for the capture owner, who records them, and for every reviewer: it states the conventions the capture readers enforce. It is documentation only, and no code reads it.
+This folder holds the golden captures of OPTION `PRCH DISPLAY PO` (IEN 1901, action `EN3^PRCHRPT`) recorded on `worldvista/vehu:202609`, one directory per case, `GC-01/` to `GC-05/`. The bridge reads its captures from this folder unless `GOLDEN_DIR` names another (section 11). This README is for the capture owner, who records them, and for every reviewer: it states the conventions the capture readers enforce. It is documentation only, and no code reads it.
 
 Each convention below belongs to the file named with it, and this README restates it. Where this README and the owning file differ, the owning file governs.
 
 | Convention | Owner |
 |---|---|
 | `split_input_lines`, `parse_normalisation`, `normalise`, `parse_meta`, `Meta`, `validate_context`; the 400 and 502 error texts | `src/bridge.rs` |
+| The bridge's environment variables `GOLDEN_DIR` and `VEHU_CONTAINER`, how they are read and their defaults; the fixed listener address and the startup messages | `src/bin/bridge.rs` |
 | `STUB_CONTEXT` | `src/inquiry.rs` |
 | `Store::from_zwr`, `load_fixtures` | `src/store.rs` |
 | `evaluate_case`, `comparison_report` | `tests/equivalence.rs` |
@@ -119,7 +120,7 @@ context={"DUZ":".5","IOF":"<IOF>","IOSL":"<IOSL>","STATION":"500"}
 docker_exec_args=["<argument>","<argument>"]
 ```
 
-**`docker_exec_args`.** Live mode runs `docker` with the argument vector `exec`, `-i`, `<container>`, followed verbatim by the elements of `docker_exec_args`. `<container>` comes only from the bridge's `VEHU_CONTAINER` setting (O-07), never from a capture or a request. Because the elements follow the container name, Docker options such as `--user vehu` cannot appear in them. If the capture needed such options, record that as an O-07 item for the team to confirm. This README sets no workaround.
+**`docker_exec_args`.** Live mode runs `docker` with the argument vector `exec`, `-i`, `<container>`, followed verbatim by the elements of `docker_exec_args`. `<container>` comes only from the bridge's `VEHU_CONTAINER` setting (section 11; O-07), never from a capture or a request. Because the elements follow the container name, Docker options such as `--user vehu` cannot appear in them. If the capture needed such options, record that as an O-07 item for the team to confirm. This README sets no workaround.
 
 ### `normalisation.txt`
 
@@ -134,13 +135,13 @@ The format belongs to `parse_normalisation` and `normalise` in `src/bridge.rs` (
 
 ### How the readers use the captures
 
-- **Replay mode.** For `/api/mumps/session` and `/api/compare/session`, the bridge scans `GC-01` to `GC-05` in order for an `input.txt` whose `split_input_lines` equals the request's inputs.
+- **Replay mode.** The bridge uses it when `VEHU_CONTAINER` is unset or empty (section 11). For `/api/mumps/session` and `/api/compare/session`, the bridge scans `GC-01` to `GC-05` in order, under `GOLDEN_DIR` (by default this folder), for an `input.txt` whose `split_input_lines` equals the request's inputs.
   - A directory whose `input.txt` is missing does not match. One whose `input.txt` is unreadable or not UTF-8 does not match either, and is listed.
   - With no match, the answer is 502 `NOT RECORDED`, or `NOT RECORDED (unreadable: <path>, <path>)` when such directories were listed.
   - In the matching directory, a missing, unreadable or non-UTF-8 `transcript.txt`, `returned.txt` or `normalisation.txt` gives 502 `CAPTURE FILE <path>: MISSING`, `CAPTURE FILE <path>: UNREADABLE` or `CAPTURE FILE <path>: NON-UTF8`. An empty `returned.txt` or `normalisation.txt` is valid.
   - A matching directory is used whole or not at all.
 - **Compare precedence.** A MUMPS-side failure gives 502 first. Otherwise a Rust-side `CorruptStore` gives 500 and an `UnsupportedBranch` gives 422. Only then is the answer 200, whose `match` is `true` only when the transcripts and the return values are both equal after normalisation. Transcript-only agreement is never a match. While O-01 and O-03 stay open, `SPEC.md` predicts that the Rust side stops at `UnsupportedBranch("PO-12.b1")` for GC-01, GC-02 and GC-05, and at `UnsupportedBranch("PO-09.b14")` for GC-03 and GC-04, so compare on a captured sequence answers 422.
-- **Live mode.** For the same two endpoints, the bridge reads `context` and `docker_exec_args` from the `meta.txt` of the first `GC-0N` directory that has one.
+- **Live mode.** The bridge uses it when `VEHU_CONTAINER` is non-empty (section 11). For the same two endpoints, the bridge reads `context` and `docker_exec_args` from the `meta.txt` of the first `GC-0N` directory under `GOLDEN_DIR` that has one.
   - A malformed `meta.txt`, or none in any directory, gives 502 `MALFORMED META <path>`. With none present, `<path>` is where `GC-01/meta.txt` would be.
   - A `context` that differs from `STUB_CONTEXT` gives 502 `CONTEXT MISMATCH <key>: expected <value>, actual <value>` (section 6).
   - In either case nothing runs.
@@ -348,3 +349,33 @@ The outcomes are never merged. The equivalence suite exits non-zero on any FAIL,
 
 - `comparison_report` in `tests/equivalence.rs` writes the per-case results into `REPORT.md`, between `<!-- COMPARISON BEGIN -->` and `<!-- COMPARISON END -->`, and nowhere else.
 - `gc_02_end_to_end_compare` in `tests/bridge.rs` posts GC-02's inputs to `/api/compare/session` and is reported apart from the synthetic tests. It prints NOT COMPARED when GC-02's prerequisites are absent.
+
+## 11. Bridge configuration
+
+`main` in `src/bin/bridge.rs` reads the bridge's configuration once at start, and this section restates it.
+
+| Variable | Read by | Type | Unset or empty | Non-empty | Purpose |
+|---|---|---|---|---|---|
+| `GOLDEN_DIR` | `main`, with `env::var_os` | An OS path, taken as given: no UTF-8 check, not canonicalised | `tests/golden/ifcap/` under the crate directory fixed at compile time (`env!("CARGO_MANIFEST_DIR")`): this folder, as an absolute path | That path | The capture root, in both modes. Replay and compare scan `GC-01` to `GC-05` under it for `input.txt`, `transcript.txt`, `returned.txt` and `normalisation.txt`; live mode reads `meta.txt` there (section 3) |
+| `VEHU_CONTAINER` | `main`, with `env::var` | A UTF-8 string | Replay mode | Live mode, with the value, untrimmed, as the Docker container name | Selects the MUMPS side. Live mode runs `docker` with `exec`, `-i`, the value, then the `meta.txt` `docker_exec_args`, directly and never through a shell. The container name comes only from this variable, never from a capture or a request |
+| `RUSTUP_AUTO_INSTALL` | rustup; the crate never reads it | Exactly `0` | Not allowed: when it is unset, rustup downloads a missing pinned toolchain (AAP 0.1.1) | `0`: a missing pinned toolchain fails with an error and nothing is downloaded | Exported in every shell that runs `rustc` or `cargo`: building or starting the bridge, and running the tests. The pin is `channel = "1.99.1"` in `rust-toolchain.toml` |
+
+- **Read once.** `main` reads both bridge variables before it listens and never sets them. A changed value takes effect only when the bridge restarts.
+- **Read per request.** The bridge reads under `GOLDEN_DIR` on each `/api/mumps/session` and `/api/compare/session` request and never checks the directory at start. A directory that does not exist reads as holding no captures: replay and compare answer 502 `NOT RECORDED`, and live mode answers 502 `MALFORMED META <GOLDEN_DIR>/GC-01/meta.txt`. Every 502 body that names a capture file shows a path built from `GOLDEN_DIR`.
+- **Relative paths.** A relative `GOLDEN_DIR` resolves against the bridge process's working directory, which the bridge never changes. The default is absolute and does not depend on it.
+- **What `GOLDEN_DIR` does not move.** It moves only the captures. The fixtures in `tests/fixtures/ifcap/` and the static files in `frontend/` always come from the crate directory fixed at compile time. `tests/equivalence.rs` and `gc_02_end_to_end_compare` in `tests/bridge.rs` always read this folder through `CARGO_MANIFEST_DIR`, and no test reads `GOLDEN_DIR` or `VEHU_CONTAINER`.
+- **Invalid UTF-8.** A `VEHU_CONTAINER` that is set but not valid UTF-8 cannot name a container. The bridge writes `bridge: VEHU_CONTAINER is not valid UTF-8` to standard error and exits with a failure status before it listens. It never falls back to replay.
+- **Address and startup line.** The address `127.0.0.1:8080` is fixed in code (`const ADDRESS`), and no environment variable sets it. Once listening, the bridge writes `bridge listening on http://127.0.0.1:8080 (replay)` or `bridge listening on http://127.0.0.1:8080 (live)` to standard error. The line names the mode and never the container. A failed bind writes `bridge: cannot listen on 127.0.0.1:8080: <OS error>` and exits with a failure status.
+- **Toolchain guard.** `RUSTUP_AUTO_INSTALL=0` is how `SPEC.md` settles conflict C1 (section "Conflict register"; AAP 0.7.2), and `REPORT.md` section "Execution evidence" records it for the evidence commands.
+
+Run from the crate folder, with each `<…>` replaced by a real value. The last three lines are alternatives: each starts one bridge on the fixed address.
+
+```sh
+export RUSTUP_AUTO_INSTALL=0
+cargo build --offline --locked
+./target/debug/bridge                              # replay, captures from this folder
+GOLDEN_DIR=<capture root> ./target/debug/bridge    # replay, captures from <capture root>
+VEHU_CONTAINER=<container> ./target/debug/bridge   # live, meta.txt from this folder
+```
+
+Live mode needs the `docker` CLI and a running container, and is the team's to run. This run's live checks are NOT RUN (AAP 0.7.3).
