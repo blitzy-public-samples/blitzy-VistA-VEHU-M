@@ -336,10 +336,11 @@ The exact capture command is the team's to confirm (O-07). This section states w
   The missing-file list is reported. A file that is present never gives NOT COMPARED.
 - **FAIL.** The capture differs; or it is malformed, inconsistent, baseline-mismatched or has a context mismatch; or the Rust side reaches a BLOCKED or n/e branch. The report names the `TAG^ROUTINE`, the contract and branch IDs, and the first differing line or byte.
 - **PASS.** A complete capture matches after normalisation on the transcript, on `returned` and on both database checks.
-- **BLOCKED.** A tool, the toolchain or a contract value is unavailable.
+- **BLOCKED.** A tool a check needs, such as `sha256sum` for the fixture and capture digests, is unavailable, and no check failed. FAIL takes precedence over BLOCKED. An unresolved contract value and a BLOCKED branch never make a case BLOCKED: both give FAIL. An unresolved `IOF` or `IOSL` in `STUB_CONTEXT` gives `CONTEXT MISMATCH`, and a BLOCKED branch gives `UnsupportedBranch` on the Rust side.
 
-Two more words apply outside the harness:
+Outside the harness, BLOCKED has a wider meaning, and two more words apply:
 
+- **BLOCKED.** A branch, contract or step is not done because source, workspace, toolchain or tool access failed, or a contract value is unresolvable. Examples are the BLOCKED branch `PO-12.b1` (O-01) and the build on a host without the pinned toolchain. The open-item ID, or the path, command and error, is given.
 - **NOT RUN.** A manual or live check was not executed; the reason is given.
 - **PENDING.** Overall acceptance, until all five cases PASS and the manual (B3, B4) and live checks are complete.
 

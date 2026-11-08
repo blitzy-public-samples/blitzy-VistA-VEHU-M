@@ -716,10 +716,16 @@ fn trace_rule(
     let unaccounted = || "the output of `normalise` fails the audit's checks".to_string();
     let mut spans = visible_spans(text, rule, next).ok_or_else(unaccounted)?;
     if rewrites_token(rule) {
+        // Spans and tokens are both in text order and disjoint, so one pass
+        // over the spans finds every token a span overlaps.
+        let mut ahead = spans.iter().peekable();
         let tokens: Vec<(usize, usize)> = text
             .match_indices(NORM_TOKEN)
             .map(|(start, token)| (start, start.saturating_add(token.len())))
-            .filter(|&(start, end)| !spans.iter().any(|&(from, to)| from < end && start < to))
+            .filter(|&(start, end)| {
+                while ahead.next_if(|&&(_, to)| to <= start).is_some() {}
+                ahead.peek().is_none_or(|&&(from, _)| end <= from)
+            })
             .collect();
         spans.extend(tokens);
         spans.sort_unstable();
@@ -749,34 +755,75 @@ fn trace_rule(
 }
 
 /// The spans `rule` replaces in `text` with a visible effect, as byte ranges
-/// in text order, found with the shared `normalise` as a prefix oracle. On a
-/// prefix `text[..end]`, `normalise` replaces exactly the spans that end
-/// within it and leaves the rest as it is: each delimiter it finds inside
-/// the prefix is the one it finds in the whole text, and one it cannot find
-/// there ends the scan. So a span ends at `end`, where the prefix ends with
-/// the close delimiter, exactly when the output for that prefix is no longer
-/// the output up to the previous span followed by the text after it. A span
-/// that is itself `<NORM>` changes nothing and is not found here (see
-/// [`rewrites_token`]). `None` when an output fails a check, including that
-/// the spans give `next`, the output for all of `text`.
+/// in text order, found with the shared `normalise` as an oracle on windows
+/// of the text. A window `text[done..end]` starts at `done`, 0 or the end of
+/// the last span found. The scan of `normalise` resumes after each span it
+/// replaces, so on the window it finds the delimiters it finds in the whole
+/// text, replaces exactly the spans that end within the window and leaves
+/// the rest as it is: one it cannot find there ends the scan. Its output for
+/// `text[..end]` is therefore the output up to `done` followed by its output
+/// for the window, and only windows are ever normalised.
+///
+/// A span that is itself `<NORM>` changes nothing and is not found here (see
+/// [`rewrites_token`]). So the output for a window equals the window until
+/// `end` reaches the end of the next visible span, and differs from it for
+/// every later `end`, since no text after a visible span makes the output
+/// equal the window again. That end is the smallest at which the window
+/// changes, found by trying windows of 1, 2, 4, ... bytes from `done`, each
+/// widened to a char boundary, until one changes, then by halving the range
+/// between the last window that did not change and the first that did. Each
+/// span costs calls logarithmic in its distance from `done`, each linear in
+/// it, and a window that reaches the end of the text unchanged ends the
+/// search. `None` when an output fails a check, including that the spans give
+/// `next`, the output for all of `text`.
 fn visible_spans(text: &str, rule: &(String, String), next: &str) -> Option<Vec<(usize, usize)>> {
     let (open, close) = rule;
     let shortest = open.len().saturating_add(close.len());
+    let window = |from: usize, to: usize| -> Option<(&str, String)> {
+        let input = text.get(from..to)?;
+        Some((input, normalise(input, std::slice::from_ref(rule))))
+    };
+    let changes = |from: usize, to: usize| -> Option<bool> {
+        let (input, output) = window(from, to)?;
+        Some(output != input)
+    };
+    let between = |low: usize, high: usize| -> Option<usize> {
+        let half = low.saturating_add(high.saturating_sub(low) / 2);
+        [
+            text.floor_char_boundary(half),
+            text.ceil_char_boundary(half),
+        ]
+        .into_iter()
+        .find(|&at| low < at && at < high)
+    };
     let mut spans = Vec::new();
     let mut done = 0usize;
     let mut done_output = String::new();
-    for (at, c) in text.char_indices() {
-        let end = at.saturating_add(c.len_utf8());
-        let prefix = text.get(..end)?;
-        if !prefix.ends_with(close.as_str()) {
-            continue;
+    loop {
+        let mut unchanged = done;
+        let mut width = 1usize;
+        let changed = loop {
+            let end = text.ceil_char_boundary(done.saturating_add(width));
+            if changes(done, end)? {
+                break Some(end);
+            }
+            if end >= text.len() {
+                break None;
+            }
+            unchanged = end;
+            width = width.saturating_mul(2);
+        };
+        let Some(mut end) = changed else {
+            break;
+        };
+        while let Some(middle) = between(unchanged, end) {
+            if changes(done, middle)? {
+                end = middle;
+            } else {
+                unchanged = middle;
+            }
         }
-        let output = normalise(prefix, std::slice::from_ref(rule));
-        let after = text.get(done..end)?;
-        let tail = output.strip_prefix(done_output.as_str())?;
-        if tail == after {
-            continue;
-        }
+        let (after, tail) = window(done, end)?;
         let before = tail.strip_suffix(NORM_TOKEN)?;
         let start = done.checked_add(before.len())?;
         let span = text.get(start..end)?;
@@ -789,7 +836,7 @@ fn visible_spans(text: &str, rule: &(String, String), next: &str) -> Option<Vec<
         }
         spans.push((start, end));
         done = end;
-        done_output = output;
+        done_output.push_str(&tail);
     }
     let rest = text.get(done..)?;
     (next.strip_prefix(done_output.as_str()) == Some(rest)).then_some(spans)
@@ -2235,6 +2282,35 @@ fn normalisation_audit_follows_file_order() {
             .map(|(original, seen)| (original.to_string(), seen.to_string()))
             .collect())
     };
+    let large_lines: Vec<(String, String)> = (0..20_000)
+        .map(|i| {
+            (
+                format!("t={:02}:{:02} ", i / 60 % 24, i % 60),
+                format!("<{i}>"),
+            )
+        })
+        .collect();
+    let large_raw: String = large_lines
+        .iter()
+        .map(|(time, id)| format!("{time}{id}\n"))
+        .chain(["TIME 13:30\n".to_string()])
+        .collect();
+    let large_audits = vec![
+        Ok(large_lines
+            .iter()
+            .map(|(time, _)| (time.clone(), time.clone()))
+            .collect()),
+        Ok(large_lines
+            .iter()
+            .flat_map(|(time, id)| {
+                [
+                    (time.clone(), NORM_TOKEN.to_string()),
+                    (id.clone(), id.clone()),
+                ]
+            })
+            .collect()),
+        spans(&[("TIME 13:30\n", "TIME 13:30\n")]),
+    ];
     let table = [
         // Rule 1 replaces all of the text, so rule 2 finds nothing.
         (
@@ -2344,6 +2420,12 @@ fn normalisation_audit_follows_file_order() {
                 spans(&[("[x]b", "ORM>b")]),
                 spans(&[("[x]b", "<N<NORM>")]),
             ],
+        ),
+        // A large input: a dense rule, a token-rewriting rule and a sparse one.
+        (
+            large_raw.as_str(),
+            vec![("t=", " "), ("<", ">"), ("TIME ", "\n")],
+            large_audits,
         ),
     ];
     for (raw, rules, expected) in table {
