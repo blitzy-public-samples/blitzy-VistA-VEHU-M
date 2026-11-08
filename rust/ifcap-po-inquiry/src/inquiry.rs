@@ -588,8 +588,12 @@ const AFTER_INDEX_NAMES: &str = "A\u{5b}";
 /// identifiers. On a selection `Y` is `ien^.01`; on `^` it is `-1`.
 fn ix_dic(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // IX N DINDEX,DF S (DF,DINDEX,DINDEX("START"))=D G EN
-    // EN ... D INIT^DIC0: the file attributes decide the prompt and the
-    // identifiers [DIC0.m:22] [DIC1.m:41-49]
+    // EN ... D INIT^DIC0: GETFILE^DIC0 and FILENUM^DILIBF read ^PRC(442,0)
+    // with $G [DIC0.m:21, 83-87] [DILIBF.m:141, 147], so a header that is
+    // absent, empty or holding only descendants leaves DIFILEI empty and EN
+    // sets Y=-1 before the prompt [DIC.m:14]: the n/e PO-09.b15, never
+    // CorruptStore. A header with a value then gives the file attributes,
+    // which decide the prompt and the identifiers [DIC0.m:23] [DIC1.m:41-49].
     let header = st.get_or_empty(&key("PRC", &["442", "0"]));
     if piece(&header, "^", 2) != FILE_442_ATTRIBUTES {
         return Err(unsupported("PO-09.b15"));
@@ -828,10 +832,13 @@ fn search(st: &Store, v: &Locals, x: &str) -> Result<(Vec<Sub>, usize), Halt> {
 
 /// The pointer-candidate rule (`SPEC.md` R6), from `P^DICM0` [DICM0.m:8-41]:
 /// true when, for some pointer index of file 442 after `C`, the pointed-to
-/// file holds an entry whose `B` value equals `x` or begins with it and
-/// under which a qualifying order is filed. The nested lookup runs with `A`
-/// and `Q` stripped [DICM.m:107], so a pointed-to entry with no qualifying
-/// order writes nothing and is simply not a candidate.
+/// file has a header holding a value and holds an entry whose `B` value
+/// equals `x` or begins with it and under which a qualifying order is filed.
+/// A pointed-to header that is absent, empty or holding only descendants
+/// ends that nested lookup before anything else is read, so its index has
+/// no candidate. The nested lookup runs with `A` and `Q` stripped
+/// [DICM.m:107], so a pointed-to entry with no qualifying order writes
+/// nothing and is simply not a candidate.
 fn pointer_candidate(st: &Store, v: &Locals, x: &str) -> Result<bool, Halt> {
     let file = key("PRC", &["442"]);
     // P1 ... I @("$O"_Y_"0))'>0") G L1   [DICM0.m:26]: no record, no pointer lookup
@@ -845,6 +852,17 @@ fn pointer_candidate(st: &Store, v: &Locals, x: &str) -> Result<bool, Halt> {
             continue;
         }
         let target = key(global, &[number]);
+        // N DS,DINDEX,DIFILEI D X^DIC   [DICM0.m:41] [DIC.m:33-34]: INIT^DIC0's
+        // GETFILE and FILENUM^DILIBF read the pointed-to header with $G
+        // [DIC0.m:21, 83-87] [DILIBF.m:141, 147]; a header that is absent,
+        // empty or holding only descendants leaves DIFILEI empty, and the
+        // nested lookup ends with Y=-1 with nothing more read.
+        if st
+            .get_or_empty(&child(&target, &Sub::from_text("0")))
+            .is_empty()
+        {
+            continue;
+        }
         let b_index = child(&target, &Sub::from_text("B"));
         let mut values = vec![Sub::from_text(x)];
         values.extend(partial_keys(st, &b_index, x));
@@ -2282,9 +2300,12 @@ mod tests {
 ^PRC(442,"C","B22222",3)=""
 "#;
 
-    /// Vendor 7, `ACME SUPPLY CO`, and vendor 8, which order 1 references
-    /// through index `D`.
-    const VENDORS: &str = r#"^PRC(440,7,0)="ACME SUPPLY CO"
+    /// The vendor file header in the fixture's form, without whose value the
+    /// nested lookup of R6 reads nothing more of file 440; vendor 7,
+    /// `ACME SUPPLY CO`; and vendor 8, which order 1 references through
+    /// index `D`.
+    const VENDORS: &str = r#"^PRC(440,0)="VENDOR^440OIs^8^2"
+^PRC(440,7,0)="ACME SUPPLY CO"
 ^PRC(440,8,0)="OTHER VENDOR"
 ^PRC(440,"B","ACME SUPPLY CO",7)=""
 ^PRC(440,"B","OTHER VENDOR",8)=""
@@ -2397,8 +2418,13 @@ mod tests {
 
     #[test]
     fn missing_file_header_is_unsupported_branch() -> Result<(), String> {
+        // The header is read with $G [DIC0.m:83-87] [DILIBF.m:141, 147]: absent,
+        // or holding only a descendant, it ends the lookup with Y=-1 before
+        // the prompt [DIC.m:14], never CorruptStore; piece 2 `442` gives other
+        // identifiers [DIC1.m:46-49].
         for header in [
             "",
+            "^PRC(442,0,1)=\"x\"\n",
             "^PRC(442,0)=\"PROCUREMENT & ACCOUNTING TRANSACTIONS^442^1^1\"\n",
         ] {
             let store = load(&format!("{header}^PRC(442,\"C\",\"A12345\",1)=\"\"\n"))?;
@@ -2607,6 +2633,43 @@ mod tests {
             inquire(&store, &inputs(&["", "ACME", "^"])),
             unsupported_branch("PO-09.b11")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pointed_to_file_without_header_value_is_not_searched() -> Result<(), String> {
+        // `SPEC.md` R6: the nested lookup reads the pointed-to header with $G
+        // [DICM0.m:41] [DIC.m:33-34] [DIC0.m:21, 83-87] [DILIBF.m:141, 147].
+        // Absent, holding only a descendant, or empty, that header ends the
+        // nested lookup with Y=-1 before the `B` index is read. Vendor 7
+        // matches `ACME` and the qualifying order 1 is filed under it, yet it
+        // is no candidate (not PO-09.b11), and a vendor zero node holding only
+        // a descendant is never read (not CorruptStore): the no-match path.
+        const REFERENCED_VENDOR: &str = r#"^PRC(440,"B","ACME SUPPLY CO",7)=""
+^PRC(442,"D",7,1)=""
+"#;
+        for (label, records) in [
+            ("header absent", "^PRC(440,7,0)=\"ACME SUPPLY CO\"\n"),
+            (
+                "header holding only a descendant",
+                "^PRC(440,0,1)=\"x\"\n^PRC(440,7,0)=\"ACME SUPPLY CO\"\n",
+            ),
+            (
+                "header empty",
+                "^PRC(440,0)=\"\"\n^PRC(440,7,0)=\"ACME SUPPLY CO\"\n",
+            ),
+            (
+                "header absent, vendor zero node holding only a descendant",
+                "^PRC(440,7,0,1)=\"x\"\n",
+            ),
+        ] {
+            let store = order_store(&format!("{records}{REFERENCED_VENDOR}"))?;
+            assert_eq!(
+                inquire(&store, &inputs(&["", "ACME", "^"])),
+                unsupported_branch(NO_MATCH),
+                "{label}"
+            );
+        }
         Ok(())
     }
 

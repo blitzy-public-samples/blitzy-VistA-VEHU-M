@@ -436,7 +436,8 @@ type HttpRequest = (String, String, Option<Vec<u8>>);
 /// bytes do not renew.
 ///
 /// `Ok(Ok(None))` means there is nothing to answer: no byte arrived before
-/// the end of input, a read error or `idle`, or the interim `100 Continue`
+/// the end of input, a read error or `idle`, or the interim `100 Continue`,
+/// sent only to an HTTP/1.1 request that expects it (see [`parse_head`]),
 /// could not be written. `Ok(Err)` carries the 400 cause. `Err` is a read
 /// timeout that cannot be set. Chunked bodies are not supported.
 fn read_request(
@@ -569,7 +570,8 @@ fn skip_prelude(bytes: &[u8]) -> &[u8] {
 /// Parses `head`, which ends with the blank line, into the request line and
 /// the headers routing needs: the method, the target in origin-form (see
 /// [`origin_form`]), the `Content-Length` and whether `Expect: 100-continue`
-/// was sent. Empty lines before the request line are ignored (see
+/// was sent; an HTTP/1.0 request's expectation counts as not sent
+/// (RFC 9110 10.1.1). Empty lines before the request line are ignored (see
 /// [`skip_prelude`]). Every header value, those of ignored headers included,
 /// must be free of control bytes other than HTAB (see [`is_field_value`]).
 /// A request carries at most one `Host`, whose value must be a host (see
@@ -633,7 +635,9 @@ fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String
             return Err(format!("{BAD_REQUEST}: TRANSFER-ENCODING NOT SUPPORTED"));
         } else if name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
         {
-            expect_continue = true;
+            // An HTTP/1.0 client may take an interim response for the final
+            // one, so its expectation is ignored (RFC 9110 10.1.1).
+            expect_continue = version == "HTTP/1.1";
         }
     }
     if version == "HTTP/1.1" && !host_seen {
@@ -3538,8 +3542,13 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         Ok(())
     }
 
+    /// `parse_context` over 10,000 keys keeps them in document order and
+    /// rejects a key repeated at the end, and a non-string value is reported
+    /// before a repetition. Only results are asserted: that repetitions are
+    /// found with a set lookup, not by rescanning earlier keys, is verified by
+    /// reading `parse_context`, because a timing assertion would be flaky.
     #[test]
-    fn context_duplicates_found_with_a_set() {
+    fn context_keeps_document_order_and_rejects_repeats_at_scale() {
         let expected: Vec<(String, String)> = (0..10_000)
             .map(|n| (format!("K{n}"), format!("v{n}")))
             .collect();
@@ -3659,10 +3668,18 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             parse_head(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
             Ok(("GET", "/".to_string(), None, false))
         );
-        // An HTTP/1.0 request needs no `Host`.
+        // An HTTP/1.0 request needs no `Host`, and its `Expect: 100-continue`
+        // is ignored (RFC 9110 10.1.1).
         assert_eq!(
             parse_head(
                 b"POST /api/rust/session HTTP/1.0\r\ncontent-length: 12\r\nContent-Length:12\r\nExpect: 100-continue\r\n\r\n"
+            ),
+            Ok(("POST", "/api/rust/session".to_string(), Some(12), false))
+        );
+        // An HTTP/1.1 request's `Expect: 100-continue` is reported.
+        assert_eq!(
+            parse_head(
+                b"POST /api/rust/session HTTP/1.1\r\nHost: h\r\nContent-Length: 12\r\nExpect: 100-continue\r\n\r\n"
             ),
             Ok(("POST", "/api/rust/session".to_string(), Some(12), true))
         );
