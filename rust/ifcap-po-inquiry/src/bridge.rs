@@ -26,6 +26,8 @@ use std::fmt::{self, Write as _};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -37,7 +39,8 @@ use crate::inquiry::{InquiryError, InquiryOutput, STUB_CONTEXT, inquire};
 use crate::store::{Store, load_fixtures};
 
 /// How often the accept loop polls its shutdown flag and `run_command`
-/// polls its child.
+/// polls its child, and how long a `run_command` stream worker blocks
+/// before it checks for cancellation.
 const POLL: Duration = Duration::from_millis(10);
 /// Read and write timeout of one client connection.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,8 +59,6 @@ const MAX_JSON_DEPTH: usize = 64;
 /// Live-mode limits on the `docker exec` child.
 const LIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const LIVE_OUTPUT_LIMIT: usize = 1024 * 1024;
-/// How long `run_command` waits for its pipe threads once the child is gone.
-const PIPE_GRACE: Duration = Duration::from_secs(1);
 
 const JSON_TYPE: &str = "application/json; charset=utf-8";
 
@@ -1393,7 +1394,12 @@ fn mismatch(key: &str, expected: &str, actual: &str) -> String {
 /// How one [`run_command`] child ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecResult {
-    /// The OS error text when the program could not be started.
+    /// The OS error text when the program could not be started; otherwise,
+    /// when the run itself failed (a stream worker that could not start,
+    /// failed or panicked, output not read to its end, or a child that could
+    /// not be waited on or killed), each failure's stage and cause, joined
+    /// by `; `. A run with this set is never a transcript, whatever the
+    /// other fields hold.
     pub spawn_error: Option<String>,
     /// The exit code; `None` when the child was killed or ended by a signal.
     pub exit_code: Option<i32>,
@@ -1455,12 +1461,16 @@ impl ExecResult {
 /// `stdin` to it and collects its output.
 ///
 /// Standard input is written, and standard output and error drained, each
-/// on its own thread, so a full pipe cannot deadlock. The child is killed
+/// on its own thread, so a full stream cannot deadlock. The child is killed
 /// when `timeout` passes before it has exited and its output has been read,
 /// or as soon as standard output passes `output_limit` bytes; at most
-/// `output_limit` bytes of each stream are kept. A pipe thread that is still
-/// running shortly after the child is gone, because a descendant holds its
-/// pipe, is left behind rather than waited for.
+/// `output_limit` bytes of each stream are kept. Once the run is over, the
+/// stream threads are cancelled, which stops each within about `POLL` even
+/// while a descendant still holds the child's streams, and every thread
+/// that started is joined before this returns. A failure of the run itself
+/// rather than of the program, such as a thread that could not start or
+/// output that could not be read, is reported in
+/// [`ExecResult::spawn_error`].
 pub fn run_command(
     program: &str,
     args: &[String],
@@ -1468,115 +1478,284 @@ pub fn run_command(
     timeout: Duration,
     output_limit: usize,
 ) -> ExecResult {
+    match execute(
+        program,
+        args,
+        stdin,
+        timeout,
+        output_limit,
+        &mut start_thread,
+    ) {
+        Ok(result) => result,
+        Err(e) => ExecResult::spawn_failure(e.to_string()),
+    }
+}
+
+/// [`run_command`] with its stream threads started through `start`. `Err`,
+/// with the OS error, only when the child's streams could not be created or
+/// the program could not be started.
+fn execute(
+    program: &str,
+    args: &[String],
+    stdin: &[u8],
+    timeout: Duration,
+    output_limit: usize,
+    start: &mut StartWorker,
+) -> io::Result<ExecResult> {
     let started = Instant::now();
-    let mut child = match Command::new(program)
+    let (streams, (child_stdin, child_stdout, child_stderr)) = stream_pairs()?;
+    // One statement, so the parent's copies of the child's ends are closed
+    // as soon as the child holds them; end of output depends on it.
+    let mut child = Command::new(program)
         .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return ExecResult::spawn_failure(e.to_string()),
-    };
+        .stdin(Stdio::from(OwnedFd::from(child_stdin)))
+        .stdout(Stdio::from(OwnedFd::from(child_stdout)))
+        .stderr(Stdio::from(OwnedFd::from(child_stderr)))
+        .spawn()?;
+    Ok(supervise(
+        &mut child,
+        streams,
+        stdin,
+        timeout,
+        output_limit,
+        started,
+        start,
+    ))
+}
+
+/// One end of each of the three connections that carry a child's standard
+/// input, output and error, in that order.
+type StdStreams = (UnixStream, UnixStream, UnixStream);
+
+/// Creates the child's standard streams: the parent's ends, then the
+/// child's. They are socket pairs rather than pipes because a socket's read
+/// and write timeouts wake a blocked worker every `POLL` to check for
+/// cancellation, which a pipe read cannot do.
+fn stream_pairs() -> io::Result<(StdStreams, StdStreams)> {
+    let (stdin, child_stdin) = UnixStream::pair()?;
+    let (stdout, child_stdout) = UnixStream::pair()?;
+    let (stderr, child_stderr) = UnixStream::pair()?;
+    stdin.set_write_timeout(Some(POLL))?;
+    stdout.set_read_timeout(Some(POLL))?;
+    stderr.set_read_timeout(Some(POLL))?;
+    Ok((
+        (stdin, stdout, stderr),
+        (child_stdin, child_stdout, child_stderr),
+    ))
+}
+
+/// What a stream worker returns: the bytes it kept, none for standard
+/// input, and how it ended. `Ok(true)` when it carried the stream to its
+/// end: end of output read, the output limit reached, or all of standard
+/// input written. `Ok(false)` when it stopped first, because the run was
+/// over or the child closed its standard input. `Err` holds the text of any
+/// other I/O error.
+type PipeOutcome = (Vec<u8>, Result<bool, String>);
+
+/// The work of one stream worker.
+type Worker = Box<dyn FnOnce() -> PipeOutcome + Send>;
+
+/// Starts a named stream worker on a thread of its own; [`start_thread`]
+/// in every real run.
+type StartWorker = dyn FnMut(&'static str, Worker) -> io::Result<JoinHandle<PipeOutcome>>;
+
+/// Starts `work` on a new thread named `name`.
+fn start_thread(name: &'static str, work: Worker) -> io::Result<JoinHandle<PipeOutcome>> {
+    thread::Builder::new().name(name.to_string()).spawn(work)
+}
+
+/// The stream workers in the order they start: the stage name their
+/// diagnostics carry, and whether the worker reads an output stream rather
+/// than writing standard input.
+const STREAMS: [(&str, bool); 3] = [
+    ("STANDARD INPUT", false),
+    ("STANDARD OUTPUT", true),
+    ("STANDARD ERROR", true),
+];
+
+/// Supervises a started child through its parent-side `streams`: starts the
+/// stream workers through `start`, polls the child until it is done, kills
+/// and reaps it when it is not, then cancels and joins every worker that
+/// started. `timeout` counts from `started`.
+fn supervise(
+    child: &mut Child,
+    streams: StdStreams,
+    stdin: &[u8],
+    timeout: Duration,
+    output_limit: usize,
+    started: Instant,
+    start: &mut StartWorker,
+) -> ExecResult {
     let exceeded = Arc::new(AtomicBool::new(false));
-    let threads = start_pipe_threads(&mut child, stdin, output_limit, &exceeded);
-    let (writer, out_reader, err_reader) = match threads {
-        Ok(threads) => threads,
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut workers = Vec::new();
+    let mut failures = Vec::new();
+    let begun = start_workers(
+        streams,
+        stdin,
+        output_limit,
+        &exceeded,
+        &cancel,
+        start,
+        &mut workers,
+    );
+    let (mut status, timed_out, mut output_limit_exceeded) = match begun {
+        Ok(()) => watch(
+            &mut || child.try_wait(),
+            &workers,
+            &exceeded,
+            timeout,
+            started,
+            &mut failures,
+        ),
         Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return ExecResult::spawn_failure(e.to_string());
+            failures.push(format!("PIPE WORKER NOT STARTED: {e}"));
+            (None, false, false)
         }
     };
+    if status.is_none() || output_limit_exceeded {
+        status = kill_and_reap(child, &mut failures).or(status);
+    }
+    cancel.store(true, Ordering::SeqCst);
+    let joined = workers.into_iter().map(JoinHandle::join).collect();
+    // The reader sets the flag before it ends, so once it is joined this
+    // also catches a limit passed just as the child exited.
+    output_limit_exceeded |= exceeded.load(Ordering::SeqCst);
+    exec_result(status, timed_out, output_limit_exceeded, failures, joined)
+}
 
-    let mut status: Option<ExitStatus> = None;
-    let mut timed_out = false;
-    let mut output_limit_exceeded = false;
+/// Polls the child through `try_wait` every `POLL` until it has exited and
+/// both output readers in `workers` have finished, standard output passes
+/// its limit, `timeout` passes since `started`, or the child cannot be
+/// waited on, which is recorded in `failures`. Gives the exit status seen,
+/// whether the run timed out and whether standard output passed its limit.
+fn watch(
+    try_wait: &mut dyn FnMut() -> io::Result<Option<ExitStatus>>,
+    workers: &[JoinHandle<PipeOutcome>],
+    exceeded: &AtomicBool,
+    timeout: Duration,
+    started: Instant,
+    failures: &mut Vec<String>,
+) -> (Option<ExitStatus>, bool, bool) {
+    let mut status = None;
     loop {
         if status.is_none() {
-            match child.try_wait() {
+            match try_wait() {
                 Ok(exited) => status = exited,
-                // The child cannot be waited on; it is killed and reaped below.
-                Err(_) => break,
+                Err(e) => {
+                    failures.push(format!("WAIT FAILED: {e}"));
+                    return (status, false, false);
+                }
             }
         }
         if exceeded.load(Ordering::SeqCst) {
-            output_limit_exceeded = true;
-            break;
+            return (status, false, true);
         }
-        if status.is_some() && out_reader.is_finished() && err_reader.is_finished() {
-            break;
+        if status.is_some() && readers_finished(workers) {
+            return (status, false, false);
         }
         if started.elapsed() >= timeout {
-            timed_out = true;
-            break;
+            return (status, true, false);
         }
         thread::sleep(POLL);
     }
-    if status.is_none() || output_limit_exceeded {
-        status = kill_and_reap(&mut child).or(status);
-    }
-
-    let grace = Instant::now()
-        .checked_add(PIPE_GRACE)
-        .unwrap_or_else(Instant::now);
-    join_within(writer, grace);
-    let stdout = join_within(out_reader, grace).unwrap_or_default();
-    let stderr = join_within(err_reader, grace).unwrap_or_default();
-    ExecResult {
-        spawn_error: None,
-        exit_code: status.and_then(|s| s.code()),
-        timed_out,
-        output_limit_exceeded,
-        stdout,
-        stderr,
-    }
 }
 
-type PipeThreads = (JoinHandle<()>, JoinHandle<Vec<u8>>, JoinHandle<Vec<u8>>);
+/// Whether every worker of [`STREAMS`] was started into `workers`, in that
+/// order, and each output reader among them has finished.
+fn readers_finished(workers: &[JoinHandle<PipeOutcome>]) -> bool {
+    workers.len() == STREAMS.len()
+        && STREAMS
+            .iter()
+            .zip(workers)
+            .all(|((_, is_reader), handle)| !is_reader || handle.is_finished())
+}
 
-/// Starts the standard-input writer and the two output readers. The
+/// Starts the standard-input writer and the two output readers one at a
+/// time, pushing each handle onto `workers` as soon as it exists, so a
+/// worker that cannot start leaves the earlier ones to be joined. The
 /// standard-output reader sets `exceeded` once more than `output_limit`
-/// bytes have arrived.
-fn start_pipe_threads(
-    child: &mut Child,
+/// bytes have arrived. Every worker stops once `cancel` is set.
+fn start_workers(
+    streams: StdStreams,
     stdin: &[u8],
     output_limit: usize,
     exceeded: &Arc<AtomicBool>,
-) -> io::Result<PipeThreads> {
-    let missing = || io::Error::other("child pipe not captured");
-    let mut input_pipe = child.stdin.take().ok_or_else(missing)?;
-    let output_pipe = child.stdout.take().ok_or_else(missing)?;
-    let error_pipe = child.stderr.take().ok_or_else(missing)?;
+    cancel: &Arc<AtomicBool>,
+    start: &mut StartWorker,
+    workers: &mut Vec<JoinHandle<PipeOutcome>>,
+) -> io::Result<()> {
+    let (input_stream, output_stream, error_stream) = streams;
     let input = stdin.to_vec();
-    // The pipe closes when the thread ends, so the child sees end of input.
-    // A child that exits without reading makes the write fail; that is not
-    // an error of the run.
-    let writer = thread::Builder::new()
-        .name("run-command-stdin".to_string())
-        .spawn(move || {
-            let _ = input_pipe.write_all(&input);
-        })?;
+    let stop = Arc::clone(cancel);
+    workers.push(start(
+        "run-command-stdin",
+        Box::new(move || write_input(input_stream, &input, &stop)),
+    )?);
+    let stop = Arc::clone(cancel);
     let flag = Arc::clone(exceeded);
-    let out_reader = thread::Builder::new()
-        .name("run-command-stdout".to_string())
-        .spawn(move || read_bounded(output_pipe, output_limit, Some(flag.as_ref())))?;
-    let err_reader = thread::Builder::new()
-        .name("run-command-stderr".to_string())
-        .spawn(move || read_bounded(error_pipe, output_limit, None))?;
-    Ok((writer, out_reader, err_reader))
+    workers.push(start(
+        "run-command-stdout",
+        Box::new(move || read_bounded(output_stream, output_limit, Some(flag.as_ref()), &stop)),
+    )?);
+    let stop = Arc::clone(cancel);
+    workers.push(start(
+        "run-command-stderr",
+        Box::new(move || read_bounded(error_stream, output_limit, None, &stop)),
+    )?);
+    Ok(())
 }
 
-/// Reads `pipe` to its end, keeping at most `limit` bytes. Past the limit,
+/// Writes `input` to the child's standard input, then closes it by dropping
+/// `stream`, so the child sees end of input. A child that closes its input
+/// first refuses the rest, `Ok(false)`, which is not a failure of the run.
+/// The writer stops, also `Ok(false)`, once `cancel` is set, checked before
+/// each write and after each write that timed out.
+fn write_input(mut stream: impl Write, input: &[u8], cancel: &AtomicBool) -> PipeOutcome {
+    let mut rest = input;
+    let end = loop {
+        if rest.is_empty() {
+            break Ok(true);
+        }
+        if cancel.load(Ordering::SeqCst) {
+            break Ok(false);
+        }
+        match stream.write(rest) {
+            Ok(0) => break Err(io::Error::from(io::ErrorKind::WriteZero).to_string()),
+            Ok(n) => rest = rest.get(n..).unwrap_or(&[]),
+            Err(e) => match e.kind() {
+                io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::TimedOut => {}
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset => {
+                    break Ok(false);
+                }
+                _ => break Err(e.to_string()),
+            },
+        }
+    };
+    (Vec::new(), end)
+}
+
+/// Reads `stream` to its end, keeping at most `limit` bytes. Past the limit,
 /// a reader with `exceeded` sets it and stops; one without keeps draining
-/// and discarding, so the child never blocks on that pipe.
-fn read_bounded(mut pipe: impl Read, limit: usize, exceeded: Option<&AtomicBool>) -> Vec<u8> {
+/// and discarding, so the child never blocks on that stream. The reader
+/// stops, `Ok(false)`, once `cancel` is set, checked before each read and
+/// after each read that timed out.
+fn read_bounded(
+    mut stream: impl Read,
+    limit: usize,
+    exceeded: Option<&AtomicBool>,
+    cancel: &AtomicBool,
+) -> PipeOutcome {
     let mut kept = Vec::new();
     let mut buf = [0u8; 8192];
-    loop {
-        match pipe.read(&mut buf) {
-            Ok(0) => return kept,
+    let end = loop {
+        if cancel.load(Ordering::SeqCst) {
+            break Ok(false);
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break Ok(true),
             Ok(n) => {
                 let chunk = buf.get(..n).unwrap_or(&[]);
                 let room = limit.saturating_sub(kept.len());
@@ -1587,33 +1766,132 @@ fn read_bounded(mut pipe: impl Read, limit: usize, exceeded: Option<&AtomicBool>
                 kept.extend_from_slice(chunk.get(..room).unwrap_or(&[]));
                 if let Some(flag) = exceeded {
                     flag.store(true, Ordering::SeqCst);
-                    return kept;
+                    break Ok(true);
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return kept,
+            Err(e) => match e.kind() {
+                io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::TimedOut => {}
+                _ => break Err(e.to_string()),
+            },
+        }
+    };
+    (kept, end)
+}
+
+/// Kills the child and reaps it, recording what fails in `failures`;
+/// `None` when it was not reaped.
+fn kill_and_reap(child: &mut Child, failures: &mut Vec<String>) -> Option<ExitStatus> {
+    let killed = child.kill();
+    reap(
+        killed,
+        |block| {
+            if block {
+                child.wait().map(Some)
+            } else {
+                child.try_wait()
+            }
+        },
+        failures,
+    )
+}
+
+/// Reaps a child that `killed`, the result of killing it, says was or was
+/// not killed, through `wait`, which blocks until the child has exited when
+/// given `true` and only polls it when given `false`. What fails is
+/// recorded in `failures`; `None` when the child was not reaped. Killing a
+/// child that has already exited succeeds, so after a failed kill the child
+/// may still be running: it is then polled once, never waited on, so the
+/// run cannot hang on it.
+fn reap(
+    killed: io::Result<()>,
+    wait: impl FnOnce(bool) -> io::Result<Option<ExitStatus>>,
+    failures: &mut Vec<String>,
+) -> Option<ExitStatus> {
+    let block = match killed {
+        Ok(()) => true,
+        Err(e) => {
+            failures.push(format!("KILL FAILED: {e}"));
+            false
+        }
+    };
+    match wait(block) {
+        Ok(status) => status,
+        Err(e) => {
+            failures.push(format!("WAIT FAILED: {e}"));
+            None
         }
     }
 }
 
-/// Kills the child and reaps it; `None` when it cannot be reaped.
-fn kill_and_reap(child: &mut Child) -> Option<ExitStatus> {
-    // Killing a child that has already exited fails harmlessly.
-    let _ = child.kill();
-    child.wait().ok()
+/// The run's result from what supervision observed and what each worker
+/// that started returned, in [`STREAMS`] order. Any failure of the run,
+/// recorded during supervision in `failures` or found here, becomes
+/// `spawn_error`, so the run never gives a transcript.
+fn exec_result(
+    status: Option<ExitStatus>,
+    timed_out: bool,
+    output_limit_exceeded: bool,
+    mut failures: Vec<String>,
+    joined: Vec<thread::Result<PipeOutcome>>,
+) -> ExecResult {
+    let explained = timed_out || output_limit_exceeded;
+    let mut outputs = Vec::new();
+    for ((name, is_reader), result) in STREAMS.into_iter().zip(joined) {
+        let kept = worker_output(name, is_reader, result, explained, &mut failures);
+        if is_reader {
+            outputs.push(kept);
+        }
+    }
+    // A reader that never started kept nothing; its start failure is
+    // already in `failures`, so the run is not a transcript.
+    let mut outputs = outputs.into_iter();
+    let stdout = outputs.next().unwrap_or_default();
+    let stderr = outputs.next().unwrap_or_default();
+    ExecResult {
+        spawn_error: (!failures.is_empty()).then(|| failures.join("; ")),
+        exit_code: status.and_then(|s| s.code()),
+        timed_out,
+        output_limit_exceeded,
+        stdout,
+        stderr,
+    }
 }
 
-/// The thread's result once it has finished, waiting until `deadline` at
-/// most. `None` when it is still running, which detaches it, or when it
-/// panicked.
-fn join_within<T>(handle: JoinHandle<T>, deadline: Instant) -> Option<T> {
-    while !handle.is_finished() && Instant::now() < deadline {
-        thread::sleep(POLL);
+/// The bytes a joined worker kept. A panic or an I/O failure is recorded in
+/// `failures` under the worker's stage `name`, and so is a reader stopped
+/// before the end of its stream, unless `explained` (a timeout or the
+/// output limit) or an earlier failure already accounts for it. A writer
+/// stopped first is no failure: input it did not write is input the child
+/// never read, as when the child leaves input over.
+fn worker_output(
+    name: &str,
+    is_reader: bool,
+    joined: thread::Result<PipeOutcome>,
+    explained: bool,
+    failures: &mut Vec<String>,
+) -> Vec<u8> {
+    let (worker, action) = if is_reader {
+        ("READER", "READ")
+    } else {
+        ("WRITER", "WRITE")
+    };
+    let (kept, end) = match joined {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            failures.push(format!("{name} {worker} PANICKED"));
+            return Vec::new();
+        }
+    };
+    match end {
+        Err(e) => failures.push(format!("{name} {action} FAILED: {e}")),
+        Ok(false) if is_reader && !explained && failures.is_empty() => {
+            failures.push(format!("{name} NOT READ TO ITS END"));
+        }
+        Ok(_) => {}
     }
-    if !handle.is_finished() {
-        return None;
-    }
-    handle.join().ok()
+    kept
 }
 
 /// The transcript of a live run, or why there is none. The first match
@@ -1655,6 +1933,9 @@ pub fn inquiry_error_to_response(e: &InquiryError) -> (u16, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::atomic::AtomicUsize;
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_string()).collect()
@@ -1879,20 +2160,49 @@ mod tests {
         assert_eq!(decide_live_result(&result), Ok("T".to_string()));
     }
 
+    /// Runs `program` as [`run_command`] does. `Ok(None)` when the program
+    /// is absent, which is reported as NOT RUN; any other failure to start
+    /// it, or a failure of the run itself, is an error naming its cause.
+    fn run_available(
+        program: &str,
+        args: &[String],
+        stdin: &[u8],
+        timeout: Duration,
+        output_limit: usize,
+    ) -> Result<Option<ExecResult>, String> {
+        match execute(
+            program,
+            args,
+            stdin,
+            timeout,
+            output_limit,
+            &mut start_thread,
+        ) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                println!("NOT RUN: {program} not found");
+                Ok(None)
+            }
+            Err(e) => Err(format!("{program} could not be started: {e}")),
+            Ok(result) => match &result.spawn_error {
+                Some(diagnostic) => Err(format!("{program} run failed: {diagnostic}")),
+                None => Ok(Some(result)),
+            },
+        }
+    }
+
     #[test]
     fn run_command_kills_on_timeout() -> Result<(), String> {
         let started = Instant::now();
-        let result = run_command(
+        let run = run_available(
             "sleep",
             &strings(&["5"]),
             b"",
             Duration::from_millis(200),
             4096,
-        );
-        if result.spawn_error.is_some() {
-            println!("NOT RUN: sleep not found");
+        )?;
+        let Some(result) = run else {
             return Ok(());
-        }
+        };
         let elapsed = started.elapsed();
         assert!(result.timed_out, "not timed out: {result:?}");
         assert!(!result.output_limit_exceeded);
@@ -1905,11 +2215,10 @@ mod tests {
     #[test]
     fn run_command_kills_on_output_limit() -> Result<(), String> {
         let started = Instant::now();
-        let result = run_command("yes", &[], b"", Duration::from_secs(10), 4096);
-        if result.spawn_error.is_some() {
-            println!("NOT RUN: yes not found");
+        let run = run_available("yes", &[], b"", Duration::from_secs(10), 4096)?;
+        let Some(result) = run else {
             return Ok(());
-        }
+        };
         assert!(
             result.output_limit_exceeded,
             "limit not enforced: {result:?}"
@@ -1926,26 +2235,527 @@ mod tests {
 
     #[test]
     fn run_command_writes_stdin_and_reports_spawn_and_exit() -> Result<(), String> {
-        let missing = run_command(
-            "/nonexistent/ifcap-po-inquiry-no-such-program",
-            &[],
-            b"",
-            Duration::from_secs(1),
-            4096,
-        );
+        let absent = "/nonexistent/ifcap-po-inquiry-no-such-program";
+        let timeout = Duration::from_secs(1);
+        let missing = run_command(absent, &[], b"", timeout, 4096);
         assert!(missing.spawn_error.is_some(), "spawned a missing program");
-        let echoed = run_command("cat", &[], b"\nA1\n^\n", Duration::from_secs(10), 4096);
-        if echoed.spawn_error.is_some() {
-            println!("NOT RUN: cat not found");
+        let error = match execute(absent, &[], b"", timeout, 4096, &mut start_thread) {
+            Ok(result) => return Err(format!("spawned a missing program: {result:?}")),
+            Err(e) => e,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(missing.spawn_error, Some(error.to_string()));
+        // A program that exists but cannot be executed fails; only an
+        // absent program is NOT RUN.
+        let not_executable = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        let refused = run_available(not_executable, &[], b"", timeout, 4096);
+        assert!(
+            matches!(&refused, Err(cause) if cause.contains("could not be started")),
+            "{refused:?}"
+        );
+        let echoed = run_available("cat", &[], b"\nA1\n^\n", Duration::from_secs(10), 4096)?;
+        let Some(echoed) = echoed else {
             return Ok(());
-        }
+        };
         assert_eq!(decide_live_result(&echoed), Ok("\nA1\n^\n".to_string()));
-        let failed = run_command("false", &[], b"", Duration::from_secs(10), 4096);
-        if failed.spawn_error.is_some() {
-            println!("NOT RUN: false not found");
+        let failed = run_available("false", &[], b"", Duration::from_secs(10), 4096)?;
+        let Some(failed) = failed else {
             return Ok(());
-        }
+        };
         assert_eq!(failed.exit_code, Some(1));
+        Ok(())
+    }
+
+    /// The text of an I/O error.
+    fn io_text(e: io::Error) -> String {
+        e.to_string()
+    }
+
+    /// Runs `work` with a cancel flag that another thread sets after
+    /// `delay`, then joins that thread.
+    fn cancelled_after<T>(
+        delay: Duration,
+        work: impl FnOnce(&AtomicBool) -> T,
+    ) -> Result<T, String> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let setter = thread::Builder::new()
+            .spawn(move || {
+                thread::sleep(delay);
+                flag.store(true, Ordering::SeqCst);
+            })
+            .map_err(io_text)?;
+        let outcome = work(&cancel);
+        setter
+            .join()
+            .map_err(|_| "the cancelling thread panicked".to_string())?;
+        Ok(outcome)
+    }
+
+    /// A `read_bounded` case over two chunks read one after the other: the
+    /// chunks, the limit and whether the reader has the exceeded flag, then
+    /// the bytes kept, whether the flag was set and how many bytes were left
+    /// unread.
+    type ReadCase = (
+        &'static [u8],
+        &'static [u8],
+        usize,
+        bool,
+        &'static [u8],
+        bool,
+        usize,
+    );
+
+    #[test]
+    fn read_bounded_reports_failure_retry_limit_and_cancel() -> Result<(), String> {
+        let cases: Vec<ReadCase> = vec![
+            (b"ab", b"cd", 16, true, b"abcd", false, 0),
+            (b"abcdef", b"gh", 4, true, b"abcd", true, 2),
+            (b"abcdef", b"gh", 4, false, b"abcd", false, 0),
+        ];
+        let cancel = AtomicBool::new(false);
+        for (number, (first, second, limit, flagged, kept, flag_set, left)) in
+            cases.into_iter().enumerate()
+        {
+            let exceeded = AtomicBool::new(false);
+            let mut stream = first.chain(second);
+            let outcome = read_bounded(&mut stream, limit, flagged.then_some(&exceeded), &cancel);
+            assert_eq!(outcome, (kept.to_vec(), Ok(true)), "case {number}");
+            assert_eq!(exceeded.load(Ordering::SeqCst), flag_set, "case {number}");
+            let (first_rest, second_rest) = stream.get_ref();
+            assert_eq!(first_rest.len() + second_rest.len(), left, "case {number}");
+        }
+        // Reading a file opened only for writing fails, after the bytes
+        // before it were kept.
+        let write_only = || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .map_err(io_text)
+        };
+        let refused = match write_only()?.read(&mut [0u8; 1]) {
+            Ok(n) => return Err(format!("read {n} bytes from a write-only file")),
+            Err(e) => e.to_string(),
+        };
+        let failing = (&b"ab"[..]).chain(write_only()?);
+        assert_eq!(
+            read_bounded(failing, 16, None, &cancel),
+            (b"ab".to_vec(), Err(refused))
+        );
+        // A stream held open with nothing more to send times out each read,
+        // which is retried until the run is cancelled.
+        let ((_, stdout, _), (_, mut peer, _)) = stream_pairs().map_err(io_text)?;
+        peer.write_all(b"ab").map_err(io_text)?;
+        let outcome = cancelled_after(Duration::from_millis(50), |cancel| {
+            read_bounded(stdout, 16, None, cancel)
+        })?;
+        drop(peer);
+        assert_eq!(outcome, (b"ab".to_vec(), Ok(false)));
+        Ok(())
+    }
+
+    #[test]
+    fn write_input_reports_refusal_failure_retry_and_cancel() -> Result<(), String> {
+        let cancel = AtomicBool::new(false);
+        let mut sink = Vec::new();
+        assert_eq!(
+            write_input(&mut sink, b"abc", &cancel),
+            (Vec::new(), Ok(true))
+        );
+        assert_eq!(sink, b"abc");
+        // Empty input writes nothing, so a file that refuses every write
+        // still takes all of it.
+        let read_only = || fs::File::open("/dev/null").map_err(io_text);
+        assert_eq!(
+            write_input(read_only()?, b"", &cancel),
+            (Vec::new(), Ok(true))
+        );
+        let refused = match read_only()?.write(b"x") {
+            Ok(n) => return Err(format!("wrote {n} bytes to a read-only file")),
+            Err(e) => e.to_string(),
+        };
+        assert_eq!(
+            write_input(read_only()?, b"abc", &cancel),
+            (Vec::new(), Err(refused))
+        );
+        // A stream that takes no more bytes is a failure, not a retry.
+        let mut room = [0u8; 2];
+        let mut short: &mut [u8] = &mut room;
+        let write_zero = io::Error::from(io::ErrorKind::WriteZero).to_string();
+        assert_eq!(
+            write_input(&mut short, b"abc", &cancel),
+            (Vec::new(), Err(write_zero))
+        );
+        assert_eq!(room, *b"ab");
+        // A child that closes its standard input refuses the rest. The input
+        // is more than the stream holds, so it is refused even while a child
+        // that another test is starting still holds a copy of the closed end.
+        let input = vec![b'x'; 4 * 1024 * 1024];
+        let ((stdin, _, _), (peer, _, _)) = stream_pairs().map_err(io_text)?;
+        drop(peer);
+        assert_eq!(write_input(stdin, &input, &cancel), (Vec::new(), Ok(false)));
+        // Input the child leaves unread fills the stream, which times out
+        // each write; it is retried until the run is cancelled.
+        let ((stdin, _, _), (peer, _, _)) = stream_pairs().map_err(io_text)?;
+        let outcome = cancelled_after(Duration::from_millis(50), |cancel| {
+            write_input(stdin, &input, cancel)
+        })?;
+        drop(peer);
+        assert_eq!(outcome, (Vec::new(), Ok(false)));
+        Ok(())
+    }
+
+    /// A worker that carried its stream to its end, keeping `kept`.
+    fn done(kept: &[u8]) -> thread::Result<PipeOutcome> {
+        Ok((kept.to_vec(), Ok(true)))
+    }
+
+    /// A worker that stopped before the end of its stream, keeping `kept`.
+    fn stopped(kept: &[u8]) -> thread::Result<PipeOutcome> {
+        Ok((kept.to_vec(), Ok(false)))
+    }
+
+    /// A worker whose stream failed with an injected error, keeping `kept`.
+    fn failed(kept: &[u8]) -> thread::Result<PipeOutcome> {
+        Ok((kept.to_vec(), Err("injected".to_string())))
+    }
+
+    /// A worker that panicked with an injected payload.
+    fn panicked() -> thread::Result<PipeOutcome> {
+        Err(Box::new("injected") as Box<dyn Any + Send>)
+    }
+
+    /// An `exec_result` case: the writer, the two readers, whether the run
+    /// timed out and whether standard output passed its limit, then the
+    /// failure diagnostic expected.
+    type ResultCase = (
+        thread::Result<PipeOutcome>,
+        thread::Result<PipeOutcome>,
+        thread::Result<PipeOutcome>,
+        bool,
+        bool,
+        Option<&'static str>,
+    );
+
+    #[test]
+    fn exec_result_rejects_failed_panicked_and_unfinished_workers() {
+        let cases: Vec<ResultCase> = vec![
+            (done(b""), done(b"T"), done(b""), false, false, None),
+            (stopped(b""), done(b"T"), done(b""), false, false, None),
+            (done(b""), done(b"T"), stopped(b""), false, true, None),
+            (
+                done(b""),
+                failed(b"T"),
+                done(b""),
+                false,
+                false,
+                Some("STANDARD OUTPUT READ FAILED: injected"),
+            ),
+            (
+                done(b""),
+                panicked(),
+                done(b""),
+                false,
+                false,
+                Some("STANDARD OUTPUT READER PANICKED"),
+            ),
+            (
+                panicked(),
+                done(b"T"),
+                done(b""),
+                false,
+                false,
+                Some("STANDARD INPUT WRITER PANICKED"),
+            ),
+            (
+                done(b""),
+                done(b"T"),
+                panicked(),
+                false,
+                false,
+                Some("STANDARD ERROR READER PANICKED"),
+            ),
+            (
+                failed(b""),
+                done(b"T"),
+                done(b""),
+                false,
+                false,
+                Some("STANDARD INPUT WRITE FAILED: injected"),
+            ),
+            (
+                done(b""),
+                done(b"T"),
+                failed(b""),
+                false,
+                false,
+                Some("STANDARD ERROR READ FAILED: injected"),
+            ),
+            (
+                done(b""),
+                stopped(b"T"),
+                done(b""),
+                false,
+                false,
+                Some("STANDARD OUTPUT NOT READ TO ITS END"),
+            ),
+            (
+                done(b""),
+                done(b"T"),
+                stopped(b""),
+                false,
+                false,
+                Some("STANDARD ERROR NOT READ TO ITS END"),
+            ),
+            (
+                failed(b""),
+                stopped(b"T"),
+                done(b""),
+                false,
+                false,
+                Some("STANDARD INPUT WRITE FAILED: injected"),
+            ),
+            (
+                done(b""),
+                panicked(),
+                failed(b""),
+                false,
+                false,
+                Some("STANDARD OUTPUT READER PANICKED; STANDARD ERROR READ FAILED: injected"),
+            ),
+            (done(b""), stopped(b"T"), stopped(b""), true, false, None),
+        ];
+        for (number, (writer, out_reader, err_reader, timed_out, limited, diagnostic)) in
+            cases.into_iter().enumerate()
+        {
+            let result = exec_result(
+                Some(ExitStatus::from_raw(0)),
+                timed_out,
+                limited,
+                Vec::new(),
+                vec![writer, out_reader, err_reader],
+            );
+            assert_eq!(result.spawn_error.as_deref(), diagnostic, "case {number}");
+            assert_eq!(result.exit_code, Some(0), "case {number}");
+            let expected = match (diagnostic, timed_out, limited) {
+                (Some(text), _, _) => Err(LiveFailure::Spawn(text.to_string())),
+                (None, true, _) => Err(LiveFailure::Timeout),
+                (None, false, true) => Err(LiveFailure::OutputTooLarge),
+                (None, false, false) => Ok("T".to_string()),
+            };
+            assert_eq!(decide_live_result(&result), expected, "case {number}");
+        }
+    }
+
+    /// The status of a child ended by SIGKILL.
+    fn killed() -> ExitStatus {
+        ExitStatus::from_raw(9)
+    }
+
+    /// A `reap` case: the kill error, if any, and what the wait or poll
+    /// answers, then the status, the failures and the calls expected.
+    type ReapCase = (
+        Option<&'static str>,
+        Result<Option<ExitStatus>, &'static str>,
+        Option<ExitStatus>,
+        &'static [&'static str],
+        &'static [&'static str],
+    );
+
+    #[test]
+    fn reap_records_kill_and_wait_failures() {
+        let exited = ExitStatus::from_raw(0);
+        let cases: Vec<ReapCase> = vec![
+            (None, Ok(Some(killed())), Some(killed()), &[], &["wait"]),
+            (None, Ok(Some(exited)), Some(exited), &[], &["wait"]),
+            (
+                Some("injected kill"),
+                Ok(None),
+                None,
+                &["KILL FAILED: injected kill"],
+                &["try_wait"],
+            ),
+            (
+                Some("injected kill"),
+                Err("injected try_wait"),
+                None,
+                &[
+                    "KILL FAILED: injected kill",
+                    "WAIT FAILED: injected try_wait",
+                ],
+                &["try_wait"],
+            ),
+            (
+                None,
+                Err("injected wait"),
+                None,
+                &["WAIT FAILED: injected wait"],
+                &["wait"],
+            ),
+        ];
+        for (number, (kill_error, answer, status, failures, calls)) in cases.into_iter().enumerate()
+        {
+            let kill = kill_error.map_or(Ok(()), |message| Err(io::Error::other(message)));
+            let mut made = Vec::new();
+            let mut recorded = Vec::new();
+            let reaped = reap(
+                kill,
+                |block| {
+                    made.push(if block { "wait" } else { "try_wait" });
+                    answer.map_err(io::Error::other)
+                },
+                &mut recorded,
+            );
+            assert_eq!(reaped, status, "case {number}");
+            assert_eq!(recorded, failures, "case {number}");
+            assert_eq!(made, calls, "case {number}");
+        }
+    }
+
+    #[test]
+    fn watch_records_a_child_it_cannot_wait_on() {
+        let mut failures = Vec::new();
+        let watched = watch(
+            &mut || Err(io::Error::other("injected try_wait")),
+            &[],
+            &AtomicBool::new(false),
+            Duration::from_secs(5),
+            Instant::now(),
+            &mut failures,
+        );
+        assert_eq!(watched, (None, false, false));
+        assert_eq!(failures, ["WAIT FAILED: injected try_wait"]);
+    }
+
+    /// Starts `sleep 5` on the child ends of fresh [`stream_pairs`], giving
+    /// the child, the parent's ends and a copy of each child end, which
+    /// stands for a descendant holding the child's streams open, reading
+    /// and writing nothing. `Ok(None)` when `sleep` is absent, which is
+    /// reported as NOT RUN; any other failure to start it is an error.
+    fn spawn_sleep() -> Result<Option<(Child, StdStreams, StdStreams)>, String> {
+        let (streams, (stdin, stdout, stderr)) = stream_pairs().map_err(io_text)?;
+        let held = (
+            stdin.try_clone().map_err(io_text)?,
+            stdout.try_clone().map_err(io_text)?,
+            stderr.try_clone().map_err(io_text)?,
+        );
+        let spawned = Command::new("sleep")
+            .arg("5")
+            .stdin(Stdio::from(OwnedFd::from(stdin)))
+            .stdout(Stdio::from(OwnedFd::from(stdout)))
+            .stderr(Stdio::from(OwnedFd::from(stderr)))
+            .spawn();
+        match spawned {
+            Ok(child) => Ok(Some((child, streams, held))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                println!("NOT RUN: sleep not found");
+                Ok(None)
+            }
+            Err(e) => Err(format!("sleep could not be started: {e}")),
+        }
+    }
+
+    /// Starts workers on real threads, counting in `finished` each one whose
+    /// work has returned; the call numbered `fail_on`, if any, fails instead.
+    fn counting_start(
+        finished: Arc<AtomicUsize>,
+        fail_on: Option<usize>,
+    ) -> impl FnMut(&'static str, Worker) -> io::Result<JoinHandle<PipeOutcome>> {
+        let mut calls = 0;
+        move |name, work| {
+            calls += 1;
+            if fail_on == Some(calls) {
+                return Err(io::Error::other("injected"));
+            }
+            let done = Arc::clone(&finished);
+            start_thread(
+                name,
+                Box::new(move || {
+                    let outcome = work();
+                    done.fetch_add(1, Ordering::SeqCst);
+                    outcome
+                }),
+            )
+        }
+    }
+
+    #[test]
+    fn run_command_joins_workers_held_open_by_a_descendant() -> Result<(), String> {
+        let Some((mut child, streams, held)) = spawn_sleep()? else {
+            return Ok(());
+        };
+        let finished = Arc::new(AtomicUsize::new(0));
+        let mut start = counting_start(Arc::clone(&finished), None);
+        let input = vec![b'x'; 4 * 1024 * 1024];
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let result = supervise(
+            &mut child, streams, &input, timeout, 4096, started, &mut start,
+        );
+        let elapsed = started.elapsed();
+        drop(held);
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            3,
+            "a worker was not joined"
+        );
+        assert!(
+            elapsed < timeout + Duration::from_millis(500),
+            "took {elapsed:?}"
+        );
+        assert!(result.timed_out, "not timed out: {result:?}");
+        assert_eq!(result.spawn_error, None);
+        assert_eq!(result.exit_code, None, "a killed child has no exit code");
+        assert_eq!(decide_live_result(&result), Err(LiveFailure::Timeout));
+        Ok(())
+    }
+
+    #[test]
+    fn run_command_partial_worker_start_kills_reaps_and_joins() -> Result<(), String> {
+        let diagnostic = "PIPE WORKER NOT STARTED: injected";
+        for fail_on in 1..=3 {
+            let Some((mut child, streams, held)) = spawn_sleep()? else {
+                return Ok(());
+            };
+            let finished = Arc::new(AtomicUsize::new(0));
+            let mut start = counting_start(Arc::clone(&finished), Some(fail_on));
+            let input = vec![b'x'; 4 * 1024 * 1024];
+            let started = Instant::now();
+            let result = supervise(
+                &mut child,
+                streams,
+                &input,
+                Duration::from_secs(5),
+                4096,
+                started,
+                &mut start,
+            );
+            let elapsed = started.elapsed();
+            drop(held);
+            assert_eq!(
+                result.spawn_error.as_deref(),
+                Some(diagnostic),
+                "worker {fail_on}"
+            );
+            assert!(
+                matches!(child.try_wait(), Ok(Some(_))),
+                "worker {fail_on}: child not reaped"
+            );
+            assert_eq!(result.exit_code, None, "worker {fail_on}");
+            assert_eq!(
+                finished.load(Ordering::SeqCst),
+                fail_on - 1,
+                "worker {fail_on}: a started worker was not joined"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "worker {fail_on}: took {elapsed:?}"
+            );
+            assert_eq!(
+                decide_live_result(&result),
+                Err(LiveFailure::Spawn(diagnostic.to_string()))
+            );
+        }
         Ok(())
     }
 
