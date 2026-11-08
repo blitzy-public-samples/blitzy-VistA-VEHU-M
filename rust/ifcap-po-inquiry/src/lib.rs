@@ -8,8 +8,8 @@
 
 #![forbid(unsafe_code)]
 
-// Declarations and re-exports stand in rustfmt's order, which `cargo fmt
-// --check` enforces; only their names and visibilities are fixed.
+// `mumps` is private: nothing in it is wider than `pub(crate)`, so it forms no
+// part of the public API.
 pub mod bridge;
 pub mod inquiry;
 mod mumps;
