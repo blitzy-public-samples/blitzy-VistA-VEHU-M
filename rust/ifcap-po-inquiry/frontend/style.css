@@ -43,6 +43,8 @@ body {
   font-family: ui-monospace, monospace;
   font-size: 1rem;
   line-height: var(--lh);
+  /* Makes 100cqi the page's width; body's width never follows its content. */
+  container-type: inline-size;
 }
 
 .terminal {
@@ -54,10 +56,22 @@ body {
   padding-inline: 2ch;
   /* The page's width, or wider only for content that cannot wrap (a
      transcript box), so the 2ch inline-end padding stays beside that
-     content if it ever overflows. Text that can wrap, such as an error
-     line, wraps at this width instead of widening it. */
+     content if it ever overflows. The rows that can wrap are held to the
+     page's width instead (next rule), so only a transcript box ever
+     widens the page. */
   inline-size: min-content;
   min-inline-size: 100%;
+}
+
+/* The title, controls, entry row and status lines stay within the page's
+   width less the two 2ch .terminal paddings, so they wrap at the page's
+   edge even while a transcript box makes .terminal wider. Container units
+   size these rows only, never a font. */
+.title,
+.controls,
+.entry,
+.status {
+  max-inline-size: calc(100cqi - 4ch);
 }
 
 .title,
@@ -94,10 +108,10 @@ button {
   min-inline-size: 44px;
 }
 
-/* The entry row spans .terminal and the input takes the room its row
-   leaves, from its minimum width up to 40 columns, so a narrow viewport
-   narrows the input instead of wrapping the cursor and buttons away from
-   it. */
+/* The entry row spans .terminal up to the page's width, and the input
+   takes the room its row leaves, from its minimum width up to 40 columns,
+   so a narrow viewport narrows the input instead of wrapping the cursor
+   and buttons away from it or past the page's edge. */
 .entry {
   align-self: stretch;
 }
@@ -209,20 +223,15 @@ button,
   display: none;
 }
 
-/* Transcript font. Each box stays 80 columns by 24 of its own rows, so on a
-   viewport too narrow for it at 1rem its font shrinks so that it fits. The
-   room is 100vw less one page scrollbar, the two 2ch .terminal paddings
-   and, per box, its gutter and 2px border; COMPARE also leaves the 2ch
-   gap. A scrollbar is taken as at most 17px and a system monospace ch as
-   at most 0.61em, so 80 columns take at most 48.8em and each 2ch of
-   padding or gap at most 1.22rem. */
-.terminal > .screen {
-  font-size: min(1rem, (100vw - 2.44rem - 36px) / 48.8);
-  line-height: var(--lh);
-}
-
+/* Transcript font. Each box is 80 columns by 24 of its own rows, sized in
+   rem only and never in viewport units, so browser zoom and the browser's
+   default font size enlarge transcript text in proportion. The single box
+   keeps the 1rem body font. Each COMPARE pane is 0.75rem, so both 80-column
+   panes stay side by side within a 1280px-wide window. A viewport narrower
+   than the box, or than both panes, scrolls the page sideways instead of
+   shrinking the text: an 80-column terminal is two-dimensional content. */
 .pane > .screen {
-  font-size: min(1rem, (100vw - 3.66rem - 55px) / 97.6);
+  font-size: 0.75rem;
   line-height: var(--lh);
 }
 
