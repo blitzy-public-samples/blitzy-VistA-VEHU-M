@@ -12,7 +12,7 @@ This document is the source-contract gate for porting OPTION `PRCH DISPLAY PO` (
 |---|---|---|
 | Baseline | Repository `github.com/blitzy-public-samples/blitzy-VistA-VEHU-M`, commit `dd3fd0f3124c8178657d9fff4173c324da30f7ae` ("VistA patches for September 2026"); clean tree at planning; `Packages/` unchanged since (section "Source-unchanged check"). Runtime image digest: NOT AVAILABLE TO THE RUN | Commit SOURCE-RESOLVED; digest OPEN (O-05) |
 | Menu option | `PRCHQ1` is a real OPTION entry, IEN 10295, type R, "New RFQ" [19+OPTION.zwr:81374-81381], not the purchase-order inquiry. Selected: `PRCH DISPLAY PO`, IEN 1901, type R [19+OPTION.zwr:14687] | SOURCE-RESOLVED |
-| Entry point | `EN3^PRCHRPT`. Option action verbatim `^DIC(19,1901,25)="EN3^PRCHRPT"`; entry action `^DIC(19,1901,20)=""` (empty) [19+OPTION.zwr:14690-14691] | SOURCE-RESOLVED |
+| Entry point | `EN3^PRCHRPT`. Option zero node verbatim `^DIC(19,1901,0)="PRCH DISPLAY PO^Purchase Order Display^^R^11740^^^^^^^"` [19+OPTION.zwr:14687]; action verbatim `^DIC(19,1901,25)="EN3^PRCHRPT"`; entry action `^DIC(19,1901,20)=""` (empty) [19+OPTION.zwr:14690-14691] | SOURCE-RESOLVED |
 | Source location | `Packages/IFCAP/Routines/PRCHRPT.m` lines 70-75 [PRCHRPT.m:70-75] | SOURCE-RESOLVED |
 | Dependencies | PO-02 to PO-41 (section "Contracts"), including FileMan `DICM0` and `DICQ1` and `^%DT` called at [PRCFSITE.m:15]. The only unresolved dynamic target is `@IOF` [PRCHDP1.m:12] | IFCAP SOURCE-RESOLVED; O-01, O-03, O-04 open |
 | Data dependencies | The 29 files and subfiles of section "FileMan definitions read". Written or killed by the original, none of it business data: `^DISV` [DIC2.m:65]; `^UTILITY($J,"W")` and `^TMP($J,"W")` [PRCHDP1.m:53-54] [PRCHDP2.m:95]; `K ^TMP($J,"PRCHDP6")` [PRCHDP2.m:25]; `K ^TMP($J,"MDEL")` [PRCHDP4.m:8, 13]. `^XUTL("XQ",$J)` is read by `^%ZIS` for the HOME device [ZIS.m:28]; its `IO*` nodes are written by `SAVEVAR^%ZIS` at sign-on [ZIS.m:82-86], not on this path | SOURCE-RESOLVED |
@@ -108,10 +108,10 @@ EN3^PRCHRPT           PO-01  option entry; maps to inquire                    [1
 | PO-09 | 442 `^PRC(442,0)` (file header), `^PRC(442,"C",X,ien)`, each later `^PRC(442)` subscript, `^PRC(442,ien,0)`, `(1)`, `(7)`; 442.5; 442.3; for pointer transforms, the pointed-to file's `B` index and the parent index under each candidate | Candidates, screen, identifiers | Generic FileMan (`DIC`, `DIC3`, `DIC4`, `DICM`, `DICM0`, `DICQ1`); stubbed over `Store` |
 | PO-10 | 442 nodes 0, 1, 7, 11, 12, 23, 24; 411 nodes 0, 1, 3; 440 nodes 0, 2, 3; 440.2 and `^DPT` only when field 5.3 is set; 5; 49; 442.5; 442.3 | Header, ship-to, vendor, status | Direct [PRCHDP1.m:4-44] |
 | PO-11 | 411 node 0 piece 7; 442 node 23 piece 7; 411.2 | Facility type | Direct [PRCHFPNT.m:44-51] |
-| PO-13, PO-17 | 442 node 1 pieces 6, 7, 8, 14; node 14 with 442.4; 420.8; node 23 piece 11 | FOB, proposal, authority, type, buyer or agent | Direct [PRCHDP1.m:53-57, 71] |
-| PO-18 to PO-24 | 442 node 0 pieces 3, 4, 5, 10, 15; node 1 pieces 10, 15; node 5; item index `2,"AC"`; node 7 piece 3; 200 `^VA(200,agent,0)` | Dates, agent, discounts, FCP block, total | Direct [PRCHDP1.m:58-68] |
-| PO-25 to PO-30 | 442 node `6,0`, node 0 piece 13, node 15; items `2,n,0`, `2,n,1,k,0`, `2,n,2`, `2,n,3,"AC"`, `2,n,4`; node 22 `"B"`; node 23 pieces 8 and 11; 420.5 | Line items | Direct [PRCHDP2.m:9-66] [PRCHUTL.m:73] |
-| PO-31 to PO-37 | 442 nodes 4, 13, 6, 11; 442.8 `^PRC(442.8,"B",PONO)` | Comments, transactions, amendments, receipts, delivery schedule | Direct [PRCHDP2.m:19-26] [PRCHDP6.m:127] [PRCHDP4.m:8-9] |
+| PO-13, PO-17 | 442 node 0 piece 5; node 1 pieces 6, 7, 8, 14; node 14 with 442.4; 420.8; node 23 piece 11 | FOB, proposal, authority, cost center, type, buyer or agent | Direct [PRCHDP1.m:53-57, 71] |
+| PO-18 to PO-24 | 442 node 0 pieces 3, 4, 10, 15; node 1 pieces 10, 15; node 5; item index `2,"AC"`; node 7 piece 3; 200 `^VA(200,agent,0)` | Dates, agent, discounts, FCP block, total | Direct [PRCHDP1.m:58-68] |
+| PO-25 to PO-30 | 442 node `6,0`, order-level node 3 (discount entries, presence tested by `$O(^PRC(442,D0,3,n))` [PRCHDP2.m:12]; an entry is PO-25.b5, n/e), node 0 piece 13, node 15; items `2,n,0`, `2,n,1,k,0`, `2,n,2`, `2,n,3,"AC"`, `2,n,4`; node 22 `"B"`; node 23 pieces 8 and 11; 420.5 | Line items | Direct [PRCHDP2.m:9-66] [PRCHUTL.m:73] |
+| PO-31 to PO-37 | 442 nodes 4, 13, 6, 11; node 0 piece 1 (the PO number; unguarded read, a `CorruptStore` site) [PRCHDP4.m:8]; 442.8 `^PRC(442.8,"B",PONO)` | Comments, transactions, amendments, receipts, PO number, delivery schedule | Direct [PRCHDP2.m:19-26] [PRCHDP6.m:127] [PRCHDP4.m:8-9] |
 | PO-15, PO-16, PO-32, PO-36, PO-37, PO-39 | `^UTILITY($J,"W")`, `^TMP($J,"W")`, `^TMP($J,"PRCHDP6")`, `^TMP($J,"MDEL")` | Word-wrap scratch; kills of amendment and delivery scratch | Scratch state in `Locals`, never `Store` [PRCHDP2.m:25, 95] [PRCHDP4.m:8, 13] |
 
 ### Literals the five cases can print
@@ -1216,3 +1216,18 @@ Checked by the team (B3, B4) in current Chrome and Firefox; this run reports eac
 6. **Labels:** the literal upper-case labels (`MUMPS`, `RUST`, `COMPARE`, `SEND`, `EXIT`) are byte-identical in every mode.
 7. **No validation:** no `autofocus`, `pattern`, `required` or `maxlength` attribute; `SEND` appends `input.value` unchanged (the empty string included); `EXIT` appends `EXIT_INPUT = "^"`; and the static search of `frontend/` recorded in `test-results/<run-id>/search-frontend.txt` has zero hits.
 8. **Transcript grid:** one `<div class="ln">` per `\n`-separated line, set through `textContent`, in an `80ch` by 24-line box with `white-space: pre`; typed inputs are not echoed; error bodies appear verbatim in a separate status line and the transcript stays as last rendered.
+9. **Screen controls:** one text input, `<input type="text">`, with a `SEND` button and an `EXIT` button; in COMPARE, the two transcript areas (MUMPS and RUST) are side by side.
+10. **Session behaviour (`app.js`):**
+    - `inputs` is an in-memory array, so a reload starts a new session with an empty sequence;
+    - `SEND` posts `{"inputs": inputs}`, the whole accumulated sequence, to `/api/{backend}/session`;
+    - changing the selector re-sends the current sequence to the newly selected backend;
+    - a request counter discards stale responses: a response to an earlier request is never drawn once a later request has been sent;
+    - no input is validated, trimmed or transformed, and backend text is never read to decide anything.
+11. **Transcript box styling:** `overflow-y: auto`, with no wrapping; each line has a fixed `line-height` with a `min-height` (or its logical equivalent `min-block-size`), so empty lines keep their row.
+12. **Retro look, shared by every mode:**
+    - the system monospace font (`ui-monospace, monospace`), with no web font, CDN or image dependency;
+    - `#33FF33` text on `#000000`;
+    - square corners;
+    - no `box-shadow`, gradient or image styling;
+    - a static block cursor, `<span class="cursor">`, after the input, with no blink animation.
+13. **Mode attribute and motion check:** the root element carries `data-mode="mumps|rust|compare"`, following the selected backend; `app.js` checks `matchMedia("(prefers-reduced-motion: reduce)")` before adding animation classes, so none is added under `reduce`.
