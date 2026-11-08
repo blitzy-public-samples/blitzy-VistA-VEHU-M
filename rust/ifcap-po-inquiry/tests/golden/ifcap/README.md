@@ -131,7 +131,7 @@ The format belongs to `parse_normalisation` and `normalise` in `src/bridge.rs` (
 - A line with no tab, more than one tab, or an empty delimiter is malformed. The bridge answers 502 `MALFORMED NORMALISATION <path> line <n>`, with the 1-based line number, and the harness reports FAIL.
 - Rules apply in file order, each to the result of the one before. A rule scans left to right and replaces the text from each open delimiter through the next close delimiter after it, both delimiters included, with `<NORM>`. Scanning resumes after the replaced text. An open delimiter with no later close delimiter leaves the rest of the text unchanged.
 - Both sides of a comparison get the same rules, and no other transformation exists.
-- **The file is expected to be empty** (zero bytes), and an empty file is valid. A rule may cover only run-time timestamps, internal record numbers and other variable fields, each documented in the rule's own case. It must leave order IDs, status, quantities, prices, amounts and error text intact. Each rule, and the original text it replaced, is reported in `REPORT.md`.
+- **The file is expected to be empty** (zero bytes), and an empty file is valid. A rule may cover only run-time timestamps, internal record numbers and other variable fields, each documented in the rule's own case. It must leave order IDs, status, quantities, prices, amounts and error text intact. `REPORT.md` reports each rule with the texts it replaces when applied alone to each side's un-normalised text, so with several rules a later rule's reported text can differ from what it replaces after the earlier ones (`REPORT.md`, "A8 coverage").
 
 ### How the readers use the captures
 

@@ -15,15 +15,21 @@
 //! between the comparison markers. Every capture-format and loader rule comes
 //! from the crate's shared helpers; nothing here re-implements one.
 //!
+//! The evaluation reads through [`CaseFiles`], a tuple of four read
+//! functions: the crate folder on disk for the golden cases, and an in-memory
+//! capture for the self-tests at the end of the file, which assert the status
+//! and the findings the same evaluation decides for controlled inputs, and
+//! read and write no file.
+//!
 //! A finding is held twice: as its console cause, which names only crate
 //! files, keys, branch IDs and positions, and as its full detail, which can
 //! quote capture values, store records and absolute paths. The console and
 //! the assertion messages show causes only; the details go to `REPORT.md`.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -358,16 +364,51 @@ fn required_files(id: &str) -> Vec<String> {
         .collect()
 }
 
-/// A file is missing only when nothing exists at its path. Anything else
-/// that stands there, even a directory or an unreadable file, is present and
-/// is judged by the format checks instead.
-fn is_missing(rel: &str) -> bool {
+/// Everything an evaluation reads, by crate-relative path, as (is missing,
+/// read, digest, fixtures). An evaluation reads only through these, and none
+/// of them writes.
+///
+/// - is missing: true only when nothing exists at the path. Anything else
+///   that stands there, even a directory or an unreadable file, is present
+///   and is judged by the format checks instead.
+/// - read: the bytes of the file at the path.
+/// - digest: the lowercase SHA-256 digest of the file at the path. `Err`
+///   says why no digest is available; a tool failure is never a digest.
+/// - fixtures: the store `load_fixtures` gives for the fixture directory.
+///   `Err` is the loader error's `Display` text, which names the file and
+///   line.
+type CaseFiles<'a> = (
+    &'a dyn Fn(&str) -> bool,
+    &'a dyn Fn(&str) -> io::Result<Vec<u8>>,
+    &'a dyn Fn(&str) -> Result<String, String>,
+    &'a dyn Fn() -> Result<Store, String>,
+);
+
+/// Whether nothing exists at `rel` in the crate folder on disk, located
+/// through `CARGO_MANIFEST_DIR`: the golden cases' is-missing function.
+fn disk_is_missing(rel: &str) -> bool {
     matches!(fs::metadata(crate_path(rel)), Err(err) if err.kind() == ErrorKind::NotFound)
 }
 
+/// The bytes of the file at `rel` in the crate folder on disk.
+fn disk_read(rel: &str) -> io::Result<Vec<u8>> {
+    fs::read(crate_path(rel))
+}
+
+/// The `sha256sum` digest of the file at `rel` in the crate folder on disk.
+fn disk_digest(rel: &str) -> Result<String, String> {
+    sha256(&crate_path(rel))
+}
+
+/// The store `load_fixtures` gives for the fixture directory on disk.
+fn disk_fixtures() -> Result<Store, String> {
+    load_fixtures(&crate_path(FIXTURES_REL)).map_err(|err| err.to_string())
+}
+
 /// The UTF-8 text of a present file.
-fn read_text(rel: &str) -> Result<String, (String, String)> {
-    let bytes = fs::read(crate_path(rel)).map_err(|err| {
+fn read_text(files: CaseFiles, rel: &str) -> Result<String, (String, String)> {
+    let (_, read, _, _) = files;
+    let bytes = read(rel).map_err(|err| {
         (
             format!("UNREADABLE {rel}"),
             format!("UNREADABLE {rel}: {err}"),
@@ -499,23 +540,27 @@ fn first_store_difference(before: &Store, after: &Store) -> Option<(String, Stri
 }
 
 /// Where two normalised texts first differ: the position, as the 1-based
-/// line and the byte offset in the expected text, and the position followed
+/// line and the byte offset of the first unequal byte, or of the end of the
+/// shorter text when it is a prefix of the other, and the position followed
 /// by the line holding that offset on each side, through its newline, made
 /// visible. Only the position is free of capture text.
 fn first_text_difference(expected: &str, actual: &str) -> Option<(String, String)> {
     if expected == actual {
         return None;
     }
-    // Every character before the first differing one is equal on both
-    // sides, so the byte offset is the same in both texts.
+    // Every byte before the offset is equal on both sides, so the offset and
+    // the newlines before it are the same in both texts. The offset may fall
+    // inside a multi-byte character, so neither text is sliced at it.
     let offset = expected
-        .char_indices()
-        .zip(actual.chars())
-        .find(|((_, e), a)| e != a)
-        .map_or_else(|| expected.len().min(actual.len()), |((index, _), _)| index);
+        .bytes()
+        .zip(actual.bytes())
+        .position(|(e, a)| e != a)
+        .unwrap_or_else(|| expected.len().min(actual.len()));
     let line = expected
-        .get(..offset)
-        .map_or(0, |prefix| prefix.matches('\n').count())
+        .bytes()
+        .take(offset)
+        .filter(|&byte| byte == b'\n')
+        .count()
         .saturating_add(1);
     let position = format!("line {line}, byte {offset}");
     let difference = format!(
@@ -527,11 +572,15 @@ fn first_text_difference(expected: &str, actual: &str) -> Option<(String, String
 }
 
 /// The line of `text` that holds byte `offset`, through its newline, quoted
-/// and made visible, cut to [`EXCERPT_CHARS`] characters.
+/// and made visible, cut to [`EXCERPT_CHARS`] characters. `offset` may fall
+/// inside a multi-byte character: the line starts after the last newline
+/// byte before it, and a newline byte never occurs inside a multi-byte
+/// character, so the start is always a character boundary.
 fn excerpt(text: &str, offset: usize) -> String {
     let start = text
-        .get(..offset)
-        .and_then(|prefix| prefix.rfind('\n'))
+        .bytes()
+        .take(offset)
+        .rposition(|byte| byte == b'\n')
         .map_or(0, |newline| newline.saturating_add(1));
     let rest = text.get(start..).unwrap_or("");
     let line = rest
@@ -547,6 +596,8 @@ fn excerpt(text: &str, offset: usize) -> String {
 }
 
 /// The original texts `rule` replaces in `raw`, in order, for the report.
+/// `raw` is one side's un-normalised text and no earlier rule is applied
+/// first.
 ///
 /// The spans are recovered from the shared `normalise` applied to `raw` with
 /// this rule alone, so no second copy of the rule logic exists: the output
@@ -730,7 +781,10 @@ fn render_meta(meta: &Meta) -> String {
     )
 }
 
-/// One normalisation rule and, for each side, the texts it replaced there.
+/// One normalisation rule and, for each side, the texts the rule replaces
+/// when applied alone to that side's un-normalised text. With several rules,
+/// a later rule's texts can differ from what it replaces after the earlier
+/// rules, so the rendered line says how they were found.
 fn render_rule(
     number: usize,
     rule: &(String, String),
@@ -756,7 +810,7 @@ fn render_rule(
         })
         .collect();
     format!(
-        "rule {number}: open {}, close {}; {}",
+        "rule {number}: open {}, close {}, applied alone to the un-normalised text; {}",
         code(&quoted(open)),
         code(&quoted(close)),
         shown.join("; ")
@@ -788,14 +842,47 @@ fn recorded_returned(text: &str) -> Option<&str> {
     }
 }
 
-/// Evaluates one case against its capture. Pure: it reads the capture, the
-/// fixtures and `MANIFEST.txt`, and writes nothing. It returns the case's
-/// status, its console summary and its report subsection.
+/// What one evaluation decided, before rendering, as (status, missing files,
+/// actual branch, step fields in [`STEP_FIELDS`] order, FAIL findings,
+/// unavailable-tool findings). Each finding is (cause, detail), in step
+/// order.
+type Evaluation = (
+    &'static str,
+    Vec<String>,
+    String,
+    [Vec<String>; STEP_COUNT],
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+);
+
+/// The status of a case whose required files are all present: FAIL when any
+/// check failed, otherwise BLOCKED when a tool a check needs was
+/// unavailable, otherwise PASS. FAIL always takes precedence over BLOCKED.
+fn case_status(failures: &[(String, String)], blocked: &[(String, String)]) -> &'static str {
+    if !failures.is_empty() {
+        FAIL
+    } else if !blocked.is_empty() {
+        BLOCKED
+    } else {
+        PASS
+    }
+}
+
+/// Evaluates one case against its capture on disk. Pure: it reads the
+/// capture, the fixtures and `MANIFEST.txt`, and writes nothing. It returns
+/// the case's status, its console summary and its report subsection.
+fn evaluate_case(case: (&str, &str, &str, &str, &str)) -> (&'static str, String, String) {
+    let (id, ..) = case;
+    let disk: CaseFiles = (&disk_is_missing, &disk_read, &disk_digest, &disk_fixtures);
+    report_case(case, &evaluate(id, disk))
+}
+
+/// Evaluates case `id` against what `files` holds, and writes nothing.
 ///
 /// Readiness comes first and alone decides NOT COMPARED; the later steps run
 /// only when every required file is present.
-fn evaluate_case(case: (&str, &str, &str, &str, &str)) -> (&'static str, String, String) {
-    let (id, test, ..) = case;
+fn evaluate(id: &str, files: CaseFiles) -> Evaluation {
+    let (is_missing, _, _, _) = files;
     let mut failures = Vec::new();
     let mut blocked = Vec::new();
 
@@ -805,15 +892,8 @@ fn evaluate_case(case: (&str, &str, &str, &str, &str)) -> (&'static str, String,
         .filter(|rel| is_missing(rel))
         .collect();
     let (status, actual_branch, steps) = if missing.is_empty() {
-        let (actual_branch, steps) = evaluate_steps(id, &mut failures, &mut blocked);
-        let status = if !failures.is_empty() {
-            FAIL
-        } else if !blocked.is_empty() {
-            BLOCKED
-        } else {
-            PASS
-        };
-        (status, actual_branch, steps)
+        let (actual_branch, steps) = evaluate_steps(id, files, &mut failures, &mut blocked);
+        (case_status(&failures, &blocked), actual_branch, steps)
     } else {
         let skipped = not_evaluated("readiness: required files missing");
         let steps = STEP_FIELDS.map(|label| {
@@ -825,23 +905,34 @@ fn evaluate_case(case: (&str, &str, &str, &str, &str)) -> (&'static str, String,
         });
         (NOT_COMPARED, skipped, steps)
     };
-    let findings = deciding(status, &failures, &blocked);
-    let summary = console_summary(id, test, status, &missing, findings);
+    (status, missing, actual_branch, steps, failures, blocked)
+}
+
+/// The status, the one-line console summary and the report subsection of
+/// `case`, from its evaluation.
+fn report_case(
+    case: (&str, &str, &str, &str, &str),
+    outcome: &Evaluation,
+) -> (&'static str, String, String) {
+    let (id, test, ..) = case;
+    let (status, missing, actual_branch, steps, failures, blocked) = outcome;
+    let findings = deciding(status, failures, blocked);
+    let summary = console_summary(id, test, status, missing, findings);
     let section = render_case(
         case,
         status,
-        &missing,
-        &actual_branch,
-        &steps,
-        &failures,
-        &blocked,
+        missing,
+        actual_branch,
+        steps,
+        failures,
+        blocked,
     );
     (status, summary, section)
 }
 
-/// Steps 2 to 7 of a case whose required files are all present. Every FAIL
-/// finding goes to `failures` and every unavailable-tool finding to
-/// `blocked`, in step order. It returns the actual branch and the step
+/// Steps 2 to 7 of a case whose required files are all present in `files`.
+/// Every FAIL finding goes to `failures` and every unavailable-tool finding
+/// to `blocked`, in step order. It returns the actual branch and the step
 /// fields, in [`STEP_FIELDS`] order.
 ///
 /// Every check runs whenever its inputs could be read and parsed, even after
@@ -849,6 +940,7 @@ fn evaluate_case(case: (&str, &str, &str, &str, &str)) -> (&'static str, String,
 /// the case's first difference.
 fn evaluate_steps(
     id: &str,
+    files: CaseFiles,
     failures: &mut Vec<(String, String)>,
     blocked: &mut Vec<(String, String)>,
 ) -> (String, [Vec<String>; STEP_COUNT]) {
@@ -856,7 +948,7 @@ fn evaluate_steps(
     let cap = |file: &str| capture_rel(id, file);
     let mut unreadable: Vec<String> = Vec::new();
     let mut read = |rel: String| {
-        let text = read_text(&rel);
+        let text = read_text(files, &rel);
         if text.is_err() {
             unreadable.push(rel);
         }
@@ -911,14 +1003,20 @@ fn evaluate_steps(
         before_text.and_then(|text| take(failures, capture_store(&cap("db-before.zwr"), &text)));
     let after =
         after_text.and_then(|text| take(failures, capture_store(&cap("db-after.zwr"), &text)));
-    let (fixture_hashes, capture_hashes, hash_summary) =
-        check_hashes(id, manifest.as_deref(), &unreadable, failures, blocked);
+    let (fixture_hashes, capture_hashes, hash_summary) = check_hashes(
+        id,
+        files,
+        manifest.as_deref(),
+        &unreadable,
+        failures,
+        blocked,
+    );
 
     // 3. Baseline identity.
+    let (_, _, _, fixture_store) = files;
     let fixtures = take(
         failures,
-        load_fixtures(&crate_path(FIXTURES_REL))
-            .map_err(|err| ("FIXTURE LOAD".to_string(), format!("FIXTURE LOAD {err}"))),
+        fixture_store().map_err(|err| ("FIXTURE LOAD".to_string(), format!("FIXTURE LOAD {err}"))),
     );
     let baseline = match (&before, &fixtures) {
         (Some(capture), Some(fixture_store)) => {
@@ -1135,7 +1233,8 @@ fn evaluate_steps(
             }
         };
 
-    // Normalisation reporting: what each rule replaced; it decides nothing.
+    // Normalisation reporting: what each rule replaces when applied alone to
+    // each side's un-normalised text; it decides nothing.
     let normalisation = match &rules {
         None => vec![not_evaluated("normalisation.txt unavailable")],
         Some(rules) if rules.is_empty() => {
@@ -1202,23 +1301,25 @@ fn evaluate_steps(
     (actual_branch, steps)
 }
 
-/// Hashes every fixture and capture file with `sha256sum`, and checks each
-/// fixture digest against its `MANIFEST.txt` row when the manifest parsed.
-/// A digest the tool cannot give is BLOCKED, never a match, except for a file
-/// already found unreadable, whose FAIL already stands. It returns the
-/// rendered fixture rows, the rendered capture rows and the hash summary.
+/// Takes the digest of every fixture and capture file in `files`, and checks
+/// each fixture digest against its `MANIFEST.txt` row when the manifest
+/// parsed. A digest the tool cannot give is BLOCKED, never a match, except
+/// for a file already found unreadable, whose FAIL already stands. It returns
+/// the rendered fixture rows, the rendered capture rows and the hash summary.
 fn check_hashes(
     id: &str,
+    files: CaseFiles,
     manifest: Option<&[(String, String, String)]>,
     unreadable: &[String],
     failures: &mut Vec<(String, String)>,
     blocked: &mut Vec<(String, String)>,
 ) -> (Vec<String>, Vec<String>, String) {
+    let (_, _, digest, _) = files;
     let mut matched = 0usize;
     let mut differing = 0usize;
     let mut unavailable = 0usize;
     let mut digest_of = |blocked: &mut Vec<(String, String)>, rel: &str| {
-        sha256(&crate_path(rel)).map_err(|reason| {
+        digest(rel).map_err(|reason| {
             unavailable = unavailable.saturating_add(1);
             if unreadable.iter().any(|path| path == rel) {
                 format!("NOT AVAILABLE (file unreadable; {reason})")
@@ -1459,45 +1560,82 @@ fn join_blocks(blocks: &[String]) -> String {
     body
 }
 
-/// Writes `body` between the comparison markers of the report at the
-/// crate-relative path `rel`, creating the file with the markers when it is
-/// absent. Every byte outside the markers is kept; with missing or
-/// out-of-order markers, or a body that would itself hold a marker, the file
-/// is left untouched. Errors name the file by `rel`, never by its absolute
-/// path.
-fn write_comparison(rel: &str, body: &str) -> Result<(), String> {
+/// Refuses a comparison body that would itself hold a marker, naming the
+/// report by `rel`.
+fn refuse_marker_body(rel: &str, body: &str) -> Result<(), String> {
     if body.contains(BEGIN_MARKER) || body.contains(END_MARKER) {
         return Err(format!(
             "the comparison body holds a marker; {rel} left untouched"
         ));
     }
-    let path = crate_path(rel);
-    let existing = match fs::read(&path) {
-        Ok(bytes) => Some(
-            String::from_utf8(bytes).map_err(|_| format!("{rel} is not UTF-8; left untouched"))?,
-        ),
-        Err(err) if err.kind() == ErrorKind::NotFound => None,
-        Err(err) => return Err(format!("cannot read {rel}: {err}")),
+    Ok(())
+}
+
+/// The bytes of the report at the crate-relative path `rel`, or `None` when
+/// nothing stands there.
+fn read_report(rel: &str) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(crate_path(rel)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("cannot read {rel}: {err}")),
+    }
+}
+
+/// The report text that results from writing `body` between the comparison
+/// markers of `existing`, the bytes the report at the crate-relative path
+/// `rel` holds (`None` when it is absent). An absent report becomes a title
+/// and a `## Comparison` section holding only the markers around `body`.
+/// Otherwise every byte through the first BEGIN marker, and from the first
+/// END marker after it, is kept, and only the text between them is replaced.
+/// A body holding a marker, a report that is not UTF-8, and missing or
+/// out-of-order markers are refused, in that order. Errors name the file by
+/// `rel`, never by its absolute path.
+fn comparison_text(rel: &str, existing: Option<&[u8]>, body: &str) -> Result<String, String> {
+    refuse_marker_body(rel, body)?;
+    let Some(existing) = existing else {
+        return Ok(format!(
+            "# REPORT\n\n## Comparison\n\n{BEGIN_MARKER}\n{body}\n{END_MARKER}\n"
+        ));
     };
-    let text = match existing {
-        None => format!("# REPORT\n\n## Comparison\n\n{BEGIN_MARKER}\n{body}\n{END_MARKER}\n"),
-        Some(existing) => {
-            let bad =
-                || format!("{rel} has missing or out-of-order comparison markers; left untouched");
-            let begin = existing.find(BEGIN_MARKER).ok_or_else(bad)?;
-            if existing.find(END_MARKER).is_some_and(|end| end < begin) {
-                return Err(bad());
-            }
-            let inner_start = begin.saturating_add(BEGIN_MARKER.len());
-            let after_begin = existing.get(inner_start..).ok_or_else(bad)?;
-            let inner_end =
-                inner_start.saturating_add(after_begin.find(END_MARKER).ok_or_else(bad)?);
-            let head = existing.get(..inner_start).ok_or_else(bad)?;
-            let tail = existing.get(inner_end..).ok_or_else(bad)?;
-            format!("{head}\n{body}\n{tail}")
-        }
+    let existing =
+        std::str::from_utf8(existing).map_err(|_| format!("{rel} is not UTF-8; left untouched"))?;
+    let bad = || format!("{rel} has missing or out-of-order comparison markers; left untouched");
+    let begin = existing.find(BEGIN_MARKER).ok_or_else(bad)?;
+    if existing.find(END_MARKER).is_some_and(|end| end < begin) {
+        return Err(bad());
+    }
+    let inner_start = begin.saturating_add(BEGIN_MARKER.len());
+    let after_begin = existing.get(inner_start..).ok_or_else(bad)?;
+    let inner_end = inner_start.saturating_add(after_begin.find(END_MARKER).ok_or_else(bad)?);
+    let head = existing.get(..inner_start).ok_or_else(bad)?;
+    let tail = existing.get(inner_end..).ok_or_else(bad)?;
+    Ok(format!("{head}\n{body}\n{tail}"))
+}
+
+/// Writes `body` between the comparison markers of the report at the
+/// crate-relative path `rel`, as [`comparison_text`] computes it. A body
+/// holding a marker is refused before the report is read, and every refusal
+/// leaves the file untouched. This is the only function that writes a file.
+fn write_comparison(rel: &str, body: &str) -> Result<(), String> {
+    refuse_marker_body(rel, body)?;
+    let existing = read_report(rel)?;
+    let text = comparison_text(rel, existing.as_deref(), body)?;
+    fs::write(crate_path(rel), text).map_err(|err| format!("cannot write {rel}: {err}"))
+}
+
+/// The bytes of `report` through the end of its first BEGIN marker, and from
+/// the first END marker after that; `None` when either marker is missing.
+/// It searches bytes, independently of [`comparison_text`], so that
+/// `comparison_report` can check the written file against the one before.
+fn marker_exterior(report: &[u8]) -> Option<(&[u8], &[u8])> {
+    let find = |haystack: &[u8], marker: &str| {
+        haystack
+            .windows(marker.len())
+            .position(|window| window == marker.as_bytes())
     };
-    fs::write(&path, text).map_err(|err| format!("cannot write {rel}: {err}"))
+    let head_end = find(report, BEGIN_MARKER)?.checked_add(BEGIN_MARKER.len())?;
+    let tail_start = head_end.checked_add(find(report.get(head_end..)?, END_MARKER)?)?;
+    Some((report.get(..head_end)?, report.get(tail_start..)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1539,19 +1677,227 @@ fn gc_05_cancelled_order() {
 
 /// Evaluates all five cases and writes the comparison section of
 /// `REPORT.md`. It asserts only on its own errors, never on case statuses,
-/// which the per-case tests decide.
+/// which the per-case tests decide. The file read back after the write must
+/// equal the text [`comparison_text`] computes from the bytes it held
+/// before, with every byte outside the markers unchanged; a refused write
+/// must leave it as it was.
 #[test]
 fn comparison_report() {
     let cases: Vec<(&str, String, String)> = CASES.into_iter().map(evaluate_case).collect();
     let (body, mut errors) = render_body(&cases);
-    if let Err(err) = write_comparison(REPORT, &body) {
-        errors.push(err);
+    match read_report(REPORT) {
+        Err(err) => errors.push(err),
+        Ok(before) => {
+            let expected = comparison_text(REPORT, before.as_deref(), &body);
+            let written = write_comparison(REPORT, &body);
+            if let Err(err) = &written {
+                errors.push(err.clone());
+            }
+            match (read_report(REPORT), expected) {
+                (Err(err), _) => errors.push(err),
+                (Ok(after), Ok(text)) => {
+                    if after.as_deref() != Some(text.as_bytes()) {
+                        errors.push(format!(
+                            "{REPORT} does not equal the text computed from its previous bytes"
+                        ));
+                    }
+                    let kept = match (before.as_deref(), after.as_deref()) {
+                        (None, _) => true,
+                        (Some(before), Some(after)) => {
+                            marker_exterior(before).is_some_and(|(head, tail)| {
+                                head.len().saturating_add(tail.len()) <= after.len()
+                                    && after.starts_with(head)
+                                    && after.ends_with(tail)
+                            })
+                        }
+                        (Some(_), None) => false,
+                    };
+                    if !kept {
+                        errors.push(format!("{REPORT} changed outside the comparison markers"));
+                    }
+                }
+                (Ok(after), Err(refusal)) => {
+                    if written.is_ok() {
+                        errors.push(refusal);
+                    }
+                    if after != before {
+                        errors.push(format!("{REPORT} changed although the write was refused"));
+                    }
+                }
+            }
+        }
     }
     assert!(
         errors.is_empty(),
         "comparison_report: {}",
         errors.join("; ")
     );
+}
+
+/// [`comparison_text`] replaces only the text between the first BEGIN marker
+/// and the first END marker after it, keeps every other byte, creates an
+/// absent report with the markers, and refuses a marker in the body, a
+/// report that is not UTF-8 and missing or out-of-order markers, in that
+/// order. Nothing here reads or writes a file.
+#[test]
+fn comparison_text_replaces_only_the_marked_text() {
+    let markers = "x <!-- COMPARISON BEGIN -->\nold\n<!-- COMPARISON END --> y";
+    let refused_markers =
+        Err("REPORT.md has missing or out-of-order comparison markers; left untouched");
+    let refused_body = Err("the comparison body holds a marker; REPORT.md left untouched");
+    let table = [
+        (
+            "prose before and after, non-ASCII, trailing section",
+            Some(
+                "# REPORT — café\n\nIntro ü.\n\n## Comparison\n\n\
+                 <!-- COMPARISON BEGIN -->\nold body\n<!-- COMPARISON END -->\n\n\
+                 ## Execution evidence\n\nNaïve ✓ run.\n\n## Review\n\nLast — line, no newline"
+                    .as_bytes(),
+            ),
+            "new body é",
+            Ok("# REPORT — café\n\nIntro ü.\n\n## Comparison\n\n\
+                <!-- COMPARISON BEGIN -->\nnew body é\n<!-- COMPARISON END -->\n\n\
+                ## Execution evidence\n\nNaïve ✓ run.\n\n## Review\n\nLast — line, no newline"),
+        ),
+        (
+            "adjacent markers, CRLF exterior",
+            Some(b"a\r\n<!-- COMPARISON BEGIN --><!-- COMPARISON END -->\r\nz".as_slice()),
+            "B",
+            Ok("a\r\n<!-- COMPARISON BEGIN -->\nB\n<!-- COMPARISON END -->\r\nz"),
+        ),
+        (
+            "empty body",
+            Some(markers.as_bytes()),
+            "",
+            Ok("x <!-- COMPARISON BEGIN -->\n\n<!-- COMPARISON END --> y"),
+        ),
+        (
+            "second marker pair kept",
+            Some(
+                b"<!-- COMPARISON BEGIN -->1<!-- COMPARISON END -->m\
+                  <!-- COMPARISON BEGIN -->2<!-- COMPARISON END -->"
+                    .as_slice(),
+            ),
+            "N",
+            Ok("<!-- COMPARISON BEGIN -->\nN\n<!-- COMPARISON END -->m\
+                <!-- COMPARISON BEGIN -->2<!-- COMPARISON END -->"),
+        ),
+        (
+            "BEGIN repeated before END, the repeat replaced",
+            Some(
+                b"<!-- COMPARISON BEGIN -->1<!-- COMPARISON BEGIN -->2\
+                  <!-- COMPARISON END -->t"
+                    .as_slice(),
+            ),
+            "N",
+            Ok("<!-- COMPARISON BEGIN -->\nN\n<!-- COMPARISON END -->t"),
+        ),
+        (
+            "absent report",
+            None,
+            "body",
+            Ok("# REPORT\n\n## Comparison\n\n\
+                <!-- COMPARISON BEGIN -->\nbody\n<!-- COMPARISON END -->\n"),
+        ),
+        (
+            "missing BEGIN",
+            Some(b"# REPORT\n\n## Comparison\n\n<!-- COMPARISON END -->\n".as_slice()),
+            "body",
+            refused_markers,
+        ),
+        (
+            "no markers",
+            Some(b"# REPORT\n".as_slice()),
+            "body",
+            refused_markers,
+        ),
+        (
+            "present empty report",
+            Some(b"".as_slice()),
+            "body",
+            refused_markers,
+        ),
+        (
+            "missing END",
+            Some(b"# REPORT\n\n<!-- COMPARISON BEGIN -->\nold\n".as_slice()),
+            "body",
+            refused_markers,
+        ),
+        (
+            "END before BEGIN",
+            Some(b"<!-- COMPARISON END -->\n<!-- COMPARISON BEGIN -->\nold\n".as_slice()),
+            "body",
+            refused_markers,
+        ),
+        (
+            "END before BEGIN, another END after it",
+            Some(
+                b"<!-- COMPARISON END -->\n<!-- COMPARISON BEGIN -->\nold\n\
+                  <!-- COMPARISON END -->\n"
+                    .as_slice(),
+            ),
+            "body",
+            refused_markers,
+        ),
+        (
+            "body holds BEGIN",
+            Some(markers.as_bytes()),
+            "a <!-- COMPARISON BEGIN --> b",
+            refused_body,
+        ),
+        (
+            "body holds END",
+            Some(markers.as_bytes()),
+            "<!-- COMPARISON END -->",
+            refused_body,
+        ),
+        (
+            "body marker refused before creation",
+            None,
+            "<!-- COMPARISON END -->",
+            refused_body,
+        ),
+        (
+            "body marker refused before UTF-8",
+            Some(b"\xff".as_slice()),
+            "<!-- COMPARISON BEGIN -->",
+            refused_body,
+        ),
+        (
+            "not UTF-8",
+            Some(b"<!-- COMPARISON BEGIN -->\n\xff\n<!-- COMPARISON END -->\n".as_slice()),
+            "body",
+            Err("REPORT.md is not UTF-8; left untouched"),
+        ),
+    ];
+    for (label, existing, body, expected) in table {
+        let expected = expected.map(str::to_string).map_err(str::to_string);
+        assert_eq!(comparison_text(REPORT, existing, body), expected, "{label}");
+    }
+}
+
+/// A repeated write of the same body is byte-stable, a report already
+/// holding the body is returned unchanged, and writing another body and then
+/// the original again restores the original text. Nothing here reads or
+/// writes a file.
+#[test]
+fn comparison_text_is_idempotent_and_reversible() -> Result<(), String> {
+    let report = "# REPORT — ü\n\n## Comparison\n\n<!-- COMPARISON BEGIN -->\nbody ✓\n\
+                  <!-- COMPARISON END -->\n\n## Review\n\nTrailing — prose.\n";
+    for (label, existing) in [("absent", None), ("present", Some(report.as_bytes()))] {
+        let once = comparison_text(REPORT, existing, "body ✓")?;
+        let twice = comparison_text(REPORT, Some(once.as_bytes()), "body ✓")?;
+        assert_eq!(twice, once, "repeat, {label} report");
+        let changed = comparison_text(REPORT, Some(once.as_bytes()), "other")?;
+        assert_ne!(changed, once, "change, {label} report");
+        let restored = comparison_text(REPORT, Some(changed.as_bytes()), "body ✓")?;
+        assert_eq!(restored, once, "restore, {label} report");
+    }
+    assert_eq!(
+        comparison_text(REPORT, Some(report.as_bytes()), "body ✓")?,
+        report
+    );
+    Ok(())
 }
 
 /// `returned.txt` framing: zero bytes is `None`, and exactly one trailing
@@ -1567,6 +1913,82 @@ fn returned_txt_framing() {
     ];
     for (text, expected) in table {
         assert_eq!(recorded_returned(text), expected, "returned.txt {text:?}");
+    }
+}
+
+/// The first difference is the first unequal byte, even inside a multi-byte
+/// character, or the end of the shorter text when it is a prefix of the
+/// other; its line counts the newlines before it, and each excerpt is the
+/// line holding that byte on its own side.
+#[test]
+fn first_text_difference_locates_first_unequal_byte() {
+    let table = [
+        ("PO 500\n", "PO 500\n", None),
+        (
+            "TOTAL 251.00\n",
+            "TOTAL 215.00\n",
+            Some((
+                "line 1, byte 7",
+                "line 1, byte 7: expected \"TOTAL 251.00\\n\", actual \"TOTAL 215.00\\n\"",
+            )),
+        ),
+        (
+            "é",
+            "ê",
+            Some((
+                "line 1, byte 1",
+                "line 1, byte 1: expected \"é\", actual \"ê\"",
+            )),
+        ),
+        (
+            "ab\ncé\n",
+            "ab\ncê\n",
+            Some((
+                "line 2, byte 5",
+                "line 2, byte 5: expected \"cé\\n\", actual \"cê\\n\"",
+            )),
+        ),
+        (
+            "ab",
+            "abc",
+            Some((
+                "line 1, byte 2",
+                "line 1, byte 2: expected \"ab\", actual \"abc\"",
+            )),
+        ),
+        (
+            "abc\ndef",
+            "abc\n",
+            Some((
+                "line 2, byte 4",
+                "line 2, byte 4: expected \"def\", actual \"\"",
+            )),
+        ),
+        (
+            "ab\ncd\n",
+            "ab\nxd\n",
+            Some((
+                "line 2, byte 3",
+                "line 2, byte 3: expected \"cd\\n\", actual \"xd\\n\"",
+            )),
+        ),
+        (
+            "a\nb",
+            "ab",
+            Some((
+                "line 1, byte 1",
+                "line 1, byte 1: expected \"a\\n\", actual \"ab\"",
+            )),
+        ),
+    ];
+    for (expected, actual, location) in table {
+        let location =
+            location.map(|(position, difference)| (position.to_string(), difference.to_string()));
+        assert_eq!(
+            first_text_difference(expected, actual),
+            location,
+            "{expected:?} against {actual:?}"
+        );
     }
 }
 
@@ -1704,5 +2126,1016 @@ fn context_cause_names_only_stub_keys() {
     ];
     for (finding, expected) in table {
         assert_eq!(context_cause(finding), expected, "{finding}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation self-tests
+// ---------------------------------------------------------------------------
+
+/// The case every self-test evaluates, over an in-memory capture.
+const SELF_TEST_CASE: (&str, &str, &str, &str, &str) = GC_01;
+
+/// Every file a GC-01 evaluation needs, written out in readiness order: the
+/// seven capture files, the eleven repository fixtures, `cases.zwr` and
+/// `MANIFEST.txt`.
+const GC_01_REQUIRED: [&str; 20] = [
+    "tests/golden/ifcap/GC-01/input.txt",
+    "tests/golden/ifcap/GC-01/transcript.txt",
+    "tests/golden/ifcap/GC-01/returned.txt",
+    "tests/golden/ifcap/GC-01/db-before.zwr",
+    "tests/golden/ifcap/GC-01/db-after.zwr",
+    "tests/golden/ifcap/GC-01/meta.txt",
+    "tests/golden/ifcap/GC-01/normalisation.txt",
+    "tests/fixtures/ifcap/411.zwr",
+    "tests/fixtures/ifcap/411.2.zwr",
+    "tests/fixtures/ifcap/420.5.zwr",
+    "tests/fixtures/ifcap/420.8.zwr",
+    "tests/fixtures/ifcap/440.zwr",
+    "tests/fixtures/ifcap/442.3.zwr",
+    "tests/fixtures/ifcap/442.4.zwr",
+    "tests/fixtures/ifcap/442.5.zwr",
+    "tests/fixtures/ifcap/442.8.zwr",
+    "tests/fixtures/ifcap/5.zwr",
+    "tests/fixtures/ifcap/49.zwr",
+    "tests/fixtures/ifcap/cases.zwr",
+    "tests/fixtures/ifcap/MANIFEST.txt",
+];
+
+/// The number of capture files at the head of [`GC_01_REQUIRED`]; the
+/// fixture files follow them.
+const GC_01_CAPTURE_COUNT: usize = 7;
+
+/// The synthetic runtime export, and so the whole synthetic fixture store:
+/// invented, never parity evidence. It holds only the purchase-order file
+/// header, which the order lookup reads before it prompts, as the routing
+/// store of `tests/bridge.rs` does.
+const SYNTHETIC_EXPORT: &str = "SYNTHETIC harness self-test store: invented, not a capture\nZWR\n^PRC(442,0)=\"PROCUREMENT & ACCOUNTING TRANSACTIONS^442I^^0\"\n";
+
+/// Nodes that file order 1 under index `C` as `X1`, with a zero node that
+/// holds a descendant but no value: the order lookup reads that node where
+/// M raises `UNDEF`, so `inquire` answers `CorruptStore`.
+const UNDEF_NODES: &str = "^PRC(442,1,0,1)=\"SYNTHETIC\"\n^PRC(442,\"C\",\"X1\",1)=\"\"\n";
+
+/// The `snapshot_id` that the synthetic `meta.txt` and every synthetic
+/// manifest row carry.
+const SYNTHETIC_SNAPSHOT: &str = "synthetic:self-test";
+
+/// The value the synthetic context gives a `STUB_CONTEXT` key whose
+/// constant is unresolved; an unresolved constant matches no value.
+const SYNTHETIC_UNRESOLVED: &str = "synthetic";
+
+/// Why no digest is available when `sha256sum` is absent, as [`sha256`]
+/// says it.
+const NO_DIGEST_TOOL: &str = "sha256sum not found";
+
+/// One file of an in-memory capture, as (its bytes, or the kind of error
+/// that reading it gives; what the digest tool reports for it).
+type MemoryFile = (Result<Vec<u8>, ErrorKind>, Result<String, String>);
+
+/// An in-memory capture, as (crate-relative paths with their files; the
+/// fixture store or the loader's error text). A path it does not hold is
+/// missing. It reads no file and writes none.
+type MemoryFiles = (BTreeMap<String, MemoryFile>, Result<Store, String>);
+
+/// Evaluates case `id` against the in-memory capture `capture`, through the
+/// same [`evaluate`] the golden cases use.
+fn evaluate_memory(id: &str, capture: &MemoryFiles) -> Evaluation {
+    let (files, fixtures) = capture;
+    let is_missing = |rel: &str| !files.contains_key(rel);
+    let read = |rel: &str| match files.get(rel).map(|(content, _)| content) {
+        None => Err(io::Error::from(ErrorKind::NotFound)),
+        Some(Ok(bytes)) => Ok(bytes.clone()),
+        Some(Err(kind)) => Err(io::Error::from(*kind)),
+    };
+    let digest = |rel: &str| {
+        files.get(rel).map_or_else(
+            || {
+                Err(format!(
+                    "sha256sum exit 1: sha256sum: {rel}: No such file or directory"
+                ))
+            },
+            |(_, digest)| digest.clone(),
+        )
+    };
+    let fixture_store = || fixtures.clone();
+    evaluate(id, (&is_missing, &read, &digest, &fixture_store))
+}
+
+/// The file at `rel` of `capture`, to change it.
+fn memory_file<'a>(capture: &'a mut MemoryFiles, rel: &str) -> Result<&'a mut MemoryFile, String> {
+    let (files, _) = capture;
+    files
+        .get_mut(rel)
+        .ok_or_else(|| format!("the synthetic capture holds no {rel}"))
+}
+
+/// The UTF-8 text of the readable file at `rel` of `capture`.
+fn memory_text(capture: &MemoryFiles, rel: &str) -> Result<String, String> {
+    let (files, _) = capture;
+    match files.get(rel).map(|(content, _)| content) {
+        Some(Ok(bytes)) => String::from_utf8(bytes.clone())
+            .map_err(|_| format!("the synthetic {rel} is not UTF-8")),
+        _ => Err(format!("the synthetic capture holds no readable {rel}")),
+    }
+}
+
+/// Replaces the bytes of the file at `rel` of `capture`, keeping its digest.
+fn memory_set(capture: &mut MemoryFiles, rel: &str, bytes: &[u8]) -> Result<(), String> {
+    let (content, _) = memory_file(capture, rel)?;
+    *content = Ok(bytes.to_vec());
+    Ok(())
+}
+
+/// Makes the file at `rel` of `capture` one that neither the harness nor
+/// `sha256sum` can read.
+fn memory_set_unreadable(capture: &mut MemoryFiles, rel: &str) -> Result<(), String> {
+    let (content, digest) = memory_file(capture, rel)?;
+    *content = Err(ErrorKind::PermissionDenied);
+    *digest = Err(format!(
+        "sha256sum exit 1: sha256sum: {rel}: Permission denied"
+    ));
+    Ok(())
+}
+
+/// Makes the digest tool unavailable for every file of `capture`.
+fn memory_without_digest_tool(capture: &mut MemoryFiles) {
+    let (files, _) = capture;
+    for (_, digest) in files.values_mut() {
+        *digest = Err(NO_DIGEST_TOOL.to_string());
+    }
+}
+
+/// Rewrites the `MANIFEST.txt` of `capture` row by row: `edit` gives each
+/// row's replacement, or `None` to drop it.
+fn memory_edit_manifest(
+    capture: &mut MemoryFiles,
+    edit: fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    let rel = fixture_rel(MANIFEST);
+    let edited: String = memory_text(capture, &rel)?
+        .lines()
+        .filter_map(edit)
+        .map(|row| format!("{row}\n"))
+        .collect();
+    memory_set(capture, &rel, edited.as_bytes())
+}
+
+/// `text` as a JSON string.
+fn json_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The synthetic context, a JSON object: every `STUB_CONTEXT` key with its
+/// constant, or [`SYNTHETIC_UNRESOLVED`] where the constant is unresolved,
+/// so that it matches once every constant is resolved.
+fn synthetic_context() -> String {
+    let members: Vec<String> = STUB_CONTEXT
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}:{}",
+                json_string(key),
+                json_string(value.unwrap_or(SYNTHETIC_UNRESOLVED))
+            )
+        })
+        .collect();
+    format!("{{{}}}", members.join(","))
+}
+
+/// A synthetic `meta.txt` with the seven keys, carrying `snapshot_id` and
+/// the `context` and `docker_exec_args` values given.
+fn synthetic_meta(snapshot_id: &str, context: &str, docker_exec_args: &str) -> String {
+    format!(
+        "image_digest=synthetic\nsource_revision=synthetic\nsnapshot_id={snapshot_id}\nrecord_ids=synthetic\nentry_point=EN3^PRCHRPT\ncontext={context}\ndocker_exec_args={docker_exec_args}\n"
+    )
+}
+
+/// The `meta.txt` of the complete synthetic capture.
+fn synthetic_meta_text() -> String {
+    synthetic_meta(SYNTHETIC_SNAPSHOT, &synthetic_context(), "[]")
+}
+
+/// A complete, consistent synthetic capture of [`SELF_TEST_CASE`]. Every
+/// required file is present and readable. The fixture store is
+/// [`SYNTHETIC_EXPORT`], held by `cases.zwr`, and the repository fixtures
+/// hold no data. `db-before.zwr` and `db-after.zwr` both equal that store.
+/// `input.txt` holds no input, and `transcript.txt` and `returned.txt` record
+/// what `inquire` answers for it. `normalisation.txt` holds no rule.
+/// `MANIFEST.txt` lists every fixture with its digest and the `snapshot_id`
+/// that `meta.txt` carries. Its only finding is the context check's, while a
+/// `STUB_CONTEXT` constant is unresolved.
+fn synthetic_capture() -> Result<MemoryFiles, String> {
+    let (id, ..) = SELF_TEST_CASE;
+    let store = Store::from_zwr(SYNTHETIC_EXPORT)
+        .map_err(|err| format!("SYNTHETIC_EXPORT does not load: {err}"))?;
+    let inputs = split_input_lines("");
+    let output =
+        inquire(&store, &inputs).map_err(|err| format!("inquire on the synthetic store: {err}"))?;
+    let returned = output
+        .returned
+        .map_or_else(String::new, |value| format!("{value}\n"));
+    let mut contents = vec![
+        (capture_rel(id, "input.txt"), String::new()),
+        (capture_rel(id, "transcript.txt"), output.transcript),
+        (capture_rel(id, "returned.txt"), returned),
+        (
+            capture_rel(id, "db-before.zwr"),
+            SYNTHETIC_EXPORT.to_string(),
+        ),
+        (
+            capture_rel(id, "db-after.zwr"),
+            SYNTHETIC_EXPORT.to_string(),
+        ),
+        (capture_rel(id, "meta.txt"), synthetic_meta_text()),
+        (capture_rel(id, "normalisation.txt"), String::new()),
+    ];
+    for file in REPO_FIXTURES {
+        contents.push((
+            fixture_rel(file),
+            format!("SYNTHETIC {file}: no data\nZWR\n"),
+        ));
+    }
+    contents.push((fixture_rel(RUNTIME_EXPORT), SYNTHETIC_EXPORT.to_string()));
+    let mut files: BTreeMap<String, MemoryFile> = contents
+        .into_iter()
+        .enumerate()
+        .map(|(index, (rel, text))| {
+            let file: MemoryFile = (Ok(text.into_bytes()), Ok(format!("{index:064x}")));
+            (rel, file)
+        })
+        .collect();
+    let mut manifest = String::new();
+    for file in required_fixtures() {
+        let rel = fixture_rel(file);
+        let digest = files
+            .get(&rel)
+            .and_then(|(_, digest)| digest.clone().ok())
+            .ok_or_else(|| format!("the synthetic capture has no digest for {rel}"))?;
+        let origin = if file == RUNTIME_EXPORT {
+            "runtime export"
+        } else {
+            "repository synthetic"
+        };
+        manifest.push_str(&format!(
+            "{file}\t{origin}\t{SYNTHETIC_SNAPSHOT}\t{digest}\n"
+        ));
+    }
+    let manifest_digest = format!("{:064x}", files.len());
+    files.insert(
+        fixture_rel(MANIFEST),
+        (Ok(manifest.into_bytes()), Ok(manifest_digest)),
+    );
+    Ok((files, Ok(store)))
+}
+
+/// The context findings, as (cause, detail), that `validate_context` gives
+/// for the synthetic `meta.txt`: one while a `STUB_CONTEXT` constant is
+/// unresolved, none once every constant is resolved.
+fn synthetic_context_findings() -> Result<Vec<(String, String)>, String> {
+    let meta = parse_meta(&synthetic_meta_text())
+        .map_err(|err| format!("the synthetic meta.txt does not parse: {err}"))?;
+    Ok(validate_context(&meta.context)
+        .err()
+        .map(|finding| (context_cause(&finding), finding))
+        .into_iter()
+        .collect())
+}
+
+/// The causes of `findings`, in order.
+fn causes(findings: &[(String, String)]) -> Vec<&str> {
+    findings.iter().map(|(cause, _)| cause.as_str()).collect()
+}
+
+/// The items of the step field `label` of `outcome`.
+fn step<'a>(outcome: &'a Evaluation, label: &str) -> Result<&'a [String], String> {
+    let (_, _, _, steps, _, _) = outcome;
+    STEP_FIELDS
+        .iter()
+        .zip(steps)
+        .find(|(field, _)| **field == label)
+        .map(|(_, items)| items.as_slice())
+        .ok_or_else(|| format!("no step field {label}"))
+}
+
+/// The console summary of a FAIL or BLOCKED case whose deciding findings
+/// begin with `cause` and number `count`.
+fn deciding_summary(status: &str, cause: &str, count: usize) -> String {
+    format!(
+        "GC-01 gc_01_standard_order: {status} {cause} (finding 1 of {count}; details in the REPORT.md comparison section)"
+    )
+}
+
+/// With no file present the case is NOT COMPARED, listing every required
+/// file in readiness order, and no later check runs.
+#[test]
+fn nothing_present_is_not_compared_listing_every_required_file() {
+    let (id, ..) = SELF_TEST_CASE;
+    let files: MemoryFiles = (BTreeMap::new(), Ok(Store::default()));
+    let outcome = evaluate_memory(id, &files);
+    let (status, missing, _, _, failures, blocked) = &outcome;
+    assert_eq!(*status, NOT_COMPARED, "status");
+    assert_eq!(*missing, GC_01_REQUIRED, "missing files");
+    assert_eq!(causes(failures), Vec::<&str>::new(), "failures");
+    assert_eq!(causes(blocked), Vec::<&str>::new(), "blocked");
+    let (status, summary, section) = report_case(SELF_TEST_CASE, &outcome);
+    assert_eq!(status, NOT_COMPARED, "reported status");
+    assert_eq!(
+        summary,
+        format!(
+            "GC-01 gc_01_standard_order: NOT COMPARED missing: {}",
+            GC_01_REQUIRED.join(", ")
+        ),
+        "console summary"
+    );
+    assert!(
+        section
+            .lines()
+            .any(|line| line == "- **Status:** NOT COMPARED"),
+        "the report subsection does not show NOT COMPARED"
+    );
+}
+
+/// One missing file alone decides NOT COMPARED and is the only file listed,
+/// even when every present file is unreadable, non-UTF-8 or malformed, no
+/// digest can be taken and the fixture store does not load: readiness runs
+/// first, and a present file never gives NOT COMPARED.
+#[test]
+fn one_missing_file_is_not_compared_over_broken_present_files() -> Result<(), String> {
+    let (id, ..) = SELF_TEST_CASE;
+    let mut broken = synthetic_capture()?;
+    for file in CAPTURE_FILES {
+        memory_set_unreadable(&mut broken, &capture_rel(id, file))?;
+    }
+    for file in required_fixtures() {
+        memory_set(&mut broken, &fixture_rel(file), b"\xFF")?;
+    }
+    memory_set(&mut broken, &fixture_rel(MANIFEST), b"not a manifest row\n")?;
+    memory_without_digest_tool(&mut broken);
+    let (_, fixtures) = &mut broken;
+    *fixtures = Err("synthetic fixture load error".to_string());
+    for rel in GC_01_REQUIRED {
+        let mut files = broken.clone();
+        let (held, _) = &mut files;
+        if held.remove(rel).is_none() {
+            return Err(format!("the synthetic capture holds no {rel}"));
+        }
+        let outcome = evaluate_memory(id, &files);
+        let (status, missing, _, _, failures, blocked) = &outcome;
+        assert_eq!(*status, NOT_COMPARED, "{rel} missing: status");
+        assert_eq!(*missing, [rel], "{rel} missing: missing files");
+        assert_eq!(
+            causes(failures),
+            Vec::<&str>::new(),
+            "{rel} missing: failures"
+        );
+        assert_eq!(
+            causes(blocked),
+            Vec::<&str>::new(),
+            "{rel} missing: blocked"
+        );
+        let (status, summary, _) = report_case(SELF_TEST_CASE, &outcome);
+        assert_eq!(status, NOT_COMPARED, "{rel} missing: reported status");
+        assert_eq!(
+            summary,
+            format!("GC-01 gc_01_standard_order: NOT COMPARED missing: {rel}"),
+            "{rel} missing: console summary"
+        );
+    }
+    Ok(())
+}
+
+/// A complete, consistent capture passes every check but the context check,
+/// whose finding is the only one while a `STUB_CONTEXT` constant is
+/// unresolved, so the case is FAIL; once every constant is resolved it has
+/// no finding and is PASS. Every digest matches and nothing is BLOCKED.
+#[test]
+fn complete_capture_fails_only_on_the_context_check() -> Result<(), String> {
+    let (id, ..) = SELF_TEST_CASE;
+    let context = synthetic_context_findings()?;
+    let expected = if context.is_empty() { PASS } else { FAIL };
+    let outcome = evaluate_memory(id, &synthetic_capture()?);
+    let (status, missing, _, _, failures, blocked) = &outcome;
+    assert_eq!(*missing, Vec::<String>::new(), "missing files");
+    assert_eq!(*failures, context, "failures");
+    assert_eq!(causes(blocked), Vec::<&str>::new(), "blocked");
+    assert_eq!(*status, expected, "status");
+    assert_eq!(
+        step(&outcome, "Hash summary")?,
+        ["12 of 12 fixture digests match MANIFEST.txt, 0 differ; 0 digests NOT AVAILABLE"],
+        "hash summary"
+    );
+    let checks = [
+        (
+            "Baseline (db-before.zwr against the fixture store)",
+            "IDENTICAL: ",
+        ),
+        ("Snapshot identity", "IDENTICAL: "),
+        (
+            "Original side (db-before.zwr against db-after.zwr)",
+            "IDENTICAL ",
+        ),
+        ("Rust side", "Ok: "),
+        ("Transcript comparison", "MATCH after normalisation "),
+        ("Returned comparison", "MATCH after normalisation"),
+    ];
+    for (label, start) in checks {
+        let items = step(&outcome, label)?;
+        assert!(
+            matches!(items, [only] if only.starts_with(start)),
+            "{label}: {items:?} does not start with {start:?}"
+        );
+    }
+    let (status, summary, section) = report_case(SELF_TEST_CASE, &outcome);
+    assert_eq!(status, expected, "reported status");
+    let expected_summary = context.first().map_or_else(
+        || "GC-01 gc_01_standard_order: PASS none".to_string(),
+        |(cause, _)| deciding_summary(FAIL, cause, context.len()),
+    );
+    assert_eq!(summary, expected_summary, "console summary");
+    assert!(
+        section
+            .lines()
+            .any(|line| line == format!("- **Status:** {expected}")),
+        "the report subsection does not show {expected}"
+    );
+    Ok(())
+}
+
+/// One change to the complete synthetic capture.
+type Defect = fn(&mut MemoryFiles) -> Result<(), String>;
+
+/// A defect's name, its change, and the findings it must give, as (cause, a
+/// text the detail holds), in step order.
+type DefectCase<'a> = (&'a str, Defect, Vec<(String, String)>);
+
+/// A digest that no synthetic file has.
+const DIFFERING_DIGEST: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+/// Each single defect of an otherwise complete capture is FAIL with exactly
+/// its own findings added, in step order around the context finding, and
+/// nothing BLOCKED: a present file that is unreadable, non-UTF-8 or
+/// malformed; a manifest that is malformed, lacks the `cases.zwr` line or
+/// carries two `snapshot_id`s; a digest that differs from its manifest row;
+/// a fixture store that does not load; a baseline or snapshot mismatch; a
+/// capture whose session wrote data; either Rust error; and a differing
+/// transcript or return value. Each expected finding is its exact cause and
+/// a text its detail holds.
+#[test]
+fn each_capture_defect_fails_with_its_findings() -> Result<(), String> {
+    let (id, ..) = SELF_TEST_CASE;
+    let context = synthetic_context_findings()?;
+    let pairs = |findings: &[(&str, &str)]| -> Vec<(String, String)> {
+        findings
+            .iter()
+            .map(|(cause, detail)| (cause.to_string(), detail.to_string()))
+            .collect()
+    };
+    // The findings of a defect whose checks come before and after the
+    // context check, which still runs.
+    let around_context = |before: &[(&str, &str)], after: &[(&str, &str)]| {
+        let mut findings = pairs(before);
+        findings.extend(context.iter().cloned());
+        findings.extend(pairs(after));
+        findings
+    };
+    let transcript = memory_text(
+        &synthetic_capture()?,
+        "tests/golden/ifcap/GC-01/transcript.txt",
+    )?;
+    let transcript_cause = format!(
+        "TRANSCRIPT DIFFERS line {}, byte {}",
+        transcript.matches('\n').count().saturating_add(1),
+        transcript.len()
+    );
+    let computed = format!("computed {DIFFERING_DIGEST}");
+    let table: Vec<DefectCase> = vec![
+        (
+            "unreadable capture file",
+            |files| memory_set_unreadable(files, "tests/golden/ifcap/GC-01/transcript.txt"),
+            around_context(
+                &[(
+                    "UNREADABLE tests/golden/ifcap/GC-01/transcript.txt",
+                    "UNREADABLE tests/golden/ifcap/GC-01/transcript.txt: permission denied",
+                )],
+                &[],
+            ),
+        ),
+        (
+            "unreadable fixture file, so the fixture store does not load",
+            |files| {
+                memory_set_unreadable(files, "tests/fixtures/ifcap/5.zwr")?;
+                let (_, fixtures) = files;
+                *fixtures =
+                    Err("tests/fixtures/ifcap/5.zwr: cannot read: permission denied".to_string());
+                Ok(())
+            },
+            around_context(
+                &[
+                    (
+                        "UNREADABLE tests/fixtures/ifcap/5.zwr",
+                        "UNREADABLE tests/fixtures/ifcap/5.zwr: permission denied",
+                    ),
+                    (
+                        "FIXTURE LOAD",
+                        "FIXTURE LOAD tests/fixtures/ifcap/5.zwr: cannot read: permission denied",
+                    ),
+                ],
+                &[],
+            ),
+        ),
+        (
+            "capture file not UTF-8",
+            |files| memory_set(files, "tests/golden/ifcap/GC-01/input.txt", b"\xFF\n"),
+            around_context(
+                &[(
+                    "NON-UTF8 tests/golden/ifcap/GC-01/input.txt",
+                    "NON-UTF8 tests/golden/ifcap/GC-01/input.txt",
+                )],
+                &[],
+            ),
+        ),
+        (
+            "meta.txt lacking keys",
+            |files| {
+                memory_set(
+                    files,
+                    "tests/golden/ifcap/GC-01/meta.txt",
+                    b"image_digest=x\n",
+                )
+            },
+            pairs(&[(
+                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt",
+                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt: ",
+            )]),
+        ),
+        (
+            "meta.txt context not a JSON object of strings",
+            |files| {
+                let meta = synthetic_meta(SYNTHETIC_SNAPSHOT, "[\"500\"]", "[]");
+                memory_set(files, "tests/golden/ifcap/GC-01/meta.txt", meta.as_bytes())
+            },
+            pairs(&[(
+                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt",
+                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt: ",
+            )]),
+        ),
+        (
+            "meta.txt docker_exec_args not a JSON array of strings",
+            |files| {
+                let meta = synthetic_meta(SYNTHETIC_SNAPSHOT, &synthetic_context(), "{}");
+                memory_set(files, "tests/golden/ifcap/GC-01/meta.txt", meta.as_bytes())
+            },
+            pairs(&[(
+                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt",
+                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt: ",
+            )]),
+        ),
+        (
+            "normalisation line without a tab",
+            |files| {
+                memory_set(
+                    files,
+                    "tests/golden/ifcap/GC-01/normalisation.txt",
+                    b"no tab\n",
+                )
+            },
+            around_context(
+                &[(
+                    "MALFORMED NORMALISATION tests/golden/ifcap/GC-01/normalisation.txt line 1",
+                    "MALFORMED NORMALISATION tests/golden/ifcap/GC-01/normalisation.txt line 1",
+                )],
+                &[],
+            ),
+        ),
+        (
+            "db-before.zwr malformed",
+            |files| {
+                memory_set(
+                    files,
+                    "tests/golden/ifcap/GC-01/db-before.zwr",
+                    b"^X(1)=$C(65)\n",
+                )
+            },
+            around_context(
+                &[(
+                    "MALFORMED CAPTURE tests/golden/ifcap/GC-01/db-before.zwr",
+                    "MALFORMED CAPTURE tests/golden/ifcap/GC-01/db-before.zwr: line 1: ",
+                )],
+                &[],
+            ),
+        ),
+        (
+            "db-after.zwr malformed",
+            |files| {
+                memory_set(
+                    files,
+                    "tests/golden/ifcap/GC-01/db-after.zwr",
+                    b"^X(1)=$C(65)\n",
+                )
+            },
+            around_context(
+                &[(
+                    "MALFORMED CAPTURE tests/golden/ifcap/GC-01/db-after.zwr",
+                    "MALFORMED CAPTURE tests/golden/ifcap/GC-01/db-after.zwr: line 1: ",
+                )],
+                &[],
+            ),
+        ),
+        (
+            "MANIFEST.txt malformed",
+            |files| {
+                memory_set(
+                    files,
+                    "tests/fixtures/ifcap/MANIFEST.txt",
+                    b"not a manifest row\n",
+                )
+            },
+            around_context(
+                &[("MALFORMED MANIFEST line 1", "MALFORMED MANIFEST line 1")],
+                &[],
+            ),
+        ),
+        (
+            "MANIFEST.txt lacking the cases.zwr line",
+            |files| {
+                memory_edit_manifest(files, |row| {
+                    (!row.starts_with("cases.zwr\t")).then(|| row.to_string())
+                })
+            },
+            around_context(
+                &[(
+                    "MANIFEST INCONSISTENT: no line for cases.zwr",
+                    "MANIFEST INCONSISTENT: no line for cases.zwr",
+                )],
+                &[],
+            ),
+        ),
+        (
+            "fixture digest differing from its manifest row",
+            |files| {
+                let (_, digest) = memory_file(files, "tests/fixtures/ifcap/5.zwr")?;
+                *digest = Ok(DIFFERING_DIGEST.to_string());
+                Ok(())
+            },
+            around_context(&[("HASH MISMATCH 5.zwr", &computed)], &[]),
+        ),
+        (
+            "fixture store not loading",
+            |files| {
+                let (_, fixtures) = files;
+                *fixtures =
+                    Err("tests/fixtures/ifcap/cases.zwr: line 3: synthetic error".to_string());
+                Ok(())
+            },
+            around_context(
+                &[(
+                    "FIXTURE LOAD",
+                    "FIXTURE LOAD tests/fixtures/ifcap/cases.zwr: line 3: synthetic error",
+                )],
+                &[],
+            ),
+        ),
+        (
+            "db-before.zwr node absent from the fixture store",
+            |files| {
+                let export = format!("{SYNTHETIC_EXPORT}^PRC(442,9,0)=\"CAPTURED\"\n");
+                memory_set(
+                    files,
+                    "tests/golden/ifcap/GC-01/db-before.zwr",
+                    export.as_bytes(),
+                )?;
+                memory_set(
+                    files,
+                    "tests/golden/ifcap/GC-01/db-after.zwr",
+                    export.as_bytes(),
+                )
+            },
+            around_context(
+                &[(
+                    "BASELINE MISMATCH",
+                    "BASELINE MISMATCH ^PRC(442,9,0): capture \"CAPTURED\", fixtures ABSENT",
+                )],
+                &[],
+            ),
+        ),
+        (
+            "db-before.zwr node with another value than the fixture store's",
+            |files| {
+                let export = "^PRC(442,0)=\"OTHER\"\n";
+                memory_set(
+                    files,
+                    "tests/golden/ifcap/GC-01/db-before.zwr",
+                    export.as_bytes(),
+                )?;
+                memory_set(
+                    files,
+                    "tests/golden/ifcap/GC-01/db-after.zwr",
+                    export.as_bytes(),
+                )
+            },
+            around_context(
+                &[(
+                    "BASELINE MISMATCH",
+                    "BASELINE MISMATCH ^PRC(442,0): capture \"OTHER\", fixtures \"PROCUREMENT & ACCOUNTING TRANSACTIONS^442I^^0\"",
+                )],
+                &[],
+            ),
+        ),
+        (
+            "meta.txt snapshot_id differing from the manifest's",
+            |files| {
+                let meta = synthetic_meta("synthetic:other", &synthetic_context(), "[]");
+                memory_set(files, "tests/golden/ifcap/GC-01/meta.txt", meta.as_bytes())
+            },
+            around_context(
+                &[(
+                    "SNAPSHOT MISMATCH",
+                    "SNAPSHOT MISMATCH: meta.txt \"synthetic:other\", MANIFEST.txt \"synthetic:self-test\"",
+                )],
+                &[],
+            ),
+        ),
+        (
+            "MANIFEST.txt carrying two snapshot_ids",
+            |files| {
+                memory_edit_manifest(files, |row| {
+                    Some(if row.starts_with("cases.zwr\t") {
+                        row.replace(SYNTHETIC_SNAPSHOT, "synthetic:other")
+                    } else {
+                        row.to_string()
+                    })
+                })
+            },
+            around_context(
+                &[(
+                    "MANIFEST INCONSISTENT snapshot_id",
+                    "MANIFEST INCONSISTENT snapshot_id: \"synthetic:other\", \"synthetic:self-test\"",
+                )],
+                &[],
+            ),
+        ),
+        (
+            "db-after.zwr differing from db-before.zwr",
+            |files| {
+                let export = format!("{SYNTHETIC_EXPORT}^PRC(442,9,0)=\"ADDED\"\n");
+                memory_set(
+                    files,
+                    "tests/golden/ifcap/GC-01/db-after.zwr",
+                    export.as_bytes(),
+                )
+            },
+            around_context(
+                &[],
+                &[(
+                    "ORIGINAL WROTE DATA",
+                    "ORIGINAL WROTE DATA ^PRC(442,9,0): before ABSENT, after \"ADDED\"",
+                )],
+            ),
+        ),
+        (
+            "Rust side reaching an unsupported branch at the station prompt",
+            |files| memory_set(files, "tests/golden/ifcap/GC-01/input.txt", b"?\n"),
+            around_context(
+                &[],
+                &[(
+                    "UNSUPPORTED BRANCH PO-05.b2 (^DIC (file 411))",
+                    "UNSUPPORTED BRANCH PO-05.b2 (^DIC (file 411))",
+                )],
+            ),
+        ),
+        (
+            "Rust side reaching an unsupported branch at the order prompt",
+            |files| memory_set(files, "tests/golden/ifcap/GC-01/input.txt", b"\n?\n"),
+            around_context(
+                &[],
+                &[(
+                    "UNSUPPORTED BRANCH PO-09.b4 (IX^DIC)",
+                    "UNSUPPORTED BRANCH PO-09.b4 (IX^DIC)",
+                )],
+            ),
+        ),
+        (
+            "Rust side reading a node without a value where M raises UNDEF",
+            |files| {
+                let export = format!("{SYNTHETIC_EXPORT}{UNDEF_NODES}");
+                let store = Store::from_zwr(&export)
+                    .map_err(|err| format!("UNDEF_NODES do not load: {err}"))?;
+                let (_, fixtures) = &mut *files;
+                *fixtures = Ok(store);
+                memory_set(files, "tests/fixtures/ifcap/cases.zwr", export.as_bytes())?;
+                memory_set(files, "tests/golden/ifcap/GC-01/input.txt", b"\nX1\n")
+            },
+            around_context(&[], &[("CORRUPT STORE", "CORRUPT STORE ^PRC(442,1,0)")]),
+        ),
+        (
+            "transcript.txt differing from the Rust transcript",
+            |files| {
+                let rel = "tests/golden/ifcap/GC-01/transcript.txt";
+                let text = memory_text(files, rel)?;
+                memory_set(files, rel, format!("{text}EXTRA\n").as_bytes())
+            },
+            around_context(&[], &[(&transcript_cause, &transcript_cause)]),
+        ),
+        (
+            "returned.txt recording a value the Rust side does not return",
+            |files| memory_set(files, "tests/golden/ifcap/GC-01/returned.txt", b"x\n"),
+            around_context(
+                &[],
+                &[(
+                    "RETURNED DIFFERS",
+                    "RETURNED DIFFERS: expected Some(\"x\"), actual None",
+                )],
+            ),
+        ),
+    ];
+    for (defect, change, expected) in table {
+        let mut files = synthetic_capture()?;
+        change(&mut files)?;
+        let outcome = evaluate_memory(id, &files);
+        let (status, missing, _, _, failures, blocked) = &outcome;
+        assert_eq!(*status, FAIL, "{defect}: status");
+        assert_eq!(*missing, Vec::<String>::new(), "{defect}: missing");
+        assert_eq!(causes(blocked), Vec::<&str>::new(), "{defect}: blocked");
+        assert_eq!(
+            causes(failures),
+            causes(&expected),
+            "{defect}: failure causes"
+        );
+        for ((cause, detail), (_, held)) in failures.iter().zip(&expected) {
+            assert!(
+                detail.contains(held.as_str()),
+                "{defect}: the {cause} detail does not hold {held:?}"
+            );
+        }
+        let (status, summary, _) = report_case(SELF_TEST_CASE, &outcome);
+        assert_eq!(status, FAIL, "{defect}: reported status");
+        let first = expected.first().map_or("", |(cause, _)| cause.as_str());
+        assert_eq!(
+            summary,
+            deciding_summary(FAIL, first, expected.len()),
+            "{defect}: console summary"
+        );
+    }
+    Ok(())
+}
+
+/// A present file that cannot be read is FAIL on its own finding, and its
+/// digest row reads NOT AVAILABLE (file unreadable; ...) with no BLOCKED
+/// finding added, for a capture file and for a fixture file alike.
+#[test]
+fn unreadable_file_digest_is_not_available_without_blocking() -> Result<(), String> {
+    let (id, ..) = SELF_TEST_CASE;
+    let table = [
+        (
+            "tests/golden/ifcap/GC-01/transcript.txt",
+            "Capture hashes",
+            "12 of 12 fixture digests match MANIFEST.txt, 0 differ; 1 digests NOT AVAILABLE",
+        ),
+        (
+            "tests/fixtures/ifcap/5.zwr",
+            "Fixture hashes",
+            "11 of 12 fixture digests match MANIFEST.txt, 0 differ; 1 digests NOT AVAILABLE",
+        ),
+    ];
+    for (rel, field, hash_summary) in table {
+        let mut files = synthetic_capture()?;
+        memory_set_unreadable(&mut files, rel)?;
+        let outcome = evaluate_memory(id, &files);
+        let (status, _, _, _, failures, blocked) = &outcome;
+        assert_eq!(*status, FAIL, "{rel}: status");
+        assert_eq!(causes(blocked), Vec::<&str>::new(), "{rel}: blocked");
+        let unreadable = format!("UNREADABLE {rel}");
+        assert_eq!(
+            causes(failures).first().copied(),
+            Some(unreadable.as_str()),
+            "{rel}: first failure"
+        );
+        let row_start = format!("`{rel}`: ");
+        let rows = step(&outcome, field)?;
+        let row = rows
+            .iter()
+            .find(|row| row.starts_with(&row_start))
+            .ok_or_else(|| format!("{rel}: no {field} row"))?;
+        assert!(
+            row.contains("computed `NOT AVAILABLE (file unreadable; "),
+            "{rel}: {row}"
+        );
+        assert_eq!(
+            step(&outcome, "Hash summary")?,
+            [hash_summary],
+            "{rel}: hash summary"
+        );
+    }
+    Ok(())
+}
+
+/// With no digest tool every one of the 19 digests is NOT AVAILABLE, each a
+/// BLOCKED finding, fixtures first and then captures. The case is BLOCKED
+/// only when no check failed: any FAIL finding takes precedence, here the
+/// context mismatch while a `STUB_CONTEXT` constant is unresolved, and a
+/// differing return value whatever the constants.
+#[test]
+fn unavailable_digest_tool_is_blocked_and_fail_takes_precedence() -> Result<(), String> {
+    let (id, ..) = SELF_TEST_CASE;
+    let context = synthetic_context_findings()?;
+    let blocked_files = GC_01_REQUIRED
+        .iter()
+        .skip(GC_01_CAPTURE_COUNT)
+        .take(REPO_FIXTURES.len().saturating_add(1))
+        .chain(GC_01_REQUIRED.iter().take(GC_01_CAPTURE_COUNT));
+    let expected_blocked: Vec<String> = blocked_files
+        .map(|rel| format!("HASH NOT AVAILABLE {rel}"))
+        .collect();
+    let mut returned_differs = causes(&context);
+    returned_differs.push("RETURNED DIFFERS");
+    let table = [
+        (
+            "no digest tool",
+            "",
+            causes(&context),
+            if context.is_empty() { BLOCKED } else { FAIL },
+        ),
+        (
+            "no digest tool, returned.txt differing",
+            "x\n",
+            returned_differs,
+            FAIL,
+        ),
+    ];
+    for (setting, returned, expected_failures, expected) in table {
+        let mut files = synthetic_capture()?;
+        memory_without_digest_tool(&mut files);
+        memory_set(
+            &mut files,
+            "tests/golden/ifcap/GC-01/returned.txt",
+            returned.as_bytes(),
+        )?;
+        let outcome = evaluate_memory(id, &files);
+        let (status, _, _, _, failures, blocked) = &outcome;
+        assert_eq!(*status, expected, "{setting}: status");
+        assert_eq!(causes(blocked), expected_blocked, "{setting}: blocked");
+        assert!(
+            blocked
+                .iter()
+                .all(|(cause, detail)| *detail == format!("{cause}: {NO_DIGEST_TOOL}")),
+            "{setting}: a blocked detail does not give the reason"
+        );
+        assert_eq!(causes(failures), expected_failures, "{setting}: failures");
+        assert_eq!(
+            step(&outcome, "Hash summary")?,
+            ["0 of 12 fixture digests match MANIFEST.txt, 0 differ; 19 digests NOT AVAILABLE"],
+            "{setting}: hash summary"
+        );
+        let (status, summary, _) = report_case(SELF_TEST_CASE, &outcome);
+        assert_eq!(status, expected, "{setting}: reported status");
+        let deciding = if expected == FAIL {
+            causes(failures)
+        } else {
+            causes(blocked)
+        };
+        let first = deciding.first().copied().unwrap_or("");
+        assert_eq!(
+            summary,
+            deciding_summary(expected, first, deciding.len()),
+            "{setting}: console summary"
+        );
+    }
+    Ok(())
+}
+
+/// The status of a case whose files are all present: PASS with no finding,
+/// BLOCKED with unavailable-tool findings only, and FAIL with any FAIL
+/// finding, whether or not a tool was also unavailable.
+#[test]
+fn case_status_gives_fail_precedence_over_blocked() {
+    let finding = |cause: &str| vec![(cause.to_string(), cause.to_string())];
+    let none: Vec<(String, String)> = Vec::new();
+    let failure = finding("RETURNED DIFFERS");
+    let unavailable = finding("HASH NOT AVAILABLE tests/fixtures/ifcap/5.zwr");
+    let table = [
+        (&none, &none, PASS),
+        (&none, &unavailable, BLOCKED),
+        (&failure, &none, FAIL),
+        (&failure, &unavailable, FAIL),
+    ];
+    for (failures, blocked, expected) in table {
+        assert_eq!(
+            case_status(failures, blocked),
+            expected,
+            "failures {:?}, blocked {:?}",
+            causes(failures),
+            causes(blocked)
+        );
     }
 }

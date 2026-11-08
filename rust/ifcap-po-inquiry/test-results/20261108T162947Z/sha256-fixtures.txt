@@ -1,0 +1,14 @@
+$ sha256sum tests/fixtures/ifcap/*
+f0f80e9ad3215b9da57d194f22f5134f6485186b996ed72eb42f9815a197a558  tests/fixtures/ifcap/411.2.zwr
+71dd66f898e2e2ae013202d8c45ba1aaca393576c415032c34a6aacf8479c2dc  tests/fixtures/ifcap/411.zwr
+49806f54ffd8796c560f1c60ee167cc4c7963f44a7bb5fc1b9fc52180466c9c9  tests/fixtures/ifcap/420.5.zwr
+5744e3a5ec5c5ebfa3eb35e5cd76a3aba3c14a79533cebe0792a8ab8f4f0e2ad  tests/fixtures/ifcap/420.8.zwr
+561cc2c490dd8b2a294341508d634c85dcfccc2423065c492e17f22b1a5cefd5  tests/fixtures/ifcap/440.zwr
+a17a790e82a4cfa62f170f20243b80926e357d9d440994390dc22b1c2c42bd34  tests/fixtures/ifcap/442.3.zwr
+0c21733a35b544fe12e5871905c677ad4470f50c0e376915de88f721dea704e0  tests/fixtures/ifcap/442.4.zwr
+bc93b9a1b77360c0667ad8564ca43a08f862c3127061d3a0995e4b95228f1899  tests/fixtures/ifcap/442.5.zwr
+8fc831d8f068e8d092244c4e639345f629f96fe543d3ad02a094f8944a8bd187  tests/fixtures/ifcap/442.8.zwr
+de7af10fbf737fdc948c1c64d50316f22b108515074075e63507c510a70acb0a  tests/fixtures/ifcap/49.zwr
+85fba36abf70a2c5e19783b05cf7be102a0100c04e5c2e5b8e72f212d8cf07c3  tests/fixtures/ifcap/5.zwr
+975228315e47a12ed9a01ef9e57f582dc41bd9b506a3544fbeddd22db7823639  tests/fixtures/ifcap/MANIFEST.txt
+exit=0
