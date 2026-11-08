@@ -30,8 +30,8 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,15 @@ const MAX_JSON_DEPTH: usize = 64;
 /// Live-mode limits on the `docker exec` child.
 const LIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const LIVE_OUTPUT_LIMIT: usize = 1024 * 1024;
+/// The most `docker exec` children live mode runs at once, across every
+/// connection, so that a burst of requests cannot multiply the processes,
+/// stream threads, descriptors and output buffers each run holds.
+const LIVE_SLOTS: usize = 4;
+/// The longest a live request waits, in all, for one of the `LIVE_SLOTS`;
+/// a request that gets none in that time starts nothing.
+const LIVE_ADMISSION_WAIT: Duration = LIVE_TIMEOUT;
+/// The one bound on live runs, shared by every connection thread.
+static LIVE_ADMISSION: Admission = Admission::new(LIVE_SLOTS);
 
 const JSON_TYPE: &str = "application/json; charset=utf-8";
 
@@ -1123,8 +1132,11 @@ fn read_capture(dir: &Path) -> Result<MumpsSide, String> {
 /// first capture directory holding a meta file, the context must equal
 /// `STUB_CONTEXT` before anything runs, and the container comes only from
 /// the bridge's own configuration. Standard input is each input followed by
-/// one `\n`, the form of a captured input file. Output is used only when
-/// the run succeeded, and the return value is unavailable.
+/// one `\n`, the form of a captured input file. Once the context has
+/// passed, the run takes one of the [`LIVE_SLOTS`] that every connection
+/// shares; a request that gets none within [`LIVE_ADMISSION_WAIT`] starts
+/// nothing and fails as `TIMEOUT`. Output is used only when the run
+/// succeeded, and the return value is unavailable.
 fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<MumpsSide, String> {
     let meta = live_meta(golden_dir)?;
     validate_context(&meta.context)?;
@@ -1135,15 +1147,96 @@ fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<MumpsSi
         stdin.push_str(input);
         stdin.push('\n');
     }
-    let result = run_command(
+    let transcript = run_admitted(
+        &LIVE_ADMISSION,
+        LIVE_ADMISSION_WAIT,
         "docker",
         &args,
         stdin.as_bytes(),
-        LIVE_TIMEOUT,
-        LIVE_OUTPUT_LIMIT,
-    );
-    let transcript = decide_live_result(&result).map_err(|failure| failure.to_string())?;
+    )
+    .map_err(|failure| failure.to_string())?;
     Ok((transcript, None, Vec::new()))
+}
+
+/// [`run_command`] of `program` with the live limits, decided by
+/// [`decide_live_result`], once `admission` has a slot free. The slot is
+/// held until the run is over. When no slot frees within `wait`, nothing
+/// starts.
+fn run_admitted(
+    admission: &Admission,
+    wait: Duration,
+    program: &str,
+    args: &[String],
+    stdin: &[u8],
+) -> Result<String, LiveFailure> {
+    let Some(permit) = admission.admit(wait) else {
+        // The request could not complete within its time budget. A live
+        // failure reports only the fixed 502 causes, and this is the one
+        // that names it, so there is no status or cause of its own.
+        return Err(LiveFailure::Timeout);
+    };
+    let result = run_command(program, args, stdin, LIVE_TIMEOUT, LIVE_OUTPUT_LIMIT);
+    drop(permit);
+    decide_live_result(&result)
+}
+
+/// A bound on how many holders of a [`Permit`] there are at once, shared by
+/// every thread that admits through it.
+struct Admission {
+    /// How many permits are held.
+    running: Mutex<usize>,
+    /// Signalled each time a permit is given back.
+    freed: Condvar,
+    /// The most permits held at once.
+    slots: usize,
+}
+
+impl Admission {
+    const fn new(slots: usize) -> Admission {
+        Admission {
+            running: Mutex::new(0),
+            freed: Condvar::new(),
+            slots,
+        }
+    }
+
+    /// A permit as soon as fewer than `slots` are held, or `None` when none
+    /// frees within `wait`, counted in all rather than per wake-up. The
+    /// count is only ever changed whole while it is locked, so a lock
+    /// poisoned by a panic elsewhere still holds a true count, and is used.
+    fn admit(&self, wait: Duration) -> Option<Permit<'_>> {
+        let running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mut running, _) = self
+            .freed
+            .wait_timeout_while(running, wait, |running| *running >= self.slots)
+            .unwrap_or_else(PoisonError::into_inner);
+        // Decided by the count itself rather than by the timeout flag, so
+        // the answer is right even after a poisoned wait.
+        if *running >= self.slots {
+            return None;
+        }
+        *running += 1;
+        Some(Permit { admission: self })
+    }
+}
+
+/// One slot of an [`Admission`], given back, waking one waiting thread,
+/// when it is dropped.
+struct Permit<'a> {
+    admission: &'a Admission,
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let mut running = self
+            .admission
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *running = running.saturating_sub(1);
+        drop(running);
+        self.admission.freed.notify_one();
+    }
 }
 
 /// The parsed meta file of the first capture directory that has one. A case
@@ -2824,6 +2917,162 @@ mod tests {
                 Err(LiveFailure::Spawn(diagnostic.to_string()))
             );
         }
+        Ok(())
+    }
+
+    /// How many permits of `admission` are held.
+    fn held_permits(admission: &Admission) -> usize {
+        *admission
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[test]
+    fn live_admission_bounds_concurrent_runs() -> Result<(), String> {
+        let admission = Admission::new(2);
+        let inside = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let admitted = AtomicUsize::new(0);
+        thread::scope(|scope| -> Result<(), String> {
+            let mut workers = Vec::new();
+            for number in 0..8 {
+                let worker = thread::Builder::new()
+                    .spawn_scoped(scope, || {
+                        let Some(permit) = admission.admit(Duration::from_secs(30)) else {
+                            return;
+                        };
+                        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(50));
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                        drop(permit);
+                    })
+                    .map_err(|e| format!("starting thread {number}: {e}"))?;
+                workers.push(worker);
+            }
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| "an admitted thread panicked".to_string())?;
+            }
+            Ok(())
+        })?;
+        let peak = peak.load(Ordering::SeqCst);
+        assert!((1..=2).contains(&peak), "{peak} ran at once in two slots");
+        assert_eq!(admitted.load(Ordering::SeqCst), 8, "a thread was refused");
+        assert_eq!(held_permits(&admission), 0, "a permit was not given back");
+        Ok(())
+    }
+
+    #[test]
+    fn live_admission_wait_is_bounded() -> Result<(), String> {
+        let admission = Admission::new(1);
+        let held = admission
+            .admit(Duration::ZERO)
+            .ok_or_else(|| "a free slot was refused".to_string())?;
+        assert!(
+            admission.admit(Duration::ZERO).is_none(),
+            "admitted past the bound"
+        );
+        let wait = Duration::from_millis(200);
+        let started = Instant::now();
+        let refused = admission.admit(wait).is_none();
+        let elapsed = started.elapsed();
+        assert!(refused, "admitted past the bound");
+        assert!(elapsed >= wait, "gave up after {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "waited {elapsed:?}");
+        // A permit given back lets a waiting thread in, and only then.
+        let released = AtomicBool::new(false);
+        let after_release = thread::scope(|scope| -> Result<Option<bool>, String> {
+            let waiter = thread::Builder::new()
+                .spawn_scoped(scope, || {
+                    let permit = admission.admit(Duration::from_secs(30))?;
+                    let after = released.load(Ordering::SeqCst);
+                    drop(permit);
+                    Some(after)
+                })
+                .map_err(io_text)?;
+            thread::sleep(Duration::from_millis(100));
+            released.store(true, Ordering::SeqCst);
+            drop(held);
+            waiter
+                .join()
+                .map_err(|_| "the waiting thread panicked".to_string())
+        })?;
+        assert_eq!(after_release, Some(true), "admitted before the release");
+        assert_eq!(held_permits(&admission), 0, "a permit was not given back");
+        Ok(())
+    }
+
+    #[test]
+    fn live_admission_bounds_real_runs() -> Result<(), String> {
+        let probe = run_available(
+            "sleep",
+            &strings(&["0"]),
+            b"",
+            Duration::from_secs(10),
+            4096,
+        )?;
+        if probe.is_none() {
+            return Ok(());
+        }
+        // Six runs of 0.3 s through two slots take three turns at least.
+        let admission = Admission::new(2);
+        let args = strings(&["0.3"]);
+        let started = Instant::now();
+        let results = thread::scope(|scope| -> Result<Vec<_>, String> {
+            let mut runs = Vec::new();
+            for number in 0..6 {
+                let run = thread::Builder::new()
+                    .spawn_scoped(scope, || {
+                        run_admitted(&admission, Duration::from_secs(60), "sleep", &args, b"")
+                    })
+                    .map_err(|e| format!("starting run {number}: {e}"))?;
+                runs.push(run);
+            }
+            runs.into_iter()
+                .map(|run| run.join().map_err(|_| "a run panicked".to_string()))
+                .collect()
+        })?;
+        let elapsed = started.elapsed();
+        assert_eq!(results, vec![Ok(String::new()); 6]);
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "more than two ran at once: {elapsed:?}"
+        );
+        assert_eq!(held_permits(&admission), 0, "a permit was not given back");
+        Ok(())
+    }
+
+    #[test]
+    fn live_admission_expiry_starts_nothing() -> Result<(), String> {
+        let absent = "/nonexistent/ifcap-po-inquiry-no-such-program";
+        let admission = Admission::new(1);
+        let held = admission
+            .admit(Duration::ZERO)
+            .ok_or_else(|| "a free slot was refused".to_string())?;
+        // Starting the absent program would be `Spawn`; with no slot free it
+        // is never tried.
+        let wait = Duration::from_millis(200);
+        let started = Instant::now();
+        let expired = run_admitted(&admission, wait, absent, &[], b"");
+        let elapsed = started.elapsed();
+        assert_eq!(expired, Err(LiveFailure::Timeout));
+        assert_eq!(
+            expired.map_err(|f| f.to_string()),
+            Err("TIMEOUT".to_string())
+        );
+        assert!(elapsed >= wait, "gave up after {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "waited {elapsed:?}");
+        drop(held);
+        let attempted = run_admitted(&admission, wait, absent, &[], b"");
+        assert!(
+            matches!(&attempted, Err(LiveFailure::Spawn(_))),
+            "{attempted:?}"
+        );
+        assert_eq!(held_permits(&admission), 0, "a permit was not given back");
         Ok(())
     }
 

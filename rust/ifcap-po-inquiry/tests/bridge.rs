@@ -5,7 +5,10 @@
 //! error texts, JSON framing and the capture-file rules. Their store and
 //! capture directories are invented. Each directory lives under
 //! `std::env::temp_dir()`, carries `synthetic` in its name and a
-//! `SYNTHETIC.txt` marker, and is removed when its test ends. Synthetic
+//! `SYNTHETIC.txt` marker, and is removed when its test ends. Its base case
+//! is `GC-01/`. The discovery checks add later `GC-0N/` entries to pin the
+//! order the bridge scans them in; a capture the bridge must pass over
+//! carries a deliberately different synthetic transcript. Synthetic
 //! fixtures are never parity evidence. Every expected Rust-side answer comes
 //! from calling `inquire` directly on the same store, never from a literal.
 //!
@@ -31,6 +34,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::DirBuilderExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,9 +55,10 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_BOUND: Duration = Duration::from_secs(5);
 /// The bound `synthetic_shutdown_joins_within_bound` holds the server to.
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(2);
-/// A session the capture-file tests send: RETURN at the station prompt and
-/// `^` at the order prompt. The replay side never runs it, so any sequence
-/// that round-trips through `split_input_lines` would do.
+/// A session the 404 tests, several 502 tests and the shutdown test send:
+/// RETURN at the station prompt and `^` at the order prompt. The replay side
+/// never runs it, so any sequence that round-trips through
+/// `split_input_lines` would do.
 const SESSION_INPUTS: [&str; 2] = ["", "^"];
 
 // ---------------------------------------------------------------------------
@@ -74,28 +79,52 @@ static SYNTHETIC_SERIAL: AtomicUsize = AtomicUsize::new(0);
 /// Runs `body` with one test's own capture directory under
 /// `std::env::temp_dir()`, named
 /// `ifcap-po-inquiry-synthetic-<test>-<pid>-<nanos>-<serial>` and marked by
-/// `SYNTHETIC.txt`. The directory is the `golden_dir` of the test's bridge,
-/// and its one case is `GC-01/`.
+/// `SYNTHETIC.txt`. The directory is the `golden_dir` of the test's bridge.
+/// Its base synthetic case is `GC-01/`, the first case the bridge scans; the
+/// discovery checks add later `GC-0N/` entries beside it.
 ///
-/// The directory is removed on every exit of `body`: `Ok`, `Err` or a
-/// panic, which is resumed once the directory is gone. The result is
-/// `body`'s, or the removal failure when `body` succeeded. A directory
-/// `body` has already removed is not an error.
+/// The directory is acquired exclusively before `body` runs. Each attempt
+/// takes a fresh `<nanos>` and `<serial>` and creates that one name,
+/// non-recursively and with mode `0o700` so that only the owner can enter
+/// it. The creation fails on any existing entry, a symbolic link included,
+/// without following it, and such an entry is never reused, followed or
+/// removed: the next name is tried instead, up to `ATTEMPTS` names.
+///
+/// Only the path this call created is removed, on every exit of `body`:
+/// `Ok`, `Err` or a panic, which is resumed once the directory is gone. The
+/// result is `body`'s, or the removal failure when `body` succeeded. A
+/// directory `body` has already removed is not an error.
 fn with_synthetic_dir<T>(
     test: &str,
     body: impl FnOnce(&Path) -> Result<T, String>,
 ) -> Result<T, String> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    let serial = SYNTHETIC_SERIAL.fetch_add(1, Ordering::SeqCst);
-    let root = std::env::temp_dir().join(format!(
-        "ifcap-po-inquiry-synthetic-{test}-{}-{nanos}-{serial}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&root)
-        .map_err(|e| format!("{test}: creating the synthetic directory: {e}"))?;
+    const ATTEMPTS: usize = 64;
+    let base = std::env::temp_dir();
+    let mut acquired = None;
+    for _ in 0..ATTEMPTS {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let serial = SYNTHETIC_SERIAL.fetch_add(1, Ordering::SeqCst);
+        let candidate = base.join(format!(
+            "ifcap-po-inquiry-synthetic-{test}-{}-{nanos}-{serial}",
+            std::process::id()
+        ));
+        match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => {
+                acquired = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{test}: creating the synthetic directory: {e}")),
+        }
+    }
+    let Some(root) = acquired else {
+        return Err(format!(
+            "{test}: no unused synthetic directory name after {ATTEMPTS} attempts"
+        ));
+    };
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         write_file(&root, "SYNTHETIC.txt", SYNTHETIC_MARKER.as_bytes())?;
         body(&root)
@@ -112,14 +141,22 @@ fn with_synthetic_dir<T>(
     }
 }
 
-/// The path of `name` inside the `GC-01/` case directory under `root`, the
-/// first case the bridge scans.
+/// The path of `name` inside the case directory `case` under `root`.
+fn case_path(root: &Path, case: &str, name: &str) -> PathBuf {
+    root.join(case).join(name)
+}
+
+/// [`case_path`] in `GC-01/`, the base synthetic case and the first case
+/// the bridge scans.
 fn case_file(root: &Path, name: &str) -> PathBuf {
-    root.join("GC-01").join(name)
+    case_path(root, "GC-01", name)
 }
 
 /// Writes `bytes` to `rel` under `root`, creating its parents. Errors name
-/// `rel`, never the temporary path.
+/// `rel`, never the temporary path. Creating the parents with
+/// `create_dir_all` is safe because they lie inside the owner-only root
+/// that [`with_synthetic_dir`] acquired exclusively, where no other user can
+/// place an entry first.
 fn write_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     let path = root.join(rel);
     if let Some(parent) = path.parent() {
@@ -247,22 +284,54 @@ fn ok_case_or_not_run(test: &str, store: &Store) -> Option<(Vec<String>, String,
     }
 }
 
-/// Writes `GC-01/input.txt` in captured form, after confirming it reads
+/// Writes `<case>/input.txt` in captured form, after confirming it reads
 /// back as `inputs` through `split_input_lines`, so that replay can match.
-fn write_inputs(root: &Path, inputs: &[String]) -> Result<(), String> {
+fn write_inputs_in(root: &Path, case: &str, inputs: &[String]) -> Result<(), String> {
     let text = capture_form(inputs);
     if let Some(input) = first_differing_input(&split_input_lines(&text), inputs) {
         return Err(format!(
-            "synthetic GC-01/input.txt: input {input} does not read back through split_input_lines"
+            "synthetic {case}/input.txt: input {input} does not read back through split_input_lines"
         ));
     }
-    write_file(root, "GC-01/input.txt", text.as_bytes())?;
+    write_file(root, &format!("{case}/input.txt"), text.as_bytes())?;
     Ok(())
 }
 
-/// Writes a whole synthetic capture into `GC-01/`. `returned.txt` is zero
-/// bytes for `None`, and otherwise the value with one trailing newline,
-/// which the bridge removes.
+/// [`write_inputs_in`] for `GC-01/`, the base synthetic case.
+fn write_inputs(root: &Path, inputs: &[String]) -> Result<(), String> {
+    write_inputs_in(root, "GC-01", inputs)
+}
+
+/// Writes a whole synthetic capture into the case directory `case`.
+/// `returned.txt` is zero bytes for `None`, and otherwise the value with
+/// one trailing newline, which the bridge removes.
+fn write_case_in(
+    root: &Path,
+    case: &str,
+    inputs: &[String],
+    transcript: &str,
+    returned: Option<&str>,
+    normalisation: &str,
+) -> Result<(), String> {
+    write_inputs_in(root, case, inputs)?;
+    write_file(
+        root,
+        &format!("{case}/transcript.txt"),
+        transcript.as_bytes(),
+    )?;
+    let returned = returned
+        .map(|value| format!("{value}\n"))
+        .unwrap_or_default();
+    write_file(root, &format!("{case}/returned.txt"), returned.as_bytes())?;
+    write_file(
+        root,
+        &format!("{case}/normalisation.txt"),
+        normalisation.as_bytes(),
+    )?;
+    Ok(())
+}
+
+/// [`write_case_in`] for `GC-01/`, the base synthetic case.
 fn write_case(
     root: &Path,
     inputs: &[String],
@@ -270,14 +339,7 @@ fn write_case(
     returned: Option<&str>,
     normalisation: &str,
 ) -> Result<(), String> {
-    write_inputs(root, inputs)?;
-    write_file(root, "GC-01/transcript.txt", transcript.as_bytes())?;
-    let returned = returned
-        .map(|value| format!("{value}\n"))
-        .unwrap_or_default();
-    write_file(root, "GC-01/returned.txt", returned.as_bytes())?;
-    write_file(root, "GC-01/normalisation.txt", normalisation.as_bytes())?;
-    Ok(())
+    write_case_in(root, "GC-01", inputs, transcript, returned, normalisation)
 }
 
 /// A well-formed capture context whose `IOF` and `IOSL` carry values,
@@ -293,6 +355,27 @@ fn meta_text(context: &str, docker_exec_args: &str) -> String {
          docker_exec_args={docker_exec_args}\n"
     )
 }
+
+/// Writes `text` as `<case>/meta.txt` under `root`.
+fn write_meta_in(root: &Path, case: &str, text: &[u8]) -> Result<(), String> {
+    write_file(root, &format!("{case}/meta.txt"), text)?;
+    Ok(())
+}
+
+/// Writes a regular file named `case` under `root`, in place of a case
+/// directory: an entry that holds no capture file.
+fn write_case_entry_file(root: &Path, case: &str) -> Result<(), String> {
+    write_file(
+        root,
+        case,
+        b"SYNTHETIC: a regular file in place of a case directory\n",
+    )?;
+    Ok(())
+}
+
+/// Builds the case entries of one row of a discovery table under the row's
+/// own synthetic root.
+type Layout<'a> = &'a dyn Fn(&Path) -> Result<(), String>;
 
 // ---------------------------------------------------------------------------
 // Server and client
@@ -580,11 +663,16 @@ fn digits(bytes: &[u8], mut pos: usize) -> Option<usize> {
     (pos > first).then_some(pos)
 }
 
+/// Scans a number; the integer part is `0` or a nonzero digit then digits.
 fn json_number(bytes: &[u8], mut pos: usize) -> Result<usize, String> {
     if bytes.get(pos) == Some(&b'-') {
         pos += 1;
     }
-    pos = digits(bytes, pos).ok_or_else(|| json_error("expected digits", pos))?;
+    pos = match bytes.get(pos) {
+        Some(b'0') => pos + 1,
+        Some(b'1'..=b'9') => digits(bytes, pos + 1).unwrap_or(pos + 1),
+        _ => return Err(json_error("expected digits", pos)),
+    };
     if bytes.get(pos) == Some(&b'.') {
         let fraction = pos + 1;
         pos = digits(bytes, fraction)
@@ -834,10 +922,15 @@ fn expect_error(resp: &(u16, Vec<u8>), status: u16, context: &str) -> Result<Str
 /// the mumps backend, stops the bridge, and returns the error text of the
 /// 502 answer.
 fn mumps_502(mode: MumpsMode, inputs: &[String]) -> Result<String, String> {
+    mumps_502_named("mumps backend over the synthetic directory", mode, inputs)
+}
+
+/// [`mumps_502`] whose failures name `context`, such as one row of a table.
+fn mumps_502_named(context: &str, mode: MumpsMode, inputs: &[String]) -> Result<String, String> {
     let resp = with_server(synthetic_store()?, mode, |addr| {
         post_session(addr, "mumps", &body_for(inputs))
     })?;
-    expect_error(&resp, 502, "mumps backend over the synthetic directory")
+    expect_error(&resp, 502, context)
 }
 
 /// Where `actual` first differs from `expected`: the 1-based line and the
@@ -990,84 +1083,348 @@ fn synthetic_mumps_replay_200() -> Result<(), String> {
     else {
         return Ok(());
     };
-    let (status, body) = with_synthetic_dir("mumps-200", |root| {
-        // A zero-byte returned.txt, which replay must answer as null.
-        write_case(root, &inputs, &transcript, None, "")?;
-        with_server(store, replay(root), |addr| {
-            post_session(addr, "mumps", &body_for(&inputs))
+    let other = strings(&["SYNTHETIC OTHER INPUT"]);
+    // The capture replay must choose: `inputs` with inquire's transcript and
+    // a zero-byte returned.txt, which replay must answer as null.
+    let chosen =
+        |root: &Path, case: &str| write_case_in(root, case, &inputs, &transcript, None, "");
+    // A capture of `inputs` that replay must pass over, whose transcript
+    // fails the transcript check if replayed.
+    let decoy = |root: &Path, case: &str| {
+        write_case_in(
+            root,
+            case,
+            &inputs,
+            &format!("SYNTHETIC {case} TRANSCRIPT: not the capture replay must choose\n"),
+            None,
+            "",
+        )
+    };
+    // A complete capture of another session, which does not match.
+    let other_session = |root: &Path, case: &str| {
+        write_case_in(root, case, &other, "SYNTHETIC OTHER TRANSCRIPT\n", None, "")
+    };
+    let layouts: [(&str, Layout<'_>); 6] = [
+        ("mumps-200", &|root| chosen(root, "GC-01")),
+        // A non-matching GC-01 does not end the scan.
+        ("mumps-200-after-other-session", &|root| {
+            other_session(root, "GC-01")?;
+            chosen(root, "GC-02")
+        }),
+        // Nor does a non-UTF-8 input.txt in GC-01, or GC-02 being absent.
+        ("mumps-200-after-non-utf8-input", &|root| {
+            decoy(root, "GC-01")?;
+            write_file(root, "GC-01/input.txt", &[0xFF, 0xFE, b'\n'])?;
+            chosen(root, "GC-03")
+        }),
+        // Nor a directory in place of GC-01's input.txt, which is unreadable.
+        ("mumps-200-after-unreadable-input", &|root| {
+            decoy(root, "GC-01")?;
+            let input = case_path(root, "GC-01", "input.txt");
+            fs::remove_file(&input)
+                .map_err(|e| format!("removing synthetic GC-01/input.txt: {e}"))?;
+            fs::create_dir(&input)
+                .map_err(|e| format!("creating the directory GC-01/input.txt: {e}"))?;
+            chosen(root, "GC-03")
+        }),
+        // Of two matching captures, the first is replayed.
+        ("mumps-200-first-duplicate", &|root| {
+            chosen(root, "GC-01")?;
+            decoy(root, "GC-02")
+        }),
+        // After a non-matching GC-01, the first match wins over a later one.
+        ("mumps-200-first-later-match", &|root| {
+            other_session(root, "GC-01")?;
+            chosen(root, "GC-02")?;
+            decoy(root, "GC-05")
+        }),
+    ];
+    for (label, layout) in layouts {
+        let (status, body) = with_synthetic_dir(label, |root| {
+            layout(root)?;
+            with_server(store.clone(), replay(root), |addr| {
+                post_session(addr, "mumps", &body_for(&inputs))
+            })
+        })?;
+        let in_row = |e: String| format!("{label}: {e}");
+        assert_eq!(status, 200, "{label}: mumps backend: status");
+        let json = json_body(&body).map_err(in_row)?;
+        let (replayed, _) = session_of(json).map_err(in_row)?;
+        assert_same(
+            &format!("{label}: replayed transcript against the chosen transcript.txt"),
+            &replayed,
+            &transcript,
+        );
+        assert!(
+            member(json, "returned").map_err(in_row)? == "null",
+            "{label}: a zero-byte returned.txt must replay as null"
+        );
+    }
+    Ok(())
+}
+
+/// Asserts that `resp` is a 200 compare answer whose `mumps` and `rust`
+/// sides carry `mumps` and `rust`, each a transcript and a return value,
+/// and whose `match` is `expected`. A response is never normalised, so each
+/// side is held to its raw text. Failures name `check`, never the body.
+fn assert_compare(
+    check: &str,
+    resp: &(u16, Vec<u8>),
+    mumps: (&str, Option<&str>),
+    rust: (&str, Option<&str>),
+    expected: &str,
+) -> Result<(), String> {
+    let (status, body) = resp;
+    assert_eq!(*status, 200, "{check}: compare status");
+    let json = json_body(body).map_err(|e| format!("{check}: {e}"))?;
+    for (side, (transcript, returned)) in [("mumps", mumps), ("rust", rust)] {
+        let (side_transcript, side_returned) = member(json, side)
+            .and_then(session_of)
+            .map_err(|e| format!("{check}: {e}"))?;
+        assert_same(
+            &format!("{check}: raw {side} side transcript"),
+            &side_transcript,
+            transcript,
+        );
+        assert_same_optional(
+            &format!("{check}: {side} side returned"),
+            side_returned.as_deref(),
+            returned,
+        );
+    }
+    let actual = member(json, "match").map_err(|e| format!("{check}: {e}"))?;
+    assert!(actual == expected, "{check}: match must be {expected}");
+    Ok(())
+}
+
+/// One compare sub-case in its own synthetic directory and bridge: `GC-01/`
+/// captures `captured` with `inquire`'s return value, under the
+/// normalisation file `rules`. The Rust side must be `inquire`'s answer and
+/// the MUMPS side the capture, both raw, and `match` must be `expected`, a
+/// literal each sub-case designs from the normalisation format, never one
+/// computed by `normalise`.
+fn compare_sub_case(
+    name: &str,
+    store: &Store,
+    case: &(Vec<String>, String, Option<String>),
+    captured: &str,
+    rules: &str,
+    expected: &str,
+) -> Result<(), String> {
+    let (inputs, transcript, returned) = case;
+    if let Err(line) = parse_normalisation(rules) {
+        return Err(format!(
+            "{name}: precondition: synthetic normalisation.txt line {line} is malformed"
+        ));
+    }
+    let resp = with_synthetic_dir(name, |root| {
+        write_case(root, inputs, captured, returned.as_deref(), rules)?;
+        with_server(store.clone(), replay(root), |addr| {
+            post_session(addr, "compare", &body_for(inputs))
         })
     })?;
-    assert_eq!(status, 200, "mumps backend: status");
-    let json = json_body(&body)?;
-    let (replayed, _) = session_of(json)?;
+    assert_compare(
+        name,
+        &resp,
+        (captured, returned.as_deref()),
+        (transcript.as_str(), returned.as_deref()),
+        expected,
+    )
+}
+
+/// One return-value sub-case of `synthetic_compare_match_false` in its own
+/// synthetic directory and bridge: `GC-01/` captures `inquire`'s own
+/// transcript with the return value `value`, which `write_case` must store
+/// as `file`, the value and one terminating newline. The mumps backend must
+/// replay exactly `value`, only that terminator removed, and compare must
+/// answer `match: false`: the transcripts agree, the return values do not,
+/// and transcript-only agreement is never a match.
+fn returned_sub_case(
+    name: &str,
+    store: &Store,
+    case: &(Vec<String>, String, Option<String>),
+    value: &str,
+    file: &str,
+) -> Result<(), String> {
+    let (inputs, transcript, returned) = case;
+    if returned.as_deref() == Some(value) {
+        return Err(format!(
+            "{name}: precondition: inquire returns the captured value itself"
+        ));
+    }
+    let (written, mumps, compare) = with_synthetic_dir(name, |root| {
+        write_case(root, inputs, transcript, Some(value), "")?;
+        let written = fs::read(root.join("GC-01").join("returned.txt"))
+            .map_err(|e| format!("{name}: reading back synthetic GC-01/returned.txt: {e}"))?;
+        let body = body_for(inputs);
+        let (mumps, compare) = with_server(store.clone(), replay(root), |addr| {
+            Ok((
+                post_session(addr, "mumps", &body)?,
+                post_session(addr, "compare", &body)?,
+            ))
+        })?;
+        Ok((written, mumps, compare))
+    })?;
     assert_same(
-        "replayed transcript against transcript.txt",
+        &format!("{name}: synthetic GC-01/returned.txt"),
+        &written,
+        file,
+    );
+    let (status, body) = &mumps;
+    assert_eq!(*status, 200, "{name}: mumps status");
+    let (replayed, replayed_returned) = json_body(body)
+        .and_then(session_of)
+        .map_err(|e| format!("{name}: {e}"))?;
+    assert_same(
+        &format!("{name}: replayed transcript"),
         &replayed,
-        &transcript,
+        transcript,
     );
-    assert!(
-        member(json, "returned")? == "null",
-        "a zero-byte returned.txt must replay as null"
+    assert_same_optional(
+        &format!("{name}: replayed returned"),
+        replayed_returned.as_deref(),
+        Some(value),
     );
-    Ok(())
+    assert_compare(
+        name,
+        &compare,
+        (transcript.as_str(), Some(value)),
+        (transcript.as_str(), returned.as_deref()),
+        "false",
+    )
+}
+
+/// The station prompt, with its default, that every `ok_case` session
+/// writes.
+const STATION_PROMPT: &str = "Select STATION NUMBER ('^' TO EXIT): 500// ";
+
+/// The captured transcript of a normalisation sub-case named `check`:
+/// `transcript` with its station prompt replaced by `prompt`. The text
+/// around the prompt is the same on both sides, and only line feeds may
+/// precede it, so no span of the sub-cases' rules opens before it; each
+/// sub-case's `match` is designed on that. `Err` names the precondition
+/// `transcript` breaks, or a `prompt` that leaves both sides equal.
+fn altered_capture(check: &str, transcript: &str, prompt: &str) -> Result<String, String> {
+    let Some((head, tail)) = transcript.split_once(STATION_PROMPT) else {
+        return Err(format!(
+            "{check}: precondition: the inquire transcript holds no station prompt"
+        ));
+    };
+    if !head.bytes().all(|byte| byte == b'\n') {
+        return Err(format!(
+            "{check}: precondition: text other than line feeds precedes the station prompt"
+        ));
+    }
+    let captured = format!("{head}{prompt}{tail}");
+    if captured == transcript {
+        return Err(format!(
+            "{check}: precondition: the captured transcript equals the inquire transcript"
+        ));
+    }
+    Ok(captured)
 }
 
 #[test]
 fn synthetic_compare_match_true() -> Result<(), String> {
     let store = synthetic_store()?;
-    let Some((inputs, transcript, returned)) =
-        ok_case_or_not_run("synthetic_compare_match_true", &store)
-    else {
+    let Some(case) = ok_case_or_not_run("synthetic_compare_match_true", &store) else {
         return Ok(());
     };
-    let (status, body) = with_synthetic_dir("compare-true", |root| {
-        write_case(root, &inputs, &transcript, returned.as_deref(), "")?;
-        with_server(store, replay(root), |addr| {
-            post_session(addr, "compare", &body_for(&inputs))
-        })
-    })?;
-    assert_eq!(status, 200, "compare backend: status");
-    let json = json_body(&body)?;
-    for side in ["mumps", "rust"] {
-        let (side_transcript, side_returned) = session_of(member(json, side)?)?;
-        assert_same(
-            &format!("{side} side transcript"),
-            &side_transcript,
-            &transcript,
-        );
-        assert_same_optional(
-            &format!("{side} side returned"),
-            side_returned.as_deref(),
-            returned.as_deref(),
-        );
-    }
-    assert!(member(json, "match")? == "true", "match must be true");
-    Ok(())
+    let (_, transcript, _) = &case;
+    // The capture is inquire's own session, under no normalisation.
+    compare_sub_case("compare-true", &store, &case, transcript, "", "true")?;
+    // One rule, one span: `Select STATION NUMBER` against
+    // `Select SYNTHETIC-A NUMBER`, both `<NORM>`.
+    let name = "compare-true-one-rule";
+    let captured = altered_capture(
+        name,
+        transcript,
+        "Select SYNTHETIC-A NUMBER ('^' TO EXIT): 500// ",
+    )?;
+    compare_sub_case(name, &store, &case, &captured, "Select \t NUMBER\n", "true")?;
+    // One rule, many spans: space to space. Each prompt holds seven spaces
+    // at the same word boundaries, so the spans pair alike on both sides,
+    // three of them differ (` STATION `, ` ('^' `, ` EXIT): ` against
+    // ` SYNTHETIC-A `, ` SYNTHETIC-B `, ` SYNTHETIC-C: `), and the
+    // seventh opens a span into the identical text after the prompt.
+    let name = "compare-true-many-spans";
+    let captured = altered_capture(
+        name,
+        transcript,
+        "Select SYNTHETIC-A NUMBER SYNTHETIC-B TO SYNTHETIC-C: 500// ",
+    )?;
+    compare_sub_case(name, &store, &case, &captured, " \t \n", "true")?;
+    // Two rules in file order, the second consuming the first's `<NORM>`:
+    // `Select STATION NUMBER ('^' TO EXIT):` and
+    // `Select SYNTHETIC-A NUMBER SYNTHETIC-B:` both end as one `<NORM>`.
+    // Applied in reverse order, the `<NORM>` rule would find nothing yet,
+    // `('^' TO EXIT)` would stand against `SYNTHETIC-B`, and `match` would
+    // be false.
+    let name = "compare-true-rule-order";
+    let captured = altered_capture(
+        name,
+        transcript,
+        "Select SYNTHETIC-A NUMBER SYNTHETIC-B: 500// ",
+    )?;
+    compare_sub_case(
+        name,
+        &store,
+        &case,
+        &captured,
+        "Select \t NUMBER\n<NORM>\t:\n",
+        "true",
+    )
 }
 
 #[test]
 fn synthetic_compare_match_false() -> Result<(), String> {
     let store = synthetic_store()?;
-    let Some((inputs, transcript, returned)) =
-        ok_case_or_not_run("synthetic_compare_match_false", &store)
-    else {
+    let Some(case) = ok_case_or_not_run("synthetic_compare_match_false", &store) else {
         return Ok(());
     };
+    let (_, transcript, _) = &case;
     let differing = format!("{transcript}SYNTHETIC DIFFERENCE\n");
-    let (status, body) = with_synthetic_dir("compare-false", |root| {
-        write_case(root, &inputs, &differing, returned.as_deref(), "")?;
-        with_server(store, replay(root), |addr| {
-            post_session(addr, "compare", &body_for(&inputs))
-        })
-    })?;
-    assert_eq!(status, 200, "compare backend: status");
-    let json = json_body(&body)?;
-    let (mumps_transcript, _) = session_of(member(json, "mumps")?)?;
-    let (rust_transcript, _) = session_of(member(json, "rust")?)?;
-    assert_same("mumps side is the capture", &mumps_transcript, &differing);
-    assert_same("rust side is inquire", &rust_transcript, &transcript);
-    assert!(member(json, "match")? == "false", "match must be false");
-    Ok(())
+    compare_sub_case("compare-false", &store, &case, &differing, "", "false")?;
+    // Equal transcripts, unequal return values. The value keeps its own
+    // trailing newline: of the two newlines that end returned.txt, the
+    // bridge removes only the file's terminator.
+    returned_sub_case(
+        "compare-false-returned",
+        &store,
+        &case,
+        "SYNTHETIC RETURN\n",
+        "SYNTHETIC RETURN\n\n",
+    )?;
+    // A returned.txt of one newline is the empty string, not null, which
+    // only a zero-byte file means.
+    returned_sub_case("compare-false-returned-empty", &store, &case, "", "\n")?;
+    // A span only the capture holds. The rule applies to both sides, so the
+    // capture's `[[SYNTHETIC]]` becomes `<NORM>`, which the Rust side does
+    // not hold: a `<NORM>` stands only for a span, never for absent text.
+    let name = "compare-false-one-sided-span";
+    let captured = altered_capture(
+        name,
+        transcript,
+        "[[SYNTHETIC]]Select STATION NUMBER ('^' TO EXIT): 500// ",
+    )?;
+    compare_sub_case(name, &store, &case, &captured, "[[\t]]\n", "false")?;
+    // An open delimiter with no later close delimiter on either side leaves
+    // the rest of each text unchanged, so `STATION` stands against
+    // `SYNTHETIC-A`.
+    let name = "compare-false-unclosed-rule";
+    let never_closed = "SYNTHETIC-NEVER-CLOSED";
+    if transcript.contains(never_closed) {
+        return Err(format!(
+            "{name}: precondition: the inquire transcript holds the close delimiter"
+        ));
+    }
+    let captured = altered_capture(
+        name,
+        transcript,
+        "Select SYNTHETIC-A NUMBER ('^' TO EXIT): 500// ",
+    )?;
+    let rules = format!("Select \t{never_closed}\n");
+    compare_sub_case(name, &store, &case, &captured, &rules, "false")
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,11 +1535,18 @@ fn synthetic_404_non_post_on_api() -> Result<(), String> {
 
 #[test]
 fn synthetic_422_unsupported_branch_end_to_end() -> Result<(), String> {
+    // The branch of `?` (help) at the order prompt.
+    const HELP_BRANCH: &str = "PO-09.b4";
     let store = synthetic_store()?;
     // RETURN at the station prompt, then `?` (help) at the order prompt.
     let inputs = strings(&["", "?"]);
-    let id = match inquire(&store, &inputs) {
-        Err(InquiryError::UnsupportedBranch(id)) => id,
+    match inquire(&store, &inputs) {
+        Err(InquiryError::UnsupportedBranch(id)) if id == HELP_BRANCH => {}
+        Err(InquiryError::UnsupportedBranch(id)) => {
+            return Err(format!(
+                "inquire on the help input gave UnsupportedBranch({id}), expected {HELP_BRANCH}"
+            ));
+        }
         Err(InquiryError::CorruptStore(_)) => {
             return Err(
                 "inquire on the help input must be UnsupportedBranch, got CorruptStore".to_string(),
@@ -1191,13 +1555,8 @@ fn synthetic_422_unsupported_branch_end_to_end() -> Result<(), String> {
         Ok(_) => {
             return Err("inquire on the help input must be UnsupportedBranch, got Ok".to_string());
         }
-    };
-    // PO-09.b4 is help at the order prompt; PO-05.b1 is station acceptance,
-    // should SPEC.md block it.
-    assert!(
-        id == "PO-09.b4" || id == "PO-05.b1",
-        "inquire on the help input gave UnsupportedBranch({id}), expected PO-09.b4 or PO-05.b1"
-    );
+    }
+    let expected = format!("UNSUPPORTED BRANCH {HELP_BRANCH}");
     let body = body_for(&inputs);
     let (rust, mumps, compare) = with_synthetic_dir("422", |root| {
         write_case(
@@ -1216,34 +1575,114 @@ fn synthetic_422_unsupported_branch_end_to_end() -> Result<(), String> {
         })
     })?;
     let error = expect_error(&rust, 422, "rust")?;
-    assert!(error.contains(&id), "rust 422 error text must name {id}");
+    assert_same("rust 422 error text", &error, &expected);
     assert_eq!(
         mumps.0, 200,
         "the synthetic capture must replay, so that compare reaches the Rust side: status"
     );
     let error = expect_error(&compare, 422, "compare")?;
-    assert!(error.contains(&id), "compare 422 error text must name {id}");
+    assert_same("compare 422 error text", &error, &expected);
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// 502, on the mumps backend
+// 502, on the mumps backend and in compare
 // ---------------------------------------------------------------------------
+
+/// RETURN at the station prompt, then `?` (help) at the order prompt: a
+/// session the Rust side answers 422, so that a compare whose MUMPS side
+/// fails has two failures to choose between.
+const HELP_INPUTS: [&str; 2] = ["", "?"];
+
+/// [`HELP_INPUTS`] with the branch ID that `inquire` names when it answers
+/// them with `UnsupportedBranch` on `store`. Any other answer is an error,
+/// for compare would then have no Rust-side 422 for the MUMPS side's 502 to
+/// precede.
+fn help_session(store: &Store) -> Result<(Vec<String>, String), String> {
+    let inputs = strings(&HELP_INPUTS);
+    match inquire(store, &inputs) {
+        Err(InquiryError::UnsupportedBranch(id)) => Ok((inputs, id)),
+        Err(InquiryError::CorruptStore(_)) => {
+            Err("inquire on the help input must be UnsupportedBranch, got CorruptStore".to_string())
+        }
+        Ok(_) => Err("inquire on the help input must be UnsupportedBranch, got Ok".to_string()),
+    }
+}
+
+/// [`expect_error`] for a body that must hold nothing but its `error`
+/// member: no transcript, return value, side or verdict of a partial
+/// result.
+fn expect_error_alone(resp: &(u16, Vec<u8>), status: u16, context: &str) -> Result<String, String> {
+    let error = expect_error(resp, status, context)?;
+    let json = json_body(&resp.1).map_err(|e| format!("{context}: {e}"))?;
+    let bytes = json.as_bytes();
+    let mut names: Vec<String> = Vec::new();
+    json_object(bytes, skip_whitespace(bytes, 0), &mut |name, _, _| {
+        names.push(name.to_string());
+    })
+    .map_err(|e| format!("{context}: {e}"))?;
+    assert!(
+        names == ["error"],
+        "{context}: the error body must hold only the member \"error\", not {names:?}"
+    );
+    Ok(error)
+}
+
+/// POSTs `inputs`, which the Rust side answers with `UnsupportedBranch(id)`,
+/// to the rust, mumps and compare backends at `addr`. The rust backend must
+/// answer 422 naming `id`, and the mumps backend 502 with exactly `cause`
+/// and nothing else. Compare must answer that same 502, because it consults
+/// its MUMPS side before its Rust side.
+fn assert_mumps_502_before_rust_422(
+    addr: SocketAddr,
+    inputs: &[String],
+    id: &str,
+    cause: &str,
+    context: &str,
+) -> Result<(), String> {
+    let body = body_for(inputs);
+    let rust = post_session(addr, "rust", &body)?;
+    let error = expect_error(&rust, 422, &format!("{context}: rust"))?;
+    assert!(
+        error.contains(id),
+        "{context}: rust 422 error text must name {id}"
+    );
+    for backend in ["mumps", "compare"] {
+        let check = format!("{context}: {backend}");
+        let error = expect_error_alone(&post_session(addr, backend, &body)?, 502, &check)?;
+        assert_same(&format!("{check} 502 error text"), &error, cause);
+    }
+    Ok(())
+}
 
 #[test]
 fn synthetic_502_not_recorded() -> Result<(), String> {
-    with_synthetic_dir("502-not-recorded", |root| {
-        // A complete capture of another session, which must not match.
+    let store = synthetic_store()?;
+    let (help, id) = help_session(&store)?;
+    // Each root holds a complete capture of another session, which must not
+    // match.
+    let write_other = |root: &Path| {
         write_case(
             root,
             &strings(&["SYNTHETIC OTHER INPUT"]),
             "SYNTHETIC TRANSCRIPT\n",
             None,
             "",
-        )?;
+        )
+    };
+    with_synthetic_dir("502-not-recorded", |root| {
+        write_other(root)?;
         let error = mumps_502(replay(root), &strings(&SESSION_INPUTS))?;
         assert_same("502 error text", &error, "NOT RECORDED");
         Ok(())
+    })?;
+    // Unrecorded on the MUMPS side and unsupported on the Rust side: compare
+    // answers the MUMPS side's 502, never the Rust side's 422.
+    with_synthetic_dir("502-not-recorded-help", |root| {
+        write_other(root)?;
+        with_server(store, replay(root), |addr| {
+            assert_mumps_502_before_rust_422(addr, &help, &id, "NOT RECORDED", "help session")
+        })
     })
 }
 
@@ -1252,129 +1691,317 @@ fn synthetic_502_not_recorded_lists_unreadable_input() -> Result<(), String> {
     with_synthetic_dir("502-unreadable-input", |root| {
         let input = write_file(root, "GC-01/input.txt", &[0xFF, 0xFE, b'\n'])?;
         let error = mumps_502(replay(root), &strings(&SESSION_INPUTS))?;
-        assert!(
-            error.starts_with("NOT RECORDED"),
-            "502 error text must start with NOT RECORDED"
-        );
-        let path = input.display().to_string();
-        assert!(
-            error.contains(&path),
-            "502 error text must list the unreadable synthetic GC-01/input.txt"
+        // GC-02 to GC-05 are absent, so GC-01's input is the only one listed.
+        assert_same(
+            "502 error text",
+            &error,
+            format!("NOT RECORDED (unreadable: {})", input.display()),
         );
         Ok(())
     })
 }
 
+/// The required files of a matching capture, in the order the bridge reads
+/// them.
+const REQUIRED_CAPTURE_FILES: [&str; 3] = ["transcript.txt", "returned.txt", "normalisation.txt"];
+
+/// Writes a valid capture of `inputs` into `GC-01/` under `root`: a
+/// non-empty transcript, a non-empty return value and one well-formed
+/// normalisation rule, so that damaging any one required file leaves the
+/// others valid.
+fn write_valid_capture(root: &Path, inputs: &[String]) -> Result<(), String> {
+    write_case(
+        root,
+        inputs,
+        "SYNTHETIC TRANSCRIPT: any text; the capture only has to be valid\n",
+        Some("SYNTHETIC RETURN"),
+        "SYNTHETIC OPEN\tSYNTHETIC CLOSE\n",
+    )
+}
+
+/// One capture-file test over the help session. A first root,
+/// `502-<kind>-intact`, confirms that the undamaged capture replays, so that
+/// compare answers the Rust side's 422. Then, each in its own root
+/// `502-<kind>-<file stem>`, `damage` changes one of
+/// [`REQUIRED_CAPTURE_FILES`] and no other file: the mumps and compare
+/// backends must both answer 502 with exactly
+/// `CAPTURE FILE <path>: <reason>` and nothing else, while the rust backend
+/// still answers 422.
+fn assert_capture_file_502(
+    kind: &str,
+    reason: &str,
+    damage: impl Fn(&Path, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let store = synthetic_store()?;
+    let (inputs, id) = help_session(&store)?;
+    let intact = format!("502-{kind}-intact");
+    with_synthetic_dir(&intact, |root| {
+        write_valid_capture(root, &inputs)?;
+        with_server(store.clone(), replay(root), |addr| {
+            let body = body_for(&inputs);
+            let (status, _) = post_session(addr, "mumps", &body)?;
+            assert_eq!(status, 200, "{intact}: mumps status");
+            let compare = post_session(addr, "compare", &body)?;
+            let error = expect_error(&compare, 422, &format!("{intact}: compare"))?;
+            assert!(
+                error.contains(&id),
+                "{intact}: compare 422 error text must name {id}"
+            );
+            Ok(())
+        })
+    })?;
+    for name in REQUIRED_CAPTURE_FILES {
+        let label = format!("502-{kind}-{}", name.strip_suffix(".txt").unwrap_or(name));
+        with_synthetic_dir(&label, |root| {
+            write_valid_capture(root, &inputs)?;
+            damage(root, name)?;
+            let cause = format!("CAPTURE FILE {}: {reason}", case_file(root, name).display());
+            with_server(store.clone(), replay(root), |addr| {
+                assert_mumps_502_before_rust_422(addr, &inputs, &id, &cause, &label)
+            })
+        })?;
+    }
+    Ok(())
+}
+
 #[test]
 fn synthetic_502_capture_file_missing() -> Result<(), String> {
-    let inputs = strings(&SESSION_INPUTS);
-    with_synthetic_dir("502-missing", |root| {
-        write_inputs(root, &inputs)?;
-        write_file(root, "GC-01/returned.txt", b"")?;
-        write_file(root, "GC-01/normalisation.txt", b"")?;
-        let error = mumps_502(replay(root), &inputs)?;
-        let path = case_file(root, "transcript.txt");
-        assert_same(
-            "502 error text",
-            &error,
-            format!("CAPTURE FILE {}: MISSING", path.display()),
-        );
-        Ok(())
+    assert_capture_file_502("missing", "MISSING", |root, name| {
+        fs::remove_file(case_file(root, name))
+            .map_err(|e| format!("removing synthetic GC-01/{name}: {e}"))
     })
 }
 
 #[test]
 fn synthetic_502_capture_file_unreadable() -> Result<(), String> {
-    let inputs = strings(&SESSION_INPUTS);
-    with_synthetic_dir("502-unreadable", |root| {
-        write_case(root, &inputs, "", None, "")?;
-        // A directory in place of transcript.txt is present but unreadable.
-        let path = case_file(root, "transcript.txt");
-        fs::remove_file(&path)
-            .map_err(|e| format!("removing synthetic GC-01/transcript.txt: {e}"))?;
-        fs::create_dir(&path)
-            .map_err(|e| format!("creating the directory GC-01/transcript.txt: {e}"))?;
-        let error = mumps_502(replay(root), &inputs)?;
-        assert_same(
-            "502 error text",
-            &error,
-            format!("CAPTURE FILE {}: UNREADABLE", path.display()),
-        );
-        Ok(())
+    // A directory in place of the file is present but unreadable.
+    assert_capture_file_502("unreadable", "UNREADABLE", |root, name| {
+        let path = case_file(root, name);
+        fs::remove_file(&path).map_err(|e| format!("removing synthetic GC-01/{name}: {e}"))?;
+        fs::create_dir(&path).map_err(|e| format!("creating the directory GC-01/{name}: {e}"))
     })
 }
 
 #[test]
 fn synthetic_502_capture_file_non_utf8() -> Result<(), String> {
-    let inputs = strings(&SESSION_INPUTS);
-    with_synthetic_dir("502-non-utf8", |root| {
-        write_case(root, &inputs, "", None, "")?;
-        let path = write_file(root, "GC-01/transcript.txt", &[0xFF, 0xFE])?;
-        let error = mumps_502(replay(root), &inputs)?;
-        assert_same(
-            "502 error text",
-            &error,
-            format!("CAPTURE FILE {}: NON-UTF8", path.display()),
-        );
-        Ok(())
+    assert_capture_file_502("non-utf8", "NON-UTF8", |root, name| {
+        fs::write(case_file(root, name), [0xFF, 0xFE])
+            .map_err(|e| format!("writing synthetic GC-01/{name}: {e}"))
     })
 }
 
 #[test]
 fn synthetic_502_malformed_normalisation() -> Result<(), String> {
+    const MALFORMED: &str = "SYNTHETIC RULE WITHOUT A TAB\n";
+    // A valid rule on line 1, then a malformed line 2.
+    const MALFORMED_LINE_2: &str =
+        "SYNTHETIC OPEN\tSYNTHETIC CLOSE\nSYNTHETIC RULE WITHOUT A TAB\n";
     let inputs = strings(&SESSION_INPUTS);
-    with_synthetic_dir("502-normalisation", |root| {
-        write_case(
+    let other = strings(&["SYNTHETIC OTHER INPUT"]);
+    // A complete, valid capture of `inputs` after the first match, which a
+    // broken first match must never fall back to.
+    let duplicate = |root: &Path, case: &str| {
+        write_case_in(
             root,
+            case,
             &inputs,
-            "SYNTHETIC TRANSCRIPT\n",
+            &format!("SYNTHETIC {case} TRANSCRIPT: a valid later duplicate\n"),
             None,
-            "SYNTHETIC RULE WITHOUT A TAB\n",
-        )?;
-        let error = mumps_502(replay(root), &inputs)?;
-        let path = case_file(root, "normalisation.txt");
-        assert_same(
-            "502 error text",
-            &error,
-            format!("MALFORMED NORMALISATION {} line 1", path.display()),
-        );
-        Ok(())
-    })
+            "",
+        )
+    };
+    // Each row: its label, its layout, and the case and line of the
+    // malformed normalisation.txt that the error must name.
+    let layouts: [(&str, Layout<'_>, &str, usize); 3] = [
+        (
+            "502-normalisation",
+            &|root| write_case(root, &inputs, "SYNTHETIC TRANSCRIPT\n", None, MALFORMED),
+            "GC-01",
+            1,
+        ),
+        (
+            "502-normalisation-no-fallback",
+            &|root| {
+                write_case(root, &inputs, "SYNTHETIC TRANSCRIPT\n", None, MALFORMED)?;
+                duplicate(root, "GC-02")
+            },
+            "GC-01",
+            1,
+        ),
+        // GC-02 is the first match, past a capture of another session.
+        (
+            "502-normalisation-later-match",
+            &|root| {
+                write_case(root, &other, "SYNTHETIC OTHER TRANSCRIPT\n", None, "")?;
+                write_case_in(
+                    root,
+                    "GC-02",
+                    &inputs,
+                    "SYNTHETIC TRANSCRIPT\n",
+                    None,
+                    MALFORMED_LINE_2,
+                )?;
+                duplicate(root, "GC-03")
+            },
+            "GC-02",
+            2,
+        ),
+    ];
+    for (label, layout, case, line) in layouts {
+        with_synthetic_dir(label, |root| {
+            layout(root)?;
+            let error = mumps_502_named(&format!("{label}: mumps backend"), replay(root), &inputs)?;
+            let path = case_path(root, case, "normalisation.txt");
+            assert_same(
+                &format!("{label}: 502 error text"),
+                &error,
+                format!("MALFORMED NORMALISATION {} line {line}", path.display()),
+            );
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 #[test]
 fn synthetic_502_malformed_meta() -> Result<(), String> {
-    with_synthetic_dir("502-meta", |root| {
-        let meta = meta_text(SYNTHETIC_CONTEXT, "not-json");
-        let path = write_file(root, "GC-01/meta.txt", meta.as_bytes())?;
-        let error = mumps_502(live(root), &strings(&SESSION_INPUTS))?;
-        assert_same(
-            "502 error text",
-            &error,
-            format!("MALFORMED META {}", path.display()),
-        );
-        Ok(())
-    })
+    let inputs = strings(&SESSION_INPUTS);
+    let malformed = meta_text(SYNTHETIC_CONTEXT, "not-json");
+    // Well formed, so reaching it gives a context mismatch, never a run.
+    let valid = meta_text(SYNTHETIC_CONTEXT, r#"["synthetic-never-run"]"#);
+    // Each row: its label, its layout, and the case whose meta.txt the error
+    // must name. A `GC-01/` given only an input file is a case directory
+    // without a meta file.
+    let layouts: [(&str, Layout<'_>, &str); 7] = [
+        (
+            "502-meta",
+            &|root| write_meta_in(root, "GC-01", malformed.as_bytes()),
+            "GC-01",
+        ),
+        // The first meta file decides, though a valid one follows it.
+        (
+            "502-meta-first-malformed",
+            &|root| {
+                write_meta_in(root, "GC-01", malformed.as_bytes())?;
+                write_meta_in(root, "GC-02", valid.as_bytes())
+            },
+            "GC-01",
+        ),
+        // An absent case is skipped.
+        (
+            "502-meta-first-case-absent",
+            &|root| write_meta_in(root, "GC-02", malformed.as_bytes()),
+            "GC-02",
+        ),
+        // So is a case entry that is a regular file.
+        (
+            "502-meta-first-case-not-a-directory",
+            &|root| {
+                write_case_entry_file(root, "GC-01")?;
+                write_meta_in(root, "GC-02", malformed.as_bytes())
+            },
+            "GC-02",
+        ),
+        // So are a case directory without a meta file and an absent GC-02.
+        (
+            "502-meta-first-case-without-meta",
+            &|root| {
+                write_inputs(root, &inputs)?;
+                write_meta_in(root, "GC-03", malformed.as_bytes())
+            },
+            "GC-03",
+        ),
+        // A first meta file that is not UTF-8 is malformed, never skipped.
+        (
+            "502-meta-first-non-utf8",
+            &|root| {
+                write_meta_in(root, "GC-01", &[0xFF, 0xFE, b'\n'])?;
+                write_meta_in(root, "GC-02", valid.as_bytes())
+            },
+            "GC-01",
+        ),
+        // With no meta file anywhere, the error names where the first would
+        // be.
+        (
+            "502-meta-none",
+            &|root| {
+                write_inputs(root, &inputs)?;
+                write_case_entry_file(root, "GC-02")
+            },
+            "GC-01",
+        ),
+    ];
+    for (label, layout, case) in layouts {
+        with_synthetic_dir(label, |root| {
+            layout(root)?;
+            let error = mumps_502_named(&format!("{label}: mumps backend"), live(root), &inputs)?;
+            let path = case_path(root, case, "meta.txt");
+            assert_same(
+                &format!("{label}: 502 error text"),
+                &error,
+                format!("MALFORMED META {}", path.display()),
+            );
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 #[test]
 fn synthetic_502_context_mismatch() -> Result<(), String> {
-    with_synthetic_dir("502-context", |root| {
-        let meta = meta_text(SYNTHETIC_CONTEXT, r#"["synthetic-never-run"]"#);
-        write_file(root, "GC-01/meta.txt", meta.as_bytes())?;
-        let error = mumps_502(live(root), &strings(&SESSION_INPUTS))?;
-        // A context error, not a spawn error or an `EXIT` cause, proves the
-        // bridge stopped before it ran `docker`.
-        assert!(
-            error.starts_with("CONTEXT MISMATCH IOF: expected UNRESOLVED, actual #"),
-            "502 error text must be the IOF context mismatch"
-        );
-        assert!(
-            !error.contains("EXIT") && !error.contains("os error"),
-            "502 error text shows that docker ran"
-        );
-        Ok(())
-    })
+    const IOF_MISMATCH: &str = "CONTEXT MISMATCH IOF: expected UNRESOLVED, actual #";
+    // SYNTHETIC_CONTEXT with another DUZ, the first key checked.
+    const DUZ_1_CONTEXT: &str = r##"{"DUZ":"1","IOF":"#","IOSL":"24","STATION":"500"}"##;
+    const EXEC_ARGS: &str = r#"["synthetic-never-run"]"#;
+    let inputs = strings(&SESSION_INPUTS);
+    let synthetic = meta_text(SYNTHETIC_CONTEXT, EXEC_ARGS);
+    let duz_1 = meta_text(DUZ_1_CONTEXT, EXEC_ARGS);
+    // Each row: its label, its layout, and the exact error text.
+    let layouts: [(&str, Layout<'_>, &str); 4] = [
+        (
+            "502-context",
+            &|root| write_meta_in(root, "GC-01", synthetic.as_bytes()),
+            IOF_MISMATCH,
+        ),
+        // The context of the first meta file is checked, not a later one's.
+        (
+            "502-context-first-meta-wins",
+            &|root| {
+                write_meta_in(root, "GC-01", synthetic.as_bytes())?;
+                write_meta_in(root, "GC-02", duz_1.as_bytes())
+            },
+            IOF_MISMATCH,
+        ),
+        // Past an absent GC-01 and a GC-02 that is a regular file.
+        (
+            "502-context-later-meta",
+            &|root| {
+                write_case_entry_file(root, "GC-02")?;
+                write_meta_in(root, "GC-03", duz_1.as_bytes())
+            },
+            "CONTEXT MISMATCH DUZ: expected .5, actual 1",
+        ),
+        // Past a GC-01 that is a regular file.
+        (
+            "502-context-first-case-not-a-directory",
+            &|root| {
+                write_case_entry_file(root, "GC-01")?;
+                write_meta_in(root, "GC-02", synthetic.as_bytes())
+            },
+            IOF_MISMATCH,
+        ),
+    ];
+    for (label, layout, expected) in layouts {
+        with_synthetic_dir(label, |root| {
+            layout(root)?;
+            let error = mumps_502_named(&format!("{label}: mumps backend"), live(root), &inputs)?;
+            // A context error, not a spawn error or an `EXIT` cause, proves the
+            // bridge stopped before it ran `docker`.
+            assert_same(&format!("{label}: 502 error text"), &error, expected);
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,6 +2015,33 @@ const PROBE: &str = "\"\\\u{e9}\u{20ac}\u{1f600}\u{1}";
 
 #[test]
 fn synthetic_json_escaping_round_trip() -> Result<(), String> {
+    // The oracle must reject what RFC 8259 rejects, a leading zero included,
+    // so that json_body cannot certify an invalid bridge body.
+    for text in [
+        "01",
+        "-01",
+        "00",
+        "-00",
+        r#"{"extra":00}"#,
+        "[01]",
+        "-",
+        "1.",
+        ".5",
+    ] {
+        assert!(parse_json(text).is_err(), "the JSON oracle accepts {text}");
+    }
+    for text in [
+        "0",
+        "-0",
+        "10",
+        "0.5",
+        "-0.5e+3",
+        "1E9",
+        r#"{"extra":0}"#,
+        "[0,10]",
+    ] {
+        assert!(parse_json(text).is_ok(), "the JSON oracle rejects {text}");
+    }
     let store = synthetic_store()?;
     let Some((case_inputs, case_transcript, _)) =
         ok_case_or_not_run("synthetic_json_escaping_round_trip", &store)
@@ -1493,10 +2147,13 @@ fn synthetic_shutdown_joins_within_bound() -> Result<(), String> {
                 assert_same("in-flight connection: interim response", &interim, CONTINUE);
                 Ok((idle, in_flight))
             })?;
-        // The session's resources go, as a caller of `serve_until` may remove
-        // them once it has returned: a connection thread still running would
-        // now answer 502, or 200 had it read the capture first.
-        fs::remove_dir_all(root).map_err(|e| format!("removing the synthetic directory: {e}"))?;
+        // The session's resources, its `GC-01/` case, go, as a caller of
+        // `serve_until` may remove them once it has returned. The root stays
+        // for `with_synthetic_dir` to remove. A connection thread still
+        // running would now find no capture and answer 502 NOT RECORDED, or
+        // 200 had it read the capture first.
+        fs::remove_dir_all(root.join("GC-01"))
+            .map_err(|e| format!("removing the synthetic GC-01 directory: {e}"))?;
         // The server may have reset the connection already, so the send may
         // fail; only an answer would be wrong.
         let _ = in_flight.write_all(&body);
