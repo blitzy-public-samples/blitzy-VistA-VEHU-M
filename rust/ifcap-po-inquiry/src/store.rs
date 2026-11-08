@@ -789,15 +789,25 @@ mod tests {
     #[test]
     fn fixture_parse_error_names_file_and_line() -> Result<(), String> {
         let dir = scratch_dir()?;
+        let broken = dir.join("broken.zwr");
         let outcome = write_file(&dir, "broken.zwr", b"ZWR\n^X(1)=\"a\"\n^X(01)=\"b\"\n")
             .map(|()| load_fixtures(&dir));
         let _ = fs::remove_dir_all(&dir);
         match outcome? {
-            Err(StoreError::Parse {
-                file: Some(file),
-                line: 3,
-                ..
-            }) => assert!(file.ends_with("broken.zwr"), "file was {file:?}"),
+            Err(err @ StoreError::Parse { line: 3, .. }) => {
+                assert!(
+                    matches!(&err, StoreError::Parse { file: Some(file), .. } if *file == broken),
+                    "expected the file {}, got {err:?}",
+                    broken.display()
+                );
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "{}: line 3: unquoted subscript is not a canonical number",
+                        broken.display()
+                    )
+                );
+            }
             other => {
                 return Err(format!(
                     "expected a parse error naming broken.zwr, got {other:?}"
@@ -817,7 +827,9 @@ mod tests {
         )
         .and_then(|()| write_file(&dir, "cases.zwr", b"ZWR\n^X(1)=\"cases\"\n"))
         .and_then(|()| write_file(&dir, "z.zwr", b"ZWR\n^X(1)=\"z\"\n^X(2)=\"z\"\n"))
-        .and_then(|()| write_file(&dir, "MANIFEST.txt", b"not ZWR at all\n"))
+        // Valid ZWR under a key no `.zwr` file sets, so loading this
+        // non-`.zwr` file would add a node rather than pass unseen.
+        .and_then(|()| write_file(&dir, "MANIFEST.txt", b"ZWR\n^X(4)=\"manifest\"\n"))
         .and_then(|()| fs::create_dir(dir.join("sub.zwr")).map_err(|e| e.to_string()))
         .map(|()| load_fixtures(&dir));
         let _ = fs::remove_dir_all(&dir);
@@ -825,6 +837,11 @@ mod tests {
         assert_eq!(store.get(&key("X", &["1"])), Some("cases"));
         assert_eq!(store.get(&key("X", &["2"])), Some("z"));
         assert_eq!(store.get(&key("X", &["3"])), Some("a"));
+        assert_eq!(
+            store.get(&key("X", &["4"])),
+            None,
+            "MANIFEST.txt is not a .zwr file and must not load"
+        );
         assert_eq!(store.len(), 3);
         Ok(())
     }
