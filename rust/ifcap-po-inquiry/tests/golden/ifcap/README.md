@@ -13,7 +13,7 @@ Each convention below belongs to the file named with it, and this README restate
 | `evaluate_case`, `comparison_report` | `tests/equivalence.rs` |
 | `gc_02_end_to_end_compare` | `tests/bridge.rs` |
 | Fixture lines and their field order | `tests/fixtures/ifcap/MANIFEST.txt` |
-| Contracts PO-01 to PO-41 and their branch IDs, resolutions R1 to R6, open items O-01 to O-08, conflicts C1 to C17 | `SPEC.md` |
+| Contracts PO-01 to PO-41 and their branch IDs, resolutions R1 to R6, open items O-01 to O-08, conflicts C1 to C18 | `SPEC.md` |
 | `EXIT_INPUT` | `frontend/app.js` |
 
 **Conventions of this README.**

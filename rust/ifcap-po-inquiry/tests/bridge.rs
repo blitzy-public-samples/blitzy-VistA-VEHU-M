@@ -17,14 +17,20 @@
 //! from the synthetic tests. Without GC-02's prerequisites it prints NOT
 //! COMPARED and passes.
 //!
-//! Two answers cannot be reached end to end, so the unit tests in
-//! `src/bridge.rs` cover them instead:
-//! - HTTP 500: every `CorruptStore` site on the Rust path lies after the
-//!   BLOCKED branch `PO-12.b1`, the device gate a found order reaches first
-//!   (`inquiry_error_to_response_corrupt_store_500`).
-//! - `match: null`: it arises only in live mode, which cannot obtain the
-//!   original's return value (open item O-06), and no live session runs here
-//!   (`compare_match_null_when_mumps_returned_unavailable`).
+//! HTTP 500 is reached end to end before the BLOCKED branch `PO-12.b1`, the
+//! device gate a found order reaches first: the order lookup (PO-09) reads
+//! nodes after a bare `$D` test, and a node holding only descendants is
+//! `CorruptStore`, for example a candidate order's zero node. `SPEC.md`
+//! "CorruptStore sites" lists the sites.
+//! `synthetic_500_corrupt_store_end_to_end` covers the answer end to end,
+//! and the unit test `inquiry_error_to_response_corrupt_store_500` in
+//! `src/bridge.rs` covers the mapping.
+//!
+//! One answer cannot be reached end to end, so a unit test in
+//! `src/bridge.rs` covers it instead: `match: null` arises only in live
+//! mode, which cannot obtain the original's return value (open item O-06),
+//! and no live session runs here
+//! (`compare_match_null_when_mumps_returned_unavailable`).
 //!
 //! No test sets an environment variable: configuration reaches the bridge
 //! only as `serve_until` arguments. Every test binds its own port and uses
@@ -1582,6 +1588,98 @@ fn synthetic_422_unsupported_branch_end_to_end() -> Result<(), String> {
     );
     let error = expect_error(&compare, 422, "compare")?;
     assert_same("compare 422 error text", &error, &expected);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 500
+// ---------------------------------------------------------------------------
+
+/// Two invented lines that [`synthetic_500_corrupt_store_end_to_end`] adds
+/// to [`SYNTHETIC_ZWR`]: order 1, filed under the `C` value `SYN500`, whose
+/// zero node holds a descendant and no value.
+const SYNTHETIC_CORRUPT_ORDER_ZWR: &str = r#"^PRC(442,1,0,1)="SYNTHETIC DESCENDANT: the zero node holds no value"
+^PRC(442,"C","SYN500",1)=""
+"#;
+
+/// The order lookup's `CorruptStore` reaches HTTP 500 end to end, before the
+/// device gate `PO-12.b1`: the candidate's zero node passes `$D` with only a
+/// descendant, so its read `$P(^(0),U)` [DIC3.m:110] finds no value. The
+/// replay carrier's transcript and return value come from `inquire` on the
+/// same store, given the station answer alone.
+#[test]
+fn synthetic_500_corrupt_store_end_to_end() -> Result<(), String> {
+    let text = format!("{SYNTHETIC_ZWR}{SYNTHETIC_CORRUPT_ORDER_ZWR}");
+    let store = Store::from_zwr(&text).map_err(|e| {
+        format!(
+            "SYNTHETIC_ZWR with the corrupt order does not load: {}",
+            store_error_cause(&e)
+        )
+    })?;
+    // RETURN at the station prompt, then the corrupt order's `C` value.
+    let inputs = strings(&["", "SYN500"]);
+    let record = match inquire(&store, &inputs) {
+        Err(InquiryError::CorruptStore(record)) => record,
+        Err(InquiryError::UnsupportedBranch(id)) => {
+            return Err(format!(
+                "inquire on the corrupt order must be CorruptStore, got UnsupportedBranch({id})"
+            ));
+        }
+        Ok(_) => {
+            return Err("inquire on the corrupt order must be CorruptStore, got Ok".to_string());
+        }
+    };
+    // The candidate's zero node, which the lookup reads before PO-12.b1.
+    assert_eq!(
+        record, "^PRC(442,1,0)",
+        "inquire on the corrupt order: CorruptStore record"
+    );
+    let expected = format!("CORRUPT STORE {record}");
+    // The replay carrier: `inquire` on the same store with the station answer
+    // alone ends `Ok` by input exhaustion at the order prompt, before the
+    // lookup reaches the corrupt node. The MUMPS side only has to replay
+    // successfully for compare to reach the Rust side.
+    let station_answer = inputs
+        .get(..1)
+        .ok_or_else(|| "the request inputs must start with the station answer".to_string())?;
+    let carrier = match inquire(&store, station_answer) {
+        Ok(output) => output,
+        Err(InquiryError::UnsupportedBranch(id)) => {
+            return Err(format!(
+                "inquire on the station answer alone must be Ok, got UnsupportedBranch({id})"
+            ));
+        }
+        Err(InquiryError::CorruptStore(node)) => {
+            return Err(format!(
+                "inquire on the station answer alone must be Ok, got CorruptStore({node})"
+            ));
+        }
+    };
+    let body = body_for(&inputs);
+    let (rust, mumps, compare) = with_synthetic_dir("500", |root| {
+        write_case(
+            root,
+            &inputs,
+            &carrier.transcript,
+            carrier.returned.as_deref(),
+            "",
+        )?;
+        with_server(store, replay(root), |addr| {
+            Ok((
+                post_session(addr, "rust", &body)?,
+                post_session(addr, "mumps", &body)?,
+                post_session(addr, "compare", &body)?,
+            ))
+        })
+    })?;
+    let error = expect_error(&rust, 500, "rust")?;
+    assert_same("rust 500 error text", &error, &expected);
+    assert_eq!(
+        mumps.0, 200,
+        "the synthetic capture must replay, so that compare reaches the Rust side: status"
+    );
+    let error = expect_error(&compare, 500, "compare")?;
+    assert_same("compare 500 error text", &error, &expected);
     Ok(())
 }
 

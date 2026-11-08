@@ -12,6 +12,8 @@ const inputs = [];
 // Every request takes the next number; a response whose number is no longer
 // the latest is stale and is dropped without touching the screen.
 let requestSeq = 0;
+// Whether the latest request is still unanswered.
+let pending = false;
 // Rows in the previous render, keyed by the pane's backend, so the RUST
 // slide-in marks only rows whose index that backend has not shown before.
 const previousLineCount = new Map();
@@ -37,33 +39,71 @@ function reactionsOn() {
   return root.dataset.mode === "rust" && !reduceMotion.matches;
 }
 
+// Every reaction class comes off at once: the working state, the shake and
+// every slide-in still running.
+function clearReactions() {
+  sendButton.classList.remove("busy");
+  transcriptEl.classList.remove("reject");
+  for (const row of transcriptEl.querySelectorAll(".ln.new")) {
+    row.classList.remove("new");
+  }
+}
+
 // Rendering, step one: one row per "\n"-separated line, text set verbatim
 // (BEL and other control bytes included), built into a detached fragment.
 // No pane is touched, so every pane of an answer is built before any is shown.
+// firstNew is the index of the first row this backend has not shown before.
 function prepareRows(container, transcript, key, animate) {
   const lines = transcript.split("\n");
-  const prev = previousLineCount.get(key) ?? 0;
   const fragment = document.createDocumentFragment();
-  lines.forEach((text, i) => {
+  lines.forEach((text) => {
     const row = document.createElement("div");
     row.className = "ln";
     row.textContent = text;
-    if (animate && i >= prev) {
-      row.classList.add("new");
-      row.addEventListener("animationend", () => row.classList.remove("new"), { once: true });
-    }
     fragment.append(row);
   });
-  return { container: container, key: key, fragment: fragment, count: lines.length };
+  return {
+    container: container,
+    key: key,
+    fragment: fragment,
+    count: lines.length,
+    animate: animate,
+    firstNew: previousLineCount.get(key) ?? 0,
+  };
+}
+
+// The slide-in. The positional rule is unchanged for every line the box
+// displays once it is scrolled to the end: a row is marked when its index is
+// firstNew or later. A new line above the box's view cannot be seen during
+// the 300 ms, so marking it would only cost one animation and one layer per
+// row, thousands of them for a long transcript. Walking back from the last
+// row stops at the first row that is old or above the view. Every row is
+// measured before any is marked, so layout is computed once.
+function markShownNewRows(container, firstNew, count) {
+  const top = container.getBoundingClientRect().top + container.clientTop;
+  const shown = [];
+  let row = container.lastElementChild;
+  let index = count - 1;
+  while (row !== null && index >= firstNew && row.getBoundingClientRect().bottom > top) {
+    shown.push(row);
+    row = row.previousElementSibling;
+    index -= 1;
+  }
+  for (const newRow of shown) {
+    newRow.classList.add("new");
+  }
 }
 
 // Rendering, step two: the pane's rows are swapped for the prepared fragment
 // in one call, however many lines it holds, so the screen shows exactly what
-// the backend returned.
+// the backend returned. A RUST render then marks its shown new rows.
 function commitRows(prepared) {
   prepared.container.replaceChildren(prepared.fragment);
   previousLineCount.set(prepared.key, prepared.count);
   prepared.container.scrollTop = prepared.container.scrollHeight;
+  if (prepared.animate) {
+    markShownNewRows(prepared.container, prepared.firstNew, prepared.count);
+  }
 }
 
 // The transcript of one 200 body side. Anything else throws before any pane
@@ -77,9 +117,10 @@ function transcriptOf(side) {
 }
 
 // The shake and red outline. The class is removed and a reflow forced first,
-// so a second rejection in a row replays the animation. One shared listener
-// ends every shake, so a shake cancelled before it finishes leaves nothing
-// behind.
+// so a second rejection in a row replays the animation. The class comes off
+// when the shake ends or is stopped early: the transcript's animation
+// listener takes it off at the end or the cancel, and the motion-preference
+// listener takes it off when reduced motion stops a shake with no event.
 function reject() {
   if (!reactionsOn()) {
     return;
@@ -89,12 +130,40 @@ function reject() {
   transcriptEl.classList.add("reject");
 }
 
-// Registered once for the life of the page. Row slide-ins bubble their
-// animationend up to the transcript, so only the transcript's own shake
-// ending removes the class.
-transcriptEl.addEventListener("animationend", (event) => {
-  if (event.target === transcriptEl) {
-    transcriptEl.classList.remove("reject");
+// Registered once for the life of the page, for both the end and the cancel
+// of every reaction animation in the transcript. A row's slide-in bubbles up
+// from the row, which loses its new class; the transcript's own shake loses
+// the reject class. The one exception is a cancel while a shake is still
+// current: reject() restarts the shake by taking the class off and putting it
+// back, which cancels the old shake, and that cancel arrives a frame later,
+// after the new shake has started, so it must not end the new one.
+function endReaction(event) {
+  if (event.target !== transcriptEl) {
+    event.target.classList.remove("new");
+    return;
+  }
+  if (
+    event.type === "animationcancel" &&
+    transcriptEl.getAnimations().some((animation) => animation.animationName === "reject-shake")
+  ) {
+    return;
+  }
+  transcriptEl.classList.remove("reject");
+}
+transcriptEl.addEventListener("animationend", endReaction);
+transcriptEl.addEventListener("animationcancel", endReaction);
+
+// Registered once for the life of the page. Under reduced motion the
+// stylesheet stops a running reaction without an animationend, or with no
+// event at all when the change beats the reaction's first frame, so every
+// reaction class is taken off here and nothing replays when motion is
+// allowed again. Allowing motion again brings back only the working state of
+// a request still in flight.
+reduceMotion.addEventListener("change", () => {
+  if (reduceMotion.matches) {
+    clearReactions();
+  } else {
+    sendButton.classList.toggle("busy", pending && reactionsOn());
   }
 });
 
@@ -136,11 +205,26 @@ function showSuccess(backend, text) {
   }
 }
 
+// The error line for a failed request. The rejection value is whatever fetch
+// or the body stream rejected with; one that cannot be turned into text is
+// reported without its text, so the failure is still shown and nothing
+// escapes send().
+function failureText(err) {
+  try {
+    return "REQUEST FAILED: " + String(err);
+  } catch {
+    return "REQUEST FAILED: UNKNOWN ERROR";
+  }
+}
+
 // Posts the whole sequence to the backend selected now and shows the answer,
-// unless a later request or a backend change has superseded it.
+// unless a later request or a backend change has superseded it. It never
+// rejects, since every failure is shown on the screen, so its callers fire it
+// without waiting or catching.
 async function send() {
   const backend = backendSelect.value;
   const seq = ++requestSeq;
+  pending = true;
   if (reactionsOn()) {
     sendButton.classList.add("busy");
   }
@@ -156,7 +240,7 @@ async function send() {
       if (seq !== requestSeq) {
         return;
       }
-      showFailure(backend, "REQUEST FAILED: " + String(err));
+      showFailure(backend, failureText(err));
       return;
     }
     if (seq !== requestSeq) {
@@ -171,7 +255,7 @@ async function send() {
       if (seq !== requestSeq) {
         return;
       }
-      showFailure(backend, "REQUEST FAILED: " + String(err));
+      showFailure(backend, failureText(err));
       return;
     }
     if (seq !== requestSeq) {
@@ -185,6 +269,7 @@ async function send() {
     showSuccess(backend, text);
   } finally {
     if (seq === requestSeq) {
+      pending = false;
       sendButton.classList.remove("busy");
     }
   }
@@ -211,11 +296,8 @@ exitButton.addEventListener("click", () => {
 backendSelect.addEventListener("change", () => {
   root.dataset.mode = backendSelect.value;
   requestSeq += 1;
-  sendButton.classList.remove("busy");
-  transcriptEl.classList.remove("reject");
-  for (const row of document.querySelectorAll(".ln")) {
-    row.classList.remove("new");
-  }
+  pending = false;
+  clearReactions();
   errorStatus.textContent = "";
   transcriptEl.replaceChildren();
   mumpsPane.replaceChildren();
