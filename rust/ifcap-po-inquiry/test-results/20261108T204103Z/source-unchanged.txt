@@ -1,0 +1,12 @@
+# A7 (end of run)
+utc: 2026-11-08T20:41:08Z
+pwd: /tmp/blitzy/blitzy-VistA-VEHU-M/blitzy-d3cd5e06-5ae1-42c7-8b11-7bb911fc681f-w-014_ba077e/rust/ifcap-po-inquiry
+$ git -C ../.. rev-parse HEAD
+3da524c7c41be21212e582d21e82442b31f48851
+exit=0
+$ git -C ../.. diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION
+exit=0
+$ git -C ../.. status --porcelain -- . ':(exclude)rust/ifcap-po-inquiry'
+exit=0
+$ git -C ../.. diff --quiet dd3fd0f3124c8178657d9fff4173c324da30f7ae HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION
+exit=0

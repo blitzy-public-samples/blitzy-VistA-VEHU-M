@@ -12,8 +12,10 @@
 //! means equivalence is accepted.
 //!
 //! [`comparison_report`] is the only writer of `REPORT.md`, and it writes only
-//! between the comparison markers. Every capture-format and loader rule comes
-//! from the crate's shared helpers; nothing here re-implements one.
+//! between the comparison markers. The harness uses the crate's shared ZWR
+//! loading, input splitting, metadata, context and normalisation helpers,
+//! and owns the manifest, returned-file framing, `SPEC.md` section and
+//! report-marker handling.
 //!
 //! The evaluation reads through [`CaseFiles`], a tuple of four read
 //! functions: the crate folder on disk for the golden cases, and an in-memory
@@ -23,8 +25,10 @@
 //!
 //! A finding is held twice: as its console cause, which names only crate
 //! files, keys, branch IDs and positions, and as its full detail, which can
-//! quote capture values, store records and absolute paths. The console and
-//! the assertion messages show causes only; the details go to `REPORT.md`.
+//! quote capture values, store records and tool or loader messages. Both
+//! name files by crate-relative path, so the report does not depend on
+//! where the crate is checked out. The console and the assertion messages
+//! show causes only; the details go to `REPORT.md`.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,7 +41,7 @@ use ifcap_po_inquiry::bridge::{
     Meta, normalise, parse_meta, parse_normalisation, split_input_lines, validate_context,
 };
 use ifcap_po_inquiry::store::load_fixtures;
-use ifcap_po_inquiry::{InquiryError, STUB_CONTEXT, Store, inquire};
+use ifcap_po_inquiry::{InquiryError, STUB_CONTEXT, Store, StoreError, inquire};
 
 // ---------------------------------------------------------------------------
 // Test data
@@ -335,7 +339,6 @@ fn crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The on-disk path of a crate-relative path.
 fn crate_path(rel: &str) -> PathBuf {
     crate_dir().join(rel)
 }
@@ -375,8 +378,8 @@ fn required_files(id: &str) -> Vec<String> {
 /// - digest: the lowercase SHA-256 digest of the file at the path. `Err`
 ///   says why no digest is available; a tool failure is never a digest.
 /// - fixtures: the store `load_fixtures` gives for the fixture directory.
-///   `Err` is the loader error's `Display` text, which names the file and
-///   line.
+///   `Err` is the loader error's `Display` text, which names the file, by
+///   its crate-relative path, and the line.
 type CaseFiles<'a> = (
     &'a dyn Fn(&str) -> bool,
     &'a dyn Fn(&str) -> io::Result<Vec<u8>>,
@@ -390,19 +393,44 @@ fn disk_is_missing(rel: &str) -> bool {
     matches!(fs::metadata(crate_path(rel)), Err(err) if err.kind() == ErrorKind::NotFound)
 }
 
-/// The bytes of the file at `rel` in the crate folder on disk.
 fn disk_read(rel: &str) -> io::Result<Vec<u8>> {
     fs::read(crate_path(rel))
 }
 
-/// The `sha256sum` digest of the file at `rel` in the crate folder on disk.
 fn disk_digest(rel: &str) -> Result<String, String> {
-    sha256(&crate_path(rel))
+    sha256(&crate_dir(), rel)
 }
 
-/// The store `load_fixtures` gives for the fixture directory on disk.
 fn disk_fixtures() -> Result<Store, String> {
-    load_fixtures(&crate_path(FIXTURES_REL)).map_err(|err| err.to_string())
+    load_fixtures(&crate_path(FIXTURES_REL)).map_err(|err| crate_relative(err).to_string())
+}
+
+/// `err` with the file it names made relative to the crate folder, so that
+/// its `Display` text, which a report detail quotes, does not depend on
+/// where the crate is checked out. A file outside the crate folder keeps
+/// its path.
+fn crate_relative(err: StoreError) -> StoreError {
+    let dir = crate_dir();
+    let relative = |file: PathBuf| {
+        file.strip_prefix(&dir)
+            .map(Path::to_path_buf)
+            .unwrap_or(file)
+    };
+    match err {
+        StoreError::Parse {
+            file,
+            line,
+            message,
+        } => StoreError::Parse {
+            file: file.map(relative),
+            line,
+            message,
+        },
+        StoreError::Io { file, message } => StoreError::Io {
+            file: relative(file),
+            message,
+        },
+    }
 }
 
 /// The UTF-8 text of a present file.
@@ -449,13 +477,16 @@ fn parse_manifest(text: &str) -> Result<Vec<(String, String, String)>, String> {
     Ok(rows)
 }
 
-/// The SHA-256 digest of `path` from `sha256sum`, run with an argument list
-/// and never through a shell. `Err` says why no digest is available; a tool
-/// failure is never a digest.
-fn sha256(path: &Path) -> Result<String, String> {
-    let output = match Command::new("sha256sum").arg(path).output() {
+/// The SHA-256 digest of the file at the relative path `rel` under `dir`,
+/// from `sha256sum` run in `dir` with an argument list and never through a
+/// shell, so that any message it gives names the file by `rel`. `Err` says
+/// why no digest is available; a tool failure is never a digest.
+fn sha256(dir: &Path, rel: &str) -> Result<String, String> {
+    let output = match Command::new("sha256sum").arg(rel).current_dir(dir).output() {
         Ok(output) => output,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
+        // A missing `dir` also fails the start with NotFound, and is not a
+        // missing tool.
+        Err(err) if err.kind() == ErrorKind::NotFound && dir.is_dir() => {
             return Err("sha256sum not found".to_string());
         }
         Err(err) => return Err(format!("sha256sum: {err}")),
@@ -595,52 +626,220 @@ fn excerpt(text: &str, offset: usize) -> String {
     }
 }
 
-/// The original texts `rule` replaces in `raw`, in order, for the report.
-/// `raw` is one side's un-normalised text and no earlier rule is applied
-/// first.
+/// Where one byte of a partly normalised text comes from in its side's
+/// un-normalised text, as (start, end, offset). A byte no rule replaced is
+/// the raw byte `start..end` and has no offset, so a `<NORM>` the raw text
+/// holds itself is six such bytes. A byte of a `<NORM>` an earlier rule
+/// wrote has its offset in that token, and `start..end` is the original
+/// text the token stands for; it keeps both when a later span cuts the
+/// token. Along a text, neither `start` nor `end` ever decreases.
+type Origin = (usize, usize, Option<usize>);
+
+/// The spans one rule replaced on one side, in text order, each as (its
+/// original text, the text the rule saw there). The two texts differ only
+/// where the span holds all or part of a `<NORM>` an earlier rule wrote.
+type Spans = Vec<(String, String)>;
+
+/// What one rule replaced on one side, as the comparison applies it, or why
+/// the output of `normalise` failed the audit's checks.
+type RuleAudit = Result<Spans, String>;
+
+/// The file-order normalisation audit of one side's un-normalised text
+/// `raw`: what each of `rules` replaced, with its original text, exactly as
+/// the comparison's `normalise(raw, rules)` applies them, and the text the
+/// last rule left. It reports only: it decides no status and changes no
+/// rule.
 ///
-/// The spans are recovered from the shared `normalise` applied to `raw` with
-/// this rule alone, so no second copy of the rule logic exists: the output
-/// is split on `<NORM>` into literal segments, and each replaced span is the
-/// shortest text at the next position that starts with the open delimiter,
-/// ends with the close delimiter and is followed by the next literal.
-/// `None` means NOT DERIVABLE: `raw` already holds `<NORM>`, so the output
-/// cannot be split unambiguously.
-fn replaced_spans(raw: &str, rule: &(String, String)) -> Option<Vec<String>> {
-    if raw.contains(NORM_TOKEN) {
-        return None;
+/// Every text comes from the shared `normalise`, so no second copy of the
+/// rule logic exists. Rule k is applied by itself to the text rules 1 to k-1
+/// left, which is how `normalise` applies the rules in file order, and the
+/// last text must equal `normalise(raw, rules)`. [`visible_spans`] finds the
+/// spans a rule's output shows, and [`rewrites_token`] decides whether the
+/// rule also replaced each `<NORM>` in the text with an identical one, which
+/// no output shows. An [`Origin`] per byte traces each text back to `raw`, so
+/// every span of every rule is reported with its original text, including
+/// where `raw` holds `<NORM>` itself and where a span cuts an earlier rule's
+/// `<NORM>`.
+///
+/// A rule is NOT DERIVABLE only when an output of `normalise` fails the
+/// audit's checks, which means `normalise` no longer applies the format the
+/// audit relies on. The later rules on that side are then NOT DERIVABLE as
+/// well, because the failed rule left no traced text for them.
+fn audit_rules(raw: &str, rules: &[(String, String)]) -> (Vec<RuleAudit>, String) {
+    let mut text = raw.to_string();
+    let mut traced: Result<Vec<Origin>, String> = Ok((0..raw.len())
+        .map(|at| (at, at.saturating_add(1), None))
+        .collect());
+    let mut audits = Vec::with_capacity(rules.len());
+    for (rule, number) in rules.iter().zip(1usize..) {
+        let next = normalise(&text, std::slice::from_ref(rule));
+        let (audit, following) = match &traced {
+            Err(reason) => (Err(reason.clone()), Err(reason.clone())),
+            Ok(origins) => match trace_rule(raw, &text, origins, rule, &next) {
+                Ok((spans, origins)) => (Ok(spans), Ok(origins)),
+                Err(reason) => (
+                    Err(reason),
+                    Err(format!(
+                        "rule {number} failed the audit's checks, so the text it left is not traced"
+                    )),
+                ),
+            },
+        };
+        audits.push(audit);
+        traced = following;
+        text = next;
     }
+    if text != normalise(raw, rules) {
+        let reason = "the rules applied one at a time do not give the comparison's text";
+        audits = rules.iter().map(|_| Err(reason.to_string())).collect();
+    }
+    (audits, text)
+}
+
+/// What `rule` replaced in `text`, the text the earlier rules left, whose
+/// bytes `origins` traces to `raw`; `next` is `normalise` of `text` with
+/// this rule only. It returns each span's (original, seen) texts, in text
+/// order, and the origins of `next`, which must trace it to `raw`.
+///
+/// A span's original text runs from the start of its first byte's origin to
+/// the end of its last byte's, a range of `raw` because origins never
+/// decrease along a text. A span that begins or ends inside an earlier
+/// rule's `<NORM>` so reports all the original text that token stood for,
+/// and the bytes of the token it leaves keep their origin.
+fn trace_rule(
+    raw: &str,
+    text: &str,
+    origins: &[Origin],
+    rule: &(String, String),
+    next: &str,
+) -> Result<(Spans, Vec<Origin>), String> {
+    let unaccounted = || "the output of `normalise` fails the audit's checks".to_string();
+    let mut spans = visible_spans(text, rule, next).ok_or_else(unaccounted)?;
+    if rewrites_token(rule) {
+        let tokens: Vec<(usize, usize)> = text
+            .match_indices(NORM_TOKEN)
+            .map(|(start, token)| (start, start.saturating_add(token.len())))
+            .filter(|&(start, end)| !spans.iter().any(|&(from, to)| from < end && start < to))
+            .collect();
+        spans.extend(tokens);
+        spans.sort_unstable();
+    }
+    let mut replaced = Vec::with_capacity(spans.len());
+    let mut following = Vec::with_capacity(next.len());
+    let mut kept = 0usize;
+    for (start, end) in spans {
+        let first = origins.get(start);
+        let last = end.checked_sub(1).and_then(|at| origins.get(at));
+        let (Some(&(from, _, _)), Some(&(_, to, _))) = (first, last) else {
+            return Err(unaccounted());
+        };
+        let original = raw.get(from..to).ok_or_else(unaccounted)?;
+        let seen = text.get(start..end).ok_or_else(unaccounted)?;
+        replaced.push((original.to_string(), seen.to_string()));
+        following.extend_from_slice(origins.get(kept..start).ok_or_else(unaccounted)?);
+        following.extend((0..NORM_TOKEN.len()).map(|offset| (from, to, Some(offset))));
+        kept = end;
+    }
+    following.extend_from_slice(origins.get(kept..).ok_or_else(unaccounted)?);
+    if traces(raw, next, &following) {
+        Ok((replaced, following))
+    } else {
+        Err(unaccounted())
+    }
+}
+
+/// The spans `rule` replaces in `text` with a visible effect, as byte ranges
+/// in text order, found with the shared `normalise` as a prefix oracle. On a
+/// prefix `text[..end]`, `normalise` replaces exactly the spans that end
+/// within it and leaves the rest as it is: each delimiter it finds inside
+/// the prefix is the one it finds in the whole text, and one it cannot find
+/// there ends the scan. So a span ends at `end`, where the prefix ends with
+/// the close delimiter, exactly when the output for that prefix is no longer
+/// the output up to the previous span followed by the text after it. A span
+/// that is itself `<NORM>` changes nothing and is not found here (see
+/// [`rewrites_token`]). `None` when an output fails a check, including that
+/// the spans give `next`, the output for all of `text`.
+fn visible_spans(text: &str, rule: &(String, String), next: &str) -> Option<Vec<(usize, usize)>> {
     let (open, close) = rule;
-    let normalised = normalise(raw, std::slice::from_ref(rule));
-    let mut literals = normalised.split(NORM_TOKEN);
-    let first = literals.next().unwrap_or("");
-    let literals: Vec<&str> = literals.collect();
-    if !raw.starts_with(first) {
-        return None;
-    }
-    let close_step = close.chars().next().map_or(1, char::len_utf8);
-    let mut position = first.len();
-    let mut spans = Vec::with_capacity(literals.len());
-    for (number, literal) in literals.iter().enumerate() {
-        let tail = raw.get(position..)?;
-        if !tail.starts_with(open.as_str()) {
+    let shortest = open.len().saturating_add(close.len());
+    let mut spans = Vec::new();
+    let mut done = 0usize;
+    let mut done_output = String::new();
+    for (at, c) in text.char_indices() {
+        let end = at.saturating_add(c.len_utf8());
+        let prefix = text.get(..end)?;
+        if !prefix.ends_with(close.as_str()) {
+            continue;
+        }
+        let output = normalise(prefix, std::slice::from_ref(rule));
+        let after = text.get(done..end)?;
+        let tail = output.strip_prefix(done_output.as_str())?;
+        if tail == after {
+            continue;
+        }
+        let before = tail.strip_suffix(NORM_TOKEN)?;
+        let start = done.checked_add(before.len())?;
+        let span = text.get(start..end)?;
+        if !after.starts_with(before)
+            || span.len() < shortest
+            || !span.starts_with(open.as_str())
+            || !span.ends_with(close.as_str())
+        {
             return None;
         }
-        let last = number.saturating_add(1) == literals.len();
-        let mut search = open.len();
-        let end = loop {
-            let found = search.saturating_add(tail.get(search..)?.find(close.as_str())?);
-            let end = found.saturating_add(close.len());
-            let after = tail.get(end..)?;
-            if (last && after == *literal) || (!last && after.starts_with(literal)) {
-                break end;
-            }
-            search = found.saturating_add(close_step);
-        };
-        spans.push(tail.get(..end)?.to_string());
-        position = position.saturating_add(end).saturating_add(literal.len());
+        spans.push((start, end));
+        done = end;
+        done_output = output;
     }
-    (position == raw.len()).then_some(spans)
+    let rest = text.get(done..)?;
+    (next.strip_prefix(done_output.as_str()) == Some(rest)).then_some(spans)
+}
+
+/// Whether `rule` replaces a `<NORM>` in the text, as a whole span, with a
+/// `<NORM>` of its own: both delimiters are non-empty, as the format
+/// requires, the token starts with the open delimiter, and the first close
+/// delimiter after that ends the token. Such a span leaves the text as it
+/// was, so no output shows it, and no other rule has a span that is
+/// exactly `<NORM>`.
+///
+/// When this holds, the rule replaces every `<NORM>` in the text that no
+/// visible span overlaps, whatever its bytes' origins: an earlier rule's
+/// token, or the raw text's own. The open delimiter is a prefix of `<NORM>`,
+/// so it starts with the token's only `<` and holds no other, and the close
+/// delimiter is a suffix ending at its only `>`, so no span begins or ends
+/// strictly inside a `<NORM>`. `<NORM>` cannot overlap itself, so its
+/// occurrences are disjoint, and a span that starts before one and reaches
+/// it covers it and is visible. For a `<NORM>` that no visible span
+/// overlaps, an open delimiter the scan finds before it therefore ends by
+/// its first byte, has a close delimiter by its end at the latest, and so
+/// begins a span that ends at or before it. The scan's next open delimiter
+/// is then the `<NORM>`'s first byte, and the first close delimiter after
+/// that ends the `<NORM>`.
+fn rewrites_token(rule: &(String, String)) -> bool {
+    let (open, close) = rule;
+    !open.is_empty()
+        && !close.is_empty()
+        && NORM_TOKEN
+            .strip_prefix(open.as_str())
+            .and_then(|rest| rest.find(close.as_str()))
+            .is_some_and(|at| {
+                at.saturating_add(close.len()).saturating_add(open.len()) == NORM_TOKEN.len()
+            })
+}
+
+/// Whether `origins` traces `text` to `raw`: one origin per byte, each byte
+/// no rule replaced equal to its raw byte, and each byte of a `<NORM>` a
+/// rule wrote, including one a later span cut, equal to the token's byte at
+/// its offset.
+fn traces(raw: &str, text: &str, origins: &[Origin]) -> bool {
+    text.len() == origins.len()
+        && text
+            .bytes()
+            .zip(origins)
+            .all(|(byte, &(start, end, offset))| match offset {
+                None => end == start.saturating_add(1) && raw.as_bytes().get(start) == Some(&byte),
+                Some(offset) => NORM_TOKEN.as_bytes().get(offset) == Some(&byte),
+            })
 }
 
 /// The contract routine of a branch ID `PO-NN.bM`.
@@ -781,47 +980,78 @@ fn render_meta(meta: &Meta) -> String {
     )
 }
 
-/// One normalisation rule and, for each side, the texts the rule replaces
-/// when applied alone to that side's un-normalised text. With several rules,
-/// a later rule's texts can differ from what it replaces after the earlier
-/// rules, so the rendered line says how they were found.
-fn render_rule(
-    number: usize,
-    rule: &(String, String),
-    sides: &[(&str, Result<&str, String>)],
-) -> String {
-    let (open, close) = rule;
-    let shown: Vec<String> = sides
+/// One line per normalisation rule, in file order: the rule, the text it is
+/// applied to, and for each side what [`audit_rules`] found it replaced in
+/// the comparison, or why the side has no text to audit.
+fn render_rules(rules: &[(String, String)], sides: &[(&str, Result<&str, String>)]) -> Vec<String> {
+    let mut shown: Vec<Vec<String>> = vec![Vec::new(); rules.len()];
+    for (label, side) in sides {
+        match side {
+            Err(reason) => {
+                for line in &mut shown {
+                    line.push(format!("{label}: {reason}"));
+                }
+            }
+            Ok(raw) => {
+                let (audits, _) = audit_rules(raw, rules);
+                for (line, audit) in shown.iter_mut().zip(&audits) {
+                    line.push(format!("{label}: {}", render_audit(audit)));
+                }
+            }
+        }
+    }
+    rules
         .iter()
-        .map(|(label, raw)| {
-            let replaced = match raw {
-                Err(reason) => reason.clone(),
-                Ok(raw) => match replaced_spans(raw, rule) {
-                    None => "NOT DERIVABLE (the text already holds `<NORM>`)".to_string(),
-                    Some(spans) if spans.is_empty() => "nothing replaced".to_string(),
-                    Some(spans) => {
-                        let spans: Vec<String> =
-                            spans.iter().map(|span| code(&quoted(span))).collect();
-                        spans.join(", ")
-                    }
-                },
+        .zip(shown)
+        .zip(1usize..)
+        .map(|(((open, close), sides), number)| {
+            let applied_to = match number {
+                1 => "the un-normalised text".to_string(),
+                2 => "the text rule 1 left".to_string(),
+                _ => format!("the text rules 1 to {} left", number.saturating_sub(1)),
             };
-            format!("{label}: {replaced}")
+            format!(
+                "rule {number}: open {}, close {}, applied in file order to {applied_to}; {}",
+                code(&quoted(open)),
+                code(&quoted(close)),
+                sides.join("; ")
+            )
         })
-        .collect();
-    format!(
-        "rule {number}: open {}, close {}, applied alone to the un-normalised text; {}",
-        code(&quoted(open)),
-        code(&quoted(close)),
-        shown.join("; ")
-    )
+        .collect()
+}
+
+/// What one rule replaced on one side: `nothing replaced`; each original
+/// text, followed by the text the rule saw where that held all or part of
+/// an earlier rule's `<NORM>`; or, when the audit's checks failed, NOT
+/// DERIVABLE with the reason.
+fn render_audit(audit: &RuleAudit) -> String {
+    match audit {
+        Err(reason) => format!("NOT DERIVABLE ({reason})"),
+        Ok(spans) if spans.is_empty() => "nothing replaced".to_string(),
+        Ok(spans) => {
+            let shown: Vec<String> = spans
+                .iter()
+                .map(|(original, seen)| {
+                    if original == seen {
+                        code(&quoted(original))
+                    } else {
+                        format!(
+                            "{} (the rule saw {})",
+                            code(&quoted(original)),
+                            code(&quoted(seen))
+                        )
+                    }
+                })
+                .collect();
+            shown.join(", ")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Evaluation
 // ---------------------------------------------------------------------------
 
-/// `Store::from_zwr` on a capture export.
 fn capture_store(rel: &str, text: &str) -> Result<Store, (String, String)> {
     Store::from_zwr(text).map_err(|err| {
         (
@@ -1233,8 +1463,9 @@ fn evaluate_steps(
             }
         };
 
-    // Normalisation reporting: what each rule replaces when applied alone to
-    // each side's un-normalised text; it decides nothing.
+    // Normalisation reporting: what each rule replaced on each side, in file
+    // order, as the comparison above applied it, with the original text of
+    // each span; it decides nothing.
     let normalisation = match &rules {
         None => vec![not_evaluated("normalisation.txt unavailable")],
         Some(rules) if rules.is_empty() => {
@@ -1273,11 +1504,7 @@ fn evaluate_steps(
                     },
                 ),
             ];
-            rules
-                .iter()
-                .enumerate()
-                .map(|(index, rule)| render_rule(index.saturating_add(1), rule, &sides))
-                .collect()
+            render_rules(rules, &sides)
         }
     };
 
@@ -1455,10 +1682,11 @@ fn render_case(
         ));
     } else {
         let missing: Vec<String> = missing.iter().map(|rel| code(rel)).collect();
+        let noun = if missing.len() == 1 { "file" } else { "files" };
         bullet_list(
             &mut out,
             &format!(
-                "Readiness: NOT READY, {} required files missing",
+                "Readiness: NOT READY, {} required {noun} missing",
                 missing.len()
             ),
             &missing,
@@ -1992,6 +2220,147 @@ fn first_text_difference_locates_first_unequal_byte() {
     }
 }
 
+/// The normalisation audit reports what each rule replaced in file order,
+/// each rule on the text the earlier rules left, with the original text of
+/// every span, including a `<NORM>` the raw text holds and a span that cuts
+/// an earlier rule's `<NORM>`; and its last text is the comparison's
+/// `normalise(raw, rules)`. No `<NORM>` mixes a cut token's bytes with
+/// others: the byte beside a cut token, on the side it was cut, is always
+/// the `<` or `>` of the token that cut it.
+#[test]
+fn normalisation_audit_follows_file_order() {
+    let spans = |pairs: &[(&str, &str)]| -> RuleAudit {
+        Ok(pairs
+            .iter()
+            .map(|(original, seen)| (original.to_string(), seen.to_string()))
+            .collect())
+    };
+    let table = [
+        // Rule 1 replaces all of the text, so rule 2 finds nothing.
+        (
+            "[{x}]",
+            vec![("[", "]"), ("{", "}")],
+            vec![spans(&[("[{x}]", "[{x}]")]), spans(&[])],
+        ),
+        // Reversed, rule 2 replaces rule 1's `<NORM>` with what surrounds it.
+        (
+            "[{x}]",
+            vec![("{", "}"), ("[", "]")],
+            vec![spans(&[("{x}", "{x}")]), spans(&[("[{x}]", "[<NORM>]")])],
+        ),
+        // Several spans per rule, in multi-byte text; an open delimiter with
+        // no later close delimiter replaces nothing.
+        (
+            "é[1]b[ü2]c[",
+            vec![("[", "]")],
+            vec![spans(&[("[1]", "[1]"), ("[ü2]", "[ü2]")])],
+        ),
+        (
+            "t=12:00 id=7; t=13:30 id=8;",
+            vec![("t=", " "), ("id=", ";")],
+            vec![
+                spans(&[("t=12:00 ", "t=12:00 "), ("t=13:30 ", "t=13:30 ")]),
+                spans(&[("id=7;", "id=7;"), ("id=8;", "id=8;")]),
+            ],
+        ),
+        // A close delimiter that overlaps itself ends the span at its first
+        // occurrence after the open delimiter.
+        ("aaaa", vec![("a", "aa")], vec![spans(&[("aaa", "aaa")])]),
+        // Rule 2 replaces rule 1's `<NORM>` with an identical `<NORM>`, which
+        // no output shows, then a span of its own.
+        (
+            "[a] <b>",
+            vec![("[", "]"), ("<", ">")],
+            vec![
+                spans(&[("[a]", "[a]")]),
+                spans(&[("[a]", "<NORM>"), ("<b>", "<b>")]),
+            ],
+        ),
+        // A span of rule 2 that covers rule 1's `<NORM>` is that one span.
+        (
+            "<a[b]>",
+            vec![("[", "]"), ("<", ">")],
+            vec![spans(&[("[b]", "[b]")]), spans(&[("<a[b]", "<a<NORM>")])],
+        ),
+        // A `<NORM>` the raw text holds is ordinary text to a rule.
+        (
+            "literal <NORM>; t=12:00;",
+            vec![("t=", ";")],
+            vec![spans(&[("t=12:00;", "t=12:00;")])],
+        ),
+        // Rule 2 replaces the raw text's own `<NORM>` and rule 1's, each
+        // with an identical `<NORM>`, and each is its own original text.
+        (
+            "<NORM> [x]",
+            vec![("[", "]"), ("<", ">")],
+            vec![
+                spans(&[("[x]", "[x]")]),
+                spans(&[("<NORM>", "<NORM>"), ("[x]", "<NORM>")]),
+            ],
+        ),
+        // A visible span that covers the raw text's own `<NORM>` is that one
+        // span.
+        (
+            "x <a <NORM>> y",
+            vec![("<", ">")],
+            vec![spans(&[("<a <NORM>", "<a <NORM>")])],
+        ),
+        // Rule 2's span begins inside rule 1's `<NORM>`, and rule 3's ends in
+        // the part of it that rule 2 left; each original covers all the text
+        // the cut token stood for.
+        (
+            "a[x]b",
+            vec![("[", "]"), ("O", "b"), ("a", "N")],
+            vec![
+                spans(&[("[x]", "[x]")]),
+                spans(&[("[x]b", "ORM>b")]),
+                spans(&[("a[x]", "a<N")]),
+            ],
+        ),
+        // Rule 2's span ends inside rule 1's `<NORM>`.
+        (
+            "a[x]b",
+            vec![("[", "]"), ("a", "N")],
+            vec![spans(&[("[x]", "[x]")]), spans(&[("a[x]", "a<N")])],
+        ),
+        // Rule 3 replaces rule 2's `<NORM>` with an identical one, but not
+        // the part of rule 1's that rule 2 left.
+        (
+            "a[x]b",
+            vec![("[", "]"), ("a", "N"), ("<", ">")],
+            vec![
+                spans(&[("[x]", "[x]")]),
+                spans(&[("a[x]", "a<N")]),
+                spans(&[("a[x]", "<NORM>")]),
+            ],
+        ),
+        // Rule 3's visible span starts in the part of rule 1's `<NORM>` that
+        // rule 2 left and covers rule 2's `<NORM>`.
+        (
+            "a[x]b",
+            vec![("[", "]"), ("O", "b"), ("<", ">")],
+            vec![
+                spans(&[("[x]", "[x]")]),
+                spans(&[("[x]b", "ORM>b")]),
+                spans(&[("[x]b", "<N<NORM>")]),
+            ],
+        ),
+    ];
+    for (raw, rules, expected) in table {
+        let rules: Vec<(String, String)> = rules
+            .into_iter()
+            .map(|(open, close)| (open.to_string(), close.to_string()))
+            .collect();
+        let (audits, last) = audit_rules(raw, &rules);
+        assert_eq!(audits, expected, "audit of {raw:?} under {rules:?}");
+        assert_eq!(
+            last,
+            normalise(raw, &rules),
+            "last text of {raw:?} under {rules:?}"
+        );
+    }
+}
+
 /// `MANIFEST.txt` rows keep file order with blank lines skipped, and a file
 /// named twice is malformed on the repeat's own line, however far apart.
 #[test]
@@ -2103,29 +2472,87 @@ fn console_summary_shows_causes_never_details() {
 }
 
 /// A context finding's console cause names its key only when the key is a
-/// `STUB_CONTEXT` name.
+/// `STUB_CONTEXT` name. The stub-key findings carry each constant's current
+/// expected text, so the test holds whether a constant is resolved or not.
 #[test]
 fn context_cause_names_only_stub_keys() {
+    let mut table: Vec<(String, String)> = STUB_CONTEXT
+        .iter()
+        .flat_map(|(key, expected)| {
+            let expected = expected.unwrap_or("UNRESOLVED");
+            ["#SECRET", "MISSING"].map(|actual| {
+                (
+                    format!("CONTEXT MISMATCH {key}: expected {expected}, actual {actual}"),
+                    format!("CONTEXT MISMATCH {key}"),
+                )
+            })
+        })
+        .collect();
+    table.extend(
+        [
+            "CONTEXT MISMATCH SECRETKEY: expected ABSENT, actual 1",
+            "CONTEXT MISMATCH IOF: SECRET: expected ABSENT, actual 1",
+        ]
+        .map(|finding| (finding.to_string(), "CONTEXT MISMATCH".to_string())),
+    );
+    for (finding, expected) in table {
+        assert_eq!(context_cause(&finding), expected, "{finding}");
+    }
+}
+
+/// A loader error names a file in the crate folder by its crate-relative
+/// path, and any other file as it was given. Nothing here reads or writes a
+/// file.
+#[test]
+fn loader_error_names_files_crate_relative() {
+    let cases = crate_path(&fixture_rel(RUNTIME_EXPORT));
+    let outside = PathBuf::from("/elsewhere/cases.zwr");
     let table = [
         (
-            "CONTEXT MISMATCH IOF: expected UNRESOLVED, actual #SECRET",
-            "CONTEXT MISMATCH IOF",
+            "parse error in a fixture file",
+            StoreError::Parse {
+                file: Some(cases.clone()),
+                line: 4,
+                message: "$C() values are not supported".to_string(),
+            },
+            "tests/fixtures/ifcap/cases.zwr: line 4: $C() values are not supported",
         ),
         (
-            "CONTEXT MISMATCH DUZ: expected .5, actual MISSING",
-            "CONTEXT MISMATCH DUZ",
+            "parse error without a file",
+            StoreError::Parse {
+                file: None,
+                line: 2,
+                message: "synthetic".to_string(),
+            },
+            "line 2: synthetic",
         ),
         (
-            "CONTEXT MISMATCH SECRETKEY: expected ABSENT, actual 1",
-            "CONTEXT MISMATCH",
+            "fixture directory not listable",
+            StoreError::Io {
+                file: crate_path(FIXTURES_REL),
+                message: "synthetic".to_string(),
+            },
+            "tests/fixtures/ifcap: cannot read: synthetic",
         ),
         (
-            "CONTEXT MISMATCH IOF: SECRET: expected ABSENT, actual 1",
-            "CONTEXT MISMATCH",
+            "fixture file not readable",
+            StoreError::Io {
+                file: cases,
+                message: "synthetic".to_string(),
+            },
+            "tests/fixtures/ifcap/cases.zwr: cannot read: synthetic",
+        ),
+        (
+            "file outside the crate folder",
+            StoreError::Io {
+                file: outside,
+                message: "synthetic".to_string(),
+            },
+            "/elsewhere/cases.zwr: cannot read: synthetic",
         ),
     ];
-    for (finding, expected) in table {
-        assert_eq!(context_cause(finding), expected, "{finding}");
+    for (label, err, expected) in table {
+        assert_eq!(crate_relative(err).to_string(), expected, "{label}");
     }
 }
 
@@ -2222,7 +2649,6 @@ fn evaluate_memory(id: &str, capture: &MemoryFiles) -> Evaluation {
     evaluate(id, (&is_missing, &read, &digest, &fixture_store))
 }
 
-/// The file at `rel` of `capture`, to change it.
 fn memory_file<'a>(capture: &'a mut MemoryFiles, rel: &str) -> Result<&'a mut MemoryFile, String> {
     let (files, _) = capture;
     files
@@ -2230,7 +2656,6 @@ fn memory_file<'a>(capture: &'a mut MemoryFiles, rel: &str) -> Result<&'a mut Me
         .ok_or_else(|| format!("the synthetic capture holds no {rel}"))
 }
 
-/// The UTF-8 text of the readable file at `rel` of `capture`.
 fn memory_text(capture: &MemoryFiles, rel: &str) -> Result<String, String> {
     let (files, _) = capture;
     match files.get(rel).map(|(content, _)| content) {
@@ -2281,7 +2706,6 @@ fn memory_edit_manifest(
     memory_set(capture, &rel, edited.as_bytes())
 }
 
-/// `text` as a JSON string.
 fn json_string(text: &str) -> String {
     let mut out = String::from("\"");
     for c in text.chars() {
@@ -2321,7 +2745,6 @@ fn synthetic_meta(snapshot_id: &str, context: &str, docker_exec_args: &str) -> S
     )
 }
 
-/// The `meta.txt` of the complete synthetic capture.
 fn synthetic_meta_text() -> String {
     synthetic_meta(SYNTHETIC_SNAPSHOT, &synthetic_context(), "[]")
 }
@@ -2412,12 +2835,10 @@ fn synthetic_context_findings() -> Result<Vec<(String, String)>, String> {
         .collect())
 }
 
-/// The causes of `findings`, in order.
 fn causes(findings: &[(String, String)]) -> Vec<&str> {
     findings.iter().map(|(cause, _)| cause.as_str()).collect()
 }
 
-/// The items of the step field `label` of `outcome`.
 fn step<'a>(outcome: &'a Evaluation, label: &str) -> Result<&'a [String], String> {
     let (_, _, _, steps, _, _) = outcome;
     STEP_FIELDS
@@ -2464,6 +2885,12 @@ fn nothing_present_is_not_compared_listing_every_required_file() {
             .any(|line| line == "- **Status:** NOT COMPARED"),
         "the report subsection does not show NOT COMPARED"
     );
+    assert!(
+        section
+            .lines()
+            .any(|line| line == "- **Readiness: NOT READY, 20 required files missing:**"),
+        "the report subsection does not count 20 missing files"
+    );
 }
 
 /// One missing file alone decides NOT COMPARED and is the only file listed,
@@ -2504,12 +2931,17 @@ fn one_missing_file_is_not_compared_over_broken_present_files() -> Result<(), St
             Vec::<&str>::new(),
             "{rel} missing: blocked"
         );
-        let (status, summary, _) = report_case(SELF_TEST_CASE, &outcome);
+        let (status, summary, section) = report_case(SELF_TEST_CASE, &outcome);
         assert_eq!(status, NOT_COMPARED, "{rel} missing: reported status");
         assert_eq!(
             summary,
             format!("GC-01 gc_01_standard_order: NOT COMPARED missing: {rel}"),
             "{rel} missing: console summary"
+        );
+        let readiness = format!("- **Readiness: NOT READY, 1 required file missing:** `{rel}`");
+        assert!(
+            section.lines().any(|line| line == readiness),
+            "{rel} missing: the report subsection does not show {readiness:?}"
         );
     }
     Ok(())
