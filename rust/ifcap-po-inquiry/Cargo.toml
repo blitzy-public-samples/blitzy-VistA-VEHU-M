@@ -1,0 +1,20 @@
+[package]
+name = "ifcap-po-inquiry"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+description = "Standard-library-only Rust port of the read-only VistA IFCAP purchase-order display (OPTION PRCH DISPLAY PO, EN3^PRCHRPT)"
+
+[lib]
+name = "ifcap_po_inquiry"
+path = "src/lib.rs"
+
+# The integration test tests/bridge.rs shares this name by design;
+# `cargo test --test bridge` selects the test, `cargo run --bin bridge` the server.
+[[bin]]
+name = "bridge"
+path = "src/bin/bridge.rs"
+
+# Intentionally empty: the crate uses the standard library only, so it builds
+# offline with `--locked` and needs no registry access.
+[dependencies]
