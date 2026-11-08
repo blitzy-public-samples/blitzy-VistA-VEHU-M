@@ -11,7 +11,9 @@
 :root {
   --fg: #33FF33;
   --bg: #000000;
-  --lh: 1.25rem;
+  /* One row: 1.25 times the font of the element that uses it, so a
+     transcript's rows scale with its own font. */
+  --lh: 1.25em;
   --glow: #99FF99;
   --red: #FF3333;
   /* Start colour of the new-line highlight; #33FF33 text on it is 5.2:1
@@ -19,13 +21,25 @@
   --hl: #1A661A;
 }
 
+/* Whole CSS px rows for a box scaled to a fractional font. The row is
+   rounded to the nearest px, so a scroll offset pinning the last row never
+   leaves part of a row showing, and a 16px font keeps its 20px rows. A
+   browser without round() keeps the unrounded row. */
+@supports (line-height: round(1.25em, 1px)) {
+  :root {
+    --lh: round(1.25em, 1px);
+  }
+}
+
 html {
   background-color: var(--bg);
   color: var(--fg);
+  font-family: ui-monospace, monospace;
 }
 
 body {
   margin: 0;
+  background-color: var(--bg);
   font-family: ui-monospace, monospace;
   font-size: 1rem;
   line-height: var(--lh);
@@ -38,6 +52,12 @@ body {
   gap: 1ch;
   padding-block: 1ch;
   padding-inline: 2ch;
+  /* The page's width, or wider only for content that cannot wrap (a
+     transcript box), so the 2ch inline-end padding stays beside that
+     content if it ever overflows. Text that can wrap, such as an error
+     line, wraps at this width instead of widening it. */
+  inline-size: min-content;
+  min-inline-size: 100%;
 }
 
 .title,
@@ -68,10 +88,23 @@ button {
   line-height: var(--lh);
   color: var(--fg);
   background-color: var(--bg);
+  /* 44 by 44 CSS px touch targets for every pointer and font size; the
+     single text line is centred inside the taller box. */
+  min-block-size: 44px;
+  min-inline-size: 44px;
+}
+
+/* The entry row spans .terminal and the input takes the room its row
+   leaves, from its minimum width up to 40 columns, so a narrow viewport
+   narrows the input instead of wrapping the cursor and buttons away from
+   it. */
+.entry {
+  align-self: stretch;
 }
 
 .entry input {
-  inline-size: 40ch;
+  flex: 1 1 0;
+  max-inline-size: 40ch;
   caret-color: var(--fg);
 }
 
@@ -91,9 +124,17 @@ button,
   outline-color: var(--fg);
 }
 
-/* 80 columns by 24 rows. The single 80ch grid column sizes the box and the
-   stable gutter is added beside it, so a vertical scrollbar never narrows
-   the visible text below 80 columns. Lines are never wrapped. */
+/* 80 columns by 24 rows of the box's own font. Size containment takes the
+   box's size from contain-intrinsic-size alone, never from its rows, so
+   the transcript never changes it. Classic scrollbars are added outside
+   that 80ch by 24-row area: the stable gutter beside it for the vertical
+   bar, and below it the horizontal bar, which overflow-x: scroll keeps
+   present, so neither takes a row or a column and every column of a line
+   longer than 80 can be scrolled to from the first render. While no
+   vertical bar is drawn, the empty gutter is painted as padding, so text
+   past column 80 shows through it. Overlay scrollbars (macOS, mobile)
+   take no room and float over the area while the platform shows them.
+   Lines are never wrapped. */
 .screen {
   display: grid;
   grid-template-columns: 80ch;
@@ -101,17 +142,23 @@ button,
   align-content: start;
   box-sizing: content-box;
   inline-size: max-content;
-  block-size: calc(24 * var(--lh));
+  contain: size;
+  contain-intrinsic-size: 80ch calc(24 * var(--lh));
+  overflow-x: scroll;
   overflow-y: auto;
+  /* Rows are snap points: a font change keeps the same row on top. */
+  scroll-snap-type: y mandatory;
   scrollbar-gutter: stable;
   scrollbar-color: var(--fg) var(--bg);
   border: 1px solid var(--fg);
+  background-color: var(--bg);
   white-space: pre;
 }
 
 .ln {
   min-block-size: var(--lh);
   line-height: var(--lh);
+  scroll-snap-align: start;
 }
 
 .cursor {
@@ -162,6 +209,23 @@ button,
   display: none;
 }
 
+/* Transcript font. Each box stays 80 columns by 24 of its own rows, so on a
+   viewport too narrow for it at 1rem its font shrinks so that it fits. The
+   room is 100vw less one page scrollbar, the two 2ch .terminal paddings
+   and, per box, its gutter and 2px border; COMPARE also leaves the 2ch
+   gap. A scrollbar is taken as at most 17px and a system monospace ch as
+   at most 0.61em, so 80 columns take at most 48.8em and each 2ch of
+   padding or gap at most 1.22rem. */
+.terminal > .screen {
+  font-size: min(1rem, (100vw - 2.44rem - 36px) / 48.8);
+  line-height: var(--lh);
+}
+
+.pane > .screen {
+  font-size: min(1rem, (100vw - 3.66rem - 55px) / 97.6);
+  line-height: var(--lh);
+}
+
 /* RUST-only reactions. Every selector pairs [data-mode="rust"] with focus,
    hover or a class app.js sets while something happens, so nothing here
    matches an idle screen, and MUMPS, COMPARE and reduced-motion users get
@@ -206,7 +270,9 @@ button,
     animation: ln-in 300ms ease-out;
   }
 
-  /* Rejection shake and red outline. */
+  /* Rejection shake and red outline. The 1ch swing stays inside the 2ch
+     .terminal padding beside the box, so it never changes the page's
+     scrollable width, and the outline does not count towards it. */
   @keyframes reject-shake {
     0%,
     100% {
