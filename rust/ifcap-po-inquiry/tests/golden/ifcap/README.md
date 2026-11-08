@@ -217,7 +217,7 @@ Echoes between the prompts, as `SPEC.md` resolves them (open item O-02 is closed
 
 **Paging.** If the original pages (O-01: `IOSL`) [Packages/IFCAP/Routines/PRCHDP2.m:31, 54], record one more empty line for each extra `ENTER '^' TO HALT: ` prompt it writes.
 
-**Exit input.** The exit input is `^` [Packages/VA FileMan/Routines/DIC11.m:23] [Packages/VA FileMan/Routines/DIC.m:45], the same constant as `EXIT_INPUT = "^"` in `frontend/app.js`, which the front-end's `EXIT` button sends as an ordinary input.
+**Exit input.** The exit input is `^` (the standard VistA up-arrow exit), decided here. Source confirms it: `^` at the order prompt ends the FileMan lookup with no output [Packages/VA FileMan/Routines/DIC11.m:23] [Packages/VA FileMan/Routines/DIC.m:45], and it is the same constant as `EXIT_INPUT = "^"` in `frontend/app.js`, which the front-end's `EXIT` button sends as an ordinary input.
 
 ## 5. Predicted-path fixture profile
 
