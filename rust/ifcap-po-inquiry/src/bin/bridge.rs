@@ -10,6 +10,7 @@
 //!   under this crate. Only the path is built here; the bridge reads it.
 
 use std::env::{self, VarError};
+use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -36,7 +37,11 @@ fn main() -> ExitCode {
         // The variable is set but cannot name a container; falling back to
         // replay would hide that the caller asked for live mode.
         Err(VarError::NotUnicode(_)) => {
-            eprintln!("bridge: VEHU_CONTAINER is not valid UTF-8");
+            // Every diagnostic in `main` is written with its error dropped: a line
+            // that standard error cannot take is lost, so an unwritable
+            // standard error never changes the exit status or stops a bridge
+            // that is otherwise valid.
+            let _ = writeln!(io::stderr(), "bridge: VEHU_CONTAINER is not valid UTF-8");
             return ExitCode::FAILURE;
         }
     };
@@ -49,18 +54,21 @@ fn main() -> ExitCode {
     let listener = match TcpListener::bind(ADDRESS) {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("bridge: cannot listen on {ADDRESS}: {error}");
+            let _ = writeln!(io::stderr(), "bridge: cannot listen on {ADDRESS}: {error}");
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("bridge listening on http://{ADDRESS} ({label})");
+    let _ = writeln!(
+        io::stderr(),
+        "bridge listening on http://{ADDRESS} ({label})"
+    );
     // Errors are printed with their Display text and end the process with a
     // failure status; returning them from `main` would print their Debug form.
     // A fixture error's text names the file and the 1-based line.
     match serve(listener, mode) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("bridge: {error}");
+            let _ = writeln!(io::stderr(), "bridge: {error}");
             ExitCode::FAILURE
         }
     }
