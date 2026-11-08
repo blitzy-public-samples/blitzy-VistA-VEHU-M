@@ -1,21 +1,30 @@
 //! Integration tests of the loopback bridge, driven through its public test
 //! hook `serve_until` over real TCP connections on `127.0.0.1:0`.
 //!
-//! The `synthetic_*` tests check routing only: static paths, status codes,
-//! error texts, JSON framing and the capture-file rules. Their store and
-//! capture directories are invented. Each directory lives under
-//! `std::env::temp_dir()`, carries `synthetic` in its name and a
-//! `SYNTHETIC.txt` marker, and is removed when its test ends. Its base case
-//! is `GC-01/`. The discovery checks add later `GC-0N/` entries to pin the
-//! order the bridge scans them in; a capture the bridge must pass over
-//! carries a deliberately different synthetic transcript. Synthetic
-//! fixtures are never parity evidence. Every expected Rust-side answer comes
-//! from calling `inquire` directly on the same store, never from a literal.
+//! The `synthetic_*` tests check routing only (static paths, status codes,
+//! error texts, JSON framing and the capture-file rules), except
+//! `synthetic_gc_02_readiness_missing_only_when_absent`, which checks the
+//! readiness rule of the GC-02 check below. Their store is
+//! invented. Each capture directory lives under `std::env::temp_dir()`,
+//! carries `synthetic` in its name and a `SYNTHETIC.txt` marker, and is
+//! removed when its test ends. Its base case is `GC-01/`, and the discovery
+//! checks add later `GC-0N/` entries to pin the order the bridge scans them
+//! in. Each capture's transcript and return value come from `inquire` on
+//! the synthetic store, given the captured session or, where `inquire`
+//! refuses it, the longest prefix of it that `inquire` answers with `Ok`. A
+//! capture the bridge must pass over carries one marked synthetic change,
+//! and the compare and escaping checks add only the differences they assert
+//! on. Synthetic fixtures are never parity evidence. Every expected
+//! Rust-side answer comes from calling `inquire` directly on the same store,
+//! never from a literal.
 //!
 //! `gc_02_end_to_end_compare` is the one check against a real capture,
 //! `tests/golden/ifcap/GC-02/` with the real fixtures, and is reported apart
 //! from the synthetic tests. Without GC-02's prerequisites it prints NOT
-//! COMPARED and passes.
+//! COMPARED and passes. Only an absent prerequisite counts as missing. One
+//! that cannot be inspected, behind a denied permission or a link loop for
+//! example, is never missing: when nothing is absent it makes the check
+//! FAIL, as `synthetic_gc_02_readiness_missing_only_when_absent` checks.
 //!
 //! HTTP 500 is reached end to end before the BLOCKED branch `PO-12.b1`, the
 //! device gate a found order reaches first: the order lookup (PO-09) reads
@@ -96,10 +105,12 @@ static SYNTHETIC_SERIAL: AtomicUsize = AtomicUsize::new(0);
 /// without following it, and such an entry is never reused, followed or
 /// removed: the next name is tried instead, up to `ATTEMPTS` names.
 ///
-/// Only the path this call created is removed, on every exit of `body`:
-/// `Ok`, `Err` or a panic, which is resumed once the directory is gone. The
-/// result is `body`'s, or the removal failure when `body` succeeded. A
-/// directory `body` has already removed is not an error.
+/// Removal of only the path this call created is attempted on every exit
+/// of `body`: `Ok`, `Err` or a panic. A panic is resumed after that
+/// attempt, whatever its outcome. An `Err` from writing `SYNTHETIC.txt` or
+/// from `body` takes precedence over a removal failure, which is returned
+/// only when `body` succeeded. A directory `body` has already removed is
+/// not an error.
 fn with_synthetic_dir<T>(
     test: &str,
     body: impl FnOnce(&Path) -> Result<T, String>,
@@ -147,7 +158,6 @@ fn with_synthetic_dir<T>(
     }
 }
 
-/// The path of `name` inside the case directory `case` under `root`.
 fn case_path(root: &Path, case: &str, name: &str) -> PathBuf {
     root.join(case).join(name)
 }
@@ -173,7 +183,6 @@ fn write_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Replay mode over the synthetic directory `root`.
 fn replay(root: &Path) -> MumpsMode {
     MumpsMode::Replay {
         golden_dir: root.to_path_buf(),
@@ -290,6 +299,31 @@ fn ok_case_or_not_run(test: &str, store: &Store) -> Option<(Vec<String>, String,
     }
 }
 
+/// The transcript and return value of a synthetic capture of `inputs`, from
+/// `inquire` on `store`: its answer to the whole session or, when it refuses
+/// that, to the longest prefix of `inputs` it answers with `Ok`, a session
+/// ended by input exhaustion before the input it refuses. `Err` names each
+/// refusal when no prefix, not even the empty one, is answered `Ok`.
+fn inquire_carrier(store: &Store, inputs: &[String]) -> Result<(String, Option<String>), String> {
+    let mut refusals: Vec<String> = Vec::new();
+    for length in (0..=inputs.len()).rev() {
+        let prefix = inputs.get(..length).unwrap_or_default();
+        match inquire(store, prefix) {
+            Ok(output) => return Ok((output.transcript, output.returned)),
+            Err(InquiryError::UnsupportedBranch(id)) => {
+                refusals.push(format!("first {length} inputs: UnsupportedBranch({id})"));
+            }
+            Err(InquiryError::CorruptStore(record)) => {
+                refusals.push(format!("first {length} inputs: CorruptStore({record})"));
+            }
+        }
+    }
+    Err(format!(
+        "inquire refuses every prefix of the synthetic session ({})",
+        refusals.join(", ")
+    ))
+}
+
 /// Writes `<case>/input.txt` in captured form, after confirming it reads
 /// back as `inputs` through `split_input_lines`, so that replay can match.
 fn write_inputs_in(root: &Path, case: &str, inputs: &[String]) -> Result<(), String> {
@@ -362,7 +396,6 @@ fn meta_text(context: &str, docker_exec_args: &str) -> String {
     )
 }
 
-/// Writes `text` as `<case>/meta.txt` under `root`.
 fn write_meta_in(root: &Path, case: &str, text: &[u8]) -> Result<(), String> {
     write_file(root, &format!("{case}/meta.txt"), text)?;
     Ok(())
@@ -423,11 +456,13 @@ fn with_server<T>(
 }
 
 /// Runs `client` against a bridge serving `store` in `mode` on its own
-/// `127.0.0.1:0` port, in its own thread, then stops the bridge on every
-/// exit of `client`: `Ok`, `Err` or a panic, which is resumed once the
-/// bridge is stopped. Stopping sets the shutdown flag and joins the server
-/// thread within `bound`. The result is `client`'s, or the stop failure
-/// when `client` succeeded.
+/// `127.0.0.1:0` port, in its own thread. Stopping the bridge is attempted
+/// on every exit of `client`: `Ok`, `Err` or a panic. It sets the shutdown
+/// flag and waits up to `bound` for the server thread; a thread still
+/// running then is left detached and reported as a stop failure (see
+/// [`stop_server`]). A panic is resumed after that attempt, whatever its
+/// outcome. An `Err` from `client` takes precedence over a stop failure,
+/// which is returned only when `client` succeeded.
 fn with_server_within<T>(
     bound: Duration,
     store: Store,
@@ -490,7 +525,6 @@ fn http(
     read_response(&mut stream).map_err(|e| format!("{method} {target}: {e}"))
 }
 
-/// POSTs `body` to `/api/{backend}/session`.
 fn post_session(addr: SocketAddr, backend: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     http(addr, "POST", &format!("/api/{backend}/session"), Some(body))
 }
@@ -857,7 +891,6 @@ fn inputs_body(inputs: &[String], encode: fn(&str) -> String) -> Vec<u8> {
     format!("{{\"inputs\":[{}]}}", elements.join(",")).into_bytes()
 }
 
-/// The session request body for `inputs`.
 fn body_for(inputs: &[String]) -> Vec<u8> {
     inputs_body(inputs, json_str)
 }
@@ -902,7 +935,6 @@ fn optional_str_member(json: &str, name: &str) -> Result<Option<String>, String>
         .map_err(|e| format!("member {name:?}: {e}"))
 }
 
-/// The string member `name` of `json`, decoded.
 fn str_member(json: &str, name: &str) -> Result<String, String> {
     optional_str_member(json, name)?.ok_or_else(|| format!("member {name:?} is null, not a string"))
 }
@@ -1090,25 +1122,39 @@ fn synthetic_mumps_replay_200() -> Result<(), String> {
         return Ok(());
     };
     let other = strings(&["SYNTHETIC OTHER INPUT"]);
+    let (other_transcript, other_returned) = inquire_carrier(&store, &other)?;
+    // The one synthetic change of a capture replay must pass over, so that
+    // replaying it fails the transcript check.
+    let passed_over = |carrier: &str, case: &str| {
+        format!("{carrier}SYNTHETIC {case} DECOY: replay must pass over this capture\n")
+    };
     // The capture replay must choose: `inputs` with inquire's transcript and
     // a zero-byte returned.txt, which replay must answer as null.
     let chosen =
         |root: &Path, case: &str| write_case_in(root, case, &inputs, &transcript, None, "");
-    // A capture of `inputs` that replay must pass over, whose transcript
-    // fails the transcript check if replayed.
+    // A capture of `inputs` that replay must pass over: the chosen capture
+    // with the synthetic change.
     let decoy = |root: &Path, case: &str| {
         write_case_in(
             root,
             case,
             &inputs,
-            &format!("SYNTHETIC {case} TRANSCRIPT: not the capture replay must choose\n"),
+            &passed_over(&transcript, case),
             None,
             "",
         )
     };
-    // A complete capture of another session, which does not match.
+    // A complete capture of another session, which does not match, with the
+    // synthetic change: inquire's own carrier of it may equal `transcript`.
     let other_session = |root: &Path, case: &str| {
-        write_case_in(root, case, &other, "SYNTHETIC OTHER TRANSCRIPT\n", None, "")
+        write_case_in(
+            root,
+            case,
+            &other,
+            &passed_over(&other_transcript, case),
+            other_returned.as_deref(),
+            "",
+        )
     };
     let layouts: [(&str, Layout<'_>); 6] = [
         ("mumps-200", &|root| chosen(root, "GC-01")),
@@ -1563,15 +1609,12 @@ fn synthetic_422_unsupported_branch_end_to_end() -> Result<(), String> {
         }
     }
     let expected = format!("UNSUPPORTED BRANCH {HELP_BRANCH}");
+    // The MUMPS side only has to replay successfully for compare to reach
+    // the Rust side.
+    let (carrier, carrier_returned) = inquire_carrier(&store, &inputs)?;
     let body = body_for(&inputs);
     let (rust, mumps, compare) = with_synthetic_dir("422", |root| {
-        write_case(
-            root,
-            &inputs,
-            "SYNTHETIC TRANSCRIPT: any text; the MUMPS side only has to succeed\n",
-            None,
-            "",
-        )?;
+        write_case(root, &inputs, &carrier, carrier_returned.as_deref(), "")?;
         with_server(store, replay(root), |addr| {
             Ok((
                 post_session(addr, "rust", &body)?,
@@ -1759,12 +1802,14 @@ fn synthetic_502_not_recorded() -> Result<(), String> {
     let (help, id) = help_session(&store)?;
     // Each root holds a complete capture of another session, which must not
     // match.
+    let other = strings(&["SYNTHETIC OTHER INPUT"]);
+    let (other_transcript, other_returned) = inquire_carrier(&store, &other)?;
     let write_other = |root: &Path| {
         write_case(
             root,
-            &strings(&["SYNTHETIC OTHER INPUT"]),
-            "SYNTHETIC TRANSCRIPT\n",
-            None,
+            &other,
+            &other_transcript,
+            other_returned.as_deref(),
             "",
         )
     };
@@ -1772,6 +1817,26 @@ fn synthetic_502_not_recorded() -> Result<(), String> {
         write_other(root)?;
         let error = mumps_502(replay(root), &strings(&SESSION_INPUTS))?;
         assert_same("502 error text", &error, "NOT RECORDED");
+        Ok(())
+    })?;
+    // A root holding nothing but SYNTHETIC.txt, and a capture directory
+    // inside it that is never created.
+    with_synthetic_dir("502-not-recorded-no-captures", |root| {
+        for (context, golden_dir) in [
+            ("empty root", root.to_path_buf()),
+            ("absent root", root.join("absent")),
+        ] {
+            let error = mumps_502_named(
+                &format!("{context}: mumps backend"),
+                replay(&golden_dir),
+                &strings(&SESSION_INPUTS),
+            )?;
+            assert_same(
+                &format!("{context}: 502 error text"),
+                &error,
+                "NOT RECORDED",
+            );
+        }
         Ok(())
     })?;
     // Unrecorded on the MUMPS side and unsupported on the Rust side: compare
@@ -1803,16 +1868,18 @@ fn synthetic_502_not_recorded_lists_unreadable_input() -> Result<(), String> {
 /// them.
 const REQUIRED_CAPTURE_FILES: [&str; 3] = ["transcript.txt", "returned.txt", "normalisation.txt"];
 
-/// Writes a valid capture of `inputs` into `GC-01/` under `root`: a
-/// non-empty transcript, a non-empty return value and one well-formed
-/// normalisation rule, so that damaging any one required file leaves the
-/// others valid.
-fn write_valid_capture(root: &Path, inputs: &[String]) -> Result<(), String> {
+/// Writes a valid capture of `inputs` into `GC-01/` under `root`: the
+/// transcript and return value [`inquire_carrier`] gives on `store`, and
+/// one well-formed normalisation rule, so that damaging any one required
+/// file leaves the others valid. `inquire` returns `None`, so returned.txt
+/// is zero bytes, which is valid.
+fn write_valid_capture(root: &Path, store: &Store, inputs: &[String]) -> Result<(), String> {
+    let (transcript, returned) = inquire_carrier(store, inputs)?;
     write_case(
         root,
         inputs,
-        "SYNTHETIC TRANSCRIPT: any text; the capture only has to be valid\n",
-        Some("SYNTHETIC RETURN"),
+        &transcript,
+        returned.as_deref(),
         "SYNTHETIC OPEN\tSYNTHETIC CLOSE\n",
     )
 }
@@ -1834,7 +1901,7 @@ fn assert_capture_file_502(
     let (inputs, id) = help_session(&store)?;
     let intact = format!("502-{kind}-intact");
     with_synthetic_dir(&intact, |root| {
-        write_valid_capture(root, &inputs)?;
+        write_valid_capture(root, &store, &inputs)?;
         with_server(store.clone(), replay(root), |addr| {
             let body = body_for(&inputs);
             let (status, _) = post_session(addr, "mumps", &body)?;
@@ -1851,7 +1918,7 @@ fn assert_capture_file_502(
     for name in REQUIRED_CAPTURE_FILES {
         let label = format!("502-{kind}-{}", name.strip_suffix(".txt").unwrap_or(name));
         with_synthetic_dir(&label, |root| {
-            write_valid_capture(root, &inputs)?;
+            write_valid_capture(root, &store, &inputs)?;
             damage(root, name)?;
             let cause = format!("CAPTURE FILE {}: {reason}", case_file(root, name).display());
             with_server(store.clone(), replay(root), |addr| {
@@ -1894,33 +1961,31 @@ fn synthetic_502_malformed_normalisation() -> Result<(), String> {
     // A valid rule on line 1, then a malformed line 2.
     const MALFORMED_LINE_2: &str =
         "SYNTHETIC OPEN\tSYNTHETIC CLOSE\nSYNTHETIC RULE WITHOUT A TAB\n";
+    let store = synthetic_store()?;
     let inputs = strings(&SESSION_INPUTS);
+    let (transcript, returned) = inquire_carrier(&store, &inputs)?;
     let other = strings(&["SYNTHETIC OTHER INPUT"]);
+    let (other_transcript, other_returned) = inquire_carrier(&store, &other)?;
+    // A capture of `inputs` in `case` under the normalisation file `rules`.
+    let capture = |root: &Path, case: &str, rules: &str| {
+        write_case_in(root, case, &inputs, &transcript, returned.as_deref(), rules)
+    };
     // A complete, valid capture of `inputs` after the first match, which a
     // broken first match must never fall back to.
-    let duplicate = |root: &Path, case: &str| {
-        write_case_in(
-            root,
-            case,
-            &inputs,
-            &format!("SYNTHETIC {case} TRANSCRIPT: a valid later duplicate\n"),
-            None,
-            "",
-        )
-    };
+    let duplicate = |root: &Path, case: &str| capture(root, case, "");
     // Each row: its label, its layout, and the case and line of the
     // malformed normalisation.txt that the error must name.
     let layouts: [(&str, Layout<'_>, &str, usize); 3] = [
         (
             "502-normalisation",
-            &|root| write_case(root, &inputs, "SYNTHETIC TRANSCRIPT\n", None, MALFORMED),
+            &|root| capture(root, "GC-01", MALFORMED),
             "GC-01",
             1,
         ),
         (
             "502-normalisation-no-fallback",
             &|root| {
-                write_case(root, &inputs, "SYNTHETIC TRANSCRIPT\n", None, MALFORMED)?;
+                capture(root, "GC-01", MALFORMED)?;
                 duplicate(root, "GC-02")
             },
             "GC-01",
@@ -1930,15 +1995,14 @@ fn synthetic_502_malformed_normalisation() -> Result<(), String> {
         (
             "502-normalisation-later-match",
             &|root| {
-                write_case(root, &other, "SYNTHETIC OTHER TRANSCRIPT\n", None, "")?;
-                write_case_in(
+                write_case(
                     root,
-                    "GC-02",
-                    &inputs,
-                    "SYNTHETIC TRANSCRIPT\n",
-                    None,
-                    MALFORMED_LINE_2,
+                    &other,
+                    &other_transcript,
+                    other_returned.as_deref(),
+                    "",
                 )?;
+                capture(root, "GC-02", MALFORMED_LINE_2)?;
                 duplicate(root, "GC-03")
             },
             "GC-02",
@@ -1967,13 +2031,15 @@ fn synthetic_502_malformed_meta() -> Result<(), String> {
     let malformed = meta_text(SYNTHETIC_CONTEXT, "not-json");
     // Well formed, so reaching it gives a context mismatch, never a run.
     let valid = meta_text(SYNTHETIC_CONTEXT, r#"["synthetic-never-run"]"#);
-    // Each row: its label, its layout, and the case whose meta.txt the error
-    // must name. A `GC-01/` given only an input file is a case directory
-    // without a meta file.
-    let layouts: [(&str, Layout<'_>, &str); 7] = [
+    // Each row: its label, its layout, the bridge's `golden_dir` (the row's
+    // root, or the named entry under it), and the case whose meta.txt the
+    // error must name. A `GC-01/` given only an input file is a case
+    // directory without a meta file.
+    let layouts: [(&str, Layout<'_>, Option<&str>, &str); 11] = [
         (
             "502-meta",
             &|root| write_meta_in(root, "GC-01", malformed.as_bytes()),
+            None,
             "GC-01",
         ),
         // The first meta file decides, though a valid one follows it.
@@ -1983,12 +2049,14 @@ fn synthetic_502_malformed_meta() -> Result<(), String> {
                 write_meta_in(root, "GC-01", malformed.as_bytes())?;
                 write_meta_in(root, "GC-02", valid.as_bytes())
             },
+            None,
             "GC-01",
         ),
         // An absent case is skipped.
         (
             "502-meta-first-case-absent",
             &|root| write_meta_in(root, "GC-02", malformed.as_bytes()),
+            None,
             "GC-02",
         ),
         // So is a case entry that is a regular file.
@@ -1998,6 +2066,7 @@ fn synthetic_502_malformed_meta() -> Result<(), String> {
                 write_case_entry_file(root, "GC-01")?;
                 write_meta_in(root, "GC-02", malformed.as_bytes())
             },
+            None,
             "GC-02",
         ),
         // So are a case directory without a meta file and an absent GC-02.
@@ -2007,6 +2076,7 @@ fn synthetic_502_malformed_meta() -> Result<(), String> {
                 write_inputs(root, &inputs)?;
                 write_meta_in(root, "GC-03", malformed.as_bytes())
             },
+            None,
             "GC-03",
         ),
         // A first meta file that is not UTF-8 is malformed, never skipped.
@@ -2016,24 +2086,60 @@ fn synthetic_502_malformed_meta() -> Result<(), String> {
                 write_meta_in(root, "GC-01", &[0xFF, 0xFE, b'\n'])?;
                 write_meta_in(root, "GC-02", valid.as_bytes())
             },
+            None,
+            "GC-01",
+        ),
+        // So is a first meta file that is a directory, which is unreadable.
+        (
+            "502-meta-first-meta-is-a-directory",
+            &|root| {
+                fs::create_dir_all(case_path(root, "GC-01", "meta.txt"))
+                    .map_err(|e| format!("creating the directory GC-01/meta.txt: {e}"))?;
+                write_meta_in(root, "GC-02", valid.as_bytes())
+            },
+            None,
             "GC-01",
         ),
         // With no meta file anywhere, the error names where the first would
-        // be.
+        // be: in a root with case entries, in an empty root, and in a
+        // capture directory that is never created.
         (
             "502-meta-none",
             &|root| {
                 write_inputs(root, &inputs)?;
                 write_case_entry_file(root, "GC-02")
             },
+            None,
+            "GC-01",
+        ),
+        ("502-meta-empty-root", &|_| Ok(()), None, "GC-01"),
+        ("502-meta-absent-root", &|_| Ok(()), Some("absent"), "GC-01"),
+        // A capture directory that is a regular file fails closed: its first
+        // meta file is unreadable, not missing.
+        (
+            "502-meta-root-is-a-file",
+            &|root| {
+                write_file(
+                    root,
+                    "root-file",
+                    b"SYNTHETIC: a regular file in place of the capture directory\n",
+                )?;
+                Ok(())
+            },
+            Some("root-file"),
             "GC-01",
         ),
     ];
-    for (label, layout, case) in layouts {
+    for (label, layout, golden, case) in layouts {
         with_synthetic_dir(label, |root| {
             layout(root)?;
-            let error = mumps_502_named(&format!("{label}: mumps backend"), live(root), &inputs)?;
-            let path = case_path(root, case, "meta.txt");
+            let golden_dir = golden.map_or_else(|| root.to_path_buf(), |name| root.join(name));
+            let error = mumps_502_named(
+                &format!("{label}: mumps backend"),
+                live(&golden_dir),
+                &inputs,
+            )?;
+            let path = case_path(&golden_dir, case, "meta.txt");
             assert_same(
                 &format!("{label}: 502 error text"),
                 &error,
@@ -2207,18 +2313,20 @@ fn read_until_closed(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
 
 #[test]
 fn synthetic_shutdown_joins_within_bound() -> Result<(), String> {
+    let store = synthetic_store()?;
     let inputs = strings(&SESSION_INPUTS);
+    let (transcript, returned) = inquire_carrier(&store, &inputs)?;
     let body = body_for(&inputs);
     with_synthetic_dir("shutdown", |root| {
         // A capture the in-flight session matches, so that a connection
         // thread running on after shutdown would answer it.
-        write_case(root, &inputs, "SYNTHETIC TRANSCRIPT\n", None, "")?;
+        write_case(root, &inputs, &transcript, returned.as_deref(), "")?;
         // The stop bound lies below the server's 5-second read timeout, so a
         // connection thread blocked in a read must be woken, not waited out:
         // `with_server_within` fails unless `serve_until` returns `Ok(())`
         // within the bound.
         let (mut idle, mut in_flight) =
-            with_server_within(SHUTDOWN_BOUND, synthetic_store()?, replay(root), |addr| {
+            with_server_within(SHUTDOWN_BOUND, store, replay(root), |addr| {
                 // One answered request shows the accept loop was running.
                 let (status, _) = http(addr, "GET", "/", None)?;
                 assert_eq!(status, 200, "GET /: status");
@@ -2313,34 +2421,79 @@ const FIXTURE_FILES: [&str; 13] = [
     "MANIFEST.txt",
 ];
 
+/// GC-02's capture directory, relative to the crate.
+const GC_02_CASE: &str = "tests/golden/ifcap/GC-02";
+/// The fixture directory, relative to the crate.
+const GC_02_FIXTURES: &str = "tests/fixtures/ifcap";
+
+/// The readiness prerequisites of `gc_02_end_to_end_compare`, relative to
+/// the crate, in the order they are reported: GC-02's capture files, then
+/// the fixtures and the manifest.
+fn gc_02_prerequisites() -> Vec<String> {
+    CAPTURE_FILES
+        .iter()
+        .map(|name| format!("{GC_02_CASE}/{name}"))
+        .chain(
+            FIXTURE_FILES
+                .iter()
+                .map(|name| format!("{GC_02_FIXTURES}/{name}")),
+        )
+        .collect()
+}
+
+/// Readiness of the relative paths `required`, as `inspect` answers for
+/// each: `Ok` when something stands at the path, an error of kind
+/// `NotFound` when nothing does. Only those paths are missing, the
+/// classification of the equivalence harness's `disk_is_missing`.
+///
+/// `Ok` lists the missing paths in order; while one is missing the case is
+/// NOT COMPARED. Any other error is a path that cannot be inspected, which
+/// is never missing: once nothing is missing, `Err` names the first such
+/// path and its cause, and the case is FAIL.
+fn missing_prerequisites(
+    required: &[String],
+    inspect: impl Fn(&str) -> io::Result<()>,
+) -> Result<Vec<String>, String> {
+    let mut missing = Vec::new();
+    let mut uninspectable = None;
+    for relative in required {
+        match inspect(relative) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(relative.clone()),
+            Err(e) => {
+                uninspectable.get_or_insert_with(|| format!("{relative}: {e}"));
+            }
+        }
+    }
+    match uninspectable {
+        Some(cause) if missing.is_empty() => Err(cause),
+        _ => Ok(missing),
+    }
+}
+
+/// The inspector of [`missing_prerequisites`] for paths relative to `base`:
+/// their metadata, following symbolic links, so a dangling link is missing.
+fn disk_inspector(base: &Path) -> impl Fn(&str) -> io::Result<()> {
+    move |relative| fs::metadata(base.join(relative)).map(|_| ())
+}
+
 #[test]
 fn gc_02_end_to_end_compare() -> Result<(), String> {
     const LABEL: &str = "gc_02_end_to_end_compare (not synthetic)";
     const GOLDEN: &str = "tests/golden/ifcap";
-    const CASE: &str = "tests/golden/ifcap/GC-02";
-    const FIXTURES: &str = "tests/fixtures/ifcap";
+    let fail = |step: &str, detail: String| format!("{LABEL}: FAIL at {step}: {detail}");
     // Every path is named relative to the crate.
-    let required = CAPTURE_FILES
-        .iter()
-        .map(|name| format!("{CASE}/{name}"))
-        .chain(
-            FIXTURE_FILES
-                .iter()
-                .map(|name| format!("{FIXTURES}/{name}")),
-        );
-    let missing: Vec<String> = required
-        .filter(|relative| !crate_dir().join(relative).exists())
-        .collect();
+    let missing = missing_prerequisites(&gc_02_prerequisites(), disk_inspector(crate_dir()))
+        .map_err(|cause| fail("readiness", cause))?;
     if !missing.is_empty() {
         println!("{LABEL}: NOT COMPARED, missing: {}", missing.join(", "));
         return Ok(());
     }
-    let fail = |step: &str, detail: String| format!("{LABEL}: FAIL at {step}: {detail}");
     let read = |name: &str| {
-        fs::read_to_string(crate_dir().join(CASE).join(name))
-            .map_err(|e| fail("reading the capture", format!("{CASE}/{name}: {e}")))
+        fs::read_to_string(crate_dir().join(GC_02_CASE).join(name))
+            .map_err(|e| fail("reading the capture", format!("{GC_02_CASE}/{name}: {e}")))
     };
-    let store = load_fixtures(&crate_dir().join(FIXTURES))
+    let store = load_fixtures(&crate_dir().join(GC_02_FIXTURES))
         .map_err(|e| fail("load_fixtures", store_error_cause(&e)))?;
     let inputs = split_input_lines(&read("input.txt")?);
     let captured_transcript = read("transcript.txt")?;
@@ -2391,4 +2544,125 @@ fn gc_02_end_to_end_compare() -> Result<(), String> {
     );
     println!("{LABEL}: PASS");
     Ok(())
+}
+
+/// The readiness of `gc_02_end_to_end_compare`: only an absent prerequisite
+/// is missing, and one that cannot be inspected is FAIL, never NOT
+/// COMPARED. The in-memory inspectors answer alike for every user, root
+/// included. The disk layouts lie inside one synthetic directory, each
+/// prerequisite an empty file, since only its presence is inspected.
+#[test]
+fn synthetic_gc_02_readiness_missing_only_when_absent() -> Result<(), String> {
+    let required = gc_02_prerequisites();
+    let input = format!("{GC_02_CASE}/input.txt");
+    assert_eq!(
+        required.first(),
+        Some(&input),
+        "input.txt is the first prerequisite"
+    );
+    let absent = || -> io::Result<()> { Err(io::Error::from(io::ErrorKind::NotFound)) };
+    let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+
+    // In memory: nothing present, then one present path.
+    assert_eq!(
+        missing_prerequisites(&required, |_| absent()),
+        Ok(required.clone()),
+        "nothing present: every prerequisite missing, in order"
+    );
+    let present = format!("{GC_02_CASE}/meta.txt");
+    let others: Vec<String> = required
+        .iter()
+        .filter(|relative| **relative != present)
+        .cloned()
+        .collect();
+    assert_eq!(
+        others.len() + 1,
+        required.len(),
+        "{present} is one prerequisite"
+    );
+    assert_eq!(
+        missing_prerequisites(&required, |relative| {
+            if relative == present {
+                Ok(())
+            } else {
+                absent()
+            }
+        }),
+        Ok(others),
+        "{present} present: every other prerequisite missing, in order"
+    );
+    // A path that cannot be inspected is FAIL once the rest are present, and
+    // is never listed as missing beside an absent one.
+    let unreadable = format!("{GC_02_FIXTURES}/cases.zwr");
+    let gone = format!("{GC_02_CASE}/db-after.zwr");
+    assert_eq!(
+        missing_prerequisites(&required, |relative| {
+            if relative == unreadable {
+                Err(denied())
+            } else {
+                Ok(())
+            }
+        }),
+        Err(format!("{unreadable}: {}", denied())),
+        "{unreadable} permission denied: FAIL naming it"
+    );
+    assert_eq!(
+        missing_prerequisites(&required, |relative| {
+            if relative == unreadable {
+                Err(denied())
+            } else if relative == gone {
+                absent()
+            } else {
+                Ok(())
+            }
+        }),
+        Ok(vec![gone.clone()]),
+        "{unreadable} permission denied and {gone} absent: only {gone} missing"
+    );
+
+    // On disk: one layout per check, rooted where the crate folder would be.
+    with_synthetic_dir("gc-02-readiness", |root| {
+        let layout = |name: &str, keep: &dyn Fn(&str) -> bool| -> Result<PathBuf, String> {
+            for relative in &required {
+                if keep(relative) {
+                    write_file(root, &format!("{name}/{relative}"), b"")?;
+                }
+            }
+            Ok(root.join(name))
+        };
+        let link = |base: &Path, target: &str| {
+            std::os::unix::fs::symlink(target, base.join(&input))
+                .map_err(|e| format!("linking synthetic {input} to {target}: {e}"))
+        };
+        let all_present = layout("present", &|_| true)?;
+        assert_eq!(
+            missing_prerequisites(&required, disk_inspector(&all_present)),
+            Ok(Vec::new()),
+            "every prerequisite a file: none missing"
+        );
+        let dangling = layout("dangling", &|relative| relative != input)?;
+        link(&dangling, "no-such-file")?;
+        assert_eq!(
+            missing_prerequisites(&required, disk_inspector(&dangling)),
+            Ok(vec![input.clone()]),
+            "input.txt a dangling link: missing"
+        );
+        let looped = layout("loop", &|relative| relative != input)?;
+        link(&looped, "input.txt")?;
+        let outcome = missing_prerequisites(&required, disk_inspector(&looped));
+        assert!(
+            matches!(&outcome, Err(cause) if cause.starts_with(&format!("{input}: "))),
+            "input.txt a link to itself (ELOOP): FAIL naming it, got {outcome:?}"
+        );
+        let not_a_dir = layout("not-a-directory", &|relative| {
+            relative.starts_with(GC_02_FIXTURES)
+        })?;
+        write_file(root, &format!("not-a-directory/{GC_02_CASE}"), b"")?;
+        let outcome = missing_prerequisites(&required, disk_inspector(&not_a_dir));
+        assert!(
+            matches!(&outcome, Err(cause) if cause.starts_with(&format!("{input}: "))),
+            "GC-02 a regular file (ENOTDIR): FAIL naming input.txt, got {outcome:?}"
+        );
+        Ok(())
+    })
 }

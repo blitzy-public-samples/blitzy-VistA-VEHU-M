@@ -18,7 +18,7 @@
 //! literal source and DD text, reproduced as fixed logic.
 //!
 //! The original's non-business writes are not reproduced: FileMan's
-//! `^DISV(DUZ,...)` after each selection (DIC2.m:65), the word-wrap scratch
+//! `^DISV(DUZ,...)` after each selection [DIC2.m:65], the word-wrap scratch
 //! `^UTILITY($J,"W")` and `^TMP($J,"W")` (held in `Locals` instead), and the
 //! kills of `^TMP($J,"PRCHDP6")` and `^TMP($J,"MDEL")`, whose only builders
 //! lie on unexercised branches.
@@ -73,10 +73,10 @@ impl std::error::Error for InquiryError {}
 /// The fixed context of every session, and the only identity of the
 /// inquiry layer: no caller can supply or override it.
 ///
-/// `DUZ` is POSTMASTER, `.5`, as the Kernel test code signs on
-/// (`D DUZ^XUP(.5)`, ZOSVGUT1.m:13). `STATION` is the snapshot's primary
-/// station, `$O(^PRC(411,"AC","Y",0))` = 500 (PRCFSITE.m:14). `IOF` and
-/// `IOSL` come from the HOME device that `^%ZIS` opens (ZIS1.m:103-113) and
+/// `DUZ` is POSTMASTER, `.5`, as the Kernel test code signs on with
+/// `D DUZ^XUP(.5)` [ZOSVGUT1.m:13]. `STATION` is the snapshot's primary
+/// station, `$O(^PRC(411,"AC","Y",0))` = 500 [PRCFSITE.m:14]. `IOF` and
+/// `IOSL` come from the HOME device that `^%ZIS` opens [ZIS1.m:103-113] and
 /// are unresolved (`None`) while open item O-01 stands. Capture contexts are
 /// validated against this table key by key.
 pub const STUB_CONTEXT: [(&str, Option<&str>); 4] = [
@@ -97,9 +97,6 @@ pub const STUB_CONTEXT: [(&str, Option<&str>); 4] = [
 pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, InquiryError> {
     let mut s = Session::new(inputs);
     let mut v = Locals::default();
-    // EN3 ;DISPLAY P.O.
-    //  D ST
-    // EN30 ... (fall-through)
     let result =
         st_prchrpt(&mut s, store, &mut v).and_then(|()| en30_prchrpt(&mut s, store, &mut v));
     match result {
@@ -125,12 +122,10 @@ enum Halt {
     Error(InquiryError),
 }
 
-/// The `UnsupportedBranch` halt for branch `id`.
 fn unsupported(id: &str) -> Halt {
     Halt::Error(InquiryError::UnsupportedBranch(id.to_string()))
 }
 
-/// The `CorruptStore` halt for the missing node `key`.
 fn corrupt(key: &[Sub]) -> Halt {
     Halt::Error(InquiryError::CorruptStore(Store::format_ref(key)))
 }
@@ -158,7 +153,6 @@ fn key(global: &str, subs: &[&str]) -> Vec<Sub> {
     key
 }
 
-/// `parent` extended by the subscript `sub`.
 fn child(parent: &[Sub], sub: &Sub) -> Vec<Sub> {
     let mut key = parent.to_vec();
     key.push(sub.clone());
@@ -203,8 +197,8 @@ fn set_first_piece(text: &str, value: &str) -> String {
     }
 }
 
-/// M `W:$Y>0 @IOF`, at PRCHDP1.m:12 and as the postcondition of the whole
-/// column-header WRITE at PRCHDP2.m:42. With `$Y` at 0 nothing is written.
+/// M `W:$Y>0 @IOF` [PRCHDP1.m:12], and as the postcondition of the whole
+/// column-header WRITE [PRCHDP2.m:42]. With `$Y` at 0 nothing is written.
 /// Otherwise the form feed runs: the HOME device's `IOF`
 /// ([`STUB_CONTEXT`]), the bytes `W @IOF` writes for it and `$Y` after it
 /// are all open item O-01, and `Session` models no form feed, so the
@@ -239,7 +233,7 @@ const DEFAULT_ORDER_PROMPT: &str = "PURCHASE ORDER: ";
 const MOP_SCREEN: &str = "$P(^(0),U,2)<10!($P(^(0),U,2)=25)";
 
 /// Piece 2 of `^PRC(442,0)`, the file attributes the order lookup's
-/// identifiers and prompt assume [442 export:3].
+/// identifiers and prompt assume [442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:3].
 const FILE_442_ATTRIBUTES: &str = "442I";
 
 /// The length of index `C`; a longer value skips the index search
@@ -383,34 +377,36 @@ struct Locals {
 /// PO-02 `ST^PRCHRPT` [PRCHRPT.m:5-7]: sets the `^PRCFSITE` flags to `SP`
 /// (station prompt) and calls `^PRCFSITE`.
 fn st_prchrpt(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
-    // ST S PRCF("X")="SP"
     v.prcf_x = Some("SP".to_string());
-    //  D ^PRCFSITE
     prcfsite(s, st, v)
 }
 
 /// PO-03 `^PRCFSITE` [PRCFSITE.m:4-29], stub: the snapshot's site context,
 /// fixed, with nothing read from `Store`. The site file holds six stations
-/// [411 export:3], so the station prompt is written. The flags `SP` hold no
-/// `A`, `F`, `Q` or `B`, so the fiscal-year, quarter and budget steps
-/// [PRCFSITE.m:16, 19-28] do not run. `PRC("FY")` and `PRC("QTR")`, which
-/// the `^%DT` date would feed [PRCFSITE.m:15], are not modelled: nothing on
-/// the path reads them.
+/// [411+ADMIN. ACTIVITY SITE PARAMETER.zwr:3], so the station prompt is
+/// written. The flags `SP` hold no `A`, `F`, `Q` or `B`, so the `A`
+/// callbacks [PRCFSITE.m:16, 19], the fiscal-year and quarter prompts
+/// [PRCFSITE.m:20, 23-25] and the budget line [PRCFSITE.m:28] are skipped.
+/// `PRC("FY")` and `PRC("QTR")`, computed from the `^%DT` date through `A`
+/// and `B` [PRCFSITE.m:15], are not modelled because they reach no output:
+/// `FY` copies `PRC("FY")` into `X` [PRCFSITE.m:21], `SE1` overwrites `X`
+/// [PRCFSITE.m:26], `OUT` kills `A`, `B`, `X` and `Y` [PRCFSITE.m:29], and
+/// no later tag on the path reads `PRC("FY")` or `PRC("QTR")`.
 fn prcfsite(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
-    // DIVFY  D DUZ G:'% Q   [5]; PO-04's exercised outcome leaves % at 1
+    // DIVFY  D DUZ G:'% Q   [PRCFSITE.m:5]; PO-04's exercised outcome leaves % at 1
     duz_prcfsite(s, st, v)?;
-    //  W ! I '$D(^PRC(411,0)) W "SITE PARAMETERS ..." G Q   [8]; the file exists
+    //  W ! I '$D(^PRC(411,0)) W "SITE PARAMETERS ..." G Q   [PRCFSITE.m:8]; the file exists
     s.nl();
-    //  I '$D(PRC("SITE")),PRCF("X") contains S or B: S PRC("SITE")=$O(^PRC(411,"AC","Y",0))   [14]
+    //  I '$D(PRC("SITE")),PRCF("X") contains S or B: S PRC("SITE")=$O(^PRC(411,"AC","Y",0))   [PRCFSITE.m:14]
     let flags = v.prcf_x.clone().unwrap_or_default();
     if v.prc_site.is_none() && (contains(&flags, "S") || contains(&flags, "B")) {
         v.prc_site = stub_value("STATION").map(str::to_string);
     }
-    //  I '$D(PRC("FY")) S %DT="",X="T" D ^%DT S A=...,PRC("FY")=...,PRC("QTR")=... S X=""   [15]
+    //  I '$D(PRC("FY")) S %DT="",X="T" D ^%DT S A=...,PRC("FY")=...,PRC("QTR")=... S X=""   [PRCFSITE.m:15]
     pct_dt(s, st, v)?;
     v.x = Some(String::new());
     // SI ... W ! S DIC("A")="Select STATION NUMBER ('^' TO EXIT): ",DIC("B")=PRC("SITE"),
-    //    DIC=411,DIC(0)="AEQMZ",DIC("S")="I +Y<1000000" D ^DIC K DIC   [18]
+    //    DIC=411,DIC(0)="AEQMZ",DIC("S")="I +Y<1000000" D ^DIC K DIC   [PRCFSITE.m:18]
     s.nl();
     v.dic_a = Some(STATION_PROMPT.to_string());
     v.dic_b = v.prc_site.clone();
@@ -423,7 +419,7 @@ fn prcfsite(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         return Err(unsupported("PO-03.b7"));
     }
     v.prc_site = Some(y);
-    // OUT S %=1 K %DT,DIC,PRC("SP"),PRC("MDIV"),PRC("L"),PRC("I"),PRCF("X"),%F,A,B,X,Y Q   [29]
+    // OUT S %=1 K %DT,DIC,PRC("SP"),PRC("MDIV"),PRC("L"),PRC("I"),PRCF("X"),%F,A,B,X,Y Q   [PRCFSITE.m:29]
     v.prcf_x = None;
     v.x = None;
     v.y = None;
@@ -447,9 +443,10 @@ fn duz_prcfsite(_s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Ha
 /// PO-41 `^%DT` [PRCFSITE.m:15] [DIDT.m:8-25], stub: called with `%DT=""`
 /// and `X="T"`. With neither the `A` nor the `E` flag, `^%DT` neither
 /// prompts nor writes [DIDT.m:11-12, 63, 67, 92]. The date it returns in
-/// `Y` feeds only `PRC("FY")`, `PRC("QTR")`, `A` and `B`, which nothing on
-/// the path reads, and `OUT^PRCFSITE` kills `Y` [PRCFSITE.m:29], so the
-/// reproduction writes nothing and sets nothing.
+/// `Y` is read only into `A` and `B`, from which `^PRCFSITE` computes
+/// `PRC("FY")` and `PRC("QTR")` [PRCFSITE.m:15]; none of them reaches any
+/// output (see [`prcfsite`]), and `OUT^PRCFSITE` kills `A`, `B` and `Y`
+/// [PRCFSITE.m:29], so the reproduction writes nothing and sets nothing.
 fn pct_dt(_s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt> {
     Ok(())
 }
@@ -460,7 +457,6 @@ fn pct_dt(_s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt> {
 /// with nothing read from `Store`. RETURN accepts the default and selects
 /// it; any other answer is classified inside the lookup, so it is PO-05.b2.
 fn dic(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
-    // ASK ... K X W ! D ^DIC1   [DIC.m:25]
     s.nl();
     // PR1 S DIY=DIPRMT(DISUB) ... I $G(DIY(DISUB))]"" S DIY=DIY_DIY(DISUB)_"// "
     //  W DIY R X:$S($G(DTIME):DTIME,1:300)   [DIC11.m:15-17]
@@ -496,7 +492,6 @@ fn dic(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
 /// (`G EN30`), and a lookup that ends without a selection returns.
 fn en30_prchrpt(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     loop {
-        // EN30 D PO Q:'$D(PRCHPO)
         po_prchrpt(s, st, v)?;
         let Some(order) = v.prchpo.clone() else {
             return Ok(());
@@ -506,13 +501,11 @@ fn en30_prchrpt(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
             s.bell();
             s.write(" >>> Status makes this record non-specifiable here.");
         }
-        //  S D0=PRCHPO D ^PRCHDP1,K
         v.d0 = Some(order);
         prchdp1(s, st, v)?;
-        // The NEW of PRCHAMNT at PRCHDP2.m:9 ends when the DO of ^PRCHDP1 returns.
+        // The NEW of PRCHAMNT [PRCHDP2.m:9] ends when the DO of ^PRCHDP1 returns.
         v.prchamnt = None;
         k_prchrpt(s, st, v)?;
-        //  G EN30
     }
 }
 
@@ -520,11 +513,9 @@ fn en30_prchrpt(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
 /// runs the lookup, and flags a requisition (MOP 8) for the display label.
 fn po_prchrpt(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // PO S PRCHP("S")="$P(^(0),U,2)<10!($P(^(0),U,2)=25)"
-    //  (the PRCHPC and PRCHDELV SETs of lines 10-11 need locals this option never sets)
+    //  (the PRCHPC and PRCHDELV SETs [PRCHRPT.m:10-11] need locals this option never sets)
     v.prchp_s = Some(MOP_SCREEN.to_string());
-    //  S PRCHP("A")="P.O./REQ.NO.: "
     v.prchp_a = Some(ORDER_PROMPT.to_string());
-    //  D EN3^PRCHPAT
     en3_prchpat(s, st, v)?;
     //  I $D(PRCHPO),$D(^PRC(442,+PRCHPO,0)),$P(^(0),U,2)=8 S PRCHNRQ=1
     if let Some(order) = v.prchpo.clone() {
@@ -603,13 +594,11 @@ fn ix_dic(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     if piece(&header, "^", 2) != FILE_442_ATTRIBUTES {
         return Err(unsupported("PO-09.b15"));
     }
-    // ASK ... K X W ! D ^DIC1   [DIC.m:25]
     s.nl();
-    // PR1 ... W DIY R X:$S($G(DTIME):DTIME,1:300)   [DIC11.m:15-17]
     s.write(v.dic_a.as_deref().unwrap_or(""));
     let x = read(s)?;
     // The read checks of PR1^DIC11, in source order [DIC11.m:19-33]; the
-    // timeout of line 18 (PO-09.b1) cannot occur.
+    // timeout [DIC11.m:18] (PO-09.b1) cannot occur.
     if x.chars().any(|c| !(' '..='~').contains(&c)) || overlong_number(&x) {
         return Err(unsupported("PO-09.b2"));
     }
@@ -724,18 +713,17 @@ fn screen_passes(v: &Locals, node0: &str) -> bool {
 fn qualifies(st: &Store, v: &Locals, ien: &Sub) -> Result<bool, Halt> {
     let entry = child(&key("PRC", &["442"]), ien);
     let zero = child(&entry, &Sub::from_text("0"));
-    // I '$D(@(DIC_"Y,0)")) X "I 0" Q   [94]
+    // I '$D(@(DIC_"Y,0)")) X "I 0" Q   [DIC3.m:94]
     if st.data(&zero) == 0 {
         return Ok(false);
     }
-    // I $D(@(DIC_"Y,0)")),'$D(^(-9)) S DIY=$P(^(0),U)   [110]
+    // I $D(@(DIC_"Y,0)")),'$D(^(-9)) S DIY=$P(^(0),U)   [DIC3.m:110]
     if st.data(&child(&entry, &Sub::from_text("-9"))) != 0 {
         return Ok(false);
     }
     let Some(node0) = st.get(&zero) else {
         return Err(corrupt(&zero));
     };
-    // X:$D(DIC("S")) DIC("S")   [124]
     Ok(screen_passes(v, node0))
 }
 
@@ -973,17 +961,15 @@ fn write_order_echo(s: &mut Session, st: &Store, ien: &Sub) -> Result<String, Ha
 /// item O-01); the header after it is ported as source gives it.
 fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     let d0 = v.d0.clone().unwrap_or_default();
-    // S PRCHD0=$G(^PRC(442,D0,0)),PRCHD1=$G(^(1)),X=0   [4]; ^(1) is ^PRC(442,D0,1)
+    // S PRCHD0=$G(^PRC(442,D0,0)),PRCHD1=$G(^(1)),X=0   [PRCHDP1.m:4]; ^(1) is ^PRC(442,D0,1)
     let prchd0 = st.get_or_empty(&key("PRC", &["442", &d0, "0"]));
     let prchd1 = st.get_or_empty(&key("PRC", &["442", &d0, "1"]));
     v.prchd0 = Some(prchd0.clone());
     v.prchd1 = Some(prchd1.clone());
     v.x = Some("0".to_string());
-    // N PRCHSIT1   [5]
-    // S PRCHDSIT=$P(PRCHD0,"-",1)   [6]
     let prchdsit = piece(&prchd0, "-", 1).to_string();
     v.prchdsit = Some(prchdsit.clone());
-    // S PRCHSIT1=$S($P($G(^PRC(442,D0,23)),U,7)]"":$P(^(23),U,7),1:$P(PRCHD0,"-"))   [7]
+    // S PRCHSIT1=$S($P($G(^PRC(442,D0,23)),U,7)]"":$P(^(23),U,7),1:$P(PRCHD0,"-"))   [PRCHDP1.m:7]
     let node23 = st.get_or_empty(&key("PRC", &["442", &d0, "23"]));
     let substation = piece(&node23, "^", 7);
     let prchsit1 = if follows(substation, "") {
@@ -991,7 +977,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     } else {
         piece(&prchd0, "-", 1)
     };
-    // S PRCHDSHP="" Q:PRCHD0']""  S:'$D(PRCHPO) PRCHPO=D0   [8]
+    // S PRCHDSHP="" Q:PRCHD0']""  S:'$D(PRCHPO) PRCHPO=D0   [PRCHDP1.m:8]
     v.prchdshp = Some(String::new());
     if !follows(&prchd0, "") {
         return Err(unsupported("PO-10.b1"));
@@ -999,12 +985,12 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     if v.prchpo.is_none() {
         v.prchpo = Some(d0.clone());
     }
-    // I PRCHD1']"",$D(^PRC(442,D0,4,1,0)) S DIC="^PRC(442,",DA=PRCHPO D EN^DIQ Q   [9]
+    // I PRCHD1']"",$D(^PRC(442,D0,4,1,0)) S DIC="^PRC(442,",DA=PRCHPO D EN^DIQ Q   [PRCHDP1.m:9]
     if !follows(&prchd1, "") && st.data(&key("PRC", &["442", &d0, "4", "1", "0"])) != 0 {
         return Err(unsupported("PO-10.b2"));
     }
     // Q:PRCHD1']""  S PRCHDS=0 I +$P(PRCHD0,U,2)'=4,$P(PRCHD1,U,12)=""
-    //  S PRCHDSHP=$G(^PRC(411,PRCHSIT1,1,+$P(PRCHD1,U,3),0))   [10]
+    //  S PRCHDSHP=$G(^PRC(411,PRCHSIT1,1,+$P(PRCHD1,U,3),0))   [PRCHDP1.m:10]
     if !follows(&prchd1, "") {
         return Err(unsupported("PO-10.b3"));
     }
@@ -1016,7 +1002,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         v.prchdshp = Some(st.get_or_empty(&key("PRC", &["411", prchsit1, "1", &location, "0"])));
     }
     // I '$T,$P(PRCHD1,U,12)]"" S PRCHDSHP=$G(^PRC(440.2,$P(PRCHD1,U,12),0)),PRCHDS=1
-    //  I +PRCHDSHP>0 S $P(PRCHDSHP,U,1)=$E($P($G(^DPT(+PRCHDSHP,0)),U,1),1,21)   [11]
+    //  I +PRCHDSHP>0 S $P(PRCHDSHP,U,1)=$E($P($G(^DPT(+PRCHDSHP,0)),U,1),1,21)   [PRCHDP1.m:11]
     if !site_ship_to && follows(patient, "") {
         let mut ship_to = st.get_or_empty(&key("PRC", &["440.2", patient, "0"]));
         v.prchds = Some("1".to_string());
@@ -1026,19 +1012,19 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         }
         v.prchdshp = Some(ship_to);
     }
-    // S IOP="HOME",%ZIS="",PRCHDST=$G(^PRC(411,PRCHDSIT,0)),PRCHDHSP=$G(^(3)) D ^%ZIS W:$Y>0 @IOF   [12]
+    // S IOP="HOME",%ZIS="",PRCHDST=$G(^PRC(411,PRCHDSIT,0)),PRCHDHSP=$G(^(3)) D ^%ZIS W:$Y>0 @IOF   [PRCHDP1.m:12]
     // (PRCHDHSP, ^PRC(411,PRCHDSIT,3), is read whole and never displayed.)
     v.prchdst = Some(st.get_or_empty(&key("PRC", &["411", &prchdsit, "0"])));
     pct_zis(s, st, v)?;
     form_feed(s, "PO-10.b4")?;
-    // S PRCHTYPE=$P($G(^PRC(442,D0,23)),U,11)   [13]
-    // I PRCHTYPE="P"!(PRCHTYPE="S") S PRCHTYPE="P"   [14]
+    // S PRCHTYPE=$P($G(^PRC(442,D0,23)),U,11)   [PRCHDP1.m:13]
+    // I PRCHTYPE="P"!(PRCHTYPE="S") S PRCHTYPE="P"   [PRCHDP1.m:14]
     let mut prchtype = piece(&node23, "^", 11).to_string();
     if prchtype == "P" || prchtype == "S" {
         prchtype = "P".to_string();
     }
     // W !,$S($G(PRCHTYPE)="P":"PC ORDER: ",$G(PRCHTYPE)="D":"DELIVER ORDER: ",
-    //  $D(PRCHNRQ):"REQUISITION: ",1:"PURCHASE ORDER: ")_$P(PRCHD0,U,1),?37,"STATUS: "   [15]
+    //  $D(PRCHNRQ):"REQUISITION: ",1:"PURCHASE ORDER: ")_$P(PRCHD0,U,1),?37,"STATUS: "   [PRCHDP1.m:15]
     let label = match prchtype.as_str() {
         "P" => "PC ORDER: ",
         "D" => "DELIVER ORDER: ",
@@ -1058,7 +1044,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         s.write(&extract(piece(&name, "^", 1), 1, 34));
     }
     // W !,"M.O.P.: ",$P($G(^PRCD(442.5,+$P(PRCHD0,U,2),0)),U,1),?37,"LAST PARTIAL RECD.: "
-    //  S X=0 I $D(^PRC(442,D0,11,0)) S I=0 F  S I=$O(^PRC(442,D0,11,I)) ...   [16]
+    //  S X=0 I $D(^PRC(442,D0,11,0)) S I=0 F  S I=$O(^PRC(442,D0,11,I)) ...   [PRCHDP1.m:16]
     let method = st.get_or_empty(&key("PRCD", &["442.5", &num(piece(&prchd0, "^", 2)), "0"]));
     s.nl();
     s.write("M.O.P.: ");
@@ -1069,7 +1055,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     if st.data(&key("PRC", &["442", &d0, "11", "0"])) != 0 {
         return Err(unsupported("PO-10.b5"));
     }
-    // S:X>0 ... W:X>0 X W !,?37,"REQUESTING SERVICE: ",$S($D(^DIC(49,+$P(PRCHD1,U,2),0)):$P(^(0),U,1),1:"")   [17]
+    // S:X>0 ... W:X>0 X W !,?37,"REQUESTING SERVICE: ",$S($D(^DIC(49,+$P(PRCHD1,U,2),0)):$P(^(0),U,1),1:"")   [PRCHDP1.m:17]
     s.nl();
     s.tab(37);
     s.write("REQUESTING SERVICE: ");
@@ -1077,11 +1063,11 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     if let Some(node) = defined(st, &service)? {
         s.write(piece(&node, "^", 1));
     }
-    // N PRCHDV1 S PRCHDV=$G(^PRC(440,+PRCHD1,0)),PRCHDV1=$P(PRCHDV,U,1)   [18]
+    // N PRCHDV1 S PRCHDV=$G(^PRC(440,+PRCHD1,0)),PRCHDV1=$P(PRCHDV,U,1)   [PRCHDP1.m:18]
     let vendor = num(&prchd1);
     let prchdv = st.get_or_empty(&key("PRC", &["440", &vendor, "0"]));
     v.prchdv = Some(prchdv.clone());
-    // I PRCHDV1="SIMPLIFIED",$P($G(^PRC(442,PRCHPO,24)),U,2)'="" S PRCHDV1=$P($G(^PRC(442,PRCHPO,24)),U,2)   [19]
+    // I PRCHDV1="SIMPLIFIED",$P($G(^PRC(442,PRCHPO,24)),U,2)'="" S PRCHDV1=$P($G(^PRC(442,PRCHPO,24)),U,2)   [PRCHDP1.m:19]
     let prchpo = v.prchpo.clone().unwrap_or_default();
     let node24 = st.get_or_empty(&key("PRC", &["442", &prchpo, "24"]));
     let free_text_vendor = piece(&node24, "^", 2);
@@ -1091,8 +1077,8 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     } else {
         piece(&prchdv, "^", 1)
     };
-    // W !,"VENDOR:",?9,PRCHDV1   [20]
-    // W ?48,"SHIP TO: ",$P(PRCHDSHP,U,1)   [21]
+    // W !,"VENDOR:",?9,PRCHDV1   [PRCHDP1.m:20]
+    // W ?48,"SHIP TO: ",$P(PRCHDSHP,U,1)   [PRCHDP1.m:21]
     let ship_to = v.prchdshp.clone().unwrap_or_default();
     s.nl();
     s.write("VENDOR:");
@@ -1101,9 +1087,8 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     s.tab(48);
     s.write("SHIP TO: ");
     s.write(piece(&ship_to, "^", 1));
-    // S PRC("SITE")=PRCHDSIT   [24]
     v.prc_site = Some(prchdsit);
-    // D FTYP^PRCHFPNT S V(1)=$P(PRCHDV,U,2),V=2,S=1 S:'PRCHDS S(S)=PRCHFTYP,S=S+1   [25]
+    // D FTYP^PRCHFPNT S V(1)=$P(PRCHDV,U,2),V=2,S=1 S:'PRCHDS S(S)=PRCHFTYP,S=S+1   [PRCHDP1.m:25]
     ftyp_prchfpnt(s, st, v)?;
     let direct_delivery = truthy(v.prchds.as_deref().unwrap_or(""));
     v.v_rows.insert(1, piece(&prchdv, "^", 2).to_string());
@@ -1114,7 +1099,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         sn += 1;
     }
     // I $P(PRCHDV,U,3)]"" S V(V)=$P(PRCHDV,U,3),V=V+1 S:$P(PRCHDV,U,4)]"" V(V)=$P(PRCHDV,U,4),V=V+1
-    //  S:$P(PRCHDV,U,5)]"" V(V)=$P(PRCHDV,U,5),V=V+1   [26]
+    //  S:$P(PRCHDV,U,5)]"" V(V)=$P(PRCHDV,U,5),V=V+1   [PRCHDP1.m:26]
     if follows(piece(&prchdv, "^", 3), "") {
         for field in 3..=5 {
             let line = piece(&prchdv, "^", field);
@@ -1125,7 +1110,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         }
     }
     // S V(V)=$S($P(PRCHDV,U,6)]"":($P(PRCHDV,U,6)_", "),1:"   ")_$P($G(^DIC(5,+$P(PRCHDV,U,7),0)),U,2)
-    //  _"  "_$P(PRCHDV,U,8),V=V+1   [27]
+    //  _"  "_$P(PRCHDV,U,8),V=V+1   [PRCHDP1.m:27]
     let city = piece(&prchdv, "^", 6);
     let state = st.get_or_empty(&key("DIC", &["5", &num(piece(&prchdv, "^", 7)), "0"]));
     let city_part = if follows(city, "") {
@@ -1142,13 +1127,13 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         ),
     );
     vn += 1;
-    // S:$P(PRCHDV,U,10)]"" V(V)=$P(PRCHDV,U,10),V=V+1   [28]
+    // S:$P(PRCHDV,U,10)]"" V(V)=$P(PRCHDV,U,10),V=V+1   [PRCHDP1.m:28]
     let phone = piece(&prchdv, "^", 10);
     if follows(phone, "") {
         v.v_rows.insert(vn, phone.to_string());
         vn += 1;
     }
-    // I $D(^PRC(440,+PRCHD1,2)),$P(^(2),U,1)]"" S V(V)="ACCT # "_$P(^(2),U,1)   [29]
+    // I $D(^PRC(440,+PRCHD1,2)),$P(^(2),U,1)]"" S V(V)="ACCT # "_$P(^(2),U,1)   [PRCHDP1.m:29]
     if let Some(node2) = defined(st, &key("PRC", &["440", &vendor, "2"]))? {
         let account = piece(&node2, "^", 1);
         if follows(account, "") {
@@ -1156,7 +1141,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         }
     }
     // I $P(PRCHDST,U,19)="Y",$D(^PRC(440,+PRCHD1,3)),$P(^(3),U,4)'=""
-    //  S V(6)="FMS Vendor Code: "_$P(^(3),U,4)_$P(^(3),U,5)   [30]
+    //  S V(6)="FMS Vendor Code: "_$P(^(3),U,4)_$P(^(3),U,5)   [PRCHDP1.m:30]
     let prchdst = v.prchdst.clone().unwrap_or_default();
     if piece(&prchdst, "^", 19) == "Y"
         && let Some(node3) = defined(st, &key("PRC", &["440", &vendor, "3"]))?
@@ -1171,7 +1156,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
             ),
         );
     }
-    // I $P(PRCHD1,U,4)="Y" S V(8)=" VERBAL PURCHASE ORDER" S:$P(PRCHD1,U,5)="Y" V(8)=" CONFIRMATION COPY"   [31]
+    // I $P(PRCHD1,U,4)="Y" S V(8)=" VERBAL PURCHASE ORDER" S:$P(PRCHD1,U,5)="Y" V(8)=" CONFIRMATION COPY"   [PRCHDP1.m:31]
     if piece(&prchd1, "^", 4) == "Y" {
         v.v_rows.insert(8, " VERBAL PURCHASE ORDER".to_string());
         if piece(&prchd1, "^", 5) == "Y" {
@@ -1179,13 +1164,13 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         }
     }
     // S PRCHEDI=$G(^PRC(440,+PRCHD1,3)) I PRCHEDI]"",$P(PRCHEDI,U,2)="Y",
-    //  $P($G(^PRC(442,D0,12)),U,16)'="n" D  S V(8)=PRCHEDIT_" DO NOT MAIL"   [32-35]
+    //  $P($G(^PRC(442,D0,12)),U,16)'="n" D  S V(8)=PRCHEDIT_" DO NOT MAIL"   [PRCHDP1.m:32-35]
     let edi = st.get_or_empty(&key("PRC", &["440", &vendor, "3"]));
     let node12 = st.get_or_empty(&key("PRC", &["442", &d0, "12"]));
     if follows(&edi, "") && piece(&edi, "^", 2) == "Y" && piece(&node12, "^", 16) != "n" {
         return Err(unsupported("PO-10.b6"));
     }
-    // S:$P(PRCHDSHP,U,2)]"" S(S)=$P(PRCHDSHP,U,2),S=S+1 S:$P(PRCHDSHP,U,3)]"" ... S:$P(PRCHDSHP,U,4)]"" ...   [36]
+    // S:$P(PRCHDSHP,U,2)]"" S(S)=$P(PRCHDSHP,U,2),S=S+1 S:$P(PRCHDSHP,U,3)]"" ... S:$P(PRCHDSHP,U,4)]"" ...   [PRCHDP1.m:36]
     for field in 2..=4 {
         let line = piece(&ship_to, "^", field);
         if follows(line, "") {
@@ -1194,7 +1179,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         }
     }
     // S S(S)=$S($P(PRCHDSHP,U,5)]"":($E($P(PRCHDSHP,U,5),1,12)_", "),1:"   ")
-    //  _$P($G(^DIC(5,+$P(PRCHDSHP,U,6),0)),U,2)_"  "_$P(PRCHDSHP,U,7),S=S+2   [37]
+    //  _$P($G(^DIC(5,+$P(PRCHDSHP,U,6),0)),U,2)_"  "_$P(PRCHDSHP,U,7),S=S+2   [PRCHDP1.m:37]
     let ship_city = piece(&ship_to, "^", 5);
     let ship_state = st.get_or_empty(&key("DIC", &["5", &num(piece(&ship_to, "^", 6)), "0"]));
     let ship_city_part = if follows(ship_city, "") {
@@ -1211,18 +1196,18 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         ),
     );
     sn += 2;
-    // I $P(PRCHDSHP,U,8)]"",'PRCHDS S S(S)="DELIVERY HOURS:",S=S+1,S(S)=$P(PRCHDSHP,U,8)   [38]
+    // I $P(PRCHDSHP,U,8)]"",'PRCHDS S S(S)="DELIVERY HOURS:",S=S+1,S(S)=$P(PRCHDSHP,U,8)   [PRCHDP1.m:38]
     let hours = piece(&ship_to, "^", 8);
     if follows(hours, "") && !direct_delivery {
         v.s_rows.insert(sn, "DELIVERY HOURS:".to_string());
         sn += 1;
         v.s_rows.insert(sn, hours.to_string());
     }
-    // I $P(PRCHDV,U)="SIMPLIFIED",$P($G(^PRC(442,PRCHPO,24)),U,2)'="" S V(1)=""   [40]
+    // I $P(PRCHDV,U)="SIMPLIFIED",$P($G(^PRC(442,PRCHPO,24)),U,2)'="" S V(1)=""   [PRCHDP1.m:40]
     if simplified {
         v.v_rows.insert(1, String::new());
     }
-    // F I=1:1:7 W ! W:$D(V(I)) ?9,V(I) W:$D(S(I)) ?57,S(I)   [41]
+    // F I=1:1:7 W ! W:$D(V(I)) ?9,V(I) W:$D(S(I)) ?57,S(I)   [PRCHDP1.m:41]
     for row in 1..=7 {
         s.nl();
         if let Some(text) = v.v_rows.get(&row) {
@@ -1234,7 +1219,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
             s.write(text);
         }
     }
-    // W ! W:$D(V(8)) V(8) W:$D(S(8)) ?57,S(8) W !   [42]
+    // W ! W:$D(V(8)) V(8) W:$D(S(8)) ?57,S(8) W !   [PRCHDP1.m:42]
     s.nl();
     if let Some(text) = v.v_rows.get(&8) {
         s.write(text);
@@ -1244,7 +1229,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         s.write(text);
     }
     s.nl();
-    // I $P(PRCHD1,U,11)]"" W ?38,"DELIVERY LOCATION: ",$P(PRCHD1,U,11),!   [43]
+    // I $P(PRCHD1,U,11)]"" W ?38,"DELIVERY LOCATION: ",$P(PRCHD1,U,11),!   [PRCHDP1.m:43]
     let location = piece(&prchd1, "^", 11);
     if follows(location, "") {
         s.tab(38);
@@ -1252,14 +1237,12 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         s.write(location);
         s.nl();
     }
-    // F I=1:1:80 W "_"   [44]
     s.write(&"_".repeat(80));
-    // I $P($G(^PRC(442,D0,24)),U,3)="RMPR" D  K RMPRPO,RMPR664,RMPRR3   [45-52]
+    // I $P($G(^PRC(442,D0,24)),U,3)="RMPR" D  K RMPRPO,RMPR664,RMPRR3   [PRCHDP1.m:45-52]
     let prosthetics = st.get_or_empty(&key("PRC", &["442", &d0, "24"]));
     if piece(&prosthetics, "^", 3) == "RMPR" {
         return Err(unsupported("PO-10.b7"));
     }
-    // FOB ... (fall-through)
     fob_prchdp1(s, st, v)
 }
 
@@ -1268,25 +1251,25 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
 /// `PRCHFTP2` is undefined on this path.
 fn ftyp_prchfpnt(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     let d0 = v.d0.clone().unwrap_or_default();
-    // N PRCSUB   [42]
-    // S PRCHFTYP="V.A. *FACILITY TYPE UNDEFINED*"   [44]
+    // N PRCSUB   [PRCHFPNT.m:42]
+    // S PRCHFTYP="V.A. *FACILITY TYPE UNDEFINED*"   [PRCHFPNT.m:44]
     v.prchftyp = Some("V.A. *FACILITY TYPE UNDEFINED*".to_string());
-    // S X=$P($G(^PRC(411,PRC("SITE"),0)),"^",7) S:X="" X=1   [45]
+    // S X=$P($G(^PRC(411,PRC("SITE"),0)),"^",7) S:X="" X=1   [PRCHFPNT.m:45]
     let site = v.prc_site.clone().unwrap_or_default();
     let mut x = piece(&st.get_or_empty(&key("PRC", &["411", &site, "0"])), "^", 7).to_string();
     if x.is_empty() {
         x = "1".to_string();
     }
-    // I $P($G(^PRC(442,D0,23)),U,7)]"" S PRCSUB=$P(^(23),U,7) D  ...   [46-47]
+    // I $P($G(^PRC(442,D0,23)),U,7)]"" S PRCSUB=$P(^(23),U,7) D  ...   [PRCHFPNT.m:46-47]
     let node23 = st.get_or_empty(&key("PRC", &["442", &d0, "23"]));
     if follows(piece(&node23, "^", 7), "") {
         return Err(unsupported("PO-11.b2"));
     }
-    // I '$D(PRCHFTP2) S PRCHFTYP=$P($G(^PRC(411.2,+X,0)),U,2)   [49]
+    // I '$D(PRCHFTP2) S PRCHFTYP=$P($G(^PRC(411.2,+X,0)),U,2)   [PRCHFPNT.m:49]
     let facility = st.get_or_empty(&key("PRC", &["411.2", &num(&x), "0"]));
     v.prchftyp = Some(piece(&facility, "^", 2).to_string());
     v.x = Some(x);
-    // K PRCHFTP2   [52]
+    // K PRCHFTP2   [PRCHFPNT.m:52]
     Ok(())
 }
 
@@ -1308,7 +1291,7 @@ fn fob_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     let prchd0 = v.prchd0.clone().unwrap_or_default();
     let prchd1 = v.prchd1.clone().unwrap_or_default();
     // FOB W !,"FOB POINT: ",$S("O"=$E($P(PRCHD1,U,6)):"ORIGIN","D"=$E($P(PRCHD1,U,6)):"DESTINATION",1:""),
-    //  ?29,"|","PROPOSAL: " S DIWL=1,DIWR=16,DIWF="",X=$P(PRCHD1,U,8) K ^UTILITY($J,"W") D DIWP^PRCUTL($G(DA))   [53]
+    //  ?29,"|","PROPOSAL: " S DIWL=1,DIWR=16,DIWF="",X=$P(PRCHD1,U,8) K ^UTILITY($J,"W") D DIWP^PRCUTL($G(DA))   [PRCHDP1.m:53]
     let point = match extract(piece(&prchd1, "^", 6), 1, 1).as_str() {
         "O" => "ORIGIN",
         "D" => "DESTINATION",
@@ -1328,12 +1311,12 @@ fn fob_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     v.utility_w_lines.clear();
     let da = v.da.clone().unwrap_or_default();
     diwp_prcutl(s, st, v, &da)?;
-    // K ^TMP($J,"W") S %X="^UTILITY($J,""W"",",%Y="^TMP($J,""W""," D %XY^%RCR   [54]
+    // K ^TMP($J,"W") S %X="^UTILITY($J,""W"",",%Y="^TMP($J,""W""," D %XY^%RCR   [PRCHDP1.m:54]
     v.tmp_w_counts.clear();
     v.tmp_w_lines.clear();
     pct_xy_pct_rcr(s, st, v)?;
     // W ?40,$G(^TMP($J,"W",1,1,0)),?57,"|AUTHORITY: ",!,"COST CENTER: ",$P(PRCHD0,U,5),
-    //  ?29,"|",?40,$G(^TMP($J,"W",1,2,0)),?57,"|  "   [55]
+    //  ?29,"|",?40,$G(^TMP($J,"W",1,2,0)),?57,"|  "   [PRCHDP1.m:55]
     s.tab(40);
     s.write(&wrap_line(&v.tmp_w_lines, 1, 1));
     s.tab(57);
@@ -1347,7 +1330,7 @@ fn fob_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     s.write(&wrap_line(&v.tmp_w_lines, 1, 2));
     s.tab(57);
     s.write("|  ");
-    // S Y=0 F I=1:1 S Y=$O(^PRC(442,D0,14,Y)) Q:'Y  W:I>1 "," W $P($G(^PRC(442.4,+^(Y,0),0)),U,2)   [56]
+    // S Y=0 F I=1:1 S Y=$O(^PRC(442,D0,14,Y)) Q:'Y  W:I>1 "," W $P($G(^PRC(442.4,+^(Y,0),0)),U,2)   [PRCHDP1.m:56]
     // ^(Y,0) is ^PRC(442,D0,14,Y,0), read unguarded.
     let methods = key("PRC", &["442", &d0, "14"]);
     let mut y = Sub::from_text("0");
@@ -1374,7 +1357,7 @@ fn fob_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
         }
     }
     // W !,"TYPE: ",$P(PRCHD1,U,14) D TY W X,?29,"|",?40,$G(^TMP($J,"W",1,3,0)),
-    //  ?57,"|"_$S($P($G(^PRC(442,D0,23)),U,11)'="":"BUYER",1:"AGENT")_":"   [57]
+    //  ?57,"|"_$S($P($G(^PRC(442,D0,23)),U,11)'="":"BUYER",1:"AGENT")_":"   [PRCHDP1.m:57]
     s.nl();
     s.write("TYPE: ");
     s.write(piece(&prchd1, "^", 14));
@@ -1392,16 +1375,12 @@ fn fob_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
         "BUYER"
     };
     s.write(&format!("|{role}:"));
-    // DIS ... (fall-through)
     dis_prchdp1(s, st, v)
 }
 
 /// PO-14 `DIWP^PRCUTL` [PRCUTL.m:33-35]: `^DIWP` with the formal `DA`, so
 /// the caller's `DA` is the same after the call.
 fn diwp_prcutl(s: &mut Session, st: &Store, v: &mut Locals, da: &str) -> Result<(), Halt> {
-    // DIWP(DA) ;call DIWP^PRCUTL($G(DA)) to save DA value
-    //  D ^DIWP
-    //  QUIT
     let caller_da = v.da.replace(da.to_string());
     let result = diwp(s, st, v);
     v.da = caller_da;
@@ -1504,12 +1483,12 @@ fn wrap_text(v: &mut Locals, diwl: i64, diwr: i64, diwi: &mut String, diwtc: boo
 fn diwp(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
     let diwl = v.diwl.unwrap_or_default();
     let diwr = v.diwr.unwrap_or_default();
-    // S:'$L(X) X=" "   [28]
+    // S:'$L(X) X=" "   [DIWP.m:28]
     let mut x = v.x.clone().unwrap_or_default();
     if x.is_empty() {
         x = " ".to_string();
     }
-    // S DIWTC=X contains $C(124)_"TAB" S:'$D(DN) DN=1   [29]
+    // S DIWTC=X contains $C(124)_"TAB" S:'$D(DN) DN=1   [DIWP.m:29]
     if contains(&x, "|TAB") {
         return Err(unsupported("PO-15.b3"));
     }
@@ -1518,23 +1497,23 @@ fn diwp(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
         v.dn = Some("1".to_string());
     }
     // LN S:'$D(DIWF) DIWF="" S:'DIWTC DIWTC=DIWF contains "N" S DIWX=X,DIW=$C(124),
-    //  I=$P(DIWF,"C",2) I I S DIWR=DIWL+I-1   [30]
+    //  I=$P(DIWF,"C",2) I I S DIWR=DIWL+I-1   [DIWP.m:30]
     if !v.diwf.get_or_insert_with(String::new).is_empty() {
         return Err(unsupported("PO-15.b3"));
     }
-    // A "|" in DIWX opens a window [37-41]
+    // A "|" in DIWX opens a window [DIWP.m:37-41]
     if contains(&x, "|") {
         return Err(unsupported("PO-15.b2"));
     }
     let diwx = x.clone();
     // I '$D(^UTILITY($J,"W",DIWL)) S ^(DIWL)=1 K DIWFU,DIWFWU,DIWLL D DIWI
-    //  S:'$D(DIWT) DIWT="5,10,15,20,25" G DIW   [31]
+    //  S:'$D(DIWT) DIWT="5,10,15,20,25" G DIW   [DIWP.m:31]
     let mut diwi = String::new();
     if let Some(&count) = v.utility_w_counts.get(&diwl) {
-        // S I=^(DIWL),DIWI=^(DIWL,I,0) I DIWI="" D DIWI G Z   [32]
-        // D NEW:DIWTC   [33]: DIWTC is 0 here
+        // S I=^(DIWL),DIWI=^(DIWL,I,0) I DIWI="" D DIWI G Z   [DIWP.m:32]
+        // D NEW:DIWTC   [DIWP.m:33]: DIWTC is 0 here
         diwi = wrap_line(&v.utility_w_lines, diwl, count);
-        // Z S Z=X?.P!DIWTC I X?1" ".E!Z S DIWTC=1 D NEW:DIWI]"" S DIWTC=Z   [34]
+        // Z S Z=X?.P!DIWTC I X?1" ".E!Z S DIWTC=1 D NEW:DIWI]"" S DIWTC=Z   [DIWP.m:34]
         let z = x.chars().all(m_punctuation) || diwtc;
         if x.starts_with(' ') || z {
             if follows(&diwi, "") {
@@ -1548,11 +1527,11 @@ fn diwp(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
             v.diwt = Some(DEFAULT_TAB_STOPS.to_string());
         }
     }
-    // DIW I DIWF contains "X" ...   [36]: no X flag
-    //  S X=$P(DIWX,DIW,1) D C:X]"" S X=$P(DIWX,DIW,1),DIWX=$P(DIWX,DIW,2,9999) G D:DIWX=""   [37]
+    // DIW I DIWF contains "X" ...   [DIWP.m:36]: no X flag
+    //  S X=$P(DIWX,DIW,1) D C:X]"" S X=$P(DIWX,DIW,1),DIWX=$P(DIWX,DIW,2,9999) G D:DIWX=""   [DIWP.m:37]
     wrap_text(v, diwl, diwr, &mut diwi, diwtc, x);
     v.x = Some(diwx);
-    // D K DIWP D PUT,PRE:DIWTC S:DIWTC DIWI="" Q   [43]
+    // D K DIWP D PUT,PRE:DIWTC S:DIWTC DIWI="" Q   [DIWP.m:43]
     wrap_put(v, diwl, &diwi);
     if diwtc {
         wrap_pre(v, diwl);
@@ -1599,7 +1578,7 @@ fn dis_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     let d0 = v.d0.clone().unwrap_or_default();
     let prchd0 = v.prchd0.clone().unwrap_or_default();
     let prchd1 = v.prchd1.clone().unwrap_or_default();
-    // DIS W !,"DELIVER ON/BEFORE " S Y=$P(PRCHD0,U,10) D DT W ?29,"|","CONTRACT: "   [58]
+    // DIS W !,"DELIVER ON/BEFORE " S Y=$P(PRCHD0,U,10) D DT W ?29,"|","CONTRACT: "   [PRCHDP1.m:58]
     s.nl();
     s.write("DELIVER ON/BEFORE ");
     v.y = Some(piece(&prchd0, "^", 10).to_string());
@@ -1607,7 +1586,7 @@ fn dis_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     s.tab(29);
     s.write("|");
     s.write("CONTRACT: ");
-    //  S Y=+$P(PRCHD1,U,10),Y=$P($G(^VA(200,Y,0)),U,1) W ?57,"|  ",$P(Y,",",2)," ",$P(Y,",",1)   [59]
+    //  S Y=+$P(PRCHD1,U,10),Y=$P($G(^VA(200,Y,0)),U,1) W ?57,"|  ",$P(Y,",",2)," ",$P(Y,",",1)   [PRCHDP1.m:59]
     let agent = num(piece(&prchd1, "^", 10));
     let person = st.get_or_empty(&key("VA", &["200", &agent, "0"]));
     let name = piece(&person, "^", 1).to_string();
@@ -1617,14 +1596,13 @@ fn dis_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     s.write(" ");
     s.write(piece(&name, ",", 1));
     v.y = Some(name);
-    //  W !,"DISCOUNT TERM: " S X=0 I $D(^PRC(442,D0,5,0)) F I=1:1:2 ...   [60]
+    //  W !,"DISCOUNT TERM: " S X=0 I $D(^PRC(442,D0,5,0)) F I=1:1:2 ...   [PRCHDP1.m:60]
     s.nl();
     s.write("DISCOUNT TERM: ");
     v.x = Some("0".to_string());
     if st.data(&key("PRC", &["442", &d0, "5", "0"])) != 0 {
         return Err(unsupported("PO-18.b2"));
     }
-    // CON ... (fall-through)
     con_prchdp1(s, st, v)
 }
 
@@ -1652,8 +1630,8 @@ fn dt_prchdp1(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> 
 fn con_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     let d0 = v.d0.clone().unwrap_or_default();
     // CON K Y S X=0 F I=1:1:3 S:(X'="") X=$O(^PRC(442,D0,2,"AC",X)) D:X'=""  D:I=2 APP W ?29,"|"
-    //  W:$D(Y) ?38,... W:X'="" ?41,X W ?57,"|" D DAT:I=1,EST:I=2,TOT:I=3 W ! K Y   [61]
-    //  .S:$D(^(X)) Y=$O(^(X,0))   [62]
+    //  W:$D(Y) ?38,... W:X'="" ?41,X W ?57,"|" D DAT:I=1,EST:I=2,TOT:I=3 W ! K Y   [PRCHDP1.m:61]
+    //  .S:$D(^(X)) Y=$O(^(X,0))   [PRCHDP1.m:62]
     v.y = None;
     let contracts = key("PRC", &["442", &d0, "2", "AC"]);
     let mut x = "0".to_string();
@@ -1686,9 +1664,7 @@ fn con_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
         s.nl();
         v.y = None;
     }
-    // F I=1:1:80 W "-"   [63]
     s.write(&"-".repeat(80));
-    // G ^PRCHDP2   [64]
     prchdp2(s, st, v)
 }
 
@@ -1731,7 +1707,6 @@ fn est_prchdp1(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
 /// PO-24 `TOT^PRCHDP1` [PRCHDP1.m:67]: the order total (field 91) as
 /// `$J(total,8,2)`.
 fn tot_prchdp1(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
-    // TOT W "TOTAL: ",$J($P(PRCHD0,U,15),8,2) Q
     s.write("TOTAL: ");
     s.write(&justify(
         piece(v.prchd0.as_deref().unwrap_or(""), "^", 15),
@@ -1749,13 +1724,13 @@ fn tot_prchdp1(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>
 /// each line item and the estimated-shipping line; then `G COM` (PO-31).
 fn prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     let d0 = v.d0.clone().unwrap_or_default();
-    // N PRCHAMNT,PRCHAMCT S PRCHAMNT=0 I $D(^PRC(442,D0,6,0)) S PRCHAMCT=$P(^PRC(442,D0,6,0),U,3),PRCHAMNT=1   [9]
+    // N PRCHAMNT,PRCHAMCT S PRCHAMNT=0 I $D(^PRC(442,D0,6,0)) S PRCHAMCT=$P(^PRC(442,D0,6,0),U,3),PRCHAMNT=1   [PRCHDP2.m:9]
     // (PRCHAMCT is read only by the amendment code, PO-33.b2.)
     v.prchamnt = Some("0".to_string());
     if defined(st, &key("PRC", &["442", &d0, "6", "0"]))?.is_some() {
         v.prchamnt = Some("1".to_string());
     }
-    // W !?8,"ENTER '^' TO HALT: " S PRCHDQ=0 R X:DTIME S:X contains "^" PRCHDQ=1 G ASK2:PRCHDQ D HDR   [10]
+    // W !?8,"ENTER '^' TO HALT: " S PRCHDQ=0 R X:DTIME S:X contains "^" PRCHDQ=1 G ASK2:PRCHDQ D HDR   [PRCHDP2.m:10]
     s.nl();
     s.tab(8);
     s.write("ENTER '^' TO HALT: ");
@@ -1768,7 +1743,7 @@ fn prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     }
     hdr_prchdp2(s, st, v)?;
     // S (N,PRCHDI)=0 F I=0:0 S PRCHDI=$O(^PRC(442,D0,2,PRCHDI)) Q:PRCHDI'>0  S PRCHDI0=^(PRCHDI,0),
-    //  PRCHDI2=$S($D(^(2)):^(2),1:""),N=+PRCHDI0 D ITEM G:PRCHDQ ASK2   [11]
+    //  PRCHDI2=$S($D(^(2)):^(2),1:""),N=+PRCHDI0 D ITEM G:PRCHDQ ASK2   [PRCHDP2.m:11]
     // ^(PRCHDI,0) is ^PRC(442,D0,2,PRCHDI,0), read unguarded; ^(2) is ^PRC(442,D0,2,PRCHDI,2).
     v.n = Some("0".to_string());
     let items = key("PRC", &["442", &d0, "2"]);
@@ -1803,12 +1778,12 @@ fn prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     if !any_item {
         return Err(unsupported("PO-25.b3"));
     }
-    // S PRCHDI=0 F I=0:0 S PRCHDI=$O(^PRC(442,D0,3,PRCHDI)) Q:PRCHDI'>0  ... D DIS   [12]
+    // S PRCHDI=0 F I=0:0 S PRCHDI=$O(^PRC(442,D0,3,PRCHDI)) Q:PRCHDI'>0  ... D DIS   [PRCHDP2.m:12]
     if first_after_zero(st, &key("PRC", &["442", &d0, "3"])).is_some_and(|sub| positive(sub.text()))
     {
         return Err(unsupported("PO-25.b5"));
     }
-    // I $P(PRCHD0,U,13)>0 W !?2,$J(N+1,3),?7,"EST. SHIPPING AND/OR HANDLING",?58,$J($P(PRCHD0,U,13),7,2)   [13]
+    // I $P(PRCHD0,U,13)>0 W !?2,$J(N+1,3),?7,"EST. SHIPPING AND/OR HANDLING",?58,$J($P(PRCHD0,U,13),7,2)   [PRCHDP2.m:13]
     let shipping = piece(v.prchd0.as_deref().unwrap_or(""), "^", 13).to_string();
     if positive(&shipping) {
         let line = add(v.n.as_deref().unwrap_or(""), "1");
@@ -1820,7 +1795,7 @@ fn prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         s.tab(58);
         s.write(&justify(&shipping, 7, Some(2)));
     }
-    // G:'$D(^PRC(442,D0,15,0)) COM ...   [14-18]
+    // G:'$D(^PRC(442,D0,15,0)) COM ...   [PRCHDP2.m:14-18]
     if st.data(&key("PRC", &["442", &d0, "15", "0"])) != 0 {
         return Err(unsupported("PO-25.b7"));
     }
@@ -1848,20 +1823,19 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
     let item = v.prchdi.clone().unwrap_or_default();
     let item0 = v.prchdi0.clone().unwrap_or_default();
     let item2 = v.prchdi2.clone().unwrap_or_default();
-    // ITEM S DIWL=1,DIWR=33,DIWF="",PRCHDIW=0 K ^UTILITY($J,"W")   [44]
+    // ITEM S DIWL=1,DIWR=33,DIWF="",PRCHDIW=0 K ^UTILITY($J,"W")   [PRCHDP2.m:44]
     v.diwl = Some(1);
     v.diwr = Some(33);
     v.diwf = Some(String::new());
     v.utility_w_counts.clear();
     v.utility_w_lines.clear();
-    //  N PURCTYPE,PURPIPE,PRCHI,PRCHJ S:$P($G(^PRC(442,D0,23)),"^",11)="S" PURCTYPE=1   [45]
+    //  N PURCTYPE,PURPIPE,PRCHI,PRCHJ S:$P($G(^PRC(442,D0,23)),"^",11)="S" PURCTYPE=1   [PRCHDP2.m:45]
     let caller_purpipe = v.purpipe.take();
     let node23 = st.get_or_empty(&key("PRC", &["442", &d0, "23"]));
     let purchase_card = piece(&node23, "^", 11) == "S";
-    //  D PIPECK S PRCHDIW=0   [46]
     pipeck_prchdp2(s, st, v)?;
     //  F PRCHJ=1:1 S PRCHDIW=$O(^PRC(442,D0,2,PRCHDI,1,PRCHDIW)) Q:PRCHDIW'>0  S X=$S($D(^(PRCHDIW,0)):^(0),1:"")
-    //   S:PURPIPE DIWF=$G(DIWF)_"|"  D DIWP^PRCUTL($G(DA))   [47]
+    //   S:PURPIPE DIWF=$G(DIWF)_"|"  D DIWP^PRCUTL($G(DA))   [PRCHDP2.m:47]
     // ^(PRCHDIW,0) and ^(0) are ^PRC(442,D0,2,PRCHDI,1,PRCHDIW,0).
     let description = key("PRC", &["442", &d0, "2", &item, "1"]);
     let mut line = Sub::from_text("0");
@@ -1884,11 +1858,11 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
     if !any_line {
         return Err(unsupported("PO-27.b2"));
     }
-    //  K ^TMP($J,"W") S %X="^UTILITY($J,""W"",",%Y="^TMP($J,""W""," D %XY^%RCR   [48]
+    //  K ^TMP($J,"W") S %X="^UTILITY($J,""W"",",%Y="^TMP($J,""W""," D %XY^%RCR   [PRCHDP2.m:48]
     v.tmp_w_counts.clear();
     v.tmp_w_lines.clear();
     pct_xy_pct_rcr(s, st, v)?;
-    //  S PRCHDCNT=$S($D(^TMP($J,"W",1)):^(1),1:"") W ! I $G(PURCTYPE)="" W ?2,$J(+$P(PRCHDI0,U,1),3)   [49]
+    //  S PRCHDCNT=$S($D(^TMP($J,"W",1)):^(1),1:"") W ! I $G(PURCTYPE)="" W ?2,$J(+$P(PRCHDI0,U,1),3)   [PRCHDP2.m:49]
     let count = v
         .tmp_w_counts
         .get(&1)
@@ -1900,10 +1874,10 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
         s.tab(2);
         s.write(&justify(&num(piece(&item0, "^", 1)), 3, None));
     }
-    //  W ?7,$S($D(^(1,1,0)):^(0),1:"")   [50]; ^(1,1,0) is ^TMP($J,"W",1,1,0)
+    //  W ?7,$S($D(^(1,1,0)):^(0),1:"")   [PRCHDP2.m:50]; ^(1,1,0) is ^TMP($J,"W",1,1,0)
     s.tab(7);
     s.write(&wrap_line(&v.tmp_w_lines, 1, 1));
-    //  I $G(PURCTYPE)="" W ?40,$J($P(PRCHDI0,U,2),5),?47,$S($D(^PRCD(420.5,+$P(PRCHDI0,U,3),0)):$P(^(0),U,1),1:"")   [51]
+    //  I $G(PURCTYPE)="" W ?40,$J($P(PRCHDI0,U,2),5),?47,$S($D(^PRCD(420.5,+$P(PRCHDI0,U,3),0)):$P(^(0),U,1),1:"")   [PRCHDP2.m:51]
     let unit = key("PRCD", &["420.5", &num(piece(&item0, "^", 3)), "0"]);
     if !purchase_card {
         s.tab(40);
@@ -1914,7 +1888,7 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
         }
     }
     //  S X=$P($P(PRCHDI0,U,9),".",2) I $G(PURCTYPE)="" W ?52,$S($L(X)>3:$J($P(PRCHDI0,U,9),5,4),
-    //   $L(X)>2:$J($P(PRCHDI0,U,9),6,3),$P(PRCHDI0,U,9)="N/C":"    N/C",1:$J($P(PRCHDI0,U,9),7,2))   [52]
+    //   $L(X)>2:$J($P(PRCHDI0,U,9),6,3),$P(PRCHDI0,U,9)="N/C":"    N/C",1:$J($P(PRCHDI0,U,9),7,2))   [PRCHDP2.m:52]
     let cost = piece(&item0, "^", 9);
     let fraction = piece(cost, ".", 2).to_string();
     let decimals = fraction.chars().count();
@@ -1932,19 +1906,19 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
         s.tab(52);
         s.write(&shown);
     }
-    //  W ?67,$J($P(PRCHDI2,U,1),7,2)   [53]
+    //  W ?67,$J($P(PRCHDI2,U,1),7,2)   [PRCHDP2.m:53]
     s.tab(67);
     s.write(&justify(piece(&item2, "^", 1), 7, Some(2)));
-    //  I PRCHDCNT>1 S K=1 F  S K=$O(^TMP($J,"W",1,K)) Q:K=""!(K'>0)  D:$Y+5>IOSL ASK Q:PRCHDQ  W !?8,^(K,0)   [54]
+    //  I PRCHDCNT>1 S K=1 F  S K=$O(^TMP($J,"W",1,K)) Q:K=""!(K'>0)  D:$Y+5>IOSL ASK Q:PRCHDQ  W !?8,^(K,0)   [PRCHDP2.m:54]
     if num_cmp(&count, "1") == Ordering::Greater {
         return Err(unsupported("PO-27.b3"));
     }
-    //  Q:PRCHDQ   [55]
+    //  Q:PRCHDQ   [PRCHDP2.m:55]
     if truthy(v.prchdq.as_deref().unwrap_or("")) {
         return Err(unsupported("PO-27.b4"));
     }
     //  W:$P(PRCHDI0,U,6)]"" !?8,"STK#: ",$P(PRCHDI0,U,6) W:$P(PRCHDI0,U,13)]"" !,?8,"NSN:  ",$P(PRCHDI0,U,13)
-    //  W:$P($G(^PRC(442,D0,2,PRCHDI,4)),U,12)]"" !,?8,"FOOD GROUP: ",$P(^(4),U,12)   [56]
+    //  W:$P($G(^PRC(442,D0,2,PRCHDI,4)),U,12)]"" !,?8,"FOOD GROUP: ",$P(^(4),U,12)   [PRCHDP2.m:56]
     let node4 = st.get_or_empty(&key("PRC", &["442", &d0, "2", &item, "4"]));
     for (label, value) in [
         ("STK#: ", piece(&item0, "^", 6)),
@@ -1959,7 +1933,7 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
         }
     }
     //  W:$P(PRCHDI2,U,8)]"" !,?8,"QTY PREV RCVD: ",$J($P(PRCHDI2,U,8),5)
-    //  I $D(^PRC(442,D0,2,PRCHDI,3,"AC")) W !,?8,"PARTIAL NO.: " ...   [57]
+    //  I $D(^PRC(442,D0,2,PRCHDI,3,"AC")) W !,?8,"PARTIAL NO.: " ...   [PRCHDP2.m:57]
     let received = piece(&item2, "^", 8);
     if follows(received, "") {
         s.nl();
@@ -1970,11 +1944,10 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
     if st.data(&key("PRC", &["442", &d0, "2", &item, "3", "AC"])) != 0 {
         return Err(unsupported("PO-27.b5"));
     }
-    //  N ZZ S ZZ=0 D EDISTAT^PRCHUTL(D0,PRCHDI,.ZZ)   [58]
     let mut zz = "0".to_string();
     edistat_prchutl(s, st, v, &d0, &item, &mut zz)?;
     //  I $G(PURCTYPE)="",$P(PRCHDI0,U,12) W:'ZZ ! W ?8,"Items per ",
-    //   $S($D(^PRCD(420.5,+$P(PRCHDI0,U,3),0)):$P(^(0),U,1),1:""),": ",$P(PRCHDI0,U,12),!   [59]
+    //   $S($D(^PRCD(420.5,+$P(PRCHDI0,U,3),0)):$P(^(0),U,1),1:""),": ",$P(PRCHDI0,U,12),!   [PRCHDP2.m:59]
     let multiple = piece(&item0, "^", 12);
     if !purchase_card && truthy(multiple) {
         if !truthy(&zz) {
@@ -1989,13 +1962,11 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
         s.write(multiple);
         s.nl();
     }
-    //  D ASK   [60]
     ask_prchdp2(s, st, v)?;
-    //  W:$X>1 !   [61]
     if s.x() > 1 {
         s.nl();
     }
-    //  W ?8,"BOC: ",$P($P(PRCHDI0,U,4)," ",1) S FMSLN=$O(^PRC(442,D0,22,"B",+$P(PRCHDI0,U,4),0))   [62]
+    //  W ?8,"BOC: ",$P($P(PRCHDI0,U,4)," ",1) S FMSLN=$O(^PRC(442,D0,22,"B",+$P(PRCHDI0,U,4),0))   [PRCHDP2.m:62]
     let boc = piece(&item0, "^", 4);
     s.tab(8);
     s.write("BOC: ");
@@ -2005,7 +1976,7 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
         .map(|sub| sub.text().to_string())
         .unwrap_or_default();
     //  I FMSLN>0,'$P($G(^PRC(442,D0,23)),U,8) S FMSLN="00"_$P($G(^PRC(442,D0,22,FMSLN,0)),U,3),
-    //   FMSLN=$E(FMSLN,$L(FMSLN)-2,99) W ?22,"FMS LINE: ",FMSLN   [63]
+    //   FMSLN=$E(FMSLN,$L(FMSLN)-2,99) W ?22,"FMS LINE: ",FMSLN   [PRCHDP2.m:63]
     if positive(&fms_line) && !truthy(piece(&node23, "^", 8)) {
         let entry = st.get_or_empty(&key("PRC", &["442", &d0, "22", &fms_line, "0"]));
         let padded = format!("00{}", piece(&entry, "^", 3));
@@ -2013,16 +1984,15 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
         s.write("FMS LINE: ");
         s.write(&extract(&padded, char_len(&padded) - 2, 99));
     }
-    //  W:$P(PRCHDI2,U,2)]"" ?40,"CONTRACT: ",$P(PRCHDI2,U,2)   [64]
+    //  W:$P(PRCHDI2,U,2)]"" ?40,"CONTRACT: ",$P(PRCHDI2,U,2)   [PRCHDP2.m:64]
     let contract = piece(&item2, "^", 2);
     if follows(contract, "") {
         s.tab(40);
         s.write("CONTRACT: ");
         s.write(contract);
     }
-    //  W !   [65]
     s.nl();
-    //  Q   [66]: the NEW of line 45 ends
+    //  Q   [PRCHDP2.m:66]: the NEW [PRCHDP2.m:45] ends
     v.purpipe = caller_purpipe;
     Ok(())
 }
@@ -2085,9 +2055,9 @@ fn edistat_prchutl(
     d1: &str,
     _linecnt: &mut String,
 ) -> Result<(), Halt> {
-    // EDISTAT(D0,D1,LINECNT) N X,Y,C S:'$D(LINECNT) LINECNT=0   [65-72]
-    //  I $D(^PRC(442,D0,2,D1,2)) S X=$P(^(2),"^",9,12) D   [73]
-    //  .I $P(X,"^",1)=""&($P(X,"^",3)="") Q   [74]
+    // EDISTAT(D0,D1,LINECNT) N X,Y,C S:'$D(LINECNT) LINECNT=0   [PRCHUTL.m:65-72]
+    //  I $D(^PRC(442,D0,2,D1,2)) S X=$P(^(2),"^",9,12) D   [PRCHUTL.m:73]
+    //  .I $P(X,"^",1)=""&($P(X,"^",3)="") Q   [PRCHUTL.m:74]
     let Some(node2) = defined(st, &key("PRC", &["442", d0, "2", d1, "2"]))? else {
         return Err(unsupported("PO-29.b1"));
     };
@@ -2129,18 +2099,17 @@ fn com_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
 /// into `ASK2` (PO-34).
 fn pt_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     let d0 = v.d0.clone().unwrap_or_default();
-    // PT I $O(^PRC(442,D0,13,0)) W !!?8,"V.A. TRANSACTION NUMBERS: " ...   [22]
+    // PT I $O(^PRC(442,D0,13,0)) W !!?8,"V.A. TRANSACTION NUMBERS: " ...   [PRCHDP2.m:22]
     if first_after_zero(st, &key("PRC", &["442", &d0, "13"])).is_some_and(|sub| truthy(sub.text()))
     {
         return Err(unsupported("PO-32.b2"));
     }
-    //  D AMENDS^PRCHDP6   [23]
     amends_prchdp6(s, st, v)?;
-    //  I $D(^PRC(442,D0,6,0)) F PRCHI=0:0 ...   [24]
+    //  I $D(^PRC(442,D0,6,0)) F PRCHI=0:0 ...   [PRCHDP2.m:24]
     if st.data(&key("PRC", &["442", &d0, "6", "0"])) != 0 {
         return Err(unsupported("PO-32.b3"));
     }
-    //  K ^TMP($J,"PRCHDP6")   [25]: only the amendment history (PO-33.b2) builds that scratch.
+    //  K ^TMP($J,"PRCHDP6")   [PRCHDP2.m:25]: only the amendment history (PO-33.b2) builds that scratch.
     // ASK2 ... (fall-through)
     ask2_prchdp2(s, st, v)
 }
@@ -2179,16 +2148,13 @@ fn ask2_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
 /// `PRCHQUIT=0`, are read only by the schedule print, which no order without
 /// a schedule reaches.
 fn en_prchdp4(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
-    // EN ;ONLINE DISPLAY OF DELIVERY SCHEDULE
-    //  S PRCHONL=1,PRCHQUIT=0
-    // EN2 ... (fall-through)
     en2_prchdp4(s, st, v)
 }
 
 /// PO-36 `EN2^PRCHDP4` [PRCHDP4.m:7-11]: the delivery schedule filed under
 /// the order number in `^PRC(442.8,"B")`; with none, `G EXDELV` (PO-37).
 fn en2_prchdp4(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
-    // EN2 ... Q:'$D(D0)  S PRCHPONO=$P(^PRC(442,D0,0),U,1),PRCHQUIT="" G:PRCHPONO="" EXDELV K ^TMP($J,"MDEL")   [8]
+    // EN2 ... Q:'$D(D0)  S PRCHPONO=$P(^PRC(442,D0,0),U,1),PRCHQUIT="" G:PRCHPONO="" EXDELV K ^TMP($J,"MDEL")   [PRCHDP4.m:8]
     // ^PRC(442,D0,0) is read unguarded.
     let d0 = v.d0.clone().unwrap_or_default();
     let zero = key("PRC", &["442", &d0, "0"]);
@@ -2199,18 +2165,17 @@ fn en2_prchdp4(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     if number.is_empty() {
         return Err(unsupported("PO-36.b2"));
     }
-    //  F PRCHI=0:0 S PRCHI=$O(^PRC(442.8,"B",PRCHPONO,PRCHI)) Q:'PRCHI  I $D(^PRC(442.8,PRCHI,0)) S Y(0)=^(0) D BLD   [9]
+    //  F PRCHI=0:0 S PRCHI=$O(^PRC(442.8,"B",PRCHPONO,PRCHI)) Q:'PRCHI  I $D(^PRC(442.8,PRCHI,0)) S Y(0)=^(0) D BLD   [PRCHDP4.m:9]
     let schedule = key("PRC", &["442.8", "B", number]);
     if first_after_zero(st, &schedule).is_some_and(|sub| truthy(sub.text())) {
         return Err(unsupported("PO-36.b3"));
     }
-    //  G:'$D(^TMP($J,"MDEL")) EXDELV   [10]: only BLD fills that scratch
+    //  G:'$D(^TMP($J,"MDEL")) EXDELV   [PRCHDP4.m:10]: only BLD fills that scratch
     exdelv_prchdp4(s, st, v)
 }
 
 /// PO-37 `EXDELV^PRCHDP4` [PRCHDP4.m:13-14]: a newline, then the kills.
 fn exdelv_prchdp4(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
-    // EXDELV W ! K ^TMP($J,"MDEL"),PRCHI,PRCHONL,PRCHPONO,PRCHQUIT,PRCHX,PRCHY,PRCHZ,I,J,K,X,Y,Z,L
     s.nl();
     v.x = None;
     v.y = None;
@@ -2220,11 +2185,11 @@ fn exdelv_prchdp4(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Ha
 /// PO-38 `ASK1^PRCHDP2` [PRCHDP2.m:33-41]: the closing prompt, whose answer
 /// is not used; then `G Q` (PO-39).
 fn ask1_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
-    // ASK1 I $G(PRCHAMNT)=2 D  ...   [33-40]
+    // ASK1 I $G(PRCHAMNT)=2 D  ...   [PRCHDP2.m:33-40]
     if v.prchamnt.as_deref() == Some("2") {
         return Err(unsupported("PO-38.b1"));
     }
-    //  W !,$C(7) G:PRCHDQ Q W "END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: " R X:DTIME G Q   [41]
+    //  W !,$C(7) G:PRCHDQ Q W "END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: " R X:DTIME G Q   [PRCHDP2.m:41]
     s.nl();
     s.bell();
     if truthy(v.prchdq.as_deref().unwrap_or("")) {
@@ -2238,9 +2203,6 @@ fn ask1_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
 /// PO-39 `Q^PRCHDP2` [PRCHDP2.m:94-95]: kills the display's locals and
 /// scratch. Its `W @IOF` is commented out, so it writes nothing.
 fn q_prchdp2(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
-    // Q ;W @IOF  ;REMOVE IF PROBLEM WITH KERNEL V6.5
-    //  K I,J,K,N,DIC,DIWF,DIWL,DIWR,IOP,PRCHDI,PRCHD0,PRCHD1,PRCHFTYP,PRCHDSIT,PRCHDHSP,PRCHDSHP,PRCHDST,
-    //   PRCHDS,PRCHDV,PRCHDQ,PRCHDI0,PRCHDI2,PRCHDIW,PRCHDCNT,PRCHI,PRCHJ,PRCHK,S,V,^TMP($J,"W"),^UTILITY($J,"W"),KK,JJ Q
     v.n = None;
     v.dic_a = None;
     v.dic_b = None;
@@ -2274,8 +2236,6 @@ fn q_prchdp2(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> 
 /// display, including `PRCHNRQ`, so the next order's label is decided
 /// afresh.
 fn k_prchrpt(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
-    // K K DEFPNT,ZTSK,ZTSAVE,ZTDTH,ZTRTN,PRCHREPR,PRCHNRQ,OK,PL,PRCHQ
-    //  K X,Y,I
     v.prchnrq = None;
     v.x = None;
     v.y = None;
@@ -2354,7 +2314,10 @@ mod tests {
         })
     }
 
-    /// `Locals` as `EN30` leaves them for order 1 of [`ORDER_FILE`].
+    /// `Locals` for order 1 of [`ORDER_FILE`], for tests that call a display contract
+    /// directly: `PRC("SITE")` from the station prompt [PRCFSITE.m:18], `PRCHPO` and `DA`
+    /// from the order lookup [PRCHPAT.m:83], `D0` from `EN30^PRCHRPT` [PRCHRPT.m:74], and
+    /// the `PRCHD0` and `PRCHD1` nodes `^PRCHDP1` loads [PRCHDP1.m:4].
     fn order_locals(store: &Store) -> Locals {
         Locals {
             prc_site: Some("500".to_string()),

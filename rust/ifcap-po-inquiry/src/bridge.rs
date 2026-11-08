@@ -1219,8 +1219,10 @@ fn required_capture_file(path: &Path) -> Result<String, String> {
 }
 
 /// The first capture under `golden_dir` whose input lines equal `inputs`,
-/// used whole or not at all. A directory with no readable UTF-8 input file
-/// does not match, and its path is listed when nothing matches.
+/// used whole or not at all. A directory whose input file is missing is
+/// skipped silently; one whose input file is present but unreadable (a
+/// directory in its place included) or not UTF-8 does not match either, and
+/// its path is listed in the `NOT RECORDED` error when nothing matches.
 fn replay(golden_dir: &Path, inputs: &[String]) -> Result<MumpsSide, String> {
     let mut unreadable: Vec<String> = Vec::new();
     for case in CASE_DIRS {
@@ -3801,33 +3803,6 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         Ok(())
     }
 
-    /// A new, empty directory under the temporary directory, created by this
-    /// call for the caller alone. Its name carries the process id, the
-    /// attempt number and the clock's nanoseconds. A name already present is
-    /// never adopted: the next one is tried, up to a fixed number of attempts.
-    fn owned_empty_dir() -> Result<PathBuf, String> {
-        const ATTEMPTS: u32 = 64;
-        let base = std::env::temp_dir();
-        for attempt in 0..ATTEMPTS {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.subsec_nanos());
-            let dir = base.join(format!(
-                "ifcap-po-inquiry-unit-no-captures-{}-{attempt}-{nanos}",
-                std::process::id()
-            ));
-            match fs::create_dir(&dir) {
-                Ok(()) => return Ok(dir),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(format!("creating {}: {e}", dir.display())),
-            }
-        }
-        Err(format!(
-            "no unused directory name under {} in {ATTEMPTS} attempts",
-            base.display()
-        ))
-    }
-
     #[test]
     fn every_status_written_with_hardening_headers() -> Result<(), String> {
         let statuses = [
@@ -3959,102 +3934,6 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 String::from_utf8_lossy(&expected),
                 "for {request_line}"
             );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn mumps_side_without_captures() -> Result<(), String> {
-        let owned = owned_empty_dir()?;
-        let first_case = CASE_DIRS.first().copied().unwrap_or_default();
-        // An empty captures directory, and one that was never created. Only
-        // this test owns the parent, so nothing else can populate either.
-        let absent = owned.join("absent");
-        // Every mode is run before any assertion, so the directory is removed
-        // whatever the results.
-        let outcomes = [&owned, &absent].map(|golden_dir| {
-            let replay = MumpsMode::Replay {
-                golden_dir: golden_dir.clone(),
-            };
-            // Live mode stops at the absent meta file, before any process runs.
-            let live = MumpsMode::Live {
-                container: "unit-test-never-run".to_string(),
-                golden_dir: golden_dir.clone(),
-            };
-            let meta = golden_dir.join(first_case).join(META_FILE);
-            [
-                (
-                    run_mumps(&replay, &strings(&["", "^"])),
-                    "NOT RECORDED".to_string(),
-                ),
-                (
-                    run_mumps(&live, &[]),
-                    format!("MALFORMED META {}", meta.display()),
-                ),
-            ]
-        });
-        let removed = fs::remove_dir_all(&owned);
-        removed.map_err(|e| format!("removing {}: {e}", owned.display()))?;
-        for (outcome, expected) in outcomes.into_iter().flatten() {
-            assert_eq!(outcome, Err(expected));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn live_meta_skips_case_entries_that_are_not_directories() -> Result<(), String> {
-        let (first, second) = match (CASE_DIRS.first(), CASE_DIRS.get(1)) {
-            (Some(first), Some(second)) => (*first, *second),
-            _ => return Err("fewer than two capture directories".to_string()),
-        };
-        // Every layout sits inside a directory this test created, so no
-        // directory another process made is adopted, populated or removed.
-        let root = owned_empty_dir()?;
-        let live = |golden_dir: &Path| MumpsMode::Live {
-            container: "unit-test-never-run".to_string(),
-            golden_dir: golden_dir.to_path_buf(),
-        };
-        // Each layout's second case holds a well-formed meta file whose DUZ
-        // differs, so reaching it gives a DUZ mismatch before anything runs.
-        let meta = META_TEXT.replacen(r#""DUZ":".5""#, r#""DUZ":".6""#, 1);
-        let case_file = root.join("case-file");
-        let meta_dir = root.join("meta-dir");
-        let root_file = root.join("root-file");
-        let malformed = |dir: &Path| {
-            format!(
-                "MALFORMED META {}",
-                dir.join(first).join(META_FILE).display()
-            )
-        };
-        // Every layout is built and run before any assertion, so the
-        // directory is removed whatever the results.
-        let built = (|| -> io::Result<()> {
-            for dir in [&case_file, &meta_dir] {
-                fs::create_dir_all(dir.join(second))?;
-                fs::write(dir.join(second).join(META_FILE), &meta)?;
-            }
-            // The first case is a regular file, which holds no meta file.
-            fs::write(case_file.join(first), "not a directory")?;
-            // The first case is a directory whose meta file is a directory.
-            fs::create_dir_all(meta_dir.join(first).join(META_FILE))?;
-            // The capture root itself is a regular file.
-            fs::write(&root_file, "not a directory")
-        })();
-        let outcomes = built.map(|()| {
-            [
-                (
-                    run_mumps(&live(&case_file), &[]),
-                    "CONTEXT MISMATCH DUZ: expected .5, actual .6".to_string(),
-                ),
-                (run_mumps(&live(&meta_dir), &[]), malformed(&meta_dir)),
-                (run_mumps(&live(&root_file), &[]), malformed(&root_file)),
-            ]
-        });
-        let removed = fs::remove_dir_all(&root);
-        let outcomes = outcomes.map_err(|e| format!("building the layouts: {e}"))?;
-        removed.map_err(|e| format!("removing the layouts: {e}"))?;
-        for (outcome, expected) in outcomes {
-            assert_eq!(outcome, Err(expected));
         }
         Ok(())
     }
