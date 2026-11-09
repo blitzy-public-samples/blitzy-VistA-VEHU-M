@@ -3949,6 +3949,16 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         }
     }
 
+    /// One `read`, retried on `Interrupted`.
+    fn read_some(stream: &mut TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match stream.read(buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                read => return read,
+            }
+        }
+    }
+
     /// Sends each chunk of `chunks` after its delay, then ends the output
     /// when `close` is set, and keeps `client` open until the server end
     /// closes or the client's read timeout passes.
@@ -3965,7 +3975,7 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             client.shutdown(Shutdown::Write)?;
         }
         let mut byte = [0u8; 1];
-        client.read(&mut byte).map(|_| ())
+        read_some(&mut client, &mut byte).map(|_| ())
     }
 
     #[test]
@@ -4699,7 +4709,7 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 .and_then(|()| waiting.set_read_timeout(Some(Duration::from_millis(500))))
                 .map_err(|e| fail("send the request", e))?;
             let mut buf = [0u8; 4096];
-            match waiting.read(&mut buf) {
+            match read_some(&mut waiting, &mut buf) {
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -4716,9 +4726,8 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             let freed = Instant::now();
             let mut received = Vec::new();
             while !received.windows(2).any(|pair| pair == b"\r\n") {
-                let n = waiting
-                    .read(&mut buf)
-                    .map_err(|e| fail("read the response", e))?;
+                let n =
+                    read_some(&mut waiting, &mut buf).map_err(|e| fail("read the response", e))?;
                 if n == 0 {
                     break;
                 }

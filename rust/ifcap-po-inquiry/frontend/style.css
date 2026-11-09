@@ -169,10 +169,19 @@ button,
   white-space: pre;
 }
 
+/* A row is as wide as its text plus half a column, and never narrower
+   than the box's 80 columns, so the scroll range ends half a column past
+   the last glyph. That outlasts the browser's whole-pixel rounding of the
+   scroll range and of the clip, so the last glyph's full edge scrolls
+   clear of a classic vertical scrollbar, while the box keeps its 80ch by
+   24-row size. */
 .ln {
   min-block-size: var(--lh);
   line-height: var(--lh);
   scroll-snap-align: start;
+  inline-size: max-content;
+  min-inline-size: 100%;
+  padding-inline-end: 0.5ch;
 }
 
 .cursor {
