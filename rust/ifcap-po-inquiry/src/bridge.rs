@@ -571,7 +571,11 @@ fn skip_prelude(bytes: &[u8]) -> &[u8] {
 /// the headers routing needs: the method, the target in origin-form (see
 /// [`origin_form`]), the `Content-Length` and whether `Expect: 100-continue`
 /// was sent; an HTTP/1.0 request's expectation counts as not sent
-/// (RFC 9110 10.1.1). Empty lines before the request line are ignored (see
+/// (RFC 9110 10.1.1). A target holding a byte other than visible ASCII or a
+/// `%` not followed by two hex digits, or an absolute-form target whose
+/// authority is not a host with an optional port, is an invalid request
+/// target, rejected before any header is read (RFC 9112 3.2, RFC 3986 2.1
+/// and 3.2.2). Empty lines before the request line are ignored (see
 /// [`skip_prelude`]). Every header value, those of ignored headers included,
 /// must be free of control bytes other than HTAB (see [`is_field_value`]).
 /// A request carries at most one `Host`, whose value must be a host (see
@@ -648,12 +652,20 @@ fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String
 
 /// The origin-form of a request target (RFC 9112 3.2): an origin-form
 /// target as sent, or an `http` absolute-form target reduced to its path
-/// and query, an empty path becoming `/` (RFC 9112 3.2.2). The scheme is
-/// matched without regard to case. The authority ends at the first `/`, `?`
-/// or `#` (RFC 3986 3.2) and takes no part in routing, but it must not be
-/// empty (RFC 9110 4.2.1) or carry userinfo (RFC 9110 4.2.4). `None` for
-/// any other target, such as `*` or another scheme.
+/// and query, an empty path becoming `/` (RFC 9112 3.2.2). The whole target,
+/// in either form, must be visible ASCII in which each `%` begins a
+/// percent-encoded octet (RFC 9112 3.2, RFC 3986 2.1); visible delimiters
+/// that browsers send raw, such as `|` or `[`, stay accepted (see
+/// [`is_target_text`]). The scheme is matched without regard to case. The
+/// authority ends at the first `/`, `?` or `#` (RFC 3986 3.2) and takes no
+/// part in routing, but it must be a host with an optional port, as a
+/// `Host` value is (see [`is_host`], RFC 3986 3.2.2 and 3.2.3), so it is
+/// never empty (RFC 9110 4.2.1) and never carries userinfo (RFC 9110
+/// 4.2.4). `None` for any other target, such as `*` or another scheme.
 fn origin_form(target: &str) -> Option<String> {
+    if !is_target_text(target) {
+        return None;
+    }
     if target.starts_with('/') {
         return Some(target.to_string());
     }
@@ -663,7 +675,7 @@ fn origin_form(target: &str) -> Option<String> {
     }
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, path_and_query) = rest.split_at_checked(authority_end)?;
-    if authority.is_empty() || authority.contains('@') {
+    if !is_host(authority) {
         return None;
     }
     if path_and_query.starts_with('/') {
@@ -671,6 +683,34 @@ fn origin_form(target: &str) -> Option<String> {
     } else {
         Some(format!("/{path_and_query}"))
     }
+}
+
+/// Request-target text: visible ASCII only, 0x21 to 0x7E, which covers
+/// every octet the request-target grammar admits (RFC 9112 3.2), so no
+/// control byte (HTAB, NUL and a CR or LF that does not end the line
+/// included), no DEL and no raw byte from 0x80 up; and each `%` followed by
+/// two hex digits (RFC 3986 2.1). A percent-encoded octet is never decoded,
+/// so `%00` or `%2e%2e` is routed as sent. Visible characters RFC 3986
+/// admits in a path or query only percent-encoded, such as `|`, `^`, `[`,
+/// `]`, `{` or `}`, are accepted and routed as sent, matching no route:
+/// browsers send several of them raw, since the WHATWG URL Standard's path
+/// and query percent-encode sets leave them unencoded.
+fn is_target_text(target: &str) -> bool {
+    let mut bytes = target.bytes();
+    while let Some(b) = bytes.next() {
+        let valid = if b == b'%' {
+            matches!(
+                (bytes.next(), bytes.next()),
+                (Some(high), Some(low)) if high.is_ascii_hexdigit() && low.is_ascii_hexdigit()
+            )
+        } else {
+            b.is_ascii_graphic()
+        };
+        if !valid {
+            return false;
+        }
+    }
+    true
 }
 
 /// An HTTP token: one or more `tchar`s (RFC 9110 5.6.2).
@@ -3705,8 +3745,20 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 String::from_utf8_lossy(head)
             );
         }
+        // Each origin-form target routed as sent: percent-encoded octets are
+        // never decoded, and visible characters RFC 3986 admits only encoded
+        // are left as they are.
+        let origin: [&str; 4] = ["/%00", "/%2e%2e/Cargo.toml", "/a|b", "/^[]{}?q=|\"<>`"];
+        for target in origin {
+            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            assert_eq!(
+                parse_head(head.as_bytes()),
+                Ok(("GET", target.to_string(), None, false)),
+                "for {target}"
+            );
+        }
         // Each absolute-form target, and the origin-form it is routed by.
-        let absolute: [(&str, &str); 7] = [
+        let absolute: [(&str, &str); 9] = [
             ("http://127.0.0.1:18221/", "/"),
             ("http://h", "/"),
             ("http://h?x", "/?x"),
@@ -3714,6 +3766,8 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             ("hTtP://h:1/api/rust/session?q=1", "/api/rust/session?q=1"),
             ("http://h/a@b", "/a@b"),
             ("http://h#f", "/#f"),
+            ("http://[::1]:8080/app.js", "/app.js"),
+            ("http://h:/", "/"),
         ];
         for (target, origin) in absolute {
             let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
@@ -3724,7 +3778,7 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             );
         }
         // Each rejected head, and the rule its 400 cause names.
-        let rejected: [(&[u8], &str); 43] = [
+        let rejected: [(&[u8], &str); 62] = [
             (b"GET /\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET / HTTP/1.1 x\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET  / HTTP/1.1\r\n\r\n", "MALFORMED REQUEST LINE"),
@@ -3749,6 +3803,86 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 "INVALID REQUEST TARGET",
             ),
             (b"GET http:/x HTTP/1.1\r\n\r\n", "INVALID REQUEST TARGET"),
+            // A target byte outside visible ASCII, or a malformed
+            // percent-encoding, in either form; an absolute-form authority
+            // that is not a host with an optional port. The heads are
+            // otherwise valid.
+            (
+                b"GET /a\x00b HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET /a\tb HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET /a\rb HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET /a\nb HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET /a\x01b HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET /a\x1fb HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET /a\x7fb HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET /\xc3\xa9 HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET /%zz HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET /%4 HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET /a% HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET /?q=\x00 HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET http://[]/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET http://[zz]/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET http://localhost:abc/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET http://h:1:2/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET http://h\x01/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET http://h/a\x00b HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
+            (
+                b"GET http://h/a\x7fb HTTP/1.1\r\nHost: h\r\n\r\n",
+                "INVALID REQUEST TARGET",
+            ),
             (b"GET / HTTP/1.1\r\nNoColon\r\n\r\n", "MALFORMED HEADER"),
             (b"GET / HTTP/1.1\r\nBad Name: x\r\n\r\n", "MALFORMED HEADER"),
             (

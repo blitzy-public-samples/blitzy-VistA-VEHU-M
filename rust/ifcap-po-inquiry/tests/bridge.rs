@@ -1533,6 +1533,56 @@ fn synthetic_400_element_with_line_break() -> Result<(), String> {
     )
 }
 
+#[test]
+fn synthetic_400_invalid_request_target() -> Result<(), String> {
+    // Raw control bytes and DEL in an origin-form target, and absolute-form
+    // targets whose authority is not a host with an optional port.
+    let rejected = [
+        "/bad\x00target",
+        "/a\tb",
+        "/a\rb",
+        "/a\nb",
+        "/a\x01b",
+        "/a\x1fb",
+        "/a\x7fb",
+        "/app.js\x00",
+        "http://[]/",
+        "http://[zz]/",
+        "http://localhost:abc/",
+        "http://h:1:2/",
+        "http://h\x01/app.js",
+    ];
+    let app_js = fs::read(crate_dir().join("frontend").join("app.js"))
+        .map_err(|e| format!("reading frontend/app.js: {e}"))?;
+    with_synthetic_dir("400-target", |root| {
+        with_server(synthetic_store()?, replay(root), |addr| {
+            for target in rejected {
+                let context = format!("GET {}", target.escape_debug());
+                let resp = http(addr, "GET", target, None)?;
+                let error = expect_error(&resp, 400, &context)?;
+                assert_eq!(
+                    error, "BAD REQUEST: INVALID REQUEST TARGET",
+                    "{context}: error text"
+                );
+            }
+            // A valid absolute-form target is still served, and a
+            // percent-encoded NUL is still an unknown path.
+            let absolute = format!("http://{addr}/app.js");
+            let (status, body) = http(addr, "GET", &absolute, None)?;
+            assert_eq!(status, 200, "GET {absolute}: status");
+            assert_same(
+                &format!("GET {absolute} against frontend/app.js"),
+                &body,
+                &app_js,
+            );
+            let resp = http(addr, "GET", "/%00", None)?;
+            let error = expect_error(&resp, 404, "GET /%00")?;
+            assert_eq!(error, "NOT FOUND", "GET /%00: error text");
+            Ok(())
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 404
 // ---------------------------------------------------------------------------
