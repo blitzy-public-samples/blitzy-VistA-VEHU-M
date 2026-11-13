@@ -1,0 +1,7 @@
+$ grep -rn 'unsafe' src/
+src/lib.rs:9:#![forbid(unsafe_code)]
+exit=0
+$ grep -rnE '\.unwrap\(|\.expect\(|panic!|unreachable!|todo!|unimplemented!' src/
+exit=1
+$ grep -rnE '[A-Za-z0-9_)]\[' src/
+exit=1

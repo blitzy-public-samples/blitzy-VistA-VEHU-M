@@ -1,0 +1,25 @@
+# A7 (SPEC.md)
+utc: 2026-11-08T05:07:58Z
+pwd: /tmp/blitzy/blitzy-VistA-VEHU-M/blitzy-d3cd5e06-5ae1-42c7-8b11-7bb911fc681f-w-001_1a2ed3/rust/ifcap-po-inquiry
+$ git -C ../.. rev-parse HEAD
+8719e11c7415616878d50994ff1d8e898a36876b
+exit=0
+$ git -C ../.. diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION
+exit=0
+$ git -C ../.. status --porcelain -- . ':(exclude)rust/ifcap-po-inquiry'
+exit=0
+$ git -C ../.. diff --quiet dd3fd0f3124c8178657d9fff4173c324da30f7ae HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION
+exit=0
+
+# A7 (end of run)
+utc: 2026-11-08T07:36:14Z
+pwd: /tmp/blitzy/blitzy-VistA-VEHU-M/blitzy-d3cd5e06-5ae1-42c7-8b11-7bb911fc681f_d7b31c/rust/ifcap-po-inquiry
+$ git -C ../.. rev-parse HEAD
+c3d72e0d6a971ad5e249a89ea0e9dffe2186073d
+exit=0
+$ git -C ../.. diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION
+exit=0
+$ git -C ../.. status --porcelain -- . ':(exclude)rust/ifcap-po-inquiry'
+exit=0
+$ git -C ../.. diff --quiet dd3fd0f3124c8178657d9fff4173c324da30f7ae HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION
+exit=0

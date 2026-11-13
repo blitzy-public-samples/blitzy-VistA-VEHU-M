@@ -1,0 +1,33 @@
+
+running 27 tests
+test gc_02_end_to_end_compare ... gc_02_end_to_end_compare (not synthetic): NOT COMPARED, missing: tests/golden/ifcap/GC-02/input.txt, tests/golden/ifcap/GC-02/transcript.txt, tests/golden/ifcap/GC-02/returned.txt, tests/golden/ifcap/GC-02/db-before.zwr, tests/golden/ifcap/GC-02/db-after.zwr, tests/golden/ifcap/GC-02/meta.txt, tests/golden/ifcap/GC-02/normalisation.txt, tests/fixtures/ifcap/cases.zwr
+ok
+test synthetic_400_element_with_line_break ... ok
+test synthetic_400_inputs_missing_or_not_array ... ok
+test synthetic_400_invalid_request_target ... ok
+test synthetic_400_malformed_json ... ok
+test synthetic_400_non_string_element ... ok
+test synthetic_404_non_post_on_api ... ok
+test synthetic_404_unknown_backend ... ok
+test synthetic_404_unknown_path ... ok
+test synthetic_422_unsupported_branch_end_to_end ... ok
+test synthetic_500_corrupt_store_end_to_end ... ok
+test synthetic_502_capture_file_missing ... ok
+test synthetic_502_capture_file_non_utf8 ... ok
+test synthetic_502_capture_file_unreadable ... ok
+test synthetic_502_context_mismatch ... ok
+test synthetic_502_malformed_meta ... ok
+test synthetic_502_malformed_normalisation ... ok
+test synthetic_502_not_recorded ... ok
+test synthetic_502_not_recorded_lists_unreadable_input ... ok
+test synthetic_compare_match_false ... ok
+test synthetic_compare_match_true ... ok
+test synthetic_gc_02_readiness_missing_only_when_absent ... ok
+test synthetic_json_escaping_round_trip ... ok
+test synthetic_mumps_replay_200 ... ok
+test synthetic_rust_session_200 ... ok
+test synthetic_shutdown_joins_within_bound ... ok
+test synthetic_static_paths_exact_match ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s
+

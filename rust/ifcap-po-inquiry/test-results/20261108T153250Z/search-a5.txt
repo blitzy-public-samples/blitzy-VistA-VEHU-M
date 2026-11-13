@@ -1,0 +1,39 @@
+$ grep -rnE 'golden|GC-0|include_str!|include_bytes!|input\.txt|transcript\.txt|returned\.txt|normalisation\.txt|meta\.txt' src/
+src/bin/bridge.rs:9://! - `GOLDEN_DIR`: the capture directory, by default `tests/golden/ifcap/`
+src/bin/bridge.rs:24:    let golden_dir = match env::var_os("GOLDEN_DIR") {
+src/bin/bridge.rs:28:            .join("golden")
+src/bin/bridge.rs:34:            golden_dir,
+src/bin/bridge.rs:36:        Ok(_) | Err(VarError::NotPresent) => MumpsMode::Replay { golden_dir },
+src/bridge.rs:71:/// `Live` carries `golden_dir` as well, because live mode reads the capture
+src/bridge.rs:72:/// command and context from the captures' `meta.txt`, and the directory can
+src/bridge.rs:77:    /// Answer from the recorded captures `GC-01` to `GC-05` under
+src/bridge.rs:78:    /// `golden_dir`.
+src/bridge.rs:79:    Replay { golden_dir: PathBuf },
+src/bridge.rs:81:    /// capture command recorded in `golden_dir`.
+src/bridge.rs:84:        golden_dir: PathBuf,
+src/bridge.rs:938:const CASE_DIRS: [&str; 5] = ["GC-01", "GC-02", "GC-03", "GC-04", "GC-05"];
+src/bridge.rs:941:const INPUT_FILE: &str = "input.txt";
+src/bridge.rs:942:const TRANSCRIPT_FILE: &str = "transcript.txt";
+src/bridge.rs:943:const RETURNED_FILE: &str = "returned.txt";
+src/bridge.rs:944:const NORMALISATION_FILE: &str = "normalisation.txt";
+src/bridge.rs:945:const META_FILE: &str = "meta.txt";
+src/bridge.rs:1042:        MumpsMode::Replay { golden_dir } => replay(golden_dir, inputs),
+src/bridge.rs:1045:            golden_dir,
+src/bridge.rs:1046:        } => live(container, golden_dir, inputs),
+src/bridge.rs:1071:/// The first capture under `golden_dir` whose input lines equal `inputs`,
+src/bridge.rs:1074:fn replay(golden_dir: &Path, inputs: &[String]) -> Result<MumpsSide, String> {
+src/bridge.rs:1077:        let dir = golden_dir.join(case);
+src/bridge.rs:1128:fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<MumpsSide, String> {
+src/bridge.rs:1129:    let meta = live_meta(golden_dir)?;
+src/bridge.rs:1155:fn live_meta(golden_dir: &Path) -> Result<Meta, String> {
+src/bridge.rs:1157:        let dir = golden_dir.join(case);
+src/bridge.rs:1171:    let first = golden_dir
+src/bridge.rs:3147:            golden_dir: PathBuf::new(),
+src/bridge.rs:3184:        let golden_dir = std::env::temp_dir().join("ifcap-po-inquiry-unit-no-such-captures");
+src/bridge.rs:3186:            golden_dir: golden_dir.clone(),
+src/bridge.rs:3195:            golden_dir: golden_dir.clone(),
+src/bridge.rs:3198:        let expected = golden_dir.join(first_case).join(META_FILE);
+src/bridge.rs:3215:        let live = |golden_dir: &Path| MumpsMode::Live {
+src/bridge.rs:3217:            golden_dir: golden_dir.to_path_buf(),
+src/bridge.rs:3396:            golden_dir: PathBuf::new(),
+exit=0

@@ -1,0 +1,32 @@
+
+running 22 tests
+test case_status_gives_fail_precedence_over_blocked ... ok
+test comparison_report ... ok
+test comparison_text_is_idempotent_and_reversible ... ok
+test comparison_text_replaces_only_the_marked_text ... ok
+test complete_capture_fails_only_on_the_context_check ... ok
+test console_summary_shows_causes_never_details ... ok
+test context_cause_names_only_stub_keys ... ok
+test each_capture_defect_fails_with_its_findings ... ok
+test first_text_difference_locates_first_unequal_byte ... ok
+test gc_01_standard_order ... GC-01 gc_01_standard_order: NOT COMPARED missing: tests/golden/ifcap/GC-01/input.txt, tests/golden/ifcap/GC-01/transcript.txt, tests/golden/ifcap/GC-01/returned.txt, tests/golden/ifcap/GC-01/db-before.zwr, tests/golden/ifcap/GC-01/db-after.zwr, tests/golden/ifcap/GC-01/meta.txt, tests/golden/ifcap/GC-01/normalisation.txt, tests/fixtures/ifcap/cases.zwr
+ok
+test gc_02_multiple_lines_and_decimals ... GC-02 gc_02_multiple_lines_and_decimals: NOT COMPARED missing: tests/golden/ifcap/GC-02/input.txt, tests/golden/ifcap/GC-02/transcript.txt, tests/golden/ifcap/GC-02/returned.txt, tests/golden/ifcap/GC-02/db-before.zwr, tests/golden/ifcap/GC-02/db-after.zwr, tests/golden/ifcap/GC-02/meta.txt, tests/golden/ifcap/GC-02/normalisation.txt, tests/fixtures/ifcap/cases.zwr
+ok
+test gc_03_missing_order ... GC-03 gc_03_missing_order: NOT COMPARED missing: tests/golden/ifcap/GC-03/input.txt, tests/golden/ifcap/GC-03/transcript.txt, tests/golden/ifcap/GC-03/returned.txt, tests/golden/ifcap/GC-03/db-before.zwr, tests/golden/ifcap/GC-03/db-after.zwr, tests/golden/ifcap/GC-03/meta.txt, tests/golden/ifcap/GC-03/normalisation.txt, tests/fixtures/ifcap/cases.zwr
+ok
+test gc_04_invalid_input ... GC-04 gc_04_invalid_input: NOT COMPARED missing: tests/golden/ifcap/GC-04/input.txt, tests/golden/ifcap/GC-04/transcript.txt, tests/golden/ifcap/GC-04/returned.txt, tests/golden/ifcap/GC-04/db-before.zwr, tests/golden/ifcap/GC-04/db-after.zwr, tests/golden/ifcap/GC-04/meta.txt, tests/golden/ifcap/GC-04/normalisation.txt, tests/fixtures/ifcap/cases.zwr
+ok
+test gc_05_cancelled_order ... GC-05 gc_05_cancelled_order: NOT COMPARED missing: tests/golden/ifcap/GC-05/input.txt, tests/golden/ifcap/GC-05/transcript.txt, tests/golden/ifcap/GC-05/returned.txt, tests/golden/ifcap/GC-05/db-before.zwr, tests/golden/ifcap/GC-05/db-after.zwr, tests/golden/ifcap/GC-05/meta.txt, tests/golden/ifcap/GC-05/normalisation.txt, tests/fixtures/ifcap/cases.zwr
+ok
+test loader_error_names_files_crate_relative ... ok
+test manifest_rows_keep_order_and_reject_repeats ... ok
+test normalisation_audit_follows_file_order ... ok
+test nothing_present_is_not_compared_listing_every_required_file ... ok
+test one_missing_file_is_not_compared_over_broken_present_files ... ok
+test returned_txt_framing ... ok
+test unavailable_digest_tool_is_blocked_and_fail_takes_precedence ... ok
+test unreadable_file_digest_is_not_available_without_blocking ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+

@@ -1,0 +1,313 @@
+/* Retro terminal screen for the purchase-order display bridge: green on
+   black, square corners, the system monospace font, no images. Every
+   reaction lives in the last block and applies in RUST mode only. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+:root {
+  --fg: #33FF33;
+  --bg: #000000;
+  /* One row: 1.25 times the font of the element that uses it, so a
+     transcript's rows scale with its own font. */
+  --lh: 1.25em;
+  --glow: #99FF99;
+  --red: #FF3333;
+  /* Start colour of the new-line highlight; #33FF33 text on it is 5.2:1
+     (WCAG AA). */
+  --hl: #1A661A;
+}
+
+/* Whole CSS px rows for a box scaled to a fractional font. The row is
+   rounded to the nearest px, so a scroll offset pinning the last row never
+   leaves part of a row showing, and a 16px font keeps its 20px rows. A
+   browser without round() keeps the unrounded row. */
+@supports (line-height: round(1.25em, 1px)) {
+  :root {
+    --lh: round(1.25em, 1px);
+  }
+}
+
+html {
+  background-color: var(--bg);
+  color: var(--fg);
+  font-family: ui-monospace, monospace;
+}
+
+body {
+  margin: 0;
+  background-color: var(--bg);
+  font-family: ui-monospace, monospace;
+  font-size: 1rem;
+  line-height: var(--lh);
+  /* Makes 100cqi the page's width; body's width never follows its content. */
+  container-type: inline-size;
+}
+
+.terminal {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1ch;
+  padding-block: 1ch;
+  padding-inline: 2ch;
+  /* The page's width, or wider only for content that cannot wrap (a
+     transcript box), so the 2ch inline-end padding stays beside that
+     content if it ever overflows. The rows that can wrap are held to the
+     page's width instead (next rule), so only a transcript box ever
+     widens the page. */
+  inline-size: min-content;
+  min-inline-size: 100%;
+}
+
+/* The title, controls, entry row and status lines stay within the page's
+   width less the two 2ch .terminal paddings, so they wrap at the page's
+   edge even while a transcript box makes .terminal wider. Container units
+   size these rows only, never a font. */
+.title,
+.controls,
+.entry,
+.status {
+  max-inline-size: calc(100cqi - 4ch);
+}
+
+.title,
+.pane h2 {
+  margin: 0;
+  font-size: inherit;
+  font-weight: normal;
+}
+
+.controls,
+.entry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1ch;
+}
+
+input,
+select,
+button {
+  margin: 0;
+  padding-block: 0;
+  padding-inline: 1ch;
+  border: 1px solid var(--fg);
+  border-radius: 0;
+  appearance: none;
+  font: inherit;
+  line-height: var(--lh);
+  color: var(--fg);
+  background-color: var(--bg);
+  /* 44 by 44 CSS px touch targets for every pointer and font size; the
+     single text line is centred inside the taller box. */
+  min-block-size: 44px;
+  min-inline-size: 44px;
+}
+
+/* The entry row spans .terminal up to the page's width, and the input
+   takes the room its row leaves, from its minimum width up to 40 columns,
+   so a narrow viewport narrows the input instead of wrapping the cursor
+   and buttons away from it or past the page's edge. */
+.entry {
+  align-self: stretch;
+}
+
+.entry input {
+  flex: 1 1 0;
+  max-inline-size: 40ch;
+  caret-color: var(--fg);
+}
+
+/* No outline at rest: a transparent solid one would be painted on every
+   control in forced-colours mode. Rings use :focus-visible, so a mouse
+   click on a button draws none. */
+input,
+select,
+button,
+.screen {
+  outline: 2px none transparent;
+  outline-offset: 2px;
+}
+
+:is(input, select, button, .screen):focus-visible {
+  outline-style: solid;
+  outline-color: var(--fg);
+}
+
+/* 80 columns by 24 rows of the box's own font. Size containment takes the
+   box's size from contain-intrinsic-size alone, never from its rows, so
+   the transcript never changes it. Classic scrollbars are added outside
+   that 80ch by 24-row area: the stable gutter beside it for the vertical
+   bar, and below it the horizontal bar, which overflow-x: scroll keeps
+   present, so neither takes a row or a column and every column of a line
+   longer than 80 can be scrolled to from the first render. While no
+   vertical bar is drawn, the empty gutter is painted as padding, so text
+   past column 80 shows through it. Overlay scrollbars (macOS, mobile)
+   take no room and float over the area while the platform shows them.
+   Lines are never wrapped. */
+.screen {
+  display: grid;
+  grid-template-columns: 80ch;
+  grid-auto-rows: var(--lh);
+  align-content: start;
+  box-sizing: content-box;
+  inline-size: max-content;
+  contain: size;
+  contain-intrinsic-size: 80ch calc(24 * var(--lh));
+  overflow-x: scroll;
+  overflow-y: auto;
+  /* Rows are snap points: a font change keeps the same row on top. */
+  scroll-snap-type: y mandatory;
+  scrollbar-gutter: stable;
+  scrollbar-color: var(--fg) var(--bg);
+  border: 1px solid var(--fg);
+  background-color: var(--bg);
+  white-space: pre;
+}
+
+/* A row is as wide as its text plus half a column, and never narrower
+   than the box's 80 columns, so the scroll range ends half a column past
+   the last glyph. That outlasts the browser's whole-pixel rounding of the
+   scroll range and of the clip, so the last glyph's full edge scrolls
+   clear of a classic vertical scrollbar, while the box keeps its 80ch by
+   24-row size. */
+.ln {
+  min-block-size: var(--lh);
+  line-height: var(--lh);
+  scroll-snap-align: start;
+  inline-size: max-content;
+  min-inline-size: 100%;
+  padding-inline-end: 0.5ch;
+}
+
+.cursor {
+  flex: none;
+  inline-size: 1ch;
+  block-size: var(--lh);
+  background-color: var(--fg);
+}
+
+.status {
+  min-block-size: var(--lh);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+::selection {
+  background-color: var(--fg);
+  color: var(--bg);
+}
+
+/* Mode layout. Structural selectors stand in for the IDs app.js uses: the
+   single-backend transcript is the screen directly inside .terminal, and
+   the match status is the status line right after .compare. */
+.compare {
+  display: none;
+  gap: 2ch;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  gap: 1ch;
+}
+
+.compare + .status {
+  display: none;
+}
+
+[data-mode="compare"] .compare {
+  display: flex;
+}
+
+[data-mode="compare"] .compare + .status {
+  display: block;
+}
+
+[data-mode="compare"] .terminal > .screen {
+  display: none;
+}
+
+/* Transcript font. Each box is 80 columns by 24 of its own rows, sized in
+   rem only and never in viewport units, so browser zoom and the browser's
+   default font size enlarge transcript text in proportion. The single box
+   keeps the 1rem body font. Each COMPARE pane is 0.75rem, so both 80-column
+   panes stay side by side within a 1280px-wide window. A viewport narrower
+   than the box, or than both panes, scrolls the page sideways instead of
+   shrinking the text: an 80-column terminal is two-dimensional content. */
+.pane > .screen {
+  font-size: 0.75rem;
+  line-height: var(--lh);
+}
+
+/* RUST-only reactions. Every selector pairs [data-mode="rust"] with focus,
+   hover or a class app.js sets while something happens, so nothing here
+   matches an idle screen, and MUMPS, COMPARE and reduced-motion users get
+   none of them. */
+@media (prefers-reduced-motion: no-preference) {
+  /* Use an outline rather than a shadow to preserve the terminal look (C14). */
+  [data-mode="rust"] :is(input, select, button):focus-visible {
+    outline-color: var(--glow);
+    transition: outline-color 150ms ease-out;
+  }
+
+  @media (hover: hover) {
+    [data-mode="rust"] .ln:hover {
+      background-color: var(--fg);
+      color: var(--bg);
+    }
+  }
+
+  /* SEND working state while a request is in flight: reverse video, label
+     unchanged. A dashed border would not show against the same-colour
+     fill, so none is set. */
+  [data-mode="rust"] .busy {
+    background-color: var(--fg);
+    color: var(--bg);
+  }
+
+  @keyframes ln-in {
+    from {
+      transform: translateX(-2ch);
+      background-color: var(--hl);
+    }
+
+    to {
+      transform: translateX(0);
+      background-color: transparent;
+    }
+  }
+
+  [data-mode="rust"] .ln.new {
+    animation: ln-in 300ms ease-out;
+  }
+
+  /* Rejection shake and red outline. The 1ch swing stays inside the 2ch
+     .terminal padding beside the box, so it never changes the page's
+     scrollable width, and the outline does not count towards it. */
+  @keyframes reject-shake {
+    0%,
+    100% {
+      transform: translateX(0);
+    }
+
+    20%,
+    60% {
+      transform: translateX(-1ch);
+    }
+
+    40%,
+    80% {
+      transform: translateX(1ch);
+    }
+  }
+
+  [data-mode="rust"] .screen.reject {
+    outline: 2px solid var(--red);
+    animation: reject-shake 300ms linear;
+  }
+}

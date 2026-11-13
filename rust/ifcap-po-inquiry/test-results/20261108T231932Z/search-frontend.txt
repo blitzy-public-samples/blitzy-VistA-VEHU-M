@@ -1,0 +1,2 @@
+$ grep -rnE 'RegExp|\.test\(|\.match\(|\.search\(|\.replace\(|\.trim\(|toUpperCase|toLowerCase|\.length *[<>=!]|isNaN|parseInt|parseFloat|Number\(|pattern=|required|maxlength|minlength|type="number"' frontend/
+exit=1

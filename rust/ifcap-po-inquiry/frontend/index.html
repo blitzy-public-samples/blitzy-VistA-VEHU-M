@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en" data-mode="mumps">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PURCHASE ORDER DISPLAY</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <!-- No skip link: main is the first and only landmark in body, so there is no block to bypass. -->
+  <main class="terminal">
+    <h1 class="title">PURCHASE ORDER DISPLAY</h1>
+    <div class="controls">
+      <label for="backend">BACKEND</label>
+      <select id="backend" autocomplete="off">
+        <option value="mumps" selected>MUMPS</option>
+        <option value="rust">RUST</option>
+        <option value="compare">COMPARE</option>
+      </select>
+    </div>
+    <div id="transcript" class="screen" role="log" aria-live="polite" aria-label="TRANSCRIPT" tabindex="0"></div>
+    <div id="compare" class="compare">
+      <section class="pane"><h2>MUMPS</h2><div id="transcript-mumps" class="screen" role="log" aria-live="polite" aria-label="MUMPS TRANSCRIPT" tabindex="0"></div></section>
+      <section class="pane"><h2>RUST</h2><div id="transcript-rust" class="screen" role="log" aria-live="polite" aria-label="RUST TRANSCRIPT" tabindex="0"></div></section>
+    </div>
+    <div id="match-status" class="status" role="status">NOT COMPARED</div>
+    <form id="entry" class="entry" autocomplete="off">
+      <label for="line">INPUT</label>
+      <input type="text" id="line" name="line" autocomplete="off" autocapitalize="off" spellcheck="false"><span class="cursor" aria-hidden="true"></span>
+      <button type="submit" id="send">SEND</button>
+      <button type="button" id="exit">EXIT</button>
+    </form>
+    <div id="error-status" class="status" role="status"></div>
+  </main>
+</body>
+</html>
