@@ -35,7 +35,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -60,7 +60,10 @@ const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 /// The most connections served at once. Each holds a thread, two descriptors
 /// (the stream and the clone that wakes it at shutdown) and request buffers
-/// of about [`MAX_HEAD`] plus [`MAX_BODY`] at most, so this bounds what
+/// of about [`MAX_HEAD`] plus [`MAX_BODY`] at most. The inputs decoded from a
+/// body hold no more text than the body, and what each input costs beyond
+/// its text is bounded by [`FREE_INPUTS`] per connection and, across the
+/// sessions with more inputs, by [`INPUT_BUDGET`]. So this bounds what
 /// clients can make the bridge hold, far below a 1024-descriptor limit, and
 /// well above the few connections a browser opens to one host. At the bound
 /// no connection is taken: further ones wait in the listener's kernel
@@ -74,6 +77,21 @@ const DRAIN_BYTES: usize = 2 * MAX_BODY;
 /// Deepest JSON nesting the reader accepts. Recursive descent on a 1 MiB
 /// body of `[` would otherwise overflow the connection thread's stack.
 const MAX_JSON_DEPTH: usize = 64;
+/// A session with at most this many inputs never waits for
+/// [`INPUT_BUDGET`], nor is charged against it: more than any typed session
+/// sends.
+const FREE_INPUTS: usize = 1024;
+/// The most decoded inputs that the sessions with more than [`FREE_INPUTS`]
+/// inputs hold at once, across every connection: as many as two maximal
+/// bodies of one-character inputs, `"a",` each, hold, so two such sessions
+/// run at once and a third waits. A decoded input costs several times its
+/// bytes in the body, so it is this, not [`MAX_CONNECTIONS`] alone, that
+/// bounds the inputs clients can make the bridge hold.
+const MAX_HELD_INPUTS: usize = MAX_BODY / 2;
+/// The one bound on decoded inputs, shared by every connection thread: a
+/// session holds its charge from before its inputs are decoded until they
+/// are freed.
+static INPUT_BUDGET: InputBudget = InputBudget::new(MAX_HELD_INPUTS, FREE_INPUTS);
 /// Live-mode limits on the `docker exec` child.
 const LIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const LIVE_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -357,7 +375,10 @@ fn handle_connection(mut stream: TcpStream, store: &Store, mumps: &MumpsMode) ->
 /// timeout cannot be set, is closed without a response, and that failure is
 /// returned, naming the stage. Every other outcome is `Ok`. The answer to a
 /// `HEAD` request, accepted or rejected, carries no content; its method is
-/// read after any empty-line prelude (see [`skip_prelude`]).
+/// read after any empty-line prelude (see [`skip_prelude`]). The bytes of the
+/// head are freed once that method is known, before the request is routed,
+/// and [`route`] takes the request, body included, so no copy of the request
+/// outlives what the session needs of it.
 fn exchange(stream: &mut TcpStream, store: &Store, mumps: &MumpsMode) -> io::Result<()> {
     let configured = stream
         .set_nonblocking(false)
@@ -366,16 +387,18 @@ fn exchange(stream: &mut TcpStream, store: &Store, mumps: &MumpsMode) -> io::Res
         return Err(abandon(stream, "configuring a connection", e));
     }
     let mut received: Vec<u8> = Vec::new();
-    let response = match read_request(stream, &mut received, IO_TIMEOUT, REQUEST_TIME) {
+    let read = read_request(stream, &mut received, IO_TIMEOUT, REQUEST_TIME);
+    // Method tokens are case-sensitive, so only `HEAD` itself is a HEAD
+    // request, rejected or not.
+    let head_request = skip_prelude(&received).starts_with(b"HEAD ");
+    drop(received);
+    let response = match read {
         Err(e) => return Err(abandon(stream, "configuring a connection", e)),
-        Ok(Ok(Some(request))) => route(&request, store, mumps),
+        Ok(Ok(Some(request))) => route(request, store, mumps),
         // Nothing to answer: the peer sent nothing, or cannot be written to.
         Ok(Ok(None)) => return Ok(()),
         Ok(Err(cause)) => error_response(400, &cause),
     };
-    // Method tokens are case-sensitive, so only `HEAD` itself is a HEAD
-    // request, rejected or not.
-    let head_request = skip_prelude(&received).starts_with(b"HEAD ");
     // A response that cannot be written means the client has gone, or has
     // not read it within `IO_TIMEOUT`: an outcome of that client, which ends
     // only this connection, shut down by `handle_connection`.
@@ -527,7 +550,14 @@ fn read_request(
         None => None,
         Some(length) if length > MAX_BODY => return Ok(Err(bad("BODY TOO LARGE"))),
         Some(length) => {
-            let mut body = rest.to_vec();
+            // The body is allocated once at its declared length and never
+            // grows past it: it takes what arrived with the head up to that
+            // length, then reads into a window of only the bytes still owed.
+            // Bytes past the declared length (a pipelined request) are not
+            // part of this request: they are not copied, nor read from the
+            // socket, and are not answered.
+            let mut body = Vec::with_capacity(length);
+            body.extend_from_slice(rest.get(..length).unwrap_or(rest));
             // A client that cannot be written to cannot be answered either.
             if expect_continue
                 && body.len() < length
@@ -536,16 +566,17 @@ fn read_request(
                 return Ok(Ok(None));
             }
             while body.len() < length {
-                match read_within(stream, &mut buf, started, request_time)? {
+                let take = length.saturating_sub(body.len()).min(buf.len());
+                let Some(window) = buf.get_mut(..take) else {
+                    return Ok(Err(bad("INCOMPLETE BODY")));
+                };
+                match read_within(stream, window, started, request_time)? {
                     Ok(0) => return Ok(Err(bad("INCOMPLETE BODY"))),
-                    Ok(n) => body.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+                    Ok(n) => body.extend_from_slice(window.get(..n).unwrap_or(&[])),
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(_) => return Ok(Err(bad("INCOMPLETE BODY"))),
                 }
             }
-            // Bytes past the declared length (a pipelined request) are not
-            // part of this request and are not answered.
-            body.truncate(length);
             Some(body)
         }
     };
@@ -906,17 +937,19 @@ const GET_REQUIRED: &str = "NOT FOUND: GET REQUIRED";
 /// an API path included, gets the path's 404, `GET REQUIRED` or
 /// `POST REQUIRED`. The `HEAD` of a static path has the headers,
 /// `Content-Length` included, of its `GET` (RFC 9110 9.3.2), and
-/// [`write_response`] leaves the content of every `HEAD` answer out.
-fn route(request: &HttpRequest, store: &Store, mumps: &MumpsMode) -> (u16, &'static str, Vec<u8>) {
+/// [`write_response`] leaves the content of every `HEAD` answer out. The
+/// request is taken, so its body goes to [`route_api`], which frees it once
+/// the inputs are decoded.
+fn route(request: HttpRequest, store: &Store, mumps: &MumpsMode) -> (u16, &'static str, Vec<u8>) {
     let (method, target, body) = request;
-    if let Some((file, content_type)) = static_file(target) {
+    if let Some((file, content_type)) = static_file(&target) {
         if method == "GET" || method == "HEAD" {
             return serve_static(file, content_type);
         }
         return error_response(404, GET_REQUIRED);
     }
     if let Some(rest) = target.strip_prefix("/api/") {
-        let (status, json) = route_api(method, rest, body.as_deref(), store, mumps);
+        let (status, json) = route_api(&method, rest, body, store, mumps);
         return (status, JSON_TYPE, json.into_bytes());
     }
     error_response(404, NOT_FOUND)
@@ -950,12 +983,15 @@ fn serve_static(file: &str, content_type: &'static str) -> (u16, &'static str, V
 /// `GET REQUIRED`. `<backend>/session` answers only `POST`. Unknown backends
 /// and paths, a query string included, and any other method are 404; the
 /// body is checked only for a known session route, and a body
-/// [`parse_session_request`] rejects is 400 `BAD REQUEST: <cause>`. The
-/// answer is `(status, JSON body)`.
+/// [`scan_session_body`] rejects is 400 `BAD REQUEST: <cause>`. An accepted
+/// body's inputs are decoded once [`INPUT_BUDGET`] admits their session,
+/// which may wait for heavier sessions to end; the body is freed then,
+/// before the session runs, and the inputs before its charge is released.
+/// The answer is `(status, JSON body)`.
 fn route_api(
     method: &str,
     rest: &str,
-    body: Option<&[u8]>,
+    body: Option<Vec<u8>>,
     store: &Store,
     mumps: &MumpsMode,
 ) -> (u16, String) {
@@ -987,99 +1023,271 @@ fn route_api(
             error_body(&format!("{BAD_REQUEST}: CONTENT-LENGTH REQUIRED")),
         );
     };
-    match parse_session_request(body) {
-        Ok(inputs) => session(store, mumps, &inputs),
-        Err(cause) => (400, error_body(&format!("{BAD_REQUEST}: {cause}"))),
+    let bad = |cause: &str| (400, error_body(&format!("{BAD_REQUEST}: {cause}")));
+    let (text, array) = match scan_session_body(&body) {
+        Ok(found) => found,
+        Err(cause) => return bad(&cause),
+    };
+    // The charge is taken before the inputs exist and declared before them,
+    // so they are freed first on every exit, unwinding included.
+    let charge = INPUT_BUDGET.admit(array.count);
+    let Some(inputs) = decode_inputs(text, array) else {
+        return bad("MALFORMED JSON");
+    };
+    drop(body);
+    let answer = session(store, mumps, &inputs);
+    drop(inputs);
+    drop(charge);
+    answer
+}
+
+/// Where the first `inputs` array of a session body opens, and how many
+/// elements it holds, as [`scan_session_body`] found them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InputsArray {
+    /// The byte offset of the array's `[` in the body.
+    start: usize,
+    /// The number of elements.
+    count: usize,
+}
+
+/// The first element of the `inputs` array that a session cannot take, by
+/// its position counted from 1.
+#[derive(Clone, Copy)]
+enum ElementFault {
+    /// An element that is not a string.
+    NotString(usize),
+    /// A string whose content, unescaped, holds a carriage return or a line
+    /// feed.
+    LineBreak(usize),
+}
+
+/// The value of the first `inputs` member of a session body, as
+/// [`scan_session_body`] found it.
+enum InputsValue {
+    /// A value that is not an array.
+    NotArray,
+    /// An array, with its first element fault, if any.
+    Array(InputsArray, Option<ElementFault>),
+}
+
+/// Checks that `body` is `{"inputs": [string, ...]}` and finds its `inputs`
+/// array, building nothing from the body: the inputs are decoded only once
+/// their session is admitted (see [`decode_inputs`]). An element holding a
+/// carriage return or line feed is rejected, because each input becomes one
+/// line of a captured input file and of live standard input. Other members
+/// of the object are ignored. Returns the body as text, with the array.
+///
+/// The whole body is checked, past a fault of the inputs too, and the cause
+/// is the first of these that holds: the body is not UTF-8 or not exactly
+/// one JSON value (`MALFORMED JSON`); the value is not an object
+/// (`BODY IS NOT A JSON OBJECT`); no member, or more than one, has the key
+/// `inputs`, compared unescaped (`INPUTS MISSING OR REPEATED`); the first
+/// `inputs` value is not an array (`INPUTS IS NOT AN ARRAY`); then the first
+/// element, by position from 1, that is not a string
+/// (`INPUT <n> IS NOT A STRING`) or holds a carriage return or line feed
+/// (`INPUT <n> CONTAINS A CARRIAGE RETURN OR LINE FEED`).
+fn scan_session_body(body: &[u8]) -> Result<(&str, InputsArray), String> {
+    let malformed = || "MALFORMED JSON".to_string();
+    let text = std::str::from_utf8(body).map_err(|_| malformed())?;
+    let mut pos = 0;
+    skip_whitespace(text, &mut pos);
+    let is_object = peek(text, pos) == Some(b'{');
+    let mut inputs_members = 0usize;
+    let mut first_inputs = None;
+    let scanned = if is_object {
+        scan_object(
+            text,
+            &mut pos,
+            0,
+            Some("inputs"),
+            |pos, depth, is_inputs| {
+                if is_inputs {
+                    inputs_members = inputs_members.saturating_add(1);
+                }
+                if !is_inputs || inputs_members > 1 {
+                    return scan_value(text, pos, depth);
+                }
+                let value = if depth <= MAX_JSON_DEPTH && peek(text, *pos) == Some(b'[') {
+                    scan_inputs(text, pos, depth)?
+                } else {
+                    scan_value(text, pos, depth)?;
+                    InputsValue::NotArray
+                };
+                first_inputs = Some(value);
+                Some(())
+            },
+        )
+    } else {
+        scan_value(text, &mut pos, 0)
+    };
+    skip_whitespace(text, &mut pos);
+    if scanned.is_none() || pos != text.len() {
+        return Err(malformed());
+    }
+    if !is_object {
+        return Err("BODY IS NOT A JSON OBJECT".to_string());
+    }
+    let (Some(value), 1) = (first_inputs, inputs_members) else {
+        return Err("INPUTS MISSING OR REPEATED".to_string());
+    };
+    match value {
+        InputsValue::NotArray => Err("INPUTS IS NOT AN ARRAY".to_string()),
+        InputsValue::Array(_, Some(ElementFault::NotString(position))) => {
+            Err(format!("INPUT {position} IS NOT A STRING"))
+        }
+        InputsValue::Array(_, Some(ElementFault::LineBreak(position))) => Err(format!(
+            "INPUT {position} CONTAINS A CARRIAGE RETURN OR LINE FEED"
+        )),
+        InputsValue::Array(array, None) => Ok((text, array)),
     }
 }
 
-/// Validates `{"inputs": [string, ...]}` and returns the inputs unmodified
-/// and in order. An element holding a carriage return or line feed is
-/// rejected, because each input becomes one line of a captured input file
-/// and of live standard input. Other members of the object are ignored.
-fn parse_session_request(body: &[u8]) -> Result<Vec<String>, String> {
-    let text = std::str::from_utf8(body).map_err(|_| "MALFORMED JSON".to_string())?;
-    let Some(json) = parse_json(text) else {
-        return Err("MALFORMED JSON".to_string());
-    };
-    let Some(members) = json_members(json) else {
-        return Err("BODY IS NOT A JSON OBJECT".to_string());
-    };
-    let mut found = members.into_iter().filter(|(key, _)| key == "inputs");
-    let (Some((_, inputs)), None) = (found.next(), found.next()) else {
-        return Err("INPUTS MISSING OR REPEATED".to_string());
-    };
-    let Some(elements) = json_elements(inputs) else {
-        return Err("INPUTS IS NOT AN ARRAY".to_string());
-    };
-    elements
-        .into_iter()
-        .enumerate()
-        .map(|(position, element)| match json_string(element) {
-            Some(text) if text.contains(['\r', '\n']) => Err(format!(
-                "INPUT {} CONTAINS A CARRIAGE RETURN OR LINE FEED",
-                position.saturating_add(1)
-            )),
-            Some(text) => Ok(text),
-            None => Err(format!(
-                "INPUT {} IS NOT A STRING",
-                position.saturating_add(1)
-            )),
-        })
-        .collect()
+/// Checks the first `inputs` array of a session body, at `*pos` and nested
+/// `depth` levels deep, and moves past it, building nothing: where it
+/// opens, how many elements it holds, and the first element a session
+/// cannot take. Every element is checked to its end, a faulty one included.
+fn scan_inputs(text: &str, pos: &mut usize, depth: usize) -> Option<InputsValue> {
+    let start = *pos;
+    let mut count = 0usize;
+    let mut fault = None;
+    scan_array(text, pos, depth, |pos, depth| {
+        count = count.saturating_add(1);
+        if depth <= MAX_JSON_DEPTH && peek(text, *pos) == Some(b'"') {
+            let mut line_break = false;
+            walk_string(text, pos, |piece| {
+                line_break |= piece.contains(['\r', '\n']);
+            })?;
+            if line_break && fault.is_none() {
+                fault = Some(ElementFault::LineBreak(count));
+            }
+        } else {
+            scan_value(text, pos, depth)?;
+            if fault.is_none() {
+                fault = Some(ElementFault::NotString(count));
+            }
+        }
+        Some(())
+    })?;
+    Some(InputsValue::Array(InputsArray { start, count }, fault))
+}
+
+/// The elements of the `inputs` array that [`scan_session_body`] found in
+/// `text`, unescaped and in order, in one pass over the array alone, into a
+/// vector allocated once at exactly their count. `None`, which an accepted
+/// body never gives, means `array` does not describe an accepted array of
+/// `text`.
+fn decode_inputs(text: &str, array: InputsArray) -> Option<Vec<String>> {
+    let mut inputs = Vec::with_capacity(array.count);
+    let mut pos = array.start;
+    // The array is a member's value, one level deep, as it was scanned.
+    scan_array(text, &mut pos, 1, |pos, _| {
+        inputs.push(decode_string(text, pos)?);
+        Some(())
+    })?;
+    (inputs.len() == array.count).then_some(inputs)
+}
+
+/// The string at `*pos`, unescaped, moving past it. The first piece
+/// [`walk_string`] hands over is copied as it stands, so a string without
+/// escapes, one piece, is held at exactly its length.
+fn decode_string(text: &str, pos: &mut usize) -> Option<String> {
+    let mut out = String::new();
+    walk_string(text, pos, |piece| {
+        if out.is_empty() {
+            out = piece.to_owned();
+        } else {
+            out.push_str(piece);
+        }
+    })?;
+    Some(out)
+}
+
+/// A bound on the decoded inputs that sessions hold at once, weighted by
+/// their count. A session with at most `free` inputs is not charged and
+/// never waits. A heavier one is charged its count, at most `capacity`, and
+/// waits until the charges held leave room for it, so one over `capacity`
+/// runs only while no other charge is held, and none ever blocks a light
+/// one.
+struct InputBudget {
+    /// The sum of the charges held.
+    held: Mutex<usize>,
+    /// Signalled whenever a charge is released.
+    released: Condvar,
+    /// The most the charges held may sum to.
+    capacity: usize,
+    /// The most inputs a session may have without being charged.
+    free: usize,
+}
+
+impl InputBudget {
+    /// A budget of `capacity` inputs, none of them held, that charges only
+    /// the sessions with more than `free` inputs.
+    const fn new(capacity: usize, free: usize) -> InputBudget {
+        InputBudget {
+            held: Mutex::new(0),
+            released: Condvar::new(),
+            capacity,
+            free,
+        }
+    }
+
+    /// The charge of a session with `inputs` inputs, taken once the charges
+    /// held leave room for it, and released when it is dropped. A lock
+    /// poisoned by a thread that panicked while holding it is taken all the
+    /// same: the sum it guards is only ever replaced whole.
+    fn admit(&self, inputs: usize) -> InputCharge<'_> {
+        let charge = if inputs <= self.free {
+            0
+        } else {
+            inputs.min(self.capacity)
+        };
+        if charge > 0 {
+            let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            while held.saturating_add(charge) > self.capacity {
+                held = self
+                    .released
+                    .wait(held)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            *held = held.saturating_add(charge);
+        }
+        InputCharge {
+            budget: self,
+            charge,
+        }
+    }
+}
+
+/// One session's charge against an [`InputBudget`]. Dropping it, on
+/// unwinding too, releases the charge and wakes every session waiting for
+/// room.
+struct InputCharge<'b> {
+    /// The budget charged.
+    budget: &'b InputBudget,
+    /// The inputs charged; 0 for a session that was not charged.
+    charge: usize,
+}
+
+impl Drop for InputCharge<'_> {
+    fn drop(&mut self) {
+        if self.charge == 0 {
+            return;
+        }
+        let mut held = self
+            .budget
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *held = held.saturating_sub(self.charge);
+        drop(held);
+        self.budget.released.notify_all();
+    }
 }
 
 // ---------------------------------------------------------------------------
 // JSON reader and writer (private, minimal)
 // ---------------------------------------------------------------------------
-
-/// Parses `text` as exactly one JSON value with optional surrounding
-/// whitespace, anything after it being malformed, and returns the value's
-/// own text without that whitespace.
-///
-/// A value is kept as its text, not as a tree: [`json_members`],
-/// [`json_elements`] and [`json_string`] read from it the kind a caller
-/// expects. Numbers keep their text, since nothing here computes with them.
-/// Throughout this reader, `None` means malformed.
-fn parse_json(text: &str) -> Option<&str> {
-    let mut pos = 0;
-    skip_whitespace(text, &mut pos);
-    let value = value_text(text, &mut pos, 0)?;
-    skip_whitespace(text, &mut pos);
-    if pos == text.len() { Some(value) } else { None }
-}
-
-/// The members of `value`, the text of exactly one JSON object: keys and
-/// value texts in document order, duplicates included, so each caller
-/// decides what a repeated key means.
-fn json_members(value: &str) -> Option<Vec<(String, &str)>> {
-    let mut pos = 0;
-    let members = read_object(value, &mut pos, 0)?;
-    if pos == value.len() {
-        Some(members)
-    } else {
-        None
-    }
-}
-
-/// The element texts of `value`, the text of exactly one JSON array, in
-/// order.
-fn json_elements(value: &str) -> Option<Vec<&str>> {
-    let mut pos = 0;
-    let elements = read_array(value, &mut pos, 0)?;
-    if pos == value.len() {
-        Some(elements)
-    } else {
-        None
-    }
-}
-
-/// The unescaped content of `value`, the text of exactly one JSON string.
-fn json_string(value: &str) -> Option<String> {
-    let mut pos = 0;
-    let text = read_string(value, &mut pos)?;
-    if pos == value.len() { Some(text) } else { None }
-}
 
 fn peek(text: &str, pos: usize) -> Option<u8> {
     text.as_bytes().get(pos).copied()
@@ -1109,25 +1317,22 @@ fn skip_whitespace(text: &str, pos: &mut usize) {
     }
 }
 
-/// The text of the value at `*pos`, moving past it as [`skip_value`] does.
-fn value_text<'t>(text: &'t str, pos: &mut usize, depth: usize) -> Option<&'t str> {
-    let start = *pos;
-    skip_value(text, pos, depth)?;
-    text.get(start..*pos)
-}
-
 /// Checks the value at `*pos`, nested `depth` levels deep, and moves past
-/// it; a value nested deeper than `MAX_JSON_DEPTH` is malformed. This is
-/// recursive descent over the bytes of `text`, and a position is always a
-/// char boundary between tokens, because every token delimiter is ASCII.
-fn skip_value(text: &str, pos: &mut usize, depth: usize) -> Option<()> {
+/// it, building nothing; a value nested deeper than `MAX_JSON_DEPTH` is
+/// malformed. This is recursive descent over the bytes of `text`, and a
+/// position is always a char boundary between tokens, because every token
+/// delimiter is ASCII. Numbers are only checked, since nothing here
+/// computes with them. Throughout this reader, `None` means malformed.
+fn scan_value(text: &str, pos: &mut usize, depth: usize) -> Option<()> {
     if depth > MAX_JSON_DEPTH {
         return None;
     }
     match peek(text, *pos) {
-        Some(b'{') => read_object(text, pos, depth).map(|_| ()),
-        Some(b'[') => read_array(text, pos, depth).map(|_| ()),
-        Some(b'"') => read_string(text, pos).map(|_| ()),
+        Some(b'{') => scan_object(text, pos, depth, None, |pos, depth, _| {
+            scan_value(text, pos, depth)
+        }),
+        Some(b'[') => scan_array(text, pos, depth, |pos, depth| scan_value(text, pos, depth)),
+        Some(b'"') => walk_string(text, pos, |_| {}),
         Some(b't') => eat_literal(text, pos, "true"),
         Some(b'f') => eat_literal(text, pos, "false"),
         Some(b'n') => eat_literal(text, pos, "null"),
@@ -1136,75 +1341,95 @@ fn skip_value(text: &str, pos: &mut usize, depth: usize) -> Option<()> {
     }
 }
 
-/// The object at `*pos`, nested `depth` levels deep, moving past it: its
-/// keys and value texts in document order, duplicates included.
-fn read_object<'t>(text: &'t str, pos: &mut usize, depth: usize) -> Option<Vec<(String, &'t str)>> {
+/// Checks the object at `*pos`, nested `depth` levels deep, and moves past
+/// it. `member` checks each member's value, at its position and nested one
+/// level deeper, and moves past it; it is told whether the member's key,
+/// unescaped, equals `wanted`. Keys are compared, never kept, and what a
+/// repeated key means is the caller's to decide.
+fn scan_object(
+    text: &str,
+    pos: &mut usize,
+    depth: usize,
+    wanted: Option<&str>,
+    mut member: impl FnMut(&mut usize, usize, bool) -> Option<()>,
+) -> Option<()> {
     eat(text, pos, b'{')?;
-    let mut members = Vec::new();
     skip_whitespace(text, pos);
     if peek(text, *pos) == Some(b'}') {
         *pos = pos.saturating_add(1);
-        return Some(members);
+        return Some(());
     }
     loop {
         skip_whitespace(text, pos);
-        let key = read_string(text, pos)?;
+        // The part of `wanted` the key has still to match, while it matches.
+        let mut unmatched = wanted;
+        walk_string(text, pos, |piece| {
+            unmatched = unmatched.and_then(|rest| rest.strip_prefix(piece));
+        })?;
         skip_whitespace(text, pos);
         eat(text, pos, b':')?;
         skip_whitespace(text, pos);
-        let value = value_text(text, pos, depth.saturating_add(1))?;
-        members.push((key, value));
+        member(pos, depth.saturating_add(1), unmatched == Some(""))?;
         skip_whitespace(text, pos);
         match bump(text, pos) {
             Some(b',') => {}
-            Some(b'}') => return Some(members),
+            Some(b'}') => return Some(()),
             _ => return None,
         }
     }
 }
 
-/// The array at `*pos`, nested `depth` levels deep, moving past it: its
-/// element texts in order.
-fn read_array<'t>(text: &'t str, pos: &mut usize, depth: usize) -> Option<Vec<&'t str>> {
+/// Checks the array at `*pos`, nested `depth` levels deep, and moves past
+/// it. `element` checks each element, at its position and nested one level
+/// deeper, and moves past it.
+fn scan_array(
+    text: &str,
+    pos: &mut usize,
+    depth: usize,
+    mut element: impl FnMut(&mut usize, usize) -> Option<()>,
+) -> Option<()> {
     eat(text, pos, b'[')?;
-    let mut elements = Vec::new();
     skip_whitespace(text, pos);
     if peek(text, *pos) == Some(b']') {
         *pos = pos.saturating_add(1);
-        return Some(elements);
+        return Some(());
     }
     loop {
         skip_whitespace(text, pos);
-        elements.push(value_text(text, pos, depth.saturating_add(1))?);
+        element(pos, depth.saturating_add(1))?;
         skip_whitespace(text, pos);
         match bump(text, pos) {
             Some(b',') => {}
-            Some(b']') => return Some(elements),
+            Some(b']') => return Some(()),
             _ => return None,
         }
     }
 }
 
-/// The string at `*pos`, unescaped, moving past it. The escapes are `\"`,
-/// `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\u` followed by four
-/// hexadecimal digits. A high-surrogate `\u` escape must be followed by a
-/// low-surrogate `\u` escape; an unpaired surrogate, an unknown escape or
-/// an unescaped control character is malformed.
-fn read_string(text: &str, pos: &mut usize) -> Option<String> {
+/// Checks the string at `*pos` and moves past it, handing `sink` its
+/// content, unescaped, in order and in pieces, none of them empty: each run
+/// without escapes as it stands in `text`, and the character of each
+/// escape. Skipping a value, comparing a key, checking an input for line
+/// breaks and decoding an input all read a string through this one walk.
+/// The escapes are `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\u`
+/// followed by four hexadecimal digits. A high-surrogate `\u` escape must be
+/// followed by a low-surrogate `\u` escape; an unpaired surrogate, an
+/// unknown escape or an unescaped control character is malformed.
+fn walk_string(text: &str, pos: &mut usize, mut sink: impl FnMut(&str)) -> Option<()> {
     eat(text, pos, b'"')?;
-    let mut out = String::new();
     let mut run_start = *pos;
     loop {
         match peek(text, *pos) {
             None => return None,
-            Some(b'"') => {
-                out.push_str(text.get(run_start..*pos)?);
+            Some(byte @ (b'"' | b'\\')) => {
+                let run = text.get(run_start..*pos)?;
+                if !run.is_empty() {
+                    sink(run);
+                }
                 *pos = pos.saturating_add(1);
-                return Some(out);
-            }
-            Some(b'\\') => {
-                out.push_str(text.get(run_start..*pos)?);
-                *pos = pos.saturating_add(1);
+                if byte == b'"' {
+                    return Some(());
+                }
                 let unescaped = match bump(text, pos) {
                     Some(b'"') => '"',
                     Some(b'\\') => '\\',
@@ -1217,7 +1442,7 @@ fn read_string(text: &str, pos: &mut usize) -> Option<String> {
                     Some(b'u') => read_unicode_escape(text, pos)?,
                     _ => return None,
                 };
-                out.push(unescaped);
+                sink(unescaped.encode_utf8(&mut [0u8; 4]));
                 run_start = *pos;
             }
             Some(byte) if byte < 0x20 => return None,
@@ -2188,6 +2413,7 @@ mod tests {
     use std::any::Any;
     use std::os::unix::process::ExitStatusExt;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_string()).collect()
@@ -2205,38 +2431,50 @@ mod tests {
         }
     }
 
+    /// The inputs of a session body, scanned and then decoded as
+    /// `route_api` does, without the admission between the two.
+    fn session_inputs(body: &[u8]) -> Result<Vec<String>, String> {
+        let (text, array) = scan_session_body(body)?;
+        decode_inputs(text, array).ok_or_else(|| "decoding failed after the scan".to_string())
+    }
+
     #[test]
     fn json_reads_escapes_and_surrogate_pairs() -> Result<(), String> {
-        let text = r#" {"s":"q\" b\\ s\/ \b\f\n\r\t \u0041\u00e9\u20ac \ud83d\ude00 \u0007",
-            "n":-1.5e3, "z":0, "a":[true,false,null], "o":{}} "#;
-        let rejected = || "rejected well-formed JSON".to_string();
-        let value = parse_json(text).ok_or_else(rejected)?;
-        assert_eq!(value, text.trim());
-        let members = json_members(value).ok_or_else(rejected)?;
-        let keys: Vec<&str> = members.iter().map(|(key, _)| key.as_str()).collect();
-        assert_eq!(keys, ["s", "n", "z", "a", "o"]);
-        let member = |key: &str| {
-            members
-                .iter()
-                .find(|(name, _)| name == key)
-                .map(|(_, member)| *member)
-        };
+        let escaped = r#""q\" b\\ s\/ \b\f\n\r\t \u0041\u00e9\u20ac \ud83d\ude00 \u0007""#;
+        let unescaped = "q\" b\\ s/ \u{8}\u{c}\n\r\t A\u{e9}\u{20ac} \u{1f600} \u{7}";
+        let mut pos = 0;
+        let text = format!("{escaped} ");
+        assert_eq!(decode_string(&text, &mut pos).as_deref(), Some(unescaped));
         assert_eq!(
-            member("s").and_then(json_string),
-            Some("q\" b\\ s/ \u{8}\u{c}\n\r\t A\u{e9}\u{20ac} \u{1f600} \u{7}".to_string())
+            pos,
+            escaped.len(),
+            "the reader stops past the closing quote"
         );
-        assert_eq!(member("n"), Some("-1.5e3"));
-        assert_eq!(member("z"), Some("0"));
+        // A string without escapes is held at exactly its length.
+        let mut pos = 0;
+        let plain = decode_string(r#""plain text é""#, &mut pos).ok_or("plain string rejected")?;
         assert_eq!(
-            member("a").and_then(json_elements),
-            Some(vec!["true", "false", "null"])
+            (plain.as_str(), plain.capacity()),
+            ("plain text é", plain.len())
         );
-        assert_eq!(member("o").and_then(json_members), Some(Vec::new()));
+        // Every kind of value, in members a session ignores, and the same
+        // escapes in an input, which may hold no CR or LF.
+        let body = format!(
+            r#" {{"s":{escaped},
+            "n":-1.5e3, "z":0, "a":[true,false,null], "o":{{}},
+            "inputs":["q\" b\\ s\/ \b\f\t \u0041\u00e9\u20ac \ud83d\ude00 \u0007",""]}} "#
+        );
+        assert_eq!(
+            session_inputs(body.as_bytes()),
+            Ok(strings(&[
+                "q\" b\\ s/ \u{8}\u{c}\t A\u{e9}\u{20ac} \u{1f600} \u{7}",
+                ""
+            ]))
+        );
         // Each reader takes exactly one value of its own kind.
-        assert_eq!(member("n").and_then(json_string), None);
-        assert_eq!(member("a").and_then(json_members), None);
-        assert_eq!(member("o").and_then(json_elements), None);
-        assert_eq!(json_string(r#""a" "#), None);
+        assert_eq!(decode_string("-1.5e3", &mut 0), None);
+        assert_eq!(scan_array("{}", &mut 0, 0, |_, _| None), None);
+        assert_eq!(scan_object("[]", &mut 0, 0, None, |_, _, _| None), None);
         let malformed = [
             r#""\ud83d""#,
             r#""\ude00""#,
@@ -2259,12 +2497,31 @@ mod tests {
             "[1] x",
             "{} {}",
         ];
+        let malformed_json = Err("MALFORMED JSON".to_string());
         for text in malformed {
-            assert!(parse_json(text).is_none(), "accepted {text:?}");
+            // As the whole body, and as the value of a member a session
+            // ignores.
+            assert_eq!(session_inputs(text.as_bytes()), malformed_json, "{text:?}");
+            let ignored = format!(r#"{{"x":{text},"inputs":[]}}"#);
+            assert_eq!(
+                session_inputs(ignored.as_bytes()),
+                malformed_json,
+                "{ignored:?}"
+            );
         }
+        // The top-level value is at depth 0, so one more array than the
+        // limit still nests within it.
         let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
-        assert!(parse_json(&nested(MAX_JSON_DEPTH)).is_some());
-        assert!(parse_json(&nested(MAX_JSON_DEPTH.saturating_add(2))).is_none());
+        let not_object = Err("BODY IS NOT A JSON OBJECT".to_string());
+        for depth in [MAX_JSON_DEPTH, MAX_JSON_DEPTH.saturating_add(1)] {
+            assert_eq!(
+                session_inputs(nested(depth).as_bytes()),
+                not_object,
+                "{depth}"
+            );
+        }
+        let too_deep = nested(MAX_JSON_DEPTH.saturating_add(2));
+        assert_eq!(session_inputs(too_deep.as_bytes()), malformed_json);
         Ok(())
     }
 
@@ -2274,10 +2531,16 @@ mod tests {
         let mut out = String::new();
         write_json_string(&mut out, original);
         assert_eq!(out, r#""q\" b\\ \n\r\t\b\f\u0007\u001f\u0000 é€😀 /""#);
-        let read_back = parse_json(&out)
-            .and_then(json_string)
+        let mut pos = 0;
+        let read_back = decode_string(&out, &mut pos)
             .ok_or_else(|| "writer output does not parse".to_string())?;
-        assert_eq!(read_back, original);
+        assert_eq!((read_back.as_str(), pos), (original, out.len()));
+        // Written without its CR and LF, it is read back as an input.
+        let input = original.replace(['\r', '\n'], "");
+        let mut element = String::new();
+        write_json_string(&mut element, &input);
+        let body = format!(r#"{{"inputs":[{element}]}}"#);
+        assert_eq!(session_inputs(body.as_bytes()), Ok(vec![input]));
         assert_eq!(error_body("NOT RECORDED"), r#"{"error":"NOT RECORDED"}"#);
         assert_eq!(
             session_body("a\u{7}\n", None),
@@ -3091,6 +3354,74 @@ mod tests {
     }
 
     #[test]
+    fn input_budget_holds_back_only_heavy_sessions() -> Result<(), String> {
+        let budget = &InputBudget::new(10, 2);
+        let held = || *budget.held.lock().unwrap_or_else(PoisonError::into_inner);
+        // A light session is admitted uncharged with the budget full, and
+        // heavy sessions that fit together are admitted together.
+        let full = budget.admit(10);
+        let light = budget.admit(2);
+        assert_eq!((full.charge, light.charge, held()), (10, 0, 10));
+        drop((light, full));
+        let halves = (budget.admit(5), budget.admit(5));
+        assert_eq!(held(), 10);
+        drop(halves);
+        assert_eq!(held(), 0);
+        // (the inputs of the session holding a charge, the inputs of a
+        // session that must wait for it, the charge that one then holds):
+        // a heavy session that does not fit, and one over the capacity,
+        // which waits for the budget to empty.
+        let waits = [(10, 3, 3), (3, 25, 10)];
+        for (holding, inputs, charged) in waits {
+            let holder = budget.admit(holding);
+            thread::scope(|scope| -> Result<(), String> {
+                let (admitted, admissions) = mpsc::channel();
+                let (release, released) = mpsc::channel::<()>();
+                let waiter = thread::Builder::new()
+                    .spawn_scoped(scope, move || {
+                        let charge = budget.admit(inputs);
+                        let _ = admitted.send(charge.charge);
+                        let _ = released.recv_timeout(Duration::from_secs(30));
+                        drop(charge);
+                    })
+                    .map_err(|e| format!("starting the waiter: {e}"))?;
+                assert_eq!(
+                    admissions.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout),
+                    "{inputs} inputs admitted while {holding} were held"
+                );
+                drop(holder);
+                assert_eq!(
+                    admissions.recv_timeout(Duration::from_secs(10)),
+                    Ok(charged)
+                );
+                assert_eq!(held(), charged);
+                let _ = release.send(());
+                waiter.join().map_err(|_| "the waiter panicked".to_string())
+            })?;
+            assert_eq!(held(), 0, "a charge of {charged} was not released");
+        }
+        // A lock poisoned by a thread that panicked holding it still admits
+        // and releases.
+        thread::scope(|scope| -> Result<(), String> {
+            let poisoner = thread::Builder::new()
+                .spawn_scoped(scope, || -> Result<(), String> {
+                    let _held = budget.held.lock();
+                    std::panic::resume_unwind(Box::new("poisoning the budget"))
+                })
+                .map_err(|e| format!("starting the poisoner: {e}"))?;
+            assert!(poisoner.join().is_err(), "the poisoner did not unwind");
+            Ok(())
+        })?;
+        assert!(budget.held.is_poisoned());
+        let charge = budget.admit(5);
+        assert_eq!(held(), 5);
+        drop(charge);
+        assert_eq!(held(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn live_admission_bounds_concurrent_runs() -> Result<(), String> {
         let slots = [const { Mutex::new(()) }; 2];
         let inside = AtomicUsize::new(0);
@@ -3675,29 +4006,90 @@ mod tests {
 
     #[test]
     fn session_request_validation() -> Result<(), String> {
-        let accepted =
-            parse_session_request(br#"{"other":1,"inputs":[""," A1 ","^","\u0007\t\u00e9"]}"#);
-        assert_eq!(accepted, Ok(strings(&["", " A1 ", "^", "\u{7}\t\u{e9}"])));
-        let rejected: [(&[u8], &str); 11] = [
+        // The inputs array is a member's value, at depth 1, so its elements
+        // are at depth 2, and a value that deep holds one array fewer than
+        // a member's value can.
+        let brackets = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        let deepest_element = format!(
+            r#"{{"inputs":[{}]}}"#,
+            brackets(MAX_JSON_DEPTH.saturating_sub(1))
+        );
+        let too_deep_element = format!(r#"{{"inputs":[{}]}}"#, brackets(MAX_JSON_DEPTH));
+        let deepest_member = format!(r#"{{"x":{},"inputs":["^"]}}"#, brackets(MAX_JSON_DEPTH));
+        let too_deep_member = format!(
+            r#"{{"x":{},"inputs":["^"]}}"#,
+            brackets(MAX_JSON_DEPTH.saturating_add(1))
+        );
+        let many = format!(r#"{{"inputs":[{}"^"]}}"#, r#""a","#.repeat(5000));
+        let mut many_inputs = vec!["a".to_string(); 5000];
+        many_inputs.push("^".to_string());
+        let accepted: &[(&[u8], Vec<String>)] = &[
+            (
+                br#"{"other":1,"inputs":[""," A1 ","^","\u0007\t\u00e9"]}"#,
+                strings(&["", " A1 ", "^", "\u{7}\t\u{e9}"]),
+            ),
+            // The key is compared unescaped.
+            (br#"{"\u0069nputs":["^"]}"#, strings(&["^"])),
+            // An `inputs` key inside another member is not a member.
+            (br#"{"x":{"inputs":1},"inputs":["^"]}"#, strings(&["^"])),
+            (deepest_member.as_bytes(), strings(&["^"])),
+            (
+                b" \t\r\n{ \"inputs\" : [ \"a\" , \"b\" ] } \r\n",
+                strings(&["a", "b"]),
+            ),
+            (br#"{"inputs":[]}"#, Vec::new()),
+            (many.as_bytes(), many_inputs),
+        ];
+        for (body, expected) in accepted {
+            let inputs = session_inputs(body)?;
+            assert_eq!(&inputs, expected, "{}", String::from_utf8_lossy(body));
+            // The inputs are held in one allocation of exactly their count.
+            assert_eq!(inputs.capacity(), inputs.len());
+        }
+        let line_break = "INPUT 1 CONTAINS A CARRIAGE RETURN OR LINE FEED";
+        // Causes in precedence order: a syntax error anywhere, an element
+        // fault's array included, is malformed; then the kind of body; then
+        // `inputs`; then the first faulty element by position.
+        let rejected: &[(&[u8], &str)] = &[
             (br#"{"inputs": ["#, "MALFORMED JSON"),
             (b"", "MALFORMED JSON"),
             (b"{\"inputs\":[\"\xff\"]}", "MALFORMED JSON"),
+            (b"{\"x\":\"\xff\",\"inputs\":[]}", "MALFORMED JSON"),
+            (br#"{"inputs":[1],}"#, "MALFORMED JSON"),
+            (br#"{"inputs":["a\nb"],}"#, "MALFORMED JSON"),
+            (br#"{"inputs":["a"]} x"#, "MALFORMED JSON"),
+            (too_deep_element.as_bytes(), "MALFORMED JSON"),
+            (too_deep_member.as_bytes(), "MALFORMED JSON"),
             (br#"["a"]"#, "BODY IS NOT A JSON OBJECT"),
+            (br#""str""#, "BODY IS NOT A JSON OBJECT"),
+            (b"1", "BODY IS NOT A JSON OBJECT"),
             (br#"{}"#, "INPUTS MISSING OR REPEATED"),
             (
                 br#"{"inputs":[],"inputs":[]}"#,
                 "INPUTS MISSING OR REPEATED",
             ),
-            (br#"{"inputs":"x"}"#, "INPUTS IS NOT AN ARRAY"),
-            (br#"{"inputs":[1]}"#, "INPUT 1 IS NOT A STRING"),
-            (br#"{"inputs":["",null]}"#, "INPUT 2 IS NOT A STRING"),
             (
-                br#"{"inputs":["a\rb"]}"#,
-                "INPUT 1 CONTAINS A CARRIAGE RETURN OR LINE FEED",
+                br#"{"inputs":"x","inputs":[]}"#,
+                "INPUTS MISSING OR REPEATED",
             ),
             (
-                br#"{"inputs":["a\nb"]}"#,
-                "INPUT 1 CONTAINS A CARRIAGE RETURN OR LINE FEED",
+                br#"{"inputs":[1],"\u0069nputs":[]}"#,
+                "INPUTS MISSING OR REPEATED",
+            ),
+            (br#"{"inputs":"x"}"#, "INPUTS IS NOT AN ARRAY"),
+            (br#"{"inputs":{}}"#, "INPUTS IS NOT AN ARRAY"),
+            (br#"{"inputs":[1]}"#, "INPUT 1 IS NOT A STRING"),
+            (br#"{"inputs":["",null]}"#, "INPUT 2 IS NOT A STRING"),
+            (deepest_element.as_bytes(), "INPUT 1 IS NOT A STRING"),
+            (br#"{"inputs":[1,"a\nb"]}"#, "INPUT 1 IS NOT A STRING"),
+            (br#"{"inputs":["a",{},"b\rc"]}"#, "INPUT 2 IS NOT A STRING"),
+            (br#"{"inputs":["a\rb"]}"#, line_break),
+            (br#"{"inputs":["a\nb"]}"#, line_break),
+            (br#"{"inputs":["a\nb",1]}"#, line_break),
+            (br#"{"inputs":["a\u000ab"]}"#, line_break),
+            (
+                br#"{"inputs":["a","\u000Db"]}"#,
+                "INPUT 2 CONTAINS A CARRIAGE RETURN OR LINE FEED",
             ),
         ];
         let store = Store::from_zwr("").map_err(|e| e.to_string())?;
@@ -3712,14 +4104,19 @@ mod tests {
             "/api/rust/session".to_string(),
             Some(br#"{"inputs": ["#.to_vec()),
         );
-        let (status, content_type, answer) = route(&malformed, &store, &mumps);
+        let (status, content_type, answer) = route(malformed, &store, &mumps);
         let answer = String::from_utf8(answer).map_err(|e| e.to_string())?;
         assert_eq!(
             (status, content_type, answer.as_str()),
             (400, JSON_TYPE, r#"{"error":"BAD REQUEST: MALFORMED JSON"}"#)
         );
-        for (body, cause) in rejected {
-            assert_eq!(parse_session_request(body), Err(cause.to_string()));
+        for &(body, cause) in rejected {
+            assert_eq!(
+                scan_session_body(body).map(|(_, array)| array),
+                Err(cause.to_string()),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
             // Each session route answers the cause inside the 400 envelope.
             let expected = error_body(&format!("{BAD_REQUEST}: {cause}"));
             for backend in ["mumps", "rust", "compare"] {
@@ -3728,7 +4125,7 @@ mod tests {
                     format!("/api/{backend}/session"),
                     Some(body.to_vec()),
                 );
-                let (status, content_type, answer) = route(&request, &store, &mumps);
+                let (status, content_type, answer) = route(request, &store, &mumps);
                 let answer = String::from_utf8(answer).map_err(|e| e.to_string())?;
                 assert_eq!(
                     (status, content_type, answer.as_str()),
@@ -3738,6 +4135,47 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn largest_session_body_answers_as_its_first_inputs() -> Result<(), String> {
+        let store = fixture_store()?;
+        // Rust sessions read no capture.
+        let mumps = MumpsMode::Replay {
+            golden_dir: PathBuf::new(),
+        };
+        let session = |body: Vec<u8>| {
+            let request = (
+                "POST".to_string(),
+                "/api/rust/session".to_string(),
+                Some(body),
+            );
+            route(request, &store, &mumps)
+        };
+        // As many one-character inputs as fit within `MAX_BODY`, then the
+        // exit: a session the budget charges, answered as the session of
+        // its first input and the exit is.
+        let mut body = br#"{"inputs":["#.to_vec();
+        let filler = br#""a","#;
+        let rest = br#""^"]}"#;
+        let count = MAX_BODY.saturating_sub(body.len().saturating_add(rest.len())) / filler.len();
+        for _ in 0..count {
+            body.extend_from_slice(filler);
+        }
+        body.extend_from_slice(rest);
+        assert!(body.len() <= MAX_BODY && count > FREE_INPUTS);
+        let largest = session(body);
+        let short = session(br#"{"inputs":["a","^"]}"#.to_vec());
+        assert_eq!(largest, short);
+        assert_eq!(largest.0, 200);
+        // No other test sends a session heavy enough to be charged, so the
+        // shared budget is empty again once the session has answered.
+        let held = *INPUT_BUDGET
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(held, 0);
         Ok(())
     }
 
@@ -4053,6 +4491,15 @@ mod tests {
             ),
             (Duration::from_millis(100), b"{}".to_vec()),
         ];
+        // A body followed by a pipelined request, with the head and later.
+        let pipelined = b"GET / HTTP/1.1\r\nHost: h\r\n\r\n";
+        let mut body_and_more = request_then_body.clone();
+        if let Some((_, body)) = body_and_more.last_mut() {
+            body.extend_from_slice(pipelined);
+        }
+        let mut with_the_head =
+            b"POST /api/rust/session HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}".to_vec();
+        with_the_head.extend_from_slice(pipelined);
         // (case, what the client sends, whether it then ends its output,
         // the outcome, the least time the outcome takes)
         let cases = [
@@ -4131,6 +4578,20 @@ mod tests {
                 "body within the deadline",
                 request_then_body,
                 false,
+                answered.clone(),
+                Duration::ZERO,
+            ),
+            (
+                "body, then a pipelined request",
+                body_and_more,
+                false,
+                answered.clone(),
+                Duration::ZERO,
+            ),
+            (
+                "body and a pipelined request with the head",
+                now(&with_the_head),
+                false,
                 answered,
                 Duration::ZERO,
             ),
@@ -4157,6 +4618,10 @@ mod tests {
             let outcome = outcome.map_err(|e| format!("{case}: read timeout not set: {e}"))?;
             println!("read_request, {case}: {outcome:?} after {took:?}");
             assert_eq!(outcome, expected, "{case}");
+            if let Ok(Some((_, _, Some(body)))) = &outcome {
+                // Allocated once, at the declared length.
+                assert_eq!(body.capacity(), body.len(), "{case}");
+            }
             assert!(sent.starts_with(&received), "{case}: received out of order");
             assert!(
                 took >= least && took < bound,
@@ -4199,7 +4664,7 @@ mod tests {
                 target.to_string(),
                 Some(br#"{"inputs":["NAME"]}"#.to_vec()),
             );
-            let (status, content_type, body) = route(&request, &store, &mumps);
+            let (status, content_type, body) = route(request, &store, &mumps);
             let body = String::from_utf8(body).map_err(|e| e.to_string())?;
             assert_eq!(
                 (status, content_type, body.as_str()),

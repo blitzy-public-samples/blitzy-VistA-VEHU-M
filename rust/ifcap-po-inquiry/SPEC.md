@@ -1454,8 +1454,8 @@ Criterion A9. Each search ran on 2026-11-15 from `rust/ifcap-po-inquiry/`, after
 | A9 check | How the design satisfies it | Confirming search or test | Result |
 |---|---|---|---|
 | No public item takes `&mut Store` or returns a mutable `Store`, and `Store` has no mutating method | `Store::from_zwr` returns an owned value; every `Store` method takes `&self`; `load_fixtures` merges each file's map before the `Store` is built | S5 | Both commands print nothing (exit status 1 each) |
-| The live bridge runs one kind of command, `docker exec -i` with the `meta.txt` start arguments | The only production caller of `run_admitted` is `live`, which passes the literal program `"docker"` and the arguments `exec`, `-i`, the container and the `golden::live_start` arguments; `run_admitted` calls `run_command`, which calls `execute`, which builds `Command::new(program)`. No shell runs on the host and no M code comes from a request | S6 | `Command::new(program)` in `execute`, and `Command::new("sleep")` inside `#[cfg(test)] mod tests` (from line 2185 of `src/bridge.rs`). `run_admitted(` hits: the production call in `live`, the definition, and three calls inside `mod tests` |
-| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2185, `src/store.rs` from line 490, `src/golden.rs` from line 1410. Both tests pass (section "Run evidence") |
+| The live bridge runs one kind of command, `docker exec -i` with the `meta.txt` start arguments | The only production caller of `run_admitted` is `live`, which passes the literal program `"docker"` and the arguments `exec`, `-i`, the container and the `golden::live_start` arguments; `run_admitted` calls `run_command`, which calls `execute`, which builds `Command::new(program)`. No shell runs on the host and no M code comes from a request | S6 | `Command::new(program)` in `execute`, and `Command::new("sleep")` inside `#[cfg(test)] mod tests` (from line 2410 of `src/bridge.rs`). `run_admitted(` hits: the production call in `live`, the definition, and three calls inside `mod tests` |
+| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2410, `src/store.rs` from line 490, `src/golden.rs` from line 1410. Both tests pass (section "Run evidence") |
 | The front-end has no create, edit, cancel or delete control | The selector, the input, SEND and EXIT only | S8; by hand (section "Front-end checklist", item 7) | No control element: the hits are `createDocumentFragment` and `createElement`, which build transcript rows, and the comments and handler for the `animationcancel` event |
 | No write path in `src/` or `frontend/` | Only reads of `&Store`; `fetch` sends only the session `POST` and the status `GET`; the MUMPS side runs the original's own read-only inquiry | S5, S7, S8 and S9 | S9 prints nothing (exit status 1); S5, S7 and S8 as above |
 
@@ -1469,26 +1469,26 @@ S6, exit status 0 for each command:
 
 ```text
 $ grep -rn 'Command::new' src/
-src/bridge.rs:1750:    let mut child = Command::new(program)
-src/bridge.rs:2966:        let spawned = Command::new("sleep")
+src/bridge.rs:1975:    let mut child = Command::new(program)
+src/bridge.rs:3229:        let spawned = Command::new("sleep")
 $ grep -n 'run_admitted(' src/bridge.rs
-1567:    run_admitted(
-1581:fn run_admitted(
-3191:                        run_admitted(&slots, Duration::from_secs(60), "sleep", &args, b"")
-3220:        let expired = run_admitted(&slots, wait, absent, &[], b"");
-3230:        let attempted = run_admitted(&slots, wait, absent, &[], b"");
+1792:    run_admitted(
+1806:fn run_admitted(
+3522:                        run_admitted(&slots, Duration::from_secs(60), "sleep", &args, b"")
+3551:        let expired = run_admitted(&slots, wait, absent, &[], b"");
+3561:        let attempted = run_admitted(&slots, wait, absent, &[], b"");
 ```
 
 S7, exit status 0:
 
 ```text
 $ grep -rnE 'fs::write|File::create|OpenOptions|create_dir|remove_file|rename\(' src/
-src/bridge.rs:2616:            fs::OpenOptions::new()
-src/bridge.rs:3257:    /// `fs::create_dir`, which fails on any existing entry, so the directory
-src/bridge.rs:3270:                match fs::create_dir(&path) {
-src/bridge.rs:3287:            fs::create_dir_all(&dir)
-src/bridge.rs:3288:                .and_then(|()| fs::write(dir.join(name), text))
-src/bridge.rs:3577:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
+src/bridge.rs:2879:            fs::OpenOptions::new()
+src/bridge.rs:3588:    /// `fs::create_dir`, which fails on any existing entry, so the directory
+src/bridge.rs:3601:                match fs::create_dir(&path) {
+src/bridge.rs:3618:            fs::create_dir_all(&dir)
+src/bridge.rs:3619:                .and_then(|()| fs::write(dir.join(name), text))
+src/bridge.rs:3908:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
 src/store.rs:516:    /// `ifcap-store-unit-<pid>-<n>` and creates it with `fs::create_dir`,
 src/store.rs:528:            match fs::create_dir(&dir) {
 src/store.rs:542:        fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
@@ -1509,7 +1509,7 @@ src/golden.rs:2685:                Made::Bytes(bytes) => fs::write(&path, bytes)
 src/golden.rs:2687:                Made::Directory => fs::create_dir(&path).map_err(|e| e.to_string())?,
 ```
 
-The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2185`, `src/golden.rs:1410`, `src/inquiry.rs:2496`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:490`.
+The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2410`, `src/golden.rs:1410`, `src/inquiry.rs:2496`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:490`.
 
 S8, exit status 0:
 
@@ -1603,10 +1603,10 @@ drwxr-sr-x 3 root root   4096 Nov 15 08:14 ..
 -rw-r--r-- 1 root root 366907 Nov 15 08:14 5.zwr
 
 tests/golden/ifcap/:
-total 44
-drwxr-sr-x 2 root root  4096 Nov 15 10:15 .
+total 48
+drwxr-sr-x 2 root root  4096 Nov 15 17:40 .
 drwxr-sr-x 3 root root  4096 Nov 15 08:14 ..
--rw------- 1 root root 33210 Nov 15 10:15 README.md
+-rw-r--r-- 1 root root 37834 Nov 15 17:40 README.md
 ```
 
 `ls tests/fixtures/ifcap/cases.zwr`, exit status 2:
@@ -1677,7 +1677,7 @@ All 11 fixtures are byte-identical to their sources.
 
 ```text
      Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
-test result: ok. 148 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 150 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
@@ -1688,7 +1688,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-168 tests pass: 148 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
+170 tests pass: 150 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
 
 `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, exit status 0. Output with the `finished in <seconds>` timings trimmed:
 

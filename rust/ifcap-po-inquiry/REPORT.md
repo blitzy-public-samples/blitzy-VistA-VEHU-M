@@ -59,10 +59,10 @@ drwxr-sr-x 3 root root   4096 Nov 15 08:14 ..
 -rw-r--r-- 1 root root 366907 Nov 15 08:14 5.zwr
 
 tests/golden/ifcap/:
-total 44
-drwxr-sr-x 2 root root  4096 Nov 15 10:15 .
+total 48
+drwxr-sr-x 2 root root  4096 Nov 15 17:40 .
 drwxr-sr-x 3 root root  4096 Nov 15 08:14 ..
--rw------- 1 root root 33210 Nov 15 10:15 README.md
+-rw-r--r-- 1 root root 37834 Nov 15 17:40 README.md
 ```
 
 `ls tests/fixtures/ifcap/cases.zwr`, exit status 2:
@@ -133,7 +133,7 @@ All 11 fixtures are byte-identical to their sources.
 
 ```text
      Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
-test result: ok. 148 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 150 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
@@ -144,7 +144,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-168 tests pass: 148 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
+170 tests pass: 150 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
 
 `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, exit status 0. Output with the `finished in <seconds>` timings trimmed:
 
