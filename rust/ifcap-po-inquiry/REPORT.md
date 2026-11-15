@@ -12,10 +12,10 @@ Written by `comparison_report` in `tests/equivalence.rs`, the only writer of thi
 - **Case:** existing order with one line (2 × $125.50)
 - **Actual test name:** `gc_01_standard_order`
 - **Status:** NOT COMPARED
-- **First difference:** `missing: tests/golden/ifcap/GC-01/input.txt, tests/golden/ifcap/GC-01/transcript.txt, tests/golden/ifcap/GC-01/returned.txt, tests/golden/ifcap/GC-01/db-before.zwr, tests/golden/ifcap/GC-01/db-after.zwr, tests/golden/ifcap/GC-01/meta.txt, tests/golden/ifcap/GC-01/normalisation.txt, tests/fixtures/ifcap/cases.zwr`
+- **First difference:** `missing: tests/golden/ifcap/GC-01/input.txt, tests/golden/ifcap/GC-01/transcript.txt, tests/golden/ifcap/GC-01/returned.txt, tests/golden/ifcap/GC-01/db-before.zwr, tests/golden/ifcap/GC-01/db-after.zwr, tests/golden/ifcap/GC-01/meta.txt, tests/golden/ifcap/GC-01/normalisation.txt, tests/fixtures/ifcap/cases.zwr, tests/fixtures/ifcap/MANIFEST.txt`
 - **Predicted contracts and branches:** PO-01 to PO-05, PO-41, PO-06 to PO-08, PO-09 (b8), PO-10 to PO-40, then PO-09 (b3) (BLOCKED at PO-12.b1 while O-01 is open)
 - **Actual branch:** NOT EVALUATED (readiness: required files missing)
-- **Readiness: NOT READY, 8 required files missing:**
+- **Readiness: NOT READY, 9 required files missing:**
   - `tests/golden/ifcap/GC-01/input.txt`
   - `tests/golden/ifcap/GC-01/transcript.txt`
   - `tests/golden/ifcap/GC-01/returned.txt`
@@ -24,6 +24,7 @@ Written by `comparison_report` in `tests/equivalence.rs`, the only writer of thi
   - `tests/golden/ifcap/GC-01/meta.txt`
   - `tests/golden/ifcap/GC-01/normalisation.txt`
   - `tests/fixtures/ifcap/cases.zwr`
+  - `tests/fixtures/ifcap/MANIFEST.txt`
 - **Inputs:** NOT EVALUATED (readiness: required files missing)
 - **Fixture hashes:** NOT EVALUATED (readiness: required files missing)
 - **Capture hashes:** NOT EVALUATED (readiness: required files missing)
@@ -46,10 +47,10 @@ Written by `comparison_report` in `tests/equivalence.rs`, the only writer of thi
 - **Case:** three lines (3 × $19.95, 2 × $125.50, 1 × $0.99)
 - **Actual test name:** `gc_02_multiple_lines_and_decimals`
 - **Status:** NOT COMPARED
-- **First difference:** `missing: tests/golden/ifcap/GC-02/input.txt, tests/golden/ifcap/GC-02/transcript.txt, tests/golden/ifcap/GC-02/returned.txt, tests/golden/ifcap/GC-02/db-before.zwr, tests/golden/ifcap/GC-02/db-after.zwr, tests/golden/ifcap/GC-02/meta.txt, tests/golden/ifcap/GC-02/normalisation.txt, tests/fixtures/ifcap/cases.zwr`
+- **First difference:** `missing: tests/golden/ifcap/GC-02/input.txt, tests/golden/ifcap/GC-02/transcript.txt, tests/golden/ifcap/GC-02/returned.txt, tests/golden/ifcap/GC-02/db-before.zwr, tests/golden/ifcap/GC-02/db-after.zwr, tests/golden/ifcap/GC-02/meta.txt, tests/golden/ifcap/GC-02/normalisation.txt, tests/fixtures/ifcap/cases.zwr, tests/fixtures/ifcap/MANIFEST.txt`
 - **Predicted contracts and branches:** PO-01 to PO-05, PO-41, PO-06 to PO-08, PO-09 (b8), PO-10 to PO-40, then PO-09 (b3) (BLOCKED at PO-12.b1 while O-01 is open)
 - **Actual branch:** NOT EVALUATED (readiness: required files missing)
-- **Readiness: NOT READY, 8 required files missing:**
+- **Readiness: NOT READY, 9 required files missing:**
   - `tests/golden/ifcap/GC-02/input.txt`
   - `tests/golden/ifcap/GC-02/transcript.txt`
   - `tests/golden/ifcap/GC-02/returned.txt`
@@ -58,6 +59,7 @@ Written by `comparison_report` in `tests/equivalence.rs`, the only writer of thi
   - `tests/golden/ifcap/GC-02/meta.txt`
   - `tests/golden/ifcap/GC-02/normalisation.txt`
   - `tests/fixtures/ifcap/cases.zwr`
+  - `tests/fixtures/ifcap/MANIFEST.txt`
 - **Inputs:** NOT EVALUATED (readiness: required files missing)
 - **Fixture hashes:** NOT EVALUATED (readiness: required files missing)
 - **Capture hashes:** NOT EVALUATED (readiness: required files missing)
@@ -80,10 +82,10 @@ Written by `comparison_report` in `tests/equivalence.rs`, the only writer of thi
 - **Case:** syntactically valid identifier absent from the fixture database
 - **Actual test name:** `gc_03_missing_order`
 - **Status:** NOT COMPARED
-- **First difference:** `missing: tests/golden/ifcap/GC-03/input.txt, tests/golden/ifcap/GC-03/transcript.txt, tests/golden/ifcap/GC-03/returned.txt, tests/golden/ifcap/GC-03/db-before.zwr, tests/golden/ifcap/GC-03/db-after.zwr, tests/golden/ifcap/GC-03/meta.txt, tests/golden/ifcap/GC-03/normalisation.txt, tests/fixtures/ifcap/cases.zwr`
+- **First difference:** `missing: tests/golden/ifcap/GC-03/input.txt, tests/golden/ifcap/GC-03/transcript.txt, tests/golden/ifcap/GC-03/returned.txt, tests/golden/ifcap/GC-03/db-before.zwr, tests/golden/ifcap/GC-03/db-after.zwr, tests/golden/ifcap/GC-03/meta.txt, tests/golden/ifcap/GC-03/normalisation.txt, tests/fixtures/ifcap/cases.zwr, tests/fixtures/ifcap/MANIFEST.txt`
 - **Predicted contracts and branches:** PO-01 to PO-05, PO-41, PO-06 to PO-08, PO-09 (b14), then PO-09 (b3) (BLOCKED at PO-09.b14 while O-03 is open)
 - **Actual branch:** NOT EVALUATED (readiness: required files missing)
-- **Readiness: NOT READY, 8 required files missing:**
+- **Readiness: NOT READY, 9 required files missing:**
   - `tests/golden/ifcap/GC-03/input.txt`
   - `tests/golden/ifcap/GC-03/transcript.txt`
   - `tests/golden/ifcap/GC-03/returned.txt`
@@ -92,6 +94,7 @@ Written by `comparison_report` in `tests/equivalence.rs`, the only writer of thi
   - `tests/golden/ifcap/GC-03/meta.txt`
   - `tests/golden/ifcap/GC-03/normalisation.txt`
   - `tests/fixtures/ifcap/cases.zwr`
+  - `tests/fixtures/ifcap/MANIFEST.txt`
 - **Inputs:** NOT EVALUATED (readiness: required files missing)
 - **Fixture hashes:** NOT EVALUATED (readiness: required files missing)
 - **Capture hashes:** NOT EVALUATED (readiness: required files missing)
@@ -114,10 +117,10 @@ Written by `comparison_report` in `tests/equivalence.rs`, the only writer of thi
 - **Case:** `INVALID!` at the order-selection prompt, then `^`
 - **Actual test name:** `gc_04_invalid_input`
 - **Status:** NOT COMPARED
-- **First difference:** `missing: tests/golden/ifcap/GC-04/input.txt, tests/golden/ifcap/GC-04/transcript.txt, tests/golden/ifcap/GC-04/returned.txt, tests/golden/ifcap/GC-04/db-before.zwr, tests/golden/ifcap/GC-04/db-after.zwr, tests/golden/ifcap/GC-04/meta.txt, tests/golden/ifcap/GC-04/normalisation.txt, tests/fixtures/ifcap/cases.zwr`
+- **First difference:** `missing: tests/golden/ifcap/GC-04/input.txt, tests/golden/ifcap/GC-04/transcript.txt, tests/golden/ifcap/GC-04/returned.txt, tests/golden/ifcap/GC-04/db-before.zwr, tests/golden/ifcap/GC-04/db-after.zwr, tests/golden/ifcap/GC-04/meta.txt, tests/golden/ifcap/GC-04/normalisation.txt, tests/fixtures/ifcap/cases.zwr, tests/fixtures/ifcap/MANIFEST.txt`
 - **Predicted contracts and branches:** PO-01 to PO-05, PO-41, PO-06 to PO-08, PO-09 (b14), then PO-09 (b3) (BLOCKED at PO-09.b14 while O-03 is open)
 - **Actual branch:** NOT EVALUATED (readiness: required files missing)
-- **Readiness: NOT READY, 8 required files missing:**
+- **Readiness: NOT READY, 9 required files missing:**
   - `tests/golden/ifcap/GC-04/input.txt`
   - `tests/golden/ifcap/GC-04/transcript.txt`
   - `tests/golden/ifcap/GC-04/returned.txt`
@@ -126,6 +129,7 @@ Written by `comparison_report` in `tests/equivalence.rs`, the only writer of thi
   - `tests/golden/ifcap/GC-04/meta.txt`
   - `tests/golden/ifcap/GC-04/normalisation.txt`
   - `tests/fixtures/ifcap/cases.zwr`
+  - `tests/fixtures/ifcap/MANIFEST.txt`
 - **Inputs:** NOT EVALUATED (readiness: required files missing)
 - **Fixture hashes:** NOT EVALUATED (readiness: required files missing)
 - **Capture hashes:** NOT EVALUATED (readiness: required files missing)
@@ -148,10 +152,10 @@ Written by `comparison_report` in `tests/equivalence.rs`, the only writer of thi
 - **Case:** existing cancelled order with retained line-item history
 - **Actual test name:** `gc_05_cancelled_order`
 - **Status:** NOT COMPARED
-- **First difference:** `missing: tests/golden/ifcap/GC-05/input.txt, tests/golden/ifcap/GC-05/transcript.txt, tests/golden/ifcap/GC-05/returned.txt, tests/golden/ifcap/GC-05/db-before.zwr, tests/golden/ifcap/GC-05/db-after.zwr, tests/golden/ifcap/GC-05/meta.txt, tests/golden/ifcap/GC-05/normalisation.txt, tests/fixtures/ifcap/cases.zwr`
+- **First difference:** `missing: tests/golden/ifcap/GC-05/input.txt, tests/golden/ifcap/GC-05/transcript.txt, tests/golden/ifcap/GC-05/returned.txt, tests/golden/ifcap/GC-05/db-before.zwr, tests/golden/ifcap/GC-05/db-after.zwr, tests/golden/ifcap/GC-05/meta.txt, tests/golden/ifcap/GC-05/normalisation.txt, tests/fixtures/ifcap/cases.zwr, tests/fixtures/ifcap/MANIFEST.txt`
 - **Predicted contracts and branches:** PO-01 to PO-05, PO-41, PO-06 to PO-08, PO-09 (b8), PO-10 to PO-40, then PO-09 (b3) (BLOCKED at PO-12.b1 while O-01 is open)
 - **Actual branch:** NOT EVALUATED (readiness: required files missing)
-- **Readiness: NOT READY, 8 required files missing:**
+- **Readiness: NOT READY, 9 required files missing:**
   - `tests/golden/ifcap/GC-05/input.txt`
   - `tests/golden/ifcap/GC-05/transcript.txt`
   - `tests/golden/ifcap/GC-05/returned.txt`
@@ -160,6 +164,7 @@ Written by `comparison_report` in `tests/equivalence.rs`, the only writer of thi
   - `tests/golden/ifcap/GC-05/meta.txt`
   - `tests/golden/ifcap/GC-05/normalisation.txt`
   - `tests/fixtures/ifcap/cases.zwr`
+  - `tests/fixtures/ifcap/MANIFEST.txt`
 - **Inputs:** NOT EVALUATED (readiness: required files missing)
 - **Fixture hashes:** NOT EVALUATED (readiness: required files missing)
 - **Capture hashes:** NOT EVALUATED (readiness: required files missing)

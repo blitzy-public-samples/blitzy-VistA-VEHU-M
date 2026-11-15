@@ -534,8 +534,9 @@ pub(crate) fn order<S: Ord + Clone + Default>(
 ///
 /// The original is captured without a terminal, so typed input is never
 /// echoed: a READ leaves the transcript, `$X` and `$Y` unchanged. Form feed
-/// (`W @IOF`) is not modelled, because the HOME device's `IOF` is unresolved
-/// (open item O-01); `inquiry.rs` returns the BLOCKED branch ID there.
+/// (`W @IOF` at PRCHDP1.m:12 and PRCHDP2.m:42) is not modelled, because the
+/// HOME device's `IOF` is unresolved (open item O-01), so reaching it ends
+/// the session after the last prompt written.
 #[derive(Debug)]
 pub(crate) struct Session<'a> {
     inputs: &'a [String],
@@ -543,6 +544,9 @@ pub(crate) struct Session<'a> {
     out: String,
     x: usize,
     y: usize,
+    /// The byte length of the transcript when the last READ was issued, 0
+    /// before any READ.
+    prompt_end: usize,
 }
 
 impl<'a> Session<'a> {
@@ -556,6 +560,7 @@ impl<'a> Session<'a> {
             out: String::new(),
             x: 0,
             y: 0,
+            prompt_end: 0,
         }
     }
 
@@ -564,9 +569,15 @@ impl<'a> Session<'a> {
     /// there). A READ never times out, so the timeout branches stay
     /// unexercised.
     ///
+    /// Every READ, including one that finds no input left, records the
+    /// transcript length as the prompt position that
+    /// [`Session::into_transcript_at_prompt`] cuts at, so the cut lands
+    /// after the prompt the READ answered.
+    ///
     /// Uses: `R X:DTIME` at PRCHDP2.m:10 (PO-25) and PRCHDP2.m:41 (PO-38),
     /// and FileMan's prompt reads at DIC11.m:17 (PO-05, PO-09).
     pub(crate) fn read(&mut self) -> Option<String> {
+        self.prompt_end = self.out.len();
         let line = self.inputs.get(self.next)?.clone();
         self.next = self.next.saturating_add(1);
         Some(line)
@@ -619,7 +630,8 @@ impl<'a> Session<'a> {
     }
 
     /// Everything written so far. Test-only: a session's transcript leaves
-    /// production code once, through [`Session::into_transcript`].
+    /// production code once, through [`Session::into_transcript`] or
+    /// [`Session::into_transcript_at_prompt`].
     #[cfg(test)]
     pub(crate) fn transcript(&self) -> &str {
         &self.out
@@ -628,6 +640,20 @@ impl<'a> Session<'a> {
     /// Ends the session and returns everything written.
     pub(crate) fn into_transcript(self) -> String {
         self.out
+    }
+
+    /// Ends the session after the last prompt written: everything written
+    /// after the last READ is dropped. A session that never READ gives `""`.
+    /// Used when input runs out or an unimplemented branch is reached (AAP
+    /// session-end rule).
+    pub(crate) fn into_transcript_at_prompt(self) -> String {
+        // `prompt_end` is always an earlier `out.len()` and `out` only grows,
+        // so `get` succeeds; the whole transcript is the non-panicking
+        // fallback should that ever stop holding.
+        match self.out.get(..self.prompt_end) {
+            Some(cut) => cut.to_string(),
+            None => self.out,
+        }
     }
 }
 
@@ -946,5 +972,42 @@ mod tests {
         assert_eq!(session.read(), None);
         assert_eq!(session.transcript(), "");
         assert_eq!((session.x(), session.y()), (0, 0));
+    }
+
+    #[test]
+    fn prompt_cut_drops_output_after_last_read() {
+        let inputs = vec!["x".to_string()];
+        let mut session = Session::new(&inputs);
+        session.write("A: ");
+        assert_eq!(session.read(), Some("x".to_string()));
+        session.write("ECHO");
+        assert_eq!(session.into_transcript_at_prompt(), "A: ");
+
+        let mut session = Session::new(&inputs);
+        session.write("A: ");
+        assert_eq!(session.read(), Some("x".to_string()));
+        session.nl();
+        session.write("B: ");
+        assert_eq!(session.read(), None);
+        session.write("TAIL");
+        assert_eq!(session.into_transcript_at_prompt(), "A: \nB: ");
+    }
+
+    #[test]
+    fn prompt_cut_without_read_is_empty() {
+        let inputs: Vec<String> = Vec::new();
+        let mut session = Session::new(&inputs);
+        session.write("TEXT");
+        assert_eq!(session.into_transcript_at_prompt(), "");
+    }
+
+    #[test]
+    fn prompt_cut_after_exhausted_read() {
+        let inputs: Vec<String> = Vec::new();
+        let mut session = Session::new(&inputs);
+        session.write("P: ");
+        assert_eq!(session.read(), None);
+        session.write("X");
+        assert_eq!(session.into_transcript_at_prompt(), "P: ");
     }
 }
