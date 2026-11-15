@@ -20,6 +20,7 @@ const previousLineCount = new Map();
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 const root = document.documentElement;
+const bridgeStatus = document.getElementById("bridge-status");
 const backendSelect = document.getElementById("backend");
 const transcriptEl = document.getElementById("transcript");
 const mumpsPane = document.getElementById("transcript-mumps");
@@ -31,7 +32,7 @@ const sendButton = document.getElementById("send");
 const exitButton = document.getElementById("exit");
 const errorStatus = document.getElementById("error-status");
 
-const NOT_COMPARED = "NOT COMPARED";
+const BRIDGE_UNREACHABLE = "BRIDGE UNREACHABLE";
 
 // The reaction classes (busy, new, reject) are added only in RUST mode and
 // only without reduced motion; style.css gates them the same way again.
@@ -168,18 +169,20 @@ reduceMotion.addEventListener("change", () => {
 });
 
 // A request that never reached a 2xx answer: the error is shown, the
-// transcripts stay as last rendered, and COMPARE has no result to show.
+// transcripts stay as last rendered, and the COMPARE verdict line is emptied,
+// since there is no verdict to show.
 function showFailure(backend, message) {
   errorStatus.textContent = message;
   if (backend === "compare") {
-    matchStatus.textContent = NOT_COMPARED;
+    matchStatus.textContent = "";
   }
   reject();
 }
 
 // A 2xx answer: every pane it names is prepared before any is committed, so
 // either every pane and the verdict change together or, for a body that
-// cannot be shown, only the error line does.
+// cannot be shown, only the error line is set and the COMPARE verdict line is
+// emptied.
 function showSuccess(backend, text) {
   errorStatus.textContent = "";
   try {
@@ -187,21 +190,23 @@ function showSuccess(backend, text) {
     if (backend === "compare") {
       const mumpsText = transcriptOf(body.mumps);
       const rustText = transcriptOf(body.rust);
-      // Only the bridge decides the comparison verdict: the status line shows
-      // its match field, and transcripts are never compared here.
-      const verdict = body["match"];
       const mumpsRows = prepareRows(mumpsPane, mumpsText, "compare:mumps", false);
       const rustRows = prepareRows(rustPane, rustText, "compare:rust", false);
       commitRows(mumpsRows);
       commitRows(rustRows);
-      matchStatus.textContent =
-        verdict === true ? "MATCH" : verdict === false ? "MISMATCH" : NOT_COMPARED;
+      // Only the bridge decides the comparison verdict: the line shows its
+      // boolean match field, and transcripts are never compared here.
+      matchStatus.textContent = body.match === true ? "MATCH" : "MISMATCH";
     } else {
       commitRows(prepareRows(transcriptEl, transcriptOf(body), backend, reactionsOn()));
     }
   } catch (err) {
-    // A 200 is never a rejection, so no shake here.
+    // A 200 is never a rejection, so no shake here, and no verdict stands
+    // beside the error line.
     errorStatus.textContent = "MALFORMED RESPONSE: " + text;
+    if (backend === "compare") {
+      matchStatus.textContent = "";
+    }
   }
 }
 
@@ -275,6 +280,50 @@ async function send() {
   }
 }
 
+// The status line of one GET /api/status body, which the bridge writes as
+// {"mumps_mode": "replay" | "live", "recorded": [...], "ready": [...],
+// "incomplete": {...}} (status_body in src/bridge.rs): the mode, then how
+// many of the five cases are recorded and how many are READY. A body without
+// that shape throws, the same as JSON that does not parse.
+function statusLine(body) {
+  if (
+    body === null ||
+    typeof body !== "object" ||
+    typeof body.mumps_mode !== "string" ||
+    !Array.isArray(body.recorded) ||
+    !Array.isArray(body.ready)
+  ) {
+    throw new TypeError("not a status body");
+  }
+  return (
+    "MUMPS BACKEND: " +
+    body.mumps_mode.toUpperCase() +
+    " RECORDED " +
+    body.recorded.length +
+    " OF 5 READY " +
+    body.ready.length +
+    " OF 5"
+  );
+}
+
+// Fills the status line from GET /api/status (route_api in src/bridge.rs),
+// asked once on load. A failed fetch or body read, a non-2xx answer, or a
+// body statusLine cannot read shows BRIDGE UNREACHABLE. It is not a
+// rejection: no shake, and no other line or request state is touched. It
+// never rejects, so it is fired without waiting or catching.
+async function showBridgeStatus() {
+  try {
+    const res = await fetch("/api/status");
+    if (!res.ok) {
+      bridgeStatus.textContent = BRIDGE_UNREACHABLE;
+      return;
+    }
+    bridgeStatus.textContent = statusLine(JSON.parse(await res.text()));
+  } catch {
+    bridgeStatus.textContent = BRIDGE_UNREACHABLE;
+  }
+}
+
 // The typed line goes in unchanged, the empty string included: RETURN
 // answers the station prompt and both display pauses
 // [Packages/IFCAP/Routines/PRCFSITE.m:18] [Packages/IFCAP/Routines/PRCHDP2.m:10, 41].
@@ -291,8 +340,9 @@ exitButton.addEventListener("click", () => {
 });
 
 // A new backend never shows another backend's transcript or verdict: any
-// request in flight is superseded, every pane is emptied, and the current
-// sequence, an empty one included, is always sent again to the new backend.
+// request in flight is superseded, every pane and the verdict line are
+// emptied, and the current sequence, an empty one included, is always sent
+// again to the new backend. The status line is left as it is.
 backendSelect.addEventListener("change", () => {
   root.dataset.mode = backendSelect.value;
   requestSeq += 1;
@@ -302,11 +352,14 @@ backendSelect.addEventListener("change", () => {
   transcriptEl.replaceChildren();
   mumpsPane.replaceChildren();
   rustPane.replaceChildren();
-  matchStatus.textContent = NOT_COMPARED;
+  matchStatus.textContent = "";
   send();
 });
 
-// Nothing is sent on load: an empty sequence matches no capture, so MUMPS
+// On load the only request is GET /api/status, for the status line. No
+// session request is sent: an empty sequence matches no capture, so MUMPS
 // replay would answer 502 while RUST showed the station prompt, and the idle
-// MUMPS and RUST screens must differ only in the selector.
+// MUMPS and RUST screens must differ only in the selector, which holds
+// because the status line reads the same in every mode.
 root.dataset.mode = backendSelect.value;
+showBridgeStatus();

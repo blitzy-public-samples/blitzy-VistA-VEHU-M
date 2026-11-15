@@ -119,7 +119,7 @@ pub enum MumpsMode {
 /// store once with [`load_fixtures`] from `tests/fixtures/ifcap/` of this
 /// crate, before anything is served; its error, a fixture that cannot be
 /// read or a malformed line (`InvalidData`), each naming the file, is
-/// returned unchanged. Then hands `listener` to [`serve_until`] with a
+/// returned unchanged. Then hands `listener` to `serve_until` with a
 /// shutdown flag that is never set, so this returns only with a serving
 /// error of `serve_until`, unchanged.
 pub fn serve(listener: TcpListener, mumps: MumpsMode) -> io::Result<()> {

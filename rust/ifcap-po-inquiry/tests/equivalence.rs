@@ -37,8 +37,9 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ifcap_po_inquiry::bridge::{
-    Meta, normalise, parse_meta, parse_normalisation, split_input_lines, validate_context,
+use ifcap_po_inquiry::golden::{
+    META_KEYS, Meta, Rule, normalise, parse_meta, parse_normalisation, split_input_lines,
+    validate_context,
 };
 use ifcap_po_inquiry::store::load_fixtures;
 use ifcap_po_inquiry::{InquiryError, STUB_CONTEXT, Store, StoreError, inquire};
@@ -82,51 +83,6 @@ const REPO_FIXTURES: [&str; 11] = [
 const RUNTIME_EXPORT: &str = "cases.zwr";
 /// One line per fixture: file, origin, `snapshot_id`, SHA-256.
 const MANIFEST: &str = "MANIFEST.txt";
-
-/// Contract ID to `TAG^ROUTINE`, for naming the routine of a branch ID.
-const CONTRACTS: [(&str, &str); 41] = [
-    ("PO-01", "EN3^PRCHRPT"),
-    ("PO-02", "ST^PRCHRPT"),
-    ("PO-03", "^PRCFSITE"),
-    ("PO-04", "DUZ^PRCFSITE"),
-    ("PO-05", "^DIC (file 411)"),
-    ("PO-06", "EN30^PRCHRPT"),
-    ("PO-07", "PO^PRCHRPT"),
-    ("PO-08", "EN3^PRCHPAT"),
-    ("PO-09", "IX^DIC"),
-    ("PO-10", "^PRCHDP1"),
-    ("PO-11", "FTYP^PRCHFPNT"),
-    ("PO-12", "^%ZIS"),
-    ("PO-13", "FOB^PRCHDP1"),
-    ("PO-14", "DIWP^PRCUTL"),
-    ("PO-15", "^DIWP"),
-    ("PO-16", "%XY^%RCR"),
-    ("PO-17", "TY^PRCHDP1"),
-    ("PO-18", "DIS^PRCHDP1"),
-    ("PO-19", "DT^PRCHDP1"),
-    ("PO-20", "CON^PRCHDP1"),
-    ("PO-21", "APP^PRCHDP1"),
-    ("PO-22", "DAT^PRCHDP1"),
-    ("PO-23", "EST^PRCHDP1"),
-    ("PO-24", "TOT^PRCHDP1"),
-    ("PO-25", "^PRCHDP2"),
-    ("PO-26", "HDR^PRCHDP2"),
-    ("PO-27", "ITEM^PRCHDP2"),
-    ("PO-28", "PIPECK^PRCHDP2"),
-    ("PO-29", "EDISTAT^PRCHUTL"),
-    ("PO-30", "ASK^PRCHDP2"),
-    ("PO-31", "COM^PRCHDP2"),
-    ("PO-32", "PT^PRCHDP2"),
-    ("PO-33", "AMENDS^PRCHDP6"),
-    ("PO-34", "ASK2^PRCHDP2"),
-    ("PO-35", "EN^PRCHDP4"),
-    ("PO-36", "EN2^PRCHDP4"),
-    ("PO-37", "EXDELV^PRCHDP4"),
-    ("PO-38", "ASK1^PRCHDP2"),
-    ("PO-39", "Q^PRCHDP2"),
-    ("PO-40", "K^PRCHRPT"),
-    ("PO-41", "^%DT"),
-];
 
 // The predicted paths are SPEC.md's "Capture mapping" text, which lists the
 // contracts in call order (^PRCFSITE runs ^%DT before ^DIC) and supersedes the
@@ -196,6 +152,15 @@ const NORM_TOKEN: &str = "<NORM>";
 
 /// The longest excerpt, in characters, shown for a differing line.
 const EXCERPT_CHARS: usize = 160;
+
+/// How a `STUB_CONTEXT` key whose constant is unresolved is reported, as
+/// `validate_context` reports it: such a key accepts any capture value.
+const UNRESOLVED: &str = "UNRESOLVED (O-01)";
+
+/// The actual branch of a session that ended `Ok`: `inquire` ends the
+/// session after the last prompt written, whether input ran out there or a
+/// branch that is not implemented was reached, and names no branch.
+const SESSION_ENDED_OK: &str = "not reported: the session ended `Ok` after the last prompt written (input ran out or a branch is not implemented)";
 
 /// The number of report fields the steps after readiness fill.
 const STEP_COUNT: usize = 15;
@@ -318,7 +283,7 @@ fn context_cause(finding: &str) -> String {
         .find(|(key, expected)| {
             finding.starts_with(&format!(
                 "CONTEXT MISMATCH {key}: expected {}, actual ",
-                expected.unwrap_or("UNRESOLVED")
+                expected.unwrap_or(UNRESOLVED)
             ))
         })
         .map_or_else(
@@ -646,7 +611,7 @@ type RuleAudit = Result<Spans, String>;
 /// audit's checks, which means `normalise` no longer applies the format the
 /// audit relies on. The later rules on that side are then NOT DERIVABLE as
 /// well, because the failed rule left no traced text for them.
-fn audit_rules(raw: &str, rules: &[(String, String)]) -> (Vec<RuleAudit>, String) {
+fn audit_rules(raw: &str, rules: &[Rule]) -> (Vec<RuleAudit>, String) {
     let mut text = raw.to_string();
     let mut traced: Result<Vec<Origin>, String> = Ok((0..raw.len())
         .map(|at| (at, at.saturating_add(1), None))
@@ -691,7 +656,7 @@ fn trace_rule(
     raw: &str,
     text: &str,
     origins: &[Origin],
-    rule: &(String, String),
+    rule: &Rule,
     next: &str,
 ) -> Result<(Spans, Vec<Origin>), String> {
     let unaccounted = || "the output of `normalise` fails the audit's checks".to_string();
@@ -757,8 +722,8 @@ fn trace_rule(
 /// it, and a window that reaches the end of the text unchanged ends the
 /// search. `None` when an output fails a check, including that the spans give
 /// `next`, the output for all of `text`.
-fn visible_spans(text: &str, rule: &(String, String), next: &str) -> Option<Vec<(usize, usize)>> {
-    let (open, close) = rule;
+fn visible_spans(text: &str, rule: &Rule, next: &str) -> Option<Vec<(usize, usize)>> {
+    let Rule { open, close } = rule;
     let shortest = open.len().saturating_add(close.len());
     let window = |from: usize, to: usize| -> Option<(&str, String)> {
         let input = text.get(from..to)?;
@@ -843,8 +808,8 @@ fn visible_spans(text: &str, rule: &(String, String), next: &str) -> Option<Vec<
 /// begins a span that ends at or before it. The scan's next open delimiter
 /// is then the `<NORM>`'s first byte, and the first close delimiter after
 /// that ends the `<NORM>`.
-fn rewrites_token(rule: &(String, String)) -> bool {
-    let (open, close) = rule;
+fn rewrites_token(rule: &Rule) -> bool {
+    let Rule { open, close } = rule;
     !open.is_empty()
         && !close.is_empty()
         && NORM_TOKEN
@@ -868,15 +833,6 @@ fn traces(raw: &str, text: &str, origins: &[Origin]) -> bool {
                 None => end == start.saturating_add(1) && raw.as_bytes().get(start) == Some(&byte),
                 Some(offset) => NORM_TOKEN.as_bytes().get(offset) == Some(&byte),
             })
-}
-
-/// The contract routine of a branch ID `PO-NN.bM`.
-fn routine_of(branch: &str) -> &'static str {
-    let contract = branch.split('.').next().unwrap_or(branch);
-    CONTRACTS
-        .iter()
-        .find(|(id, _)| *id == contract)
-        .map_or("UNKNOWN CONTRACT", |(_, routine)| routine)
 }
 
 // ---------------------------------------------------------------------------
@@ -986,7 +942,7 @@ fn render_stub_context() -> String {
         .iter()
         .map(|(key, value)| {
             code(&value.map_or_else(
-                || format!("{key}=UNRESOLVED"),
+                || format!("{key}={UNRESOLVED}"),
                 |value| format!("{key}={}", quoted(value)),
             ))
         })
@@ -995,23 +951,39 @@ fn render_stub_context() -> String {
 }
 
 /// The meta values the report shows; `docker_exec_args` is the live mode's
-/// concern and is shown as its argument count.
+/// concern and decides nothing here: it is shown as the count of arguments
+/// `Meta::docker_exec_args` splits it into, or as why it rejects the value.
 fn render_meta(meta: &Meta) -> String {
+    let shown = |key: &str| code(&value_or_absent(meta.get(key)));
+    let exec_args = meta.docker_exec_args().map_or_else(
+        |reason| format!("not usable ({reason})"),
+        |args| format!("{} arguments", args.len()),
+    );
     format!(
-        "image_digest {}, source_revision {}, snapshot_id {}, record_ids {}, entry_point {}, docker_exec_args {} arguments",
-        code(&quoted(&meta.image_digest)),
-        code(&quoted(&meta.source_revision)),
-        code(&quoted(&meta.snapshot_id)),
-        code(&quoted(&meta.record_ids)),
-        code(&quoted(&meta.entry_point)),
-        meta.docker_exec_args.len()
+        "image_digest {}, source_revision {}, snapshot_id {}, record_ids {}, entry_point {}, docker_exec_args {exec_args}",
+        shown("image_digest"),
+        shown("source_revision"),
+        shown("snapshot_id"),
+        shown("record_ids"),
+        shown("entry_point"),
     )
+}
+
+/// Parses a `meta.txt` with the shared `parse_meta`, and requires every one
+/// of the `META_KEYS`, as a capture must hold them all to be compared; the
+/// first missing key is the error. The context check judges `context`.
+fn checked_meta(text: &str) -> Result<Meta, String> {
+    let meta = parse_meta(text)?;
+    match META_KEYS.iter().find(|key| meta.get(key).is_none()) {
+        Some(key) => Err(format!("missing key {key}")),
+        None => Ok(meta),
+    }
 }
 
 /// One line per normalisation rule, in file order: the rule, the text it is
 /// applied to, and for each side what [`audit_rules`] found it replaced in
 /// the comparison, or why the side has no text to audit.
-fn render_rules(rules: &[(String, String)], sides: &[(&str, Result<&str, String>)]) -> Vec<String> {
+fn render_rules(rules: &[Rule], sides: &[(&str, Result<&str, String>)]) -> Vec<String> {
     let mut shown: Vec<Vec<String>> = vec![Vec::new(); rules.len()];
     for (label, side) in sides {
         match side {
@@ -1032,7 +1004,7 @@ fn render_rules(rules: &[(String, String)], sides: &[(&str, Result<&str, String>
         .iter()
         .zip(shown)
         .zip(1usize..)
-        .map(|(((open, close), sides), number)| {
+        .map(|((Rule { open, close }, sides), number)| {
             let applied_to = match number {
                 1 => "the un-normalised text".to_string(),
                 2 => "the text rule 1 left".to_string(),
@@ -1241,7 +1213,7 @@ fn evaluate_steps(
     let meta = meta_text.and_then(|text| {
         take(
             failures,
-            parse_meta(&text).map_err(|msg| {
+            checked_meta(&text).map_err(|msg| {
                 (
                     format!("MALFORMED META {meta_rel}"),
                     format!("MALFORMED META {meta_rel}: {msg}"),
@@ -1254,7 +1226,7 @@ fn evaluate_steps(
         take(
             failures,
             parse_normalisation(&text)
-                .map_err(|line| plain(format!("MALFORMED NORMALISATION {norm_rel} line {line}"))),
+                .map_err(|msg| plain(format!("MALFORMED NORMALISATION {norm_rel}: {msg}"))),
         )
     });
     let before =
@@ -1304,7 +1276,7 @@ fn evaluate_steps(
                     code(&quoted(only)),
                     not_evaluated("meta.txt unavailable")
                 ),
-                ([only], Some(meta)) if meta.snapshot_id == *only => {
+                ([only], Some(meta)) if meta.get("snapshot_id") == Some(*only) => {
                     format!(
                         "IDENTICAL: MANIFEST.txt and meta.txt carry {}",
                         code(&quoted(only))
@@ -1316,7 +1288,7 @@ fn evaluate_steps(
                         "SNAPSHOT MISMATCH".to_string(),
                         format!(
                             "SNAPSHOT MISMATCH: meta.txt {}, MANIFEST.txt {}",
-                            quoted(&meta.snapshot_id),
+                            value_or_absent(meta.get("snapshot_id")),
                             quoted(only)
                         ),
                     ),
@@ -1345,12 +1317,19 @@ fn evaluate_steps(
         .as_ref()
         .map_or_else(|| not_evaluated("meta.txt unavailable"), render_meta);
 
-    // 4. Context.
-    let context = match &meta {
+    // 4. Context: a `context` that does not parse is this check's finding.
+    let context = match meta.as_ref().map(Meta::context) {
         None => not_evaluated("meta.txt unavailable"),
-        Some(meta) => {
-            let actual = render_context(&meta.context);
-            match validate_context(&meta.context) {
+        Some(Err(msg)) => failed(
+            failures,
+            (
+                format!("MALFORMED META {meta_rel}"),
+                format!("MALFORMED META {meta_rel}: {msg}"),
+            ),
+        ),
+        Some(Ok(pairs)) => {
+            let actual = render_context(&pairs);
+            match validate_context(&pairs) {
                 Ok(()) => format!("MATCH; actual {actual}"),
                 Err(finding) => {
                     let shown = failed(failures, (context_cause(&finding), finding));
@@ -1388,19 +1367,7 @@ fn evaluate_steps(
                         output.transcript.len(),
                         render_returned(output.returned.as_deref())
                     );
-                    let actual_branch =
-                        "none: the session ended without reaching an unsupported branch"
-                            .to_string();
-                    (Some(output), rust_side, actual_branch)
-                }
-                Err(InquiryError::UnsupportedBranch(branch)) => {
-                    let routine = routine_of(&branch);
-                    let actual_branch = format!("{} ({})", code(&branch), code(routine));
-                    let rust_side = failed(
-                        failures,
-                        plain(format!("UNSUPPORTED BRANCH {branch} ({routine})")),
-                    );
-                    (None, rust_side, actual_branch)
+                    (Some(output), rust_side, SESSION_ENDED_OK.to_string())
                 }
                 Err(InquiryError::CorruptStore(missing_node)) => {
                     let rust_side = failed(
@@ -2410,9 +2377,12 @@ fn normalisation_audit_follows_file_order() {
         ),
     ];
     for (raw, rules, expected) in table {
-        let rules: Vec<(String, String)> = rules
+        let rules: Vec<Rule> = rules
             .into_iter()
-            .map(|(open, close)| (open.to_string(), close.to_string()))
+            .map(|(open, close)| Rule {
+                open: open.to_string(),
+                close: close.to_string(),
+            })
             .collect();
         let (audits, last) = audit_rules(raw, &rules);
         assert_eq!(audits, expected, "audit of {raw:?} under {rules:?}");
@@ -2536,14 +2506,16 @@ fn console_summary_shows_causes_never_details() {
 
 /// A context finding's console cause names its key only when the key is a
 /// `STUB_CONTEXT` name. The stub-key findings carry each constant's current
-/// expected text, so the test holds whether a constant is resolved or not.
+/// expected text, so the test holds whether a constant is resolved or not,
+/// and include the finding `validate_context` itself gives for a context
+/// lacking each key, so the causes follow its text.
 #[test]
-fn context_cause_names_only_stub_keys() {
+fn context_cause_names_only_stub_keys() -> Result<(), String> {
     let mut table: Vec<(String, String)> = STUB_CONTEXT
         .iter()
         .flat_map(|(key, expected)| {
-            let expected = expected.unwrap_or("UNRESOLVED");
-            ["#SECRET", "MISSING"].map(|actual| {
+            let expected = expected.unwrap_or(UNRESOLVED);
+            ["#SECRET", "ABSENT"].map(|actual| {
                 (
                     format!("CONTEXT MISMATCH {key}: expected {expected}, actual {actual}"),
                     format!("CONTEXT MISMATCH {key}"),
@@ -2551,6 +2523,22 @@ fn context_cause_names_only_stub_keys() {
             })
         })
         .collect();
+    for (key, _) in STUB_CONTEXT {
+        let lacking: Vec<(String, String)> = STUB_CONTEXT
+            .iter()
+            .filter(|(name, _)| *name != key)
+            .map(|(name, value)| {
+                (
+                    name.to_string(),
+                    value.unwrap_or(SYNTHETIC_UNRESOLVED).to_string(),
+                )
+            })
+            .collect();
+        let finding = validate_context(&lacking)
+            .err()
+            .ok_or_else(|| format!("validate_context accepts a context lacking {key}"))?;
+        table.push((finding, format!("CONTEXT MISMATCH {key}")));
+    }
     table.extend(
         [
             "CONTEXT MISMATCH SECRETKEY: expected ABSENT, actual 1",
@@ -2561,6 +2549,7 @@ fn context_cause_names_only_stub_keys() {
     for (finding, expected) in table {
         assert_eq!(context_cause(&finding), expected, "{finding}");
     }
+    Ok(())
 }
 
 /// A loader error names a file in the crate folder by its crate-relative
@@ -2668,8 +2657,15 @@ const UNDEF_NODES: &str = "^PRC(442,1,0,1)=\"SYNTHETIC\"\n^PRC(442,\"C\",\"X1\",
 const SYNTHETIC_SNAPSHOT: &str = "synthetic:self-test";
 
 /// The value the synthetic context gives a `STUB_CONTEXT` key whose
-/// constant is unresolved; an unresolved constant matches no value.
+/// constant is unresolved; an unresolved constant accepts any value.
 const SYNTHETIC_UNRESOLVED: &str = "synthetic";
+
+/// The two cut transcripts a session gives when it ends at a prompt: after
+/// the station prompt, and after the station echo and the order prompt
+/// (`SPEC.md` R1).
+const STATION_PROMPT_BYTES: &str = "\n\n\nSelect STATION NUMBER ('^' TO EXIT): 500// ";
+const ORDER_PROMPT_BYTES: &str =
+    "\n\n\nSelect STATION NUMBER ('^' TO EXIT): 500//       CAMP MASTER\n\n\nP.O./REQ.NO.: ";
 
 /// Why no digest is available when `sha256sum` is absent, as [`sha256`]
 /// says it.
@@ -2796,16 +2792,16 @@ fn synthetic_context() -> String {
     format!("{{{}}}", members.join(","))
 }
 
-/// A synthetic `meta.txt` with the seven keys, carrying `snapshot_id` and
-/// the `context` and `docker_exec_args` values given.
+/// A synthetic `meta.txt` with the eight `META_KEYS`, carrying
+/// `snapshot_id` and the `context` and `docker_exec_args` values given.
 fn synthetic_meta(snapshot_id: &str, context: &str, docker_exec_args: &str) -> String {
     format!(
-        "image_digest=synthetic\nsource_revision=synthetic\nsnapshot_id={snapshot_id}\nrecord_ids=synthetic\nentry_point=EN3^PRCHRPT\ncontext={context}\ndocker_exec_args={docker_exec_args}\n"
+        "image_digest=synthetic\nsource_revision=synthetic\nsnapshot_id={snapshot_id}\nrecord_ids=synthetic\nentry_point=EN3^PRCHRPT\ncontext={context}\nsetup=synthetic\ndocker_exec_args={docker_exec_args}\n"
     )
 }
 
 fn synthetic_meta_text() -> String {
-    synthetic_meta(SYNTHETIC_SNAPSHOT, &synthetic_context(), "[]")
+    synthetic_meta(SYNTHETIC_SNAPSHOT, &synthetic_context(), "synthetic")
 }
 
 /// A complete, consistent synthetic capture of [`SELF_TEST_CASE`]. Every
@@ -2815,8 +2811,9 @@ fn synthetic_meta_text() -> String {
 /// `input.txt` holds no input, and `transcript.txt` and `returned.txt` record
 /// what `inquire` answers for it. `normalisation.txt` holds no rule.
 /// `MANIFEST.txt` lists every fixture with its digest and the `snapshot_id`
-/// that `meta.txt` carries. Its only finding is the context check's, while a
-/// `STUB_CONTEXT` constant is unresolved.
+/// that `meta.txt` carries. Its only possible finding is the context
+/// check's, which `validate_context` gives none of: the synthetic context
+/// holds each resolved constant and a value for each unresolved key.
 fn synthetic_capture() -> Result<MemoryFiles, String> {
     let (id, ..) = SELF_TEST_CASE;
     let store = Store::from_zwr(SYNTHETIC_EXPORT)
@@ -2882,12 +2879,15 @@ fn synthetic_capture() -> Result<MemoryFiles, String> {
 }
 
 /// The context findings, as (cause, detail), that `validate_context` gives
-/// for the synthetic `meta.txt`: one while a `STUB_CONTEXT` constant is
-/// unresolved, none once every constant is resolved.
+/// for the synthetic `meta.txt`: none, since an unresolved `STUB_CONTEXT`
+/// constant accepts any value and every resolved one is given.
 fn synthetic_context_findings() -> Result<Vec<(String, String)>, String> {
     let meta = parse_meta(&synthetic_meta_text())
         .map_err(|err| format!("the synthetic meta.txt does not parse: {err}"))?;
-    Ok(validate_context(&meta.context)
+    let context = meta
+        .context()
+        .map_err(|err| format!("the synthetic meta.txt context does not parse: {err}"))?;
+    Ok(validate_context(&context)
         .err()
         .map(|finding| (context_cause(&finding), finding))
         .into_iter()
@@ -3006,10 +3006,10 @@ fn one_missing_file_is_not_compared_over_broken_present_files() -> Result<(), St
     Ok(())
 }
 
-/// A complete, consistent capture passes every check but the context check,
-/// whose finding is the only one while a `STUB_CONTEXT` constant is
-/// unresolved, so the case is FAIL; once every constant is resolved it has
-/// no finding and is PASS. Every digest matches and nothing is BLOCKED.
+/// A complete, consistent capture passes every check; its failures are
+/// exactly the context check's findings, which `validate_context` gives
+/// none of for the synthetic context, so the case is PASS. Every digest
+/// matches and nothing is BLOCKED.
 #[test]
 fn complete_capture_fails_only_on_the_context_check() -> Result<(), String> {
     let (id, ..) = SELF_TEST_CASE;
@@ -3076,12 +3076,13 @@ const DIFFERING_DIGEST: &str = "ffffffffffffffffffffffffffffffffffffffffffffffff
 /// Each single defect of an otherwise complete capture is FAIL with exactly
 /// its own findings added, in step order around the context finding, and
 /// nothing BLOCKED: a present file that is unreadable, non-UTF-8 or
-/// malformed; a manifest that is malformed, lacks the `cases.zwr` line or
-/// carries two `snapshot_id`s; a digest that differs from its manifest row;
-/// a fixture store that does not load; a baseline or snapshot mismatch; a
-/// capture whose session wrote data; either Rust error; and a differing
-/// transcript or return value. Each expected finding is its exact cause and
-/// a text its detail holds.
+/// malformed, a `meta.txt` lacking keys and one whose `context` does not
+/// parse included; a manifest that is malformed, lacks the `cases.zwr` line
+/// or carries two `snapshot_id`s; a digest that differs from its manifest
+/// row; a fixture store that does not load; a baseline or snapshot
+/// mismatch; a capture whose session wrote data; the Rust side's
+/// `CorruptStore`; and a differing transcript or return value. Each
+/// expected finding is its exact cause and a text its detail holds.
 #[test]
 fn each_capture_defect_fails_with_its_findings() -> Result<(), String> {
     let (id, ..) = SELF_TEST_CASE;
@@ -3167,29 +3168,18 @@ fn each_capture_defect_fails_with_its_findings() -> Result<(), String> {
             },
             pairs(&[(
                 "MALFORMED META tests/golden/ifcap/GC-01/meta.txt",
-                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt: ",
+                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt: missing key source_revision",
             )]),
         ),
         (
             "meta.txt context not a JSON object of strings",
             |files| {
-                let meta = synthetic_meta(SYNTHETIC_SNAPSHOT, "[\"500\"]", "[]");
+                let meta = synthetic_meta(SYNTHETIC_SNAPSHOT, "[\"500\"]", "synthetic");
                 memory_set(files, "tests/golden/ifcap/GC-01/meta.txt", meta.as_bytes())
             },
             pairs(&[(
                 "MALFORMED META tests/golden/ifcap/GC-01/meta.txt",
-                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt: ",
-            )]),
-        ),
-        (
-            "meta.txt docker_exec_args not a JSON array of strings",
-            |files| {
-                let meta = synthetic_meta(SYNTHETIC_SNAPSHOT, &synthetic_context(), "{}");
-                memory_set(files, "tests/golden/ifcap/GC-01/meta.txt", meta.as_bytes())
-            },
-            pairs(&[(
-                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt",
-                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt: ",
+                "MALFORMED META tests/golden/ifcap/GC-01/meta.txt: context: ",
             )]),
         ),
         (
@@ -3203,8 +3193,8 @@ fn each_capture_defect_fails_with_its_findings() -> Result<(), String> {
             },
             around_context(
                 &[(
-                    "MALFORMED NORMALISATION tests/golden/ifcap/GC-01/normalisation.txt line 1",
-                    "MALFORMED NORMALISATION tests/golden/ifcap/GC-01/normalisation.txt line 1",
+                    "MALFORMED NORMALISATION tests/golden/ifcap/GC-01/normalisation.txt: normalisation line 1: expected one tab between two non-empty delimiters",
+                    "MALFORMED NORMALISATION tests/golden/ifcap/GC-01/normalisation.txt: normalisation line 1: ",
                 )],
                 &[],
             ),
@@ -3346,7 +3336,7 @@ fn each_capture_defect_fails_with_its_findings() -> Result<(), String> {
         (
             "meta.txt snapshot_id differing from the manifest's",
             |files| {
-                let meta = synthetic_meta("synthetic:other", &synthetic_context(), "[]");
+                let meta = synthetic_meta("synthetic:other", &synthetic_context(), "synthetic");
                 memory_set(files, "tests/golden/ifcap/GC-01/meta.txt", meta.as_bytes())
             },
             around_context(
@@ -3391,28 +3381,6 @@ fn each_capture_defect_fails_with_its_findings() -> Result<(), String> {
                 &[(
                     "ORIGINAL WROTE DATA",
                     "ORIGINAL WROTE DATA ^PRC(442,9,0): before ABSENT, after \"ADDED\"",
-                )],
-            ),
-        ),
-        (
-            "Rust side reaching an unsupported branch at the station prompt",
-            |files| memory_set(files, "tests/golden/ifcap/GC-01/input.txt", b"?\n"),
-            around_context(
-                &[],
-                &[(
-                    "UNSUPPORTED BRANCH PO-05.b2 (^DIC (file 411))",
-                    "UNSUPPORTED BRANCH PO-05.b2 (^DIC (file 411))",
-                )],
-            ),
-        ),
-        (
-            "Rust side reaching an unsupported branch at the order prompt",
-            |files| memory_set(files, "tests/golden/ifcap/GC-01/input.txt", b"\n?\n"),
-            around_context(
-                &[],
-                &[(
-                    "UNSUPPORTED BRANCH PO-09.b4 (IX^DIC)",
-                    "UNSUPPORTED BRANCH PO-09.b4 (IX^DIC)",
                 )],
             ),
         ),
@@ -3481,6 +3449,98 @@ fn each_capture_defect_fails_with_its_findings() -> Result<(), String> {
     Ok(())
 }
 
+/// A Rust session that reaches a branch that is not implemented ends `Ok`
+/// after the last prompt written, which is no finding of its own: a capture
+/// whose transcript ends at that prompt matches, at the station prompt
+/// (`?`, PO-05.b2) and at the order prompt (`?`, PO-09.b4) alike, and the
+/// actual branch is not reported.
+#[test]
+fn unimplemented_branch_ends_the_session_ok_at_the_last_prompt() -> Result<(), String> {
+    let (id, ..) = SELF_TEST_CASE;
+    let context = synthetic_context_findings()?;
+    let expected = if context.is_empty() { PASS } else { FAIL };
+    let table = [
+        ("station prompt", "?\n", STATION_PROMPT_BYTES),
+        ("order prompt", "\n?\n", ORDER_PROMPT_BYTES),
+    ];
+    for (prompt, input, transcript) in table {
+        let mut files = synthetic_capture()?;
+        memory_set(
+            &mut files,
+            "tests/golden/ifcap/GC-01/input.txt",
+            input.as_bytes(),
+        )?;
+        memory_set(
+            &mut files,
+            "tests/golden/ifcap/GC-01/transcript.txt",
+            transcript.as_bytes(),
+        )?;
+        let outcome = evaluate_memory(id, &files);
+        let (status, missing, actual_branch, _, failures, blocked) = &outcome;
+        assert_eq!(*missing, Vec::<String>::new(), "{prompt}: missing files");
+        assert_eq!(*failures, context, "{prompt}: failures");
+        assert_eq!(causes(blocked), Vec::<&str>::new(), "{prompt}: blocked");
+        assert_eq!(*status, expected, "{prompt}: status");
+        assert_eq!(actual_branch, SESSION_ENDED_OK, "{prompt}: actual branch");
+        let rust_side = format!(
+            "Ok: transcript of {} bytes, returned `None`",
+            transcript.len()
+        );
+        assert_eq!(
+            step(&outcome, "Rust side")?,
+            [rust_side],
+            "{prompt}: Rust side"
+        );
+        assert_eq!(
+            step(&outcome, "Transcript comparison")?,
+            [format!(
+                "MATCH after normalisation ({} bytes)",
+                transcript.len()
+            )],
+            "{prompt}: transcript comparison"
+        );
+    }
+    Ok(())
+}
+
+/// `docker_exec_args` is the live mode's concern and decides nothing here:
+/// the Meta field shows the count of arguments `Meta::docker_exec_args`
+/// splits it into on single spaces, or why it rejects the value, and the
+/// case keeps the complete capture's outcome.
+#[test]
+fn docker_exec_args_is_shown_and_decides_nothing() -> Result<(), String> {
+    let (id, ..) = SELF_TEST_CASE;
+    let context = synthetic_context_findings()?;
+    let expected = if context.is_empty() { PASS } else { FAIL };
+    let table = [
+        ("synthetic", "docker_exec_args 1 arguments"),
+        ("su - vehu", "docker_exec_args 3 arguments"),
+        ("", "docker_exec_args not usable ("),
+        ("a  b", "docker_exec_args not usable ("),
+        ("{}", "docker_exec_args 1 arguments"),
+    ];
+    for (value, shown) in table {
+        let mut files = synthetic_capture()?;
+        let meta = synthetic_meta(SYNTHETIC_SNAPSHOT, &synthetic_context(), value);
+        memory_set(
+            &mut files,
+            "tests/golden/ifcap/GC-01/meta.txt",
+            meta.as_bytes(),
+        )?;
+        let outcome = evaluate_memory(id, &files);
+        let (status, _, _, _, failures, blocked) = &outcome;
+        assert_eq!(*failures, context, "{value:?}: failures");
+        assert_eq!(causes(blocked), Vec::<&str>::new(), "{value:?}: blocked");
+        assert_eq!(*status, expected, "{value:?}: status");
+        let items = step(&outcome, "Meta")?;
+        assert!(
+            matches!(items, [only] if only.contains(shown)),
+            "{value:?}: {items:?} does not hold {shown:?}"
+        );
+    }
+    Ok(())
+}
+
 /// A present file that cannot be read is FAIL on its own finding, and its
 /// digest row reads NOT AVAILABLE (file unreadable; ...) with no BLOCKED
 /// finding added, for a capture file and for a fixture file alike.
@@ -3533,9 +3593,9 @@ fn unreadable_file_digest_is_not_available_without_blocking() -> Result<(), Stri
 
 /// With no digest tool every one of the 19 digests is NOT AVAILABLE, each a
 /// BLOCKED finding, fixtures first and then captures. The case is BLOCKED
-/// only when no check failed: any FAIL finding takes precedence, here the
-/// context mismatch while a `STUB_CONTEXT` constant is unresolved, and a
-/// differing return value whatever the constants.
+/// only when no check failed: any FAIL finding takes precedence, here a
+/// differing return value, with any context finding `validate_context`
+/// gives for the synthetic context (none under its current rule).
 #[test]
 fn unavailable_digest_tool_is_blocked_and_fail_takes_precedence() -> Result<(), String> {
     let (id, ..) = SELF_TEST_CASE;
