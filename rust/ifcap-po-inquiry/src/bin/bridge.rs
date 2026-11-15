@@ -14,13 +14,13 @@
 //! lists. Once listening, the bridge writes three lines to standard output:
 //! `http://127.0.0.1:8080/`, then `MUMPS MODE: REPLAY` or
 //! `MUMPS MODE: LIVE <container>`, then `RECORDED <n> OF 5 READY <m> OF 5`.
-//! Diagnostics go to standard error. The exit status is 1 when
-//! `VEHU_CONTAINER` is not valid UTF-8 or the address cannot be bound, in
-//! which cases nothing reaches standard output, and when `serve` returns an
-//! error, such as fixtures that cannot be loaded. A missing capture directory
-//! is reported and serving continues, with no case recorded.
+//! Diagnostics go to standard error. The exit status is 1 when the address
+//! cannot be bound, in which case nothing reaches standard output, and when
+//! `serve` returns an error, such as fixtures that cannot be loaded. A
+//! missing capture directory is reported and serving continues, with no case
+//! recorded.
 
-use std::env::{self, VarError};
+use std::env;
 use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -40,16 +40,16 @@ fn main() -> ExitCode {
     // dropped: a line that its stream cannot take is lost, so an unwritable
     // standard output or standard error never changes the exit status or
     // stops a bridge that is otherwise valid.
-    let container = match env::var("VEHU_CONTAINER") {
-        Ok(container) if !container.is_empty() => Some(container),
-        Ok(_) | Err(VarError::NotPresent) => None,
-        // The variable is set but cannot name a container; falling back to
-        // replay would hide that the caller asked for live mode.
-        Err(VarError::NotUnicode(_)) => {
-            let _ = writeln!(io::stderr(), "bridge: VEHU_CONTAINER is not valid UTF-8");
-            return ExitCode::FAILURE;
-        }
-    };
+    let container = env::var_os("VEHU_CONTAINER")
+        .filter(|container| !container.is_empty())
+        .map(|container| {
+            // A value that is not valid UTF-8 still selects live mode and is
+            // converted lossily, because `MumpsMode` carries the container
+            // name as text.
+            container
+                .into_string()
+                .unwrap_or_else(|raw| raw.to_string_lossy().into_owned())
+        });
     let listener = match TcpListener::bind(ADDRESS) {
         Ok(listener) => listener,
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {

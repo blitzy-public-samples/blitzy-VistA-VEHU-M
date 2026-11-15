@@ -919,7 +919,7 @@ Bytes SOURCE-RESOLVED: `<BEL> ??\n\nP.O./REQ.NO.: `, then one READ. The plan's "
 
 ### R5 Order-lookup rules for `ix_dic`
 
-**Data provenance (decision).** The repository holds no purchase orders. The file 442 export's header `^PRC(442,0)="PROCUREMENT & ACCOUNTING TRANSACTIONS^442I^^0"` has an empty last-IEN piece 3 and an entry count of 0 in piece 4 [442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:3]. Its only other nodes, `^PRC(442,"AH",31,99999949)=""` and `^PRC(442,"AI",31,99999949)=""`, are index entries for a record the export does not hold: there is no `^PRC(442,99999949,…)` node [442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:4-5]. The 442 export is therefore not a fixture. The `^PRC(442,0)` header, the five orders, their `C` index entries and every other file 442 node the five cases read reach the `Store` only through `tests/fixtures/ifcap/cases.zwr`, which is built from the READY captures' `db-before.zwr` by `tests/golden/ifcap/README.md` Part B step 6 (the capture owner, Rainman Kemp, records the captures) and which `load_fixtures` loads last. The run generates no capture data. Until `cases.zwr` is supplied, a `Store` loaded from the eleven repository fixtures holds no `^PRC(442)` node, so `ix_dic` ends at step 1 (PO-09.b15), before writing: the session ends after the station prompt.
+**Data provenance (decision).** The repository holds no purchase orders. The file 442 export's header `^PRC(442,0)="PROCUREMENT & ACCOUNTING TRANSACTIONS^442I^^0"` has an empty last-IEN piece 3 and an entry count of 0 in piece 4 [442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:3]. Its only other nodes, `^PRC(442,"AH",31,99999949)=""` and `^PRC(442,"AI",31,99999949)=""`, are index entries for a record the export does not hold: there is no `^PRC(442,99999949,…)` node [442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:4-5]. The 442 export is therefore not a fixture. The `^PRC(442,0)` header, the three found-order records of GC-01, GC-02 and GC-05 (GC-03 and GC-04 load no order), their `C` index entries and every other file 442 node the five cases read reach the `Store` only through `tests/fixtures/ifcap/cases.zwr`, which is built from the READY captures' `db-before.zwr` by `tests/golden/ifcap/README.md` Part B step 6 (the capture owner, Rainman Kemp, records the captures; the step's conditional subsection gives the READY-subset build and the existing-file preflight a run applies) and which `load_fixtures` loads last. The run generates no capture data. Until `cases.zwr` is supplied, a `Store` loaded from the eleven repository fixtures holds no `^PRC(442)` node, so `ix_dic` ends at step 1 (PO-09.b15), before writing: the session ends after the station prompt.
 
 1. **File header** (PO-09.b15): `^PRC(442,0)` must hold a value with piece 2 exactly `442I` [442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:3]. A header that is absent, empty or holding only descendants, read through `$G`, leaves `DIFILEI` empty, so the original returns `Y=-1` without a prompt [DIC0.m:21, 83-87] [DILIBF.m:141, 147] [DIC.m:14]; another piece 2 displays different identifiers [DIC1.m:46-49]. Either way `ix_dic` returns `Halt::Unexercised("PO-09.b15")` before writing, and the session ends after the last prompt written, the station prompt; the station echo written after it is dropped.
 2. **Prompt and read:** `\n`, `P.O./REQ.NO.: `, one READ.
@@ -1475,21 +1475,21 @@ S7, exit status 0:
 ```text
 $ grep -rnE 'fs::write|File::create|OpenOptions|create_dir|remove_file|rename\(' src/
 src/bridge.rs:2516:            fs::OpenOptions::new()
-src/bridge.rs:3154:    /// `fs::create_dir`, which fails on any existing entry, so the directory
-src/bridge.rs:3167:                match fs::create_dir(&path) {
-src/bridge.rs:3184:            fs::create_dir_all(&dir)
-src/bridge.rs:3185:                .and_then(|()| fs::write(dir.join(name), text))
-src/bridge.rs:3461:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
+src/bridge.rs:3156:    /// `fs::create_dir`, which fails on any existing entry, so the directory
+src/bridge.rs:3169:                match fs::create_dir(&path) {
+src/bridge.rs:3186:            fs::create_dir_all(&dir)
+src/bridge.rs:3187:                .and_then(|()| fs::write(dir.join(name), text))
+src/bridge.rs:3476:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
 src/store.rs:506:    /// `ifcap-store-unit-<pid>-<n>` and creates it with `fs::create_dir`,
 src/store.rs:518:            match fs::create_dir(&dir) {
-src/store.rs:531:        fs::write(dir.join(name), bytes).map_err(|e| e.to_string())
-src/store.rs:864:        .and_then(|()| fs::create_dir(dir.join("sub.zwr")).map_err(|e| e.to_string()))
-src/golden.rs:869:    /// `ifcap-golden-unit-<pid>-<n>` and creates it with `fs::create_dir`,
-src/golden.rs:882:                match fs::create_dir(&dir) {
-src/golden.rs:975:        fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-src/golden.rs:978:            fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-src/golden.rs:1301:        fs::create_dir(dir.join(TRANSCRIPT)).map_err(|e| e.to_string())?;
-src/golden.rs:1435:        fs::create_dir(dir.join(META)).map_err(|e| e.to_string())?;
+src/store.rs:532:        fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
+src/store.rs:878:            fs::create_dir(&sub).map_err(|e| format!("cannot create {}: {e}", sub.display()))
+src/golden.rs:871:    /// `ifcap-golden-unit-<pid>-<n>` and creates it with `fs::create_dir`,
+src/golden.rs:884:                match fs::create_dir(&dir) {
+src/golden.rs:992:        fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+src/golden.rs:995:            fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+src/golden.rs:1318:        fs::create_dir(dir.join(TRANSCRIPT)).map_err(|e| e.to_string())?;
+src/golden.rs:1452:        fs::create_dir(dir.join(META)).map_err(|e| e.to_string())?;
 ```
 
 The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2112`, `src/golden.rs:860`, `src/inquiry.rs:2418`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:480`.
@@ -1527,9 +1527,9 @@ if [ -f tests/fixtures/ifcap/cases.zwr ]; then sha256sum tests/fixtures/ifcap/ca
 |---|---|---|---|
 | Planning measurement | Before any change of this run | 0, 0 | `ABSENT tests/fixtures/ifcap/cases.zwr` |
 | Before | 2026-11-15T10:52:56Z, before this document's first edit | 0, 0 | `ABSENT tests/fixtures/ifcap/cases.zwr` (`find` printed nothing) |
-| After | 2026-11-15T11:11:52Z, after this document's edits | 0, 0 | `ABSENT tests/fixtures/ifcap/cases.zwr` (`find` printed nothing) |
+| After | 2026-11-15T12:25:06Z, after this document's edits | 0, 0 | `ABSENT tests/fixtures/ifcap/cases.zwr` (`find` printed nothing) |
 
-**Equality rule.** Every file present in the baseline listing must have the same hash in the after listing. A `cases.zwr` that a run builds, because it finds READY captures and no `cases.zwr`, is the one permitted addition; it is recorded on its own line as `CREATED BY RUN` and is not part of the equality. No capture file and no `cases.zwr` exists at this baseline, so no file is listed, none was created, and the rule holds.
+**Equality rule.** Every file present in the baseline listing must have the same hash in the after listing. A `cases.zwr` that a run builds, because it finds READY captures and no `cases.zwr`, is the one permitted addition; it is recorded on its own line as `CREATED BY RUN` and is not part of the equality. An existing `cases.zwr` is never edited: with READY captures, a run checks it before editing code by the preflight of `tests/golden/ifcap/README.md` Part B step 6, which lists every line extracted from the READY captures' `db-before.zwr` that is found neither in `cases.zwr` nor in a supporting fixture; the run records that comparison in section "Run evidence" and opens a section "Open items" entry for each affected case, naming its nodes, with the action "rebuild `cases.zwr` by README step 6". No capture file and no `cases.zwr` exists at this baseline, so no file is listed, none was created, and the rule holds.
 
 ## Run evidence
 
@@ -1664,14 +1664,14 @@ test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
    Doc-tests ifcap_po_inquiry
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-149 tests pass: 132 unit tests in `src/`, 15 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
+152 tests pass: 132 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
 
 `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, exit status 0. Output with the `finished in <seconds>` timings trimmed:
 
@@ -1699,24 +1699,27 @@ All five cases are NOT COMPARED, because none has a capture. Exit 0 is not accep
     Finished `test` profile [unoptimized + debuginfo] target(s)
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
 
-running 15 tests
+running 18 tests
 test end_to_end_real_captures ... ok
-test mumps_replay_502_not_recorded ... ok
-test status_empty_folder ... ok
-test compare_match_true_for_ready_equal_case ... ok
-test compare_match_false_for_context_duz_1 ... ok
-test compare_match_false_for_differing_ready_case ... ok
-test static_paths_exact_match ... ok
-test mumps_replay_200_when_recorded ... ok
-test rust_session_200 ... ok
 test compare_match_false_for_incomplete_case ... ok
-test startup_with_empty_folder ... ok
 test not_found_404_texts ... ok
+test mumps_replay_502_not_recorded ... ok
+test startup_with_empty_folder ... ok
+test rust_session_200 ... ok
+test mumps_replay_200_when_recorded ... ok
+test compare_match_true_for_ready_equal_case ... ok
+test compare_match_false_for_differing_ready_case ... ok
+test compare_match_false_when_difference_is_outside_the_rule ... ok
+test compare_match_true_when_rule_covers_the_difference ... ok
+test compare_match_false_for_context_duz_1 ... ok
 test bad_request_400_on_every_backend ... ok
-test status_incomplete_case ... ok
+test status_empty_folder ... ok
 test status_ready_case ... ok
+test status_incomplete_case ... ok
+test static_paths_exact_match ... ok
+test status_and_compare_incomplete_on_cr_or_malformed_rule ... ok
 
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ### Format and lint
@@ -1781,7 +1784,7 @@ $ grep -E '^\| PO-[0-9]+\.b' SPEC.md | grep -c '| not exercised, not implemented
 
 ### Document limits
 
-`wc -l -w testingMethods.md`, exit status 0: `52  593 testingMethods.md` (at most 60 lines and 600 words). `wc -l runPlaybook.md`, exit status 0: `114 runPlaybook.md` (at most 150 lines).
+`wc -l -w testingMethods.md`, exit status 0: `52  593 testingMethods.md` (at most 60 lines and 600 words). `wc -l runPlaybook.md`, exit status 0: `116 runPlaybook.md` (at most 150 lines).
 
 ### HL7 domain
 

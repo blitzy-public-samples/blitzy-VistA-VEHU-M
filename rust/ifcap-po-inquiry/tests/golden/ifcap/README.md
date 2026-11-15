@@ -171,7 +171,7 @@ The verdicts `tests/equivalence.rs` gives:
 ### 11. Fixtures and `cases.zwr`
 
 - `tests/fixtures/ifcap/*.zwr` are the 11 supporting fixtures, unchanged copies of repository exports: `411.zwr`, `411.2.zwr`, `420.5.zwr`, `420.8.zwr`, `440.zwr`, `442.3.zwr`, `442.4.zwr`, `442.5.zwr`, `442.8.zwr`, `5.zwr` and `49.zwr`.
-- `tests/fixtures/ifcap/cases.zwr` is the team-built file of Part B step 6. `store::load_fixtures` loads every `*.zwr` file in byte order of name with `cases.zwr` last, so it wins on a repeated node; a missing `cases.zwr` is not an error [src/store.rs:274-326].
+- `tests/fixtures/ifcap/cases.zwr` is the file Part B step 6 builds. `store::load_fixtures` loads every `*.zwr` file in byte order of name with `cases.zwr` last, so it wins on a repeated node; a missing `cases.zwr` is not an error [src/store.rs:274-326].
 - The bridge loads the Store once, when it starts, so restart it after adding `cases.zwr`.
 - Without `cases.zwr` the fixtures hold no `^PRC(442,0)` header, so the order lookup ends before writing its prompt [Packages/VA FileMan/Routines/DIC.m:14] and a Rust session ends after the station prompt (PO-09.b15; conflict K6). The original on VEHU never reaches that state.
 - No hash or listing file is kept beside the fixtures.
@@ -180,7 +180,7 @@ The verdicts `tests/equivalence.rs` gives:
 
 - Only `src/golden.rs` reads the capture files. Its callers are `src/bridge.rs`, `src/bin/bridge.rs` (the startup counts), `tests/equivalence.rs` and `tests/bridge.rs`, and none of them re-implements a check. `inquire` and `Store` never read them.
 - No rule is ever derived from capture content (acceptance criterion A4): captures judge the port, and source alone decides its rules.
-- Capture files, `normalisation.txt` and an existing `cases.zwr` are never edited, and no code is special-cased to a transcript.
+- Capture files, `normalisation.txt` and an existing `cases.zwr` are never edited (a run with READY cases checks an existing `cases.zwr` by the preflight of Part B step 6), and no code is special-cased to a transcript.
 - `tests/bridge.rs` writes its synthetic case folders only under `std::env::temp_dir()`, never here.
 - No test sets or reads `GOLDEN_DIR` or `VEHU_CONTAINER`; only `src/bin/bridge.rs` reads them.
 
@@ -250,7 +250,7 @@ The team runs these steps on its Docker host. Nothing here was run by this repos
 **Fixture profile.** The team's records must meet it. A record outside it ends the Rust session at an n/e branch, and the case FAILs.
 
 - `^PRC(442,0)` holds piece 2 `442I`, as in the repository export [Packages/IFCAP/Globals/442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:3]. The orders' index nodes give the file a subscript after `"A["`, such as `"C"` [Packages/VA FileMan/Routines/DICM.m:71].
-- Each order has station 500 in node 0 piece 1 and method of processing (field .02, node 0 piece 2) `1`, which is below 10, so the lookup screen passes [Packages/IFCAP/Routines/PRCHRPT.m:9] [Packages/IFCAP/Routines/PRCHPAT.m:81].
+- Each order's node 0 piece 1 holds its full `.01` number `500-<C value>`, such as `500-GC1001` [Packages/VA FileMan/Globals/DD.zwr:514312], whose part after `500-` is its `C` index value `$P(X,"-",2)` [Packages/VA FileMan/Globals/DD.zwr:514318-514320]. The piece's leading numeric value, 500, is the station the lookup screen compares, and method of processing (field .02, node 0 piece 2) is `1`, which is below 10, so the lookup screen passes [Packages/IFCAP/Routines/PRCHRPT.m:9] [Packages/IFCAP/Routines/PRCHPAT.m:81].
 - No two orders share a `C` value, and no `C` value is a prefix of another.
 - Nodes 0 and 1 are present. None of nodes 11, 5, 3, 15, 4, 13 or 6 is present.
 - Field 5.3 is empty. The vendor is not EDI. Field 65 is not `RMPR`. Node 23 piece 7 is empty. Field .08 is not `Y`.
@@ -337,11 +337,29 @@ Run each case a second time from the restored snapshot, and compare the two runs
 - Save it as `tests/fixtures/ifcap/cases.zwr`. It loads last and wins on a repeated node [src/store.rs:274-326].
 - Add no other file.
 
+**Conditional path: a run that finds new case folders.** A run that changes the port and finds `GC-0N` folders that were absent when it was planned takes these steps, in order:
+
+1. Before editing any code, record the baseline capture-hash listing with the two lines of step 7, and evaluate the six readiness checks of Part A section 9 for every case.
+2. **No READY case.** Create nothing: no `cases.zwr` is built, and every recorded case is judged as it stands.
+3. **At least one READY case and no `tests/fixtures/ifcap/cases.zwr`.** Build it from the READY cases' `db-before.zwr` only:
+   - the node selection of the first bullet above, each line once;
+   - omit any line already present verbatim in a supporting fixture;
+   - keep the lines in ZWR collation order under the two ZWR header lines;
+   - it is a text transformation and executes no MUMPS;
+   - the after listing records the file on its own line as `CREATED BY RUN`, outside the equality rule of `SPEC.md` "Capture hashes".
+4. **At least one READY case and an existing `cases.zwr`: the preflight.** Leave the file untouched, and before editing any code:
+   - apply the extraction of the first bullet above to the READY cases' `db-before.zwr`;
+   - list every extracted line found neither in `cases.zwr` nor in a supporting fixture;
+   - record that comparison in `SPEC.md` "Run evidence";
+   - for any line listed, add a `SPEC.md` "Open items" entry naming the case and its nodes, with the action "rebuild `cases.zwr` by README step 6";
+   - it is not a harness check: the harness reports those cases by the ordinary comparison, which shows the difference the missing records cause.
+5. Each READY case then ends PASS or FAIL.
+
 ### Step 7. Checks
 
 From `rust/ifcap-po-inquiry/`:
 
-- Run `cargo test --offline --locked`. It prints `GC-0N <verdict>` for each case; `REPORT.md` part 2 shows the verdicts and part 3 each case's readiness.
+- Run `cargo test --offline --locked`. `REPORT.md` part 2 shows the verdicts and part 3 each case's readiness. The test also prints `GC-0N <verdict>` for each case, which Cargo shows only when the test fails; to see the lines on a passing run, use `cargo test --offline --locked --test equivalence -- --nocapture` (`RUNNING.md` step 2).
 - Restart the bridge with `cargo run --offline --locked --bin bridge`. Confirm its third startup line `RECORDED <n> OF 5 READY <m> OF 5` and the screen's status line `MUMPS BACKEND: REPLAY RECORDED <n> OF 5 READY <m> OF 5`.
 - Record the capture hashes with these two lines, verbatim:
 

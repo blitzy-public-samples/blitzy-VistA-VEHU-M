@@ -528,7 +528,20 @@ mod tests {
     }
 
     fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
-        fs::write(dir.join(name), bytes).map_err(|e| e.to_string())
+        let path = dir.join(name);
+        fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+
+    /// Removes the [`scratch_dir`] directory `dir` with everything in it and
+    /// then gives back `outcome`, the result of the work done in it. A
+    /// failure in `outcome` is returned first; otherwise a directory that
+    /// cannot be removed, a missing one included, is an error naming it, so
+    /// a passing test cannot leave its directory behind unnoticed.
+    fn remove_scratch<T>(dir: &Path, outcome: Result<T, String>) -> Result<T, String> {
+        let removed = fs::remove_dir_all(dir);
+        let value = outcome?;
+        removed.map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
+        Ok(value)
     }
 
     #[test]
@@ -791,8 +804,8 @@ mod tests {
         let outcome = write_file(&dir, "a.zwr", b"^X(1)=\"a\"\n")
             .and_then(|()| write_file(&dir, "bad.zwr", b"^X(2)=\"\xff\xfe\"\n"))
             .map(|()| load_fixtures(&dir));
-        let _ = fs::remove_dir_all(&dir);
-        match outcome? {
+        let outcome = remove_scratch(&dir, outcome)?;
+        match outcome {
             Err(err) => {
                 let message = err.to_string();
                 assert!(message.contains("bad.zwr"), "message was {message:?}");
@@ -807,8 +820,7 @@ mod tests {
         }
         let scratch = scratch_dir()?;
         let missing = scratch.join("absent");
-        let outcome = load_fixtures(&missing);
-        let _ = fs::remove_dir_all(&scratch);
+        let outcome = remove_scratch(&scratch, Ok(load_fixtures(&missing)))?;
         match outcome {
             Err(err) => {
                 let message = err.to_string();
@@ -827,8 +839,8 @@ mod tests {
         let broken = dir.join("broken.zwr");
         let outcome = write_file(&dir, "broken.zwr", b"ZWR\n^X(1)=\"a\"\n^X(01)=\"b\"\n")
             .map(|()| load_fixtures(&dir));
-        let _ = fs::remove_dir_all(&dir);
-        match outcome? {
+        let outcome = remove_scratch(&dir, outcome)?;
+        match outcome {
             Err(err) => {
                 assert_eq!(err.kind(), ErrorKind::InvalidData, "got {err:?}");
                 assert_eq!(
@@ -851,6 +863,7 @@ mod tests {
     #[test]
     fn load_fixtures_order_puts_cases_last() -> Result<(), String> {
         let dir = scratch_dir()?;
+        let sub = dir.join("sub.zwr");
         let outcome = write_file(
             &dir,
             "a.zwr",
@@ -861,10 +874,12 @@ mod tests {
         // Valid ZWR under a key no `.zwr` file sets, so loading this
         // non-`.zwr` file would add a node rather than pass unseen.
         .and_then(|()| write_file(&dir, "notes.txt", b"ZWR\n^X(4)=\"notes\"\n"))
-        .and_then(|()| fs::create_dir(dir.join("sub.zwr")).map_err(|e| e.to_string()))
+        .and_then(|()| {
+            fs::create_dir(&sub).map_err(|e| format!("cannot create {}: {e}", sub.display()))
+        })
         .map(|()| load_fixtures(&dir));
-        let _ = fs::remove_dir_all(&dir);
-        let store = outcome?.map_err(|e| e.to_string())?;
+        let outcome = remove_scratch(&dir, outcome)?;
+        let store = outcome.map_err(|e| e.to_string())?;
         assert_eq!(store.get(&key("X", &["1"])), Some("cases"));
         assert_eq!(store.get(&key("X", &["2"])), Some("z"));
         assert_eq!(store.get(&key("X", &["3"])), Some("a"));
@@ -882,8 +897,8 @@ mod tests {
         let dir = scratch_dir()?;
         let outcome = write_file(&dir, "442.3.zwr", b"ZWR\n^PRCD(442.3,1,0)=\"x^1^3\"\n")
             .map(|()| load_fixtures(&dir));
-        let _ = fs::remove_dir_all(&dir);
-        let store = outcome?.map_err(|e| e.to_string())?;
+        let outcome = remove_scratch(&dir, outcome)?;
+        let store = outcome.map_err(|e| e.to_string())?;
         assert_eq!(store.get(&key("PRCD", &["442.3", "1", "0"])), Some("x^1^3"));
         Ok(())
     }
@@ -899,8 +914,8 @@ mod tests {
             b"ZWR\n^X(1)=\"a\"\n^X(1,2)=\"b\"\n^X(\"B\",\"a\",1)=\"\"\n",
         )
         .map(|()| load_fixtures(&dir));
-        let _ = fs::remove_dir_all(&dir);
-        let store = outcome?.map_err(|e| e.to_string())?;
+        let outcome = remove_scratch(&dir, outcome)?;
+        let store = outcome.map_err(|e| e.to_string())?;
         let before = store.clone();
         assert_eq!(store.get(&key("X", &["1"])), Some("a"));
         assert_eq!(store.get(&key("X", &["9"])), None);

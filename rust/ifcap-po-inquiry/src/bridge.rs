@@ -3148,8 +3148,10 @@ mod tests {
         );
     }
 
-    /// A new directory under the system temporary directory, removed with
-    /// everything in it when dropped, on a failed assertion too. Each attempt
+    /// A new directory under the system temporary directory. A test that
+    /// reaches its end removes it with everything in it by
+    /// [`Scratch::close`], which reports a failed removal; `Drop` removes it
+    /// best effort when a test fails early or unwinds. Each attempt
     /// takes the next name `ifcap-bridge-unit-<pid>-<n>` and creates it with
     /// `fs::create_dir`, which fails on any existing entry, so the directory
     /// belongs to this test alone.
@@ -3185,13 +3187,26 @@ mod tests {
                 .and_then(|()| fs::write(dir.join(name), text))
                 .map_err(|e| format!("writing {id}/{name}: {e}"))
         }
+
+        /// Removes the directory with everything in it, on a test's normal
+        /// path. A failure, a directory already gone included, is an error
+        /// naming the directory, so a passing test cannot leave it behind
+        /// unnoticed.
+        fn close(mut self) -> Result<(), String> {
+            let path = std::mem::take(&mut self.path);
+            fs::remove_dir_all(&path).map_err(|e| format!("removing {}: {e}", path.display()))
+        }
     }
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            // A folder that cannot be removed stays under the temporary
-            // directory; no assertion depends on its removal.
-            let _ = fs::remove_dir_all(&self.path);
+            // Best-effort removal for a test that ends before `close`, by an
+            // early error return or an unwind: that test has already failed,
+            // and a removal failure cannot be reported from here. A closed
+            // `Scratch` holds an empty path and is skipped.
+            if !self.path.as_os_str().is_empty() {
+                let _ = fs::remove_dir_all(&self.path);
+            }
         }
     }
 
@@ -3403,7 +3418,7 @@ mod tests {
                 )
             );
         }
-        Ok(())
+        scratch.close()
     }
 
     #[test]
@@ -3477,7 +3492,7 @@ mod tests {
             mumps_session(&mumps, &inputs),
             (200, session_body("RECORDED\n", None))
         );
-        Ok(())
+        scratch.close()
     }
 
     #[test]
@@ -3510,7 +3525,7 @@ mod tests {
             compare_session(&store, &mumps, &inputs),
             (502, error_body(&format!("MUMPS: {mismatch}")))
         );
-        Ok(())
+        scratch.close()
     }
 
     #[test]
@@ -3553,7 +3568,7 @@ mod tests {
             response.ends_with(&format!("\r\n\r\n{status}")),
             "{response}"
         );
-        Ok(())
+        scratch.close()
     }
 
     #[test]
@@ -4226,7 +4241,7 @@ mod tests {
                 "for {request_line}"
             );
         }
-        Ok(())
+        scratch.close()
     }
 
     #[test]

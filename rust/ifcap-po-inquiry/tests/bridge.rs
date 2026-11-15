@@ -19,8 +19,9 @@
 //! synthetic capture is never parity evidence.
 //!
 //! No test sets or reads an environment variable: configuration reaches the
-//! bridge only as `serve` arguments. Every test has its own folder and its
-//! own port, so the tests also run in parallel.
+//! bridge only as `serve` arguments. Every bridge has its own folder and its
+//! own port, a test that starts several included, so the tests also run in
+//! parallel.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -166,6 +167,24 @@ const DUZ_1_CONTEXT: &str = r##"{"DUZ":"1","IOF":"#","IOSL":"24","STATION":"500"
 /// One normalisation rule whose delimiters no Rust transcript holds.
 const SYNTHETIC_RULES: &str = "<<SYNTHETIC-OPEN\tSYNTHETIC-CLOSE>>\n";
 
+/// [`SYNTHETIC_RULES`] with a space where the tab belongs: a rule line
+/// without a tab, which `golden::parse_normalisation` rejects. A case holding
+/// it fails `normalisation_parses` and no other check.
+const MALFORMED_RULES: &str = "<<SYNTHETIC-OPEN SYNTHETIC-CLOSE>>\n";
+
+/// One valid rule, open `EXIT): ` and close `// `, whose span both
+/// [`STATION_PROMPT_TRANSCRIPT`] and [`DIFFERING_TRANSCRIPT`] hold: by
+/// `SPEC.md` "Normalisation" each becomes
+/// `\n\n\nSelect STATION NUMBER ('^' TO <NORM>`, so their one difference, the
+/// station number, lies inside the span.
+const ACTIVE_RULES: &str = "EXIT): \t// \n";
+
+/// [`DIFFERING_TRANSCRIPT`] with `CODE` for `NUMBER`, a second difference
+/// from the Rust side's transcript that lies outside every span of
+/// [`ACTIVE_RULES`]: it becomes `\n\n\nSelect STATION CODE ('^' TO <NORM>`,
+/// still unequal to the Rust side's after the rule.
+const OUTSIDE_SPAN_TRANSCRIPT: &str = "\n\n\nSelect STATION CODE ('^' TO EXIT): 501// ";
+
 /// The text of both synthetic exports, `db-before.zwr` and `db-after.zwr`.
 const SYNTHETIC_EXPORT: &str = "SYNTHETIC export written by tests/bridge.rs\nZWR\n\
      ^PRC(442,0)=\"PROCUREMENT & ACCOUNTING TRANSACTIONS^442I^^0\"\n";
@@ -180,6 +199,14 @@ fn synthetic_meta(context: &str) -> String {
     )
 }
 
+/// [`synthetic_meta`] of [`SYNTHETIC_CONTEXT`] with a carriage return ending
+/// the `setup` value. `golden::parse_meta` keeps the `\r` in that value, so
+/// all eight keys stay present and the context stays accepted: a case holding
+/// it fails `no_carriage_return` and no other check.
+fn cr_in_setup_meta() -> String {
+    synthetic_meta(SYNTHETIC_CONTEXT).replacen("; not a capture\n", "; not a capture\r\n", 1)
+}
+
 /// The input sequence of every synthetic capture: the exit input alone.
 fn exit_only() -> Vec<String> {
     vec![EXIT_INPUT.to_string()]
@@ -187,12 +214,38 @@ fn exit_only() -> Vec<String> {
 
 /// Writes the synthetic case `root/<case_id>/` by the capture convention:
 /// `input.txt` holding the one line [`EXIT_INPUT`], `transcript` as
-/// `transcript.txt` with no newline added, a zero-byte `returned.txt`,
-/// [`synthetic_meta`] of `context`, [`SYNTHETIC_RULES`], and
+/// `transcript.txt` with no newline added, a zero-byte `returned.txt`, `meta`
+/// as `meta.txt` and `rules` as `normalisation.txt`, each byte for byte, and
 /// [`SYNTHETIC_EXPORT`] as `db-before.zwr` and, when `with_db_after`, as
-/// `db-after.zwr`. No file holds a carriage return, so with `with_db_after`
-/// and an accepted context the case is READY; without `db-after.zwr` it is
-/// INCOMPLETE on `seven_files_present` and `db_before_equals_after`.
+/// `db-after.zwr`. The fixed files hold no carriage return and pass every
+/// check they enter, so the case's readiness depends only on `transcript`,
+/// `meta`, `rules` and `with_db_after`.
+fn write_case_files(
+    root: &Path,
+    case_id: &str,
+    transcript: &str,
+    meta: &str,
+    rules: &str,
+    with_db_after: bool,
+) -> Result<(), String> {
+    let file = |name: &str, bytes: &[u8]| write_file(root, &format!("{case_id}/{name}"), bytes);
+    file("input.txt", format!("{EXIT_INPUT}\n").as_bytes())?;
+    file("transcript.txt", transcript.as_bytes())?;
+    file("returned.txt", b"")?;
+    file("meta.txt", meta.as_bytes())?;
+    file("normalisation.txt", rules.as_bytes())?;
+    file("db-before.zwr", SYNTHETIC_EXPORT.as_bytes())?;
+    if with_db_after {
+        file("db-after.zwr", SYNTHETIC_EXPORT.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// [`write_case_files`] with [`synthetic_meta`] of `context` and
+/// [`SYNTHETIC_RULES`]. With a `transcript` free of carriage returns no file
+/// holds one, so with `with_db_after` and an accepted context the case is
+/// READY; without `db-after.zwr` it is INCOMPLETE on `seven_files_present`
+/// and `db_before_equals_after`.
 fn write_synthetic_case(
     root: &Path,
     case_id: &str,
@@ -200,17 +253,14 @@ fn write_synthetic_case(
     context: &str,
     with_db_after: bool,
 ) -> Result<(), String> {
-    let file = |name: &str, bytes: &[u8]| write_file(root, &format!("{case_id}/{name}"), bytes);
-    file("input.txt", format!("{EXIT_INPUT}\n").as_bytes())?;
-    file("transcript.txt", transcript.as_bytes())?;
-    file("returned.txt", b"")?;
-    file("meta.txt", synthetic_meta(context).as_bytes())?;
-    file("normalisation.txt", SYNTHETIC_RULES.as_bytes())?;
-    file("db-before.zwr", SYNTHETIC_EXPORT.as_bytes())?;
-    if with_db_after {
-        file("db-after.zwr", SYNTHETIC_EXPORT.as_bytes())?;
-    }
-    Ok(())
+    write_case_files(
+        root,
+        case_id,
+        transcript,
+        &synthetic_meta(context),
+        SYNTHETIC_RULES,
+        with_db_after,
+    )
 }
 
 /// The synthetic READY `GC-01`: [`STATION_PROMPT_TRANSCRIPT`] under
@@ -935,6 +985,28 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Over a synthetic folder holding only the `GC-01` that
+/// [`write_case_files`] writes from these arguments: the whole
+/// `GET /api/status` answer, then the compare answer to the exit input
+/// alone, which equals that case's inputs.
+fn status_and_compare_over_gc01(
+    test: &str,
+    transcript: &str,
+    meta: &str,
+    rules: &str,
+    with_db_after: bool,
+) -> Result<(StatusReport, Compared), String> {
+    with_bridge(
+        test,
+        |root| write_case_files(root, "GC-01", transcript, meta, rules, with_db_after),
+        |addr| {
+            let report = get_status(addr)?;
+            let resp = post_session(addr, "compare", &body_for(&exit_only()))?;
+            Ok((report, expect_compare(&resp, "compare [^]")?))
+        },
+    )
+}
+
+/// Over a synthetic folder holding only the `GC-01` that
 /// [`write_synthetic_case`] writes from these arguments: the ids
 /// `GET /api/status` reports READY, then the compare answer to the exit
 /// input alone, which equals that case's inputs.
@@ -944,15 +1016,14 @@ fn compare_over_synthetic_gc01(
     context: &str,
     with_db_after: bool,
 ) -> Result<(Vec<String>, Compared), String> {
-    with_bridge(
+    let (report, compared) = status_and_compare_over_gc01(
         test,
-        |root| write_synthetic_case(root, "GC-01", transcript, context, with_db_after),
-        |addr| {
-            let ready = get_status(addr)?.ready;
-            let resp = post_session(addr, "compare", &body_for(&exit_only()))?;
-            Ok((ready, expect_compare(&resp, "compare [^]")?))
-        },
-    )
+        transcript,
+        &synthetic_meta(context),
+        SYNTHETIC_RULES,
+        with_db_after,
+    )?;
+    Ok((report.ready, compared))
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,6 +1144,73 @@ fn compare_match_false_for_differing_ready_case() -> Result<(), String> {
         STATION_PROMPT_TRANSCRIPT,
     );
     assert!(!compared.matched, "match is true for a differing case");
+    Ok(())
+}
+
+/// `match` compares the transcripts after the case's rules: for a READY case
+/// whose raw transcript differs from the Rust side's only inside a span of
+/// [`ACTIVE_RULES`], `match` is true, and both sides are still answered raw,
+/// never rewritten by the rule.
+#[test]
+fn compare_match_true_when_rule_covers_the_difference() -> Result<(), String> {
+    let (report, compared) = status_and_compare_over_gc01(
+        "compare_match_true_when_rule_covers_the_difference",
+        DIFFERING_TRANSCRIPT,
+        &synthetic_meta(SYNTHETIC_CONTEXT),
+        ACTIVE_RULES,
+        true,
+    )?;
+    assert_eq!(report.ready, ["GC-01"], "status: ready");
+    assert_same(
+        "mumps transcript against the written transcript.txt",
+        &compared.mumps.transcript,
+        DIFFERING_TRANSCRIPT,
+    );
+    assert_eq!(compared.mumps.returned, None, "mumps returned");
+    assert_same(
+        "rust transcript",
+        &compared.rust.transcript,
+        STATION_PROMPT_TRANSCRIPT,
+    );
+    assert_eq!(compared.rust.returned, None, "rust returned");
+    assert!(
+        compared.matched,
+        "match is false for a READY case differing only inside a rule span"
+    );
+    Ok(())
+}
+
+/// The negative control of
+/// [`compare_match_true_when_rule_covers_the_difference`]: under the same
+/// rule, a READY case whose raw transcript also differs from the Rust side's
+/// outside the rule's span gives `match` false, and both sides are answered
+/// raw.
+#[test]
+fn compare_match_false_when_difference_is_outside_the_rule() -> Result<(), String> {
+    let (report, compared) = status_and_compare_over_gc01(
+        "compare_match_false_when_difference_is_outside_the_rule",
+        OUTSIDE_SPAN_TRANSCRIPT,
+        &synthetic_meta(SYNTHETIC_CONTEXT),
+        ACTIVE_RULES,
+        true,
+    )?;
+    assert_eq!(report.ready, ["GC-01"], "status: ready");
+    assert_same(
+        "mumps transcript against the written transcript.txt",
+        &compared.mumps.transcript,
+        OUTSIDE_SPAN_TRANSCRIPT,
+    );
+    assert_eq!(compared.mumps.returned, None, "mumps returned");
+    assert_same(
+        "rust transcript",
+        &compared.rust.transcript,
+        STATION_PROMPT_TRANSCRIPT,
+    );
+    assert_eq!(compared.rust.returned, None, "rust returned");
+    assert!(
+        !compared.matched,
+        "match is true for a difference outside the rule's span"
+    );
     Ok(())
 }
 
@@ -1243,6 +1381,60 @@ fn status_incomplete_case() -> Result<(), String> {
         ],
     )];
     assert_eq!(report.incomplete, expected, "incomplete");
+    Ok(())
+}
+
+/// A recorded `GC-01` with both exports and a transcript equal to the Rust
+/// side's fails exactly one readiness check: a carriage return ending its
+/// `meta.txt` `setup` value fails `no_carriage_return`, and a rule line
+/// without a tab fails `normalisation_parses`. Each row has its own folder
+/// and bridge. `GET /api/status` reports the case recorded, not READY and
+/// INCOMPLETE on that one check; COMPARE answers 200 with both raw outputs
+/// and `match` false, because only a READY case can match.
+#[test]
+fn status_and_compare_incomplete_on_cr_or_malformed_rule() -> Result<(), String> {
+    let cr_meta = cr_in_setup_meta();
+    let valid_meta = synthetic_meta(SYNTHETIC_CONTEXT);
+    // Test name, meta.txt, normalisation.txt, and the one check they fail.
+    let rows = [
+        (
+            "status_and_compare_incomplete_on_cr",
+            cr_meta.as_str(),
+            SYNTHETIC_RULES,
+            "no_carriage_return",
+        ),
+        (
+            "status_and_compare_incomplete_on_malformed_rule",
+            valid_meta.as_str(),
+            MALFORMED_RULES,
+            "normalisation_parses",
+        ),
+    ];
+    for (test, meta, rules, check) in rows {
+        let (report, compared) =
+            status_and_compare_over_gc01(test, STATION_PROMPT_TRANSCRIPT, meta, rules, true)?;
+        assert_eq!(report.mumps_mode, "replay", "{test}: mumps_mode");
+        assert_eq!(report.recorded, ["GC-01"], "{test}: recorded");
+        assert!(report.ready.is_empty(), "{test}: ready: {:?}", report.ready);
+        let expected = vec![("GC-01".to_string(), vec![check.to_string()])];
+        assert_eq!(report.incomplete, expected, "{test}: incomplete");
+        assert_same(
+            &format!("{test}: mumps transcript"),
+            &compared.mumps.transcript,
+            STATION_PROMPT_TRANSCRIPT,
+        );
+        assert_eq!(compared.mumps.returned, None, "{test}: mumps returned");
+        assert_same(
+            &format!("{test}: rust transcript"),
+            &compared.rust.transcript,
+            STATION_PROMPT_TRANSCRIPT,
+        );
+        assert_eq!(compared.rust.returned, None, "{test}: rust returned");
+        assert!(
+            !compared.matched,
+            "{test}: match is true for a case INCOMPLETE on {check}"
+        );
+    }
     Ok(())
 }
 

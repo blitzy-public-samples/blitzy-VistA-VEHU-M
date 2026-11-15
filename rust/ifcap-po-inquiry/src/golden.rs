@@ -864,8 +864,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A new directory under the system temporary directory, created by
-    /// [`Scratch::new`] and therefore owned by it, removed when dropped (on a
-    /// failed assertion too). Each attempt takes the next name
+    /// [`Scratch::new`] and therefore owned by it. A test that reaches its
+    /// end removes it with [`Scratch::close`], which reports a failed
+    /// removal; `Drop` removes it best effort when a test fails early or
+    /// unwinds. Each attempt takes the next name
     /// `ifcap-golden-unit-<pid>-<n>` and creates it with `fs::create_dir`,
     /// which fails on any existing entry, a symbolic link included, without
     /// following it. An existing entry is never removed or reused.
@@ -894,11 +896,26 @@ mod tests {
         fn path(&self) -> &Path {
             &self.0
         }
+
+        /// Removes the directory with everything in it, on a test's normal
+        /// path. A failure, a directory already gone included, is an error
+        /// naming the directory, so a passing test cannot leave it behind
+        /// unnoticed.
+        fn close(mut self) -> Result<(), String> {
+            let dir = std::mem::take(&mut self.0);
+            fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))
+        }
     }
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            // Best-effort removal for a test that ends before `close`, by an
+            // early error return or an unwind: that test has already failed,
+            // and a removal failure cannot be reported from here. A closed
+            // `Scratch` holds an empty path and is skipped.
+            if !self.0.as_os_str().is_empty() {
+                let _ = fs::remove_dir_all(&self.0);
+            }
         }
     }
 
@@ -1322,7 +1339,7 @@ mod tests {
         let not_a_folder = dir.join(INPUT);
         assert_eq!(readiness(&not_a_folder), Readiness::Absent);
         assert_eq!(CHECKS.len(), 6);
-        Ok(())
+        scratch.close()
     }
 
     #[test]
@@ -1357,7 +1374,7 @@ mod tests {
                 )],
             }
         );
-        Ok(())
+        scratch.close()
     }
 
     #[test]
@@ -1414,7 +1431,7 @@ mod tests {
             return Err("GC-05 is not recorded".to_string());
         };
         assert_eq!(case.returned, Some("1".to_string()));
-        Ok(())
+        scratch.close()
     }
 
     #[test]
@@ -1435,7 +1452,7 @@ mod tests {
         fs::create_dir(dir.join(META)).map_err(|e| e.to_string())?;
         let expected = format!("{}: not a regular file", dir.join(META).display());
         assert_eq!(load_case(golden, "GC-03"), CaseLoad::Unreadable(expected));
-        Ok(())
+        scratch.close()
     }
 
     #[test]
@@ -1465,7 +1482,7 @@ mod tests {
         );
         let found = find_capture(golden, &strings(&["^"]))?;
         assert_eq!(found.map(|case| case.id), Some("GC-02".to_string()));
-        Ok(())
+        scratch.close()
     }
 
     #[test]
@@ -1496,6 +1513,7 @@ mod tests {
                 ])
             ))
         );
+        scratch.close()?;
         let scratch = Scratch::new()?;
         let golden = scratch.path();
         write_case(
@@ -1510,6 +1528,7 @@ mod tests {
                     .to_string()
             )
         );
+        scratch.close()?;
         let scratch = Scratch::new()?;
         let golden = scratch.path();
         write_case(
@@ -1518,7 +1537,7 @@ mod tests {
             &[(META, b"docker_exec_args=a b\n".to_vec())],
         )?;
         assert_eq!(live_start(golden), Err("missing key context".to_string()));
-        Ok(())
+        scratch.close()
     }
 
     #[test]

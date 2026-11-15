@@ -137,14 +137,14 @@ test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
    Doc-tests ifcap_po_inquiry
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-149 tests pass: 132 unit tests in `src/`, 15 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
+152 tests pass: 132 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
 
 `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, exit status 0. Output with the `finished in <seconds>` timings trimmed:
 
@@ -172,24 +172,27 @@ All five cases are NOT COMPARED, because none has a capture. Exit 0 is not accep
     Finished `test` profile [unoptimized + debuginfo] target(s)
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
 
-running 15 tests
+running 18 tests
 test end_to_end_real_captures ... ok
-test mumps_replay_502_not_recorded ... ok
-test status_empty_folder ... ok
-test compare_match_true_for_ready_equal_case ... ok
-test compare_match_false_for_context_duz_1 ... ok
-test compare_match_false_for_differing_ready_case ... ok
-test static_paths_exact_match ... ok
-test mumps_replay_200_when_recorded ... ok
-test rust_session_200 ... ok
 test compare_match_false_for_incomplete_case ... ok
-test startup_with_empty_folder ... ok
 test not_found_404_texts ... ok
+test mumps_replay_502_not_recorded ... ok
+test startup_with_empty_folder ... ok
+test rust_session_200 ... ok
+test mumps_replay_200_when_recorded ... ok
+test compare_match_true_for_ready_equal_case ... ok
+test compare_match_false_for_differing_ready_case ... ok
+test compare_match_false_when_difference_is_outside_the_rule ... ok
+test compare_match_true_when_rule_covers_the_difference ... ok
+test compare_match_false_for_context_duz_1 ... ok
 test bad_request_400_on_every_backend ... ok
-test status_incomplete_case ... ok
+test status_empty_folder ... ok
 test status_ready_case ... ok
+test status_incomplete_case ... ok
+test static_paths_exact_match ... ok
+test status_and_compare_incomplete_on_cr_or_malformed_rule ... ok
 
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ### Format and lint
@@ -254,7 +257,7 @@ $ grep -E '^\| PO-[0-9]+\.b' SPEC.md | grep -c '| not exercised, not implemented
 
 ### Document limits
 
-`wc -l -w testingMethods.md`, exit status 0: `52  593 testingMethods.md` (at most 60 lines and 600 words). `wc -l runPlaybook.md`, exit status 0: `114 runPlaybook.md` (at most 150 lines).
+`wc -l -w testingMethods.md`, exit status 0: `52  593 testingMethods.md` (at most 60 lines and 600 words). `wc -l runPlaybook.md`, exit status 0: `116 runPlaybook.md` (at most 150 lines).
 
 ### HL7 domain
 
