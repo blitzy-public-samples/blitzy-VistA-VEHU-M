@@ -242,6 +242,12 @@ async function send() {
   const backend = backendSelect.value;
   const seq = ++requestSeq;
   pending = true;
+  // The verdict line only ever describes the sequence last answered, so it
+  // is empty while a compare is in flight: a 200 sets it again, and an error
+  // leaves it empty.
+  if (backend === "compare") {
+    matchStatus.textContent = "";
+  }
   if (reactionsOn()) {
     sendButton.classList.add("busy");
   }
@@ -339,15 +345,44 @@ async function showBridgeStatus() {
 // The typed line goes in unchanged, the empty string included: RETURN
 // answers the station prompt and both display pauses
 // [Packages/IFCAP/Routines/PRCFSITE.m:18] [Packages/IFCAP/Routines/PRCHDP2.m:10, 41].
+// INPUT is then emptied and given focus, so the next answer can be typed at
+// once: a mouse click on SEND moves focus to the button, and keystrokes
+// there would be lost.
 entryForm.addEventListener("submit", (event) => {
   event.preventDefault();
   inputs.push(lineInput.value);
   lineInput.value = "";
+  lineInput.focus();
   send();
 });
 
-exitButton.addEventListener("click", () => {
+// A mouse double-click on SEND is one answer, not two. The second and later
+// clicks of one multi-click (event.detail above 1) are stopped before they
+// submit the form, which would add the emptied INPUT as an extra RETURN, and
+// focus goes back to INPUT, which that click's press moved to the button. A
+// key press, on INPUT or on SEND, clicks with detail 0, and clicks far enough
+// apart each count from 1 again, so each of those still sends one answer.
+sendButton.addEventListener("click", (event) => {
+  if (event.detail > 1) {
+    event.preventDefault();
+    lineInput.focus();
+  }
+});
+
+// EXIT adds only the exit input. Any text typed in INPUT is discarded, not
+// sent, so it cannot follow the exit input on a later RETURN, and INPUT gets
+// focus back from the button. As on SEND, the second and later clicks of one
+// mouse multi-click add nothing and only give INPUT focus back: replay
+// matches the whole input sequence, so an extra "^" would leave a recorded
+// case NOT RECORDED.
+exitButton.addEventListener("click", (event) => {
+  if (event.detail > 1) {
+    lineInput.focus();
+    return;
+  }
   inputs.push(EXIT_INPUT);
+  lineInput.value = "";
+  lineInput.focus();
   send();
 });
 

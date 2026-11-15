@@ -86,7 +86,7 @@ This is the state of a fresh checkout: `tests/golden/ifcap/` holds only its READ
 
 ## Step 6. Run the three modes
 
-- Choose MUMPS, RUST or COMPARE in the selector. Type one input in INPUT and press SEND, or RETURN, for each input line of a case. An empty line is a RETURN at the prompt. EXIT sends `^`.
+- Choose MUMPS, RUST or COMPARE in the selector. Type one input in INPUT and press SEND, or RETURN, for each input line of a case. An empty line is a RETURN at the prompt. EXIT sends `^` and empties INPUT without sending what was typed there.
 - Typed input is never echoed. The transcript shows only what the backend writes.
 - Every SEND posts the whole sequence typed so far, because the bridge keeps no session state. Changing the backend clears the screen and sends the same sequence to the new backend. Reloading the page starts a new, empty sequence.
 - **MUMPS** replays the capture whose inputs equal the whole sequence, so a sequence that is only part of a case answers `NOT RECORDED` until the case's last input.
@@ -94,7 +94,7 @@ This is the state of a fresh checkout: `tests/golden/ifcap/` holds only its READ
 - **COMPARE** shows both raw transcripts side by side.
   - It shows `MATCH` only when the capture for the inputs is READY, its `meta.txt` `context` is accepted, the two transcripts are equal after that case's normalisation, and the two return values are equal.
   - It shows `MISMATCH` otherwise, inputs with no capture included.
-  - It shows nothing before a compare and after an error.
+  - It shows nothing before a compare, while a compare request is in flight, and after an error.
 - Example, GC-04: SEND an empty line, type `INVALID!` and SEND, then EXIT.
 - The same answers come from the command line while the bridge runs:
 

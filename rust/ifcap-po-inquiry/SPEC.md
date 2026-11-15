@@ -1390,10 +1390,15 @@ Checked by the team (B3, B4) in current Chrome and Firefox; this run reports eac
    - a 300 ms shake and red outline on a rejection, meaning only a non-2xx response or a failed request, never an HTTP 200.
 3. **Reduced motion:** none of the five reactions under `prefers-reduced-motion: reduce`.
 4. **MUMPS and COMPARE** redraw instantly, with no transition.
-5. **Cases:** GC-01 to GC-05 run in MUMPS, RUST and COMPARE modes; the displayed transcript equals the capture; COMPARE's `#match-status` shows `MATCH` or `MISMATCH`, taken only from the boolean `match` of a 200 answer, and is empty before a compare and after an error.
+5. **Cases:** GC-01 to GC-05 run in MUMPS, RUST and COMPARE modes; the displayed transcript equals the capture; COMPARE's `#match-status` shows `MATCH` or `MISMATCH`, taken only from the boolean `match` of a 200 answer, and is empty before a compare, while a compare request is in flight, and after an error.
 6. **Labels:** the literal upper-case labels (`MUMPS`, `RUST`, `COMPARE`, `SEND`, `EXIT`) are byte-identical in every mode.
-7. **No validation:** no `autofocus`, `pattern`, `required` or `maxlength` attribute; `SEND` appends `input.value` unchanged (the empty string included); `EXIT` appends `EXIT_INPUT = "^"`; and the static searches S8 and S9 of `frontend/`, recorded in section "Read-only enforcement results", find no create, edit, cancel or delete control and no `PUT`, `PATCH` or `DELETE` request.
-8. **Transcript grid:** one `<div class="ln">` per `\n`-separated line, set through `textContent`, in an `80ch` by 24-line box with `white-space: pre`; typed inputs are not echoed; error bodies appear verbatim in a separate status line and the transcript stays as last rendered.
+7. **No validation:** no `autofocus`, `pattern`, `required` or `maxlength` attribute; `SEND` appends `input.value` unchanged (the empty string included); `EXIT` appends only `EXIT_INPUT = "^"`, discarding unsent any text typed in the input; after `SEND` or `EXIT`, by key or by mouse, the input is empty and has focus; the second and later clicks of one mouse double-click on `SEND` or `EXIT` add no input, while each separate key press or click adds one; and the static searches S8 and S9 of `frontend/`, recorded in section "Read-only enforcement results", find no create, edit, cancel or delete control and no `PUT`, `PATCH` or `DELETE` request.
+8. **Transcript grid:** one `<div class="ln">` per `\n`-separated line, set through `textContent`, in an `80ch` by 24-line box with `white-space: pre`; typed inputs are not echoed; error bodies appear verbatim in a separate status line and the transcript stays as last rendered. Control bytes are set as they are. Current Chrome (157) draws `<BEL>` (`$C(7)`, byte 0x07) and ESC (`$C(27)`, byte 0x1B) each as a one-cell box and interprets no escape sequence:
+   - the no-match `<BEL> ??` (PO-09.b14) and `<BEL> >>> Status …` (PO-06.b2) read as a box then the text;
+   - text after a `<BEL>` on its line sits one column right of where a terminal puts it;
+   - the clear-and-home sequence `$C(27,91,50,74,27,91,72)` of an O-01 candidate `IOF` reads as a box, `[2J`, a box, `[H`;
+   - both COMPARE panes draw them the same way, so the comparison is unaffected;
+   - the screen does not hide them, because the displayed transcript equals the capture (item 5).
 9. **Screen controls:** one text input, `<input type="text">`, with a `SEND` button and an `EXIT` button; in COMPARE, the two transcript areas (MUMPS and RUST) are side by side.
 10. **Session behaviour (`app.js`):**
     - `inputs` is an in-memory array, so a reload starts a new session with an empty sequence;
