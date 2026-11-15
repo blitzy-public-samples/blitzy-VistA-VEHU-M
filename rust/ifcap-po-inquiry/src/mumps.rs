@@ -648,12 +648,14 @@ impl<'a> Session<'a> {
     /// session-end rule).
     pub(crate) fn into_transcript_at_prompt(self) -> String {
         // `prompt_end` is always an earlier `out.len()` and `out` only grows,
-        // so `get` succeeds; the whole transcript is the non-panicking
+        // so the `get` check succeeds and the owned buffer is truncated in
+        // place with no copy; the whole transcript is the non-panicking
         // fallback should that ever stop holding.
-        match self.out.get(..self.prompt_end) {
-            Some(cut) => cut.to_string(),
-            None => self.out,
+        let mut out = self.out;
+        if out.get(..self.prompt_end).is_some() {
+            out.truncate(self.prompt_end);
         }
+        out
     }
 }
 
@@ -928,6 +930,9 @@ mod tests {
             ("19.995", 6, Some(3), "19.995"),
             ("2.5", 3, Some(0), "  3"),
             (".4", 3, Some(0), "  0"),
+            ("-1.005", 0, Some(2), "-1.01"),
+            ("-2.5", 3, Some(0), " -3"),
+            ("-.25", 5, Some(1), " -0.3"),
             ("", 7, Some(2), "   0.00"),
             ("007", 4, None, " 007"),
             ("12345678", 3, None, "12345678"),
@@ -1009,5 +1014,26 @@ mod tests {
         assert_eq!(session.read(), None);
         session.write("X");
         assert_eq!(session.into_transcript_at_prompt(), "P: ");
+    }
+
+    #[test]
+    fn prompt_cut_off_boundary_keeps_whole_transcript() {
+        let inputs: Vec<String> = Vec::new();
+        let cases = [("P: ", 4), ("\u{e9}", 1)];
+        for (out, prompt_end) in cases {
+            let session = Session {
+                inputs: &inputs,
+                next: 0,
+                out: out.to_string(),
+                x: 0,
+                y: 0,
+                prompt_end,
+            };
+            assert_eq!(
+                session.into_transcript_at_prompt(),
+                out,
+                "into_transcript_at_prompt with out {out:?}, prompt_end {prompt_end}"
+            );
+        }
     }
 }

@@ -133,7 +133,7 @@ All 11 fixtures are byte-identical to their sources.
 
 ```text
      Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
-test result: ok. 131 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
@@ -144,7 +144,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-148 tests pass: 131 unit tests in `src/`, 15 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
+149 tests pass: 132 unit tests in `src/`, 15 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
 
 `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, exit status 0. Output with the `finished in <seconds>` timings trimmed:
 
