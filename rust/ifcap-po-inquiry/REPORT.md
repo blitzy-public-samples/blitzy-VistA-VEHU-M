@@ -215,18 +215,18 @@ src/lib.rs:9:#![forbid(unsafe_code)]
 S2, `grep -rnE '[A-Za-z_)]\[[^]]+\]' src/`, exit status 0. The one hit, reviewed, is a comment quoting the M code `DIC(0)["E"` [DIC.m:63], not Rust indexing:
 
 ```text
-src/inquiry.rs:720:        // W:DIC(0)["E" ! ends the line before G ASK [DIC.m:63], whose W ! and
+src/inquiry.rs:745:        // W:DIC(0)["E" ! ends the line before G ASK [DIC.m:63], whose W ! and
 ```
 
 S3, `grep -n 'golden' src/inquiry.rs src/store.rs src/mumps.rs`, exit status 1, no output.
 
-S4, `grep -rnE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/`, exit status 0, 81 hits, every one in `src/golden.rs`. Output trimmed to the per-file summary of `grep -rlE` and `grep -cE` with the same pattern:
+S4, `grep -rnE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/`, exit status 0, 82 hits, every one in `src/golden.rs`. Output trimmed to the per-file summary of `grep -rlE` and `grep -cE` with the same pattern:
 
 ```text
 $ grep -rlE '<same pattern>' src/
 src/golden.rs
 $ grep -rcE '<same pattern>' src/golden.rs
-81
+82
 ```
 
 ### Specification counts

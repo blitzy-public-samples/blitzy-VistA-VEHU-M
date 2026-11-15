@@ -1455,7 +1455,7 @@ Criterion A9. Each search ran on 2026-11-15 from `rust/ifcap-po-inquiry/`, after
 |---|---|---|---|
 | No public item takes `&mut Store` or returns a mutable `Store`, and `Store` has no mutating method | `Store::from_zwr` returns an owned value; every `Store` method takes `&self`; `load_fixtures` merges each file's map before the `Store` is built | S5 | Both commands print nothing (exit status 1 each) |
 | The live bridge runs one kind of command, `docker exec -i` with the `meta.txt` start arguments | The only production caller of `run_admitted` is `live`, which passes the literal program `"docker"` and the arguments `exec`, `-i`, the container and the `golden::live_start` arguments; `run_admitted` calls `run_command`, which calls `execute`, which builds `Command::new(program)`. No shell runs on the host and no M code comes from a request | S6 | `Command::new(program)` in `execute`, and `Command::new("sleep")` inside `#[cfg(test)] mod tests` (from line 2410 of `src/bridge.rs`). `run_admitted(` hits: the production call in `live`, the definition, and three calls inside `mod tests` |
-| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2410, `src/store.rs` from line 490, `src/golden.rs` from line 1410. Both tests pass (section "Run evidence") |
+| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2410, `src/store.rs` from line 490, `src/golden.rs` from line 1420. Both tests pass (section "Run evidence") |
 | The front-end has no create, edit, cancel or delete control | The selector, the input, SEND and EXIT only | S8; by hand (section "Front-end checklist", item 7) | No control element: the hits are `createDocumentFragment` and `createElement`, which build transcript rows, and the comments and handler for the `animationcancel` event |
 | No write path in `src/` or `frontend/` | Only reads of `&Store`; `fetch` sends only the session `POST` and the status `GET`; the MUMPS side runs the original's own read-only inquiry | S5, S7, S8 and S9 | S9 prints nothing (exit status 1); S5, S7 and S8 as above |
 
@@ -1495,21 +1495,21 @@ src/store.rs:542:        fs::write(&path, bytes).map_err(|e| format!("cannot wri
 src/store.rs:889:            fs::create_dir(&sub).map_err(|e| format!("cannot create {}: {e}", sub.display()))
 src/store.rs:912:            fs::create_dir(entry).map_err(|e| format!("cannot create {}: {e}", entry.display()))
 src/store.rs:916:            fs::create_dir(&target)
-src/golden.rs:1421:    /// `ifcap-golden-unit-<pid>-<n>` and creates it with `fs::create_dir`,
-src/golden.rs:1434:                match fs::create_dir(&dir) {
-src/golden.rs:1550:        File::create(path)
-src/golden.rs:1558:        fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-src/golden.rs:1561:            fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-src/golden.rs:1895:        fs::create_dir(dir.join(TRANSCRIPT)).map_err(|e| e.to_string())?;
-src/golden.rs:2032:        fs::create_dir(dir.join(META)).map_err(|e| e.to_string())?;
-src/golden.rs:2099:                    Bad::Bytes(bytes) => fs::write(&path, bytes),
-src/golden.rs:2100:                    Bad::Directory => fs::create_dir(&path),
-src/golden.rs:2162:            fs::create_dir(&path).map_err(|e| e.to_string())?;
-src/golden.rs:2685:                Made::Bytes(bytes) => fs::write(&path, bytes).map_err(|e| e.to_string())?,
-src/golden.rs:2687:                Made::Directory => fs::create_dir(&path).map_err(|e| e.to_string())?,
+src/golden.rs:1431:    /// `ifcap-golden-unit-<pid>-<n>` and creates it with `fs::create_dir`,
+src/golden.rs:1444:                match fs::create_dir(&dir) {
+src/golden.rs:1560:        File::create(path)
+src/golden.rs:1568:        fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+src/golden.rs:1571:            fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+src/golden.rs:1905:        fs::create_dir(dir.join(TRANSCRIPT)).map_err(|e| e.to_string())?;
+src/golden.rs:2042:        fs::create_dir(dir.join(META)).map_err(|e| e.to_string())?;
+src/golden.rs:2109:                    Bad::Bytes(bytes) => fs::write(&path, bytes),
+src/golden.rs:2110:                    Bad::Directory => fs::create_dir(&path),
+src/golden.rs:2172:            fs::create_dir(&path).map_err(|e| e.to_string())?;
+src/golden.rs:2696:                Made::Bytes(bytes) => fs::write(&path, bytes).map_err(|e| e.to_string())?,
+src/golden.rs:2698:                Made::Directory => fs::create_dir(&path).map_err(|e| e.to_string())?,
 ```
 
-The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2410`, `src/golden.rs:1410`, `src/inquiry.rs:2496`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:490`.
+The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2410`, `src/golden.rs:1420`, `src/inquiry.rs:2537`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:490`.
 
 S8, exit status 0:
 
@@ -1759,18 +1759,18 @@ src/lib.rs:9:#![forbid(unsafe_code)]
 S2, `grep -rnE '[A-Za-z_)]\[[^]]+\]' src/`, exit status 0. The one hit, reviewed, is a comment quoting the M code `DIC(0)["E"` [DIC.m:63], not Rust indexing:
 
 ```text
-src/inquiry.rs:720:        // W:DIC(0)["E" ! ends the line before G ASK [DIC.m:63], whose W ! and
+src/inquiry.rs:745:        // W:DIC(0)["E" ! ends the line before G ASK [DIC.m:63], whose W ! and
 ```
 
 S3, `grep -n 'golden' src/inquiry.rs src/store.rs src/mumps.rs`, exit status 1, no output.
 
-S4, `grep -rnE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/`, exit status 0, 81 hits, every one in `src/golden.rs`. Output trimmed to the per-file summary of `grep -rlE` and `grep -cE` with the same pattern:
+S4, `grep -rnE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/`, exit status 0, 82 hits, every one in `src/golden.rs`. Output trimmed to the per-file summary of `grep -rlE` and `grep -cE` with the same pattern:
 
 ```text
 $ grep -rlE '<same pattern>' src/
 src/golden.rs
 $ grep -rcE '<same pattern>' src/golden.rs
-81
+82
 ```
 
 ### Specification counts

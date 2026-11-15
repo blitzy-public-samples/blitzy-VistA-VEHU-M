@@ -40,11 +40,18 @@ use crate::store::{Store, Sub};
 // Public items
 // ---------------------------------------------------------------------------
 
-/// Everything one session wrote, and what its entry point returned.
+/// What one session of `EN3^PRCHRPT` [PRCHRPT.m:70-75] wrote, and what its
+/// entry point returned. The session runs `D ST` [PRCHRPT.m:71], then
+/// repeats `EN30` [PRCHRPT.m:72-75] until the order lookup selects nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InquiryOutput {
-    /// Everything the original writes, in order, with `\n` line endings and
-    /// no echo of input.
+    /// The original's output, in order, with `\n` line endings and no echo
+    /// of input. A session that ends where `EN3` quits, `Q:'$D(PRCHPO)`
+    /// [PRCHRPT.m:72], keeps all of it. One that ends early, as [`inquire`]
+    /// sets out (input running out at a READ, or an unimplemented branch),
+    /// keeps only what was written through its last prompt: anything written
+    /// after the last READ, such as the station or order echo, is dropped,
+    /// and a session that never READ gives `""`.
     pub transcript: String,
     /// The entry point's return value. Always `None`: OPTION 1901 enters
     /// `EN3^PRCHRPT` by `DO` [19+OPTION.zwr:14691], and the routine quits
@@ -52,15 +59,21 @@ pub struct InquiryOutput {
     pub returned: Option<String>,
 }
 
-/// Why a session could not be reproduced.
+/// Why a session of `EN3^PRCHRPT` [PRCHRPT.m:70-75] could not be
+/// reproduced: the original stops with an M `UNDEF` error in its order
+/// lookup, the `IX^DIC` of `EN3^PRCHPAT` [PRCHPAT.m:78-83], which
+/// `EN30 D PO` [PRCHRPT.m:72] reaches through `D EN3^PRCHPAT`
+/// [PRCHRPT.m:13].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InquiryError {
     /// A read of a node holding no value on an exercised path, where the
     /// original raises an M `UNDEF` error: a node holding only descendants
     /// that passed a bare `$D` test, at sites (a) to (f) of `SPEC.md`
-    /// "Contracts", for example the candidate order's zero node at
-    /// `S DIY=$P(^(0),U)` [DIC3.m:110]. Carries the node's global reference
-    /// as [`Store::format_ref`] writes it, such as `^PRC(442,1,0)`.
+    /// "Contracts", for example the candidate order's zero node, read for
+    /// piece 1, file 442 field .01 PURCHASE ORDER NUMBER at `0;1`
+    /// [DD.zwr:514312], by `S DIY=$P(^(0),U)` in `S^DIC3` [DIC3.m:110].
+    /// Carries the node's global reference as [`Store::format_ref`] writes
+    /// it, such as `^PRC(442,1,0)`.
     CorruptStore(String),
 }
 
@@ -256,7 +269,9 @@ const STATION_PROMPT: &str = "Select STATION NUMBER ('^' TO EXIT): ";
 /// `.01` value, which is empty [DIC2.m:10, 25, 32]; `DIC("W")` writes two
 /// spaces [DIC1.m:52-56]; the identifier `^DD(411,0,"ID",.1)` writes two
 /// spaces and the file 4 name of `^PRC(411,500,0)` piece 10, `CAMP MASTER`
-/// [DD.zwr:488724] [4+INSTITUTION.zwr:494]. No newline follows.
+/// [DD.zwr:488724] [4+INSTITUTION.zwr:494]. No newline follows. This is a
+/// fixed-literal equivalent: the identifier, with its `@(…)` and `D Y^DIQ`,
+/// is resolved once for the fixed context, and no M code is evaluated.
 const STATION_ECHO: &str = "      CAMP MASTER";
 
 /// `PRCHP("A")`, the order prompt text [PRCHRPT.m:12].
@@ -329,7 +344,8 @@ struct Locals {
     /// resolves to: `I +$P(^(0),U,1)=PRC("SITE")`, followed by `PRCHP("S")`
     /// when that is defined [PRCHPAT.m:81]. `Some(false)` is the station test
     /// only, `Some(true)` the station test, then [`MOP_SCREEN`]; with `None`
-    /// (undefined) every entry passes.
+    /// (undefined) every entry passes. The M text is never kept or
+    /// evaluated: [`screen_passes`] applies the fixed rule.
     dic_s: Option<bool>,
     /// `D`, the index the order lookup starts on.
     d: Option<String>,
@@ -494,6 +510,10 @@ fn pct_dt(_s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt> {
 /// `DIC(0)="AEQMZ"`, resolved byte for byte for the snapshot (`SPEC.md` R1),
 /// with nothing read from `Store`. RETURN accepts the default and selects
 /// it; any other answer is classified inside the lookup, so it is PO-05.b2.
+/// The literal screen `DIC("S")="I +Y<1000000"` [PRCFSITE.m:18], which 500
+/// passes, and the pre-lookup node `X ^DD(411,.01,7.5)` [DIC.m:36]
+/// [DD.zwr:488792], which writes nothing, are fixed behaviour here: no M
+/// code is evaluated.
 fn dic(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
     s.nl();
     // PR1 S DIY=DIPRMT(DISUB) ... I $G(DIY(DISUB))]"" S DIY=DIY_DIY(DISUB)_"// "
@@ -615,8 +635,13 @@ fn en3_prchpat(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     Ok(())
 }
 
-/// The subscript `A` followed by an opening bracket, which FileMan orders
-/// from to test whether file 442 has any index at all [DICM.m:71].
+/// The subscript `A` followed by an opening bracket, from which `W^DICM`
+/// orders `^PRC(442,` to test for a later index-name subscript before the
+/// whole-file fallback [DICM.m:71]. Index names such as `B` and `C` collate
+/// after it, and one such as `AC` before it. With such a subscript, and no
+/// `N` in `DIC(0)`, the lookup goes to `DD` and `BAD^DIC1`
+/// [DICM.m:85-87]; with none it scans the whole file for an entry whose
+/// field .01 equals `X` [DICM.m:72-81], the n/e PO-09.b16.
 const AFTER_INDEX_NAMES: &str = "A\u{5b}";
 
 /// PO-09 `IX^DIC` [DIC.m:84-86], stub over `Store`: the order lookup of
@@ -782,6 +807,11 @@ const NESTED_LOOKUP_INDEXES: [(&str, &str, &[&str]); 3] = [
 /// 442.3 (`ST`); none of them has a date, pointer or variable-pointer index
 /// or a node-7 field, so no `%DT` echo [DICM1.m:15-23] can occur, and a
 /// nested miss writes nothing because `A` and `Q` are stripped [DICM.m:107].
+///
+/// The guard is a fixed-literal equivalent of `P^DICM0`'s XECUTEd pointer
+/// screen and the `G @Y` field-type dispatch [DICM0.m:8-41] [DICM1.m:8-11]
+/// [DICM.m:30-34], over the literal DD index and field definitions its
+/// constants cite; no M code is evaluated.
 fn no_match_guard(st: &Store, x: &str) -> bool {
     // (a)
     let file = key("PRC", &["442"]);
@@ -922,10 +952,15 @@ fn backtick_value(x: &str) -> bool {
         .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || m_punctuation(c)))
 }
 
-/// `DIC("S")` of the order lookup applied to an entry's zero node, its naked
-/// reference `^(0)` being `^PRC(442,ien,0)` [DIC3.m:122-124]: the entry's
-/// station `+$P(^(0),U,1)` equals `PRC("SITE")`, and with the MOP rule its
-/// method of purchase is numerically below 10 or is the text `25`.
+/// `DIC("S")` of the order lookup applied to an entry's zero node, as a
+/// fixed predicate for the literal screen `I +$P(^(0),U,1)=PRC("SITE")`
+/// [PRCHPAT.m:81], with `,` and the literal MOP rule
+/// `$P(^(0),U,2)<10!($P(^(0),U,2)=25)` ([`MOP_SCREEN`], [PRCHRPT.m:9])
+/// appended when `PRCHP("S")` is defined. Where `S^DIC3` XECUTEs it, the
+/// naked reference `^(0)` is `^PRC(442,ien,0)` [DIC3.m:122-124]. The entry
+/// passes when its station `+$P(^(0),U,1)` equals `PRC("SITE")` and, with
+/// the MOP rule, its method of purchase is numerically below 10 or is the
+/// text `25`. No M code is evaluated.
 fn screen_passes(v: &Locals, node0: &str) -> bool {
     let site = v
         .prc_site
@@ -1067,7 +1102,9 @@ fn search(st: &Store, v: &Locals, x: &str) -> Result<(Vec<Sub>, usize), Halt> {
 /// ends that nested lookup before anything else is read, so its index has
 /// no candidate. The nested lookup runs with `A` and `Q` stripped
 /// [DICM.m:107], so a pointed-to entry with no qualifying order writes
-/// nothing and is simply not a candidate.
+/// nothing and is simply not a candidate. This is fixed logic for the
+/// nested screen `P^DICM0` builds from literal index and file names; it
+/// evaluates no M code.
 fn pointer_candidate(st: &Store, v: &Locals, x: &str) -> Result<bool, Halt> {
     let file = key("PRC", &["442"]);
     // P1 ... I @("$O"_Y_"0))'>0") G L1   [DICM0.m:26]: no record, no pointer lookup
@@ -1115,7 +1152,8 @@ fn pointer_candidate(st: &Store, v: &Locals, x: &str) -> Result<bool, Halt> {
 /// One pointed-to entry of the nested lookup: it must exist without a `-9`
 /// node [DIC3.m:94, 110], and the screen `P^DICM0` builds must find a parent
 /// order `p > 0` under `^PRC(442,index,entry,p)` whose zero node exists and
-/// passes the order screen [DICM0.m:32, 36].
+/// passes the order screen [DICM0.m:32, 36]. That screen is reproduced as
+/// fixed logic, never XECUTEd.
 fn pointed_entry_qualifies(
     st: &Store,
     v: &Locals,
@@ -1151,8 +1189,9 @@ fn pointed_entry_qualifies(
 /// [DIC2.m:10, 25, 32]; `WOV^DICQ1` then writes two spaces before each
 /// identifier of `^DD(442,0,"ID")` in subscript order, after
 /// `$E(^PRC(442,ien,0),0)` points the naked reference at `^PRC(442,ien,0)`
-/// [DICQ1.m:86-88] [DD.zwr:514202-514204]. Nothing follows: file 442 asks
-/// no confirmation [DIC2.m:54-58].
+/// [DICQ1.m:86-88] [DD.zwr:514202-514204]. The echo is fixed output for
+/// those literal identifiers, whose M code is never executed. Nothing
+/// follows: file 442 asks no confirmation [DIC2.m:54-58].
 fn write_order_echo(s: &mut Session, st: &Store, ien: &Sub) -> Result<String, Halt> {
     let entry = child(&key("PRC", &["442"]), ien);
     let zero = child(&entry, &Sub::from_text("0"));
@@ -1791,7 +1830,9 @@ fn diwp(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
 /// PO-16 `%XY^%RCR` [DIRCR.m:24-30] [ZTRCR.m:21-27], reproduced for the
 /// literal `%X="^UTILITY($J,""W"","` and `%Y="^TMP($J,""W"","`
 /// [PRCHDP1.m:54] [PRCHDP2.m:48]: copies every node of the `^UTILITY`
-/// scratch to the same subscripts of the `^TMP` scratch.
+/// scratch to the same subscripts of the `^TMP` scratch. The `@%Z` and
+/// `$Q(@%Z)` indirection [DIRCR.m:29] is not evaluated: the copy is fixed
+/// to those two literal roots.
 fn pct_rcr(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // F  S %Z=$Q(@%Z) Q:$P(%Z,%A)]""!(%Z="")  S @(%Y_$E(%Z,%B,255))=@%Z   [DIRCR.m:29]
     v.tmp_w_counts.extend(&v.utility_w_counts);

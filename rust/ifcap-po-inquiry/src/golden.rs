@@ -6,7 +6,8 @@
 //! [`CAPTURE_FILES`], every line ended by `\n`:
 //!
 //! - `input.txt`: the typed inputs, one per line ([`split_input_lines`]);
-//! - `transcript.txt`: the original's standard output, compared raw;
+//! - `transcript.txt`: the original's raw standard output, compared only
+//!   after the case's normalisation rules ([`normalise`]);
 //! - `returned.txt`: the entry point's return value, zero bytes meaning none
 //!   ([`read_returned`]). `EN3^PRCHRPT` is entered by `DO` and returns
 //!   nothing, so this workflow always records zero bytes;
@@ -172,7 +173,11 @@ pub fn read_returned(text: &str) -> Option<String> {
 /// through the next `close`, both literal and included, becomes `<NORM>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
+    /// The open delimiter, literal and non-empty: the text before the tab of
+    /// a `normalisation.txt` line ([`parse_normalisation`]).
     pub open: String,
+    /// The close delimiter, literal and non-empty: the text after the tab of
+    /// a `normalisation.txt` line ([`parse_normalisation`]).
     pub close: String,
 }
 
@@ -501,10 +506,9 @@ fn read_hex4(text: &str, pos: &mut usize) -> Option<u32> {
 /// `UNRESOLVED (O-01)`. A resolved constant must equal every occurrence of
 /// its key, else `CONTEXT MISMATCH <key>: expected <constant>, actual
 /// <value>`. An unresolved constant (`IOF`, `IOSL` while open item O-01
-/// stands) accepts any value, and consumers reading `STUB_CONTEXT` report
-/// the key as `UNRESOLVED (O-01)`. Then each capture key `STUB_CONTEXT`
-/// lacks fails, in capture order, as `CONTEXT MISMATCH <key>: expected
-/// ABSENT, actual <value>`. The first failure is returned. No capture value
+/// stands) accepts any value. Then each capture key `STUB_CONTEXT` lacks
+/// fails, in capture order, as `CONTEXT MISMATCH <key>: expected ABSENT,
+/// actual <value>`. The first failure is returned. No capture value
 /// overrides a constant.
 ///
 /// Diagnostic values such as `IOM` and the HOME device's name belong in
@@ -1129,8 +1133,12 @@ fn exists(path: &Path) -> bool {
 /// name, in [`CHECKS`] order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Readiness {
+    /// The case folder does not exist (AAP 0.3.2): nothing, or something
+    /// other than a directory, is at its path.
     Absent,
+    /// INCOMPLETE: the names of the failed [`CHECKS`], in that order.
     Incomplete(Vec<&'static str>),
+    /// READY: all six [`CHECKS`] pass.
     Ready,
 }
 
@@ -1173,8 +1181,12 @@ pub fn is_recorded(case_dir: &Path) -> bool {
 /// id with its failed checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
+    /// The ids [`is_recorded`] accepts, in [`CASE_IDS`] order.
     pub recorded: Vec<&'static str>,
+    /// The ids whose [`readiness`] is `Ready`, in [`CASE_IDS`] order.
     pub ready: Vec<&'static str>,
+    /// Each id whose [`readiness`] is `Incomplete`, with its failed
+    /// [`CHECKS`], in [`CASE_IDS`] order.
     pub incomplete: Vec<(&'static str, Vec<&'static str>)>,
 }
 
@@ -1216,19 +1228,21 @@ pub fn status(golden_dir: &Path) -> Status {
 /// shows only as a failed check in `readiness`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Case {
-    /// The case id, which is also its folder name.
+    /// The case id, one of [`CASE_IDS`], which is also its folder name.
     pub id: String,
     /// [`split_input_lines`] of `input.txt`.
     pub inputs: Vec<String>,
-    /// `transcript.txt`, raw.
+    /// Raw `transcript.txt` (request capture convention, AAP 0.3.2), never
+    /// normalised here: comparisons apply `rules` through [`normalise`].
     pub transcript: String,
     /// [`read_returned`] of `returned.txt`; `None` when it is absent.
     pub returned: Option<String>,
-    /// The rules of `normalisation.txt`; none when it is absent or does not
-    /// parse.
+    /// [`parse_normalisation`] of `normalisation.txt`, `SPEC.md`
+    /// "Normalisation"; none when it is absent or does not parse.
     pub rules: Vec<Rule>,
-    /// `meta.txt`, when it is present and parses.
+    /// [`parse_meta`] of `meta.txt`, when it is present and parses.
     pub meta: Option<Meta>,
+    /// The case's [`readiness`], from the same reading as its content.
     pub readiness: Readiness,
 }
 
@@ -1236,19 +1250,22 @@ pub struct Case {
 /// 0.7.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CaseLoad {
-    /// The case folder does not exist: nothing, or something other than a
-    /// directory, is at its path. NOT COMPARED.
+    /// The case folder does not exist (AAP 0.3.2): nothing, or something
+    /// other than a directory, is at its path. NOT COMPARED.
     Absent,
     /// The folder exists but `input.txt` or `transcript.txt` is missing,
     /// whatever the other files hold, readable or not: NOT COMPARED. The
-    /// failed checks are carried for the readiness report.
+    /// failed [`CHECKS`] are carried for the readiness report.
     NotRecorded(Vec<&'static str>),
+    /// `input.txt` and `transcript.txt` present, every present capture file
+    /// readable and UTF-8 (AAP 0.3.2): PASS or FAIL by checks and comparison.
     Recorded(Case),
-    /// The case is recorded, its `input.txt` and `transcript.txt` both
-    /// present, but a capture file that is present cannot be read or is not
-    /// UTF-8; or the case folder's own metadata cannot be read, so that
-    /// whether it exists is unknown: that file's or folder's path, `: ` and
-    /// the cause, free of parentheses. The case is FAIL.
+    /// The case is recorded ([`is_recorded`]), its `input.txt` and
+    /// `transcript.txt` both present, but a capture file that is present
+    /// cannot be read or is not UTF-8; or the case folder's own metadata
+    /// cannot be read, so that whether it exists is unknown: that file's or
+    /// folder's path, `: ` and the cause, free of parentheses. The case is
+    /// FAIL.
     Unreadable(String),
 }
 
@@ -1328,22 +1345,11 @@ fn hydrate(case_id: &str, case_dir: &Path, input: CaptureFile) -> CaseLoad {
 
 /// The capture the MUMPS replay side answers `inputs` with (AAP 0.3.2): the
 /// first `Recorded` case, in [`CASE_IDS`] order, whose inputs equal
-/// `inputs`, or `None`. An `Unreadable` case met on the way is `Err` with
-/// its cause at once. The golden folder is read on every call, so new
-/// captures need no restart.
-///
-/// Each case is staged, giving what [`load_case`] would give for it with
-/// less work. Its folder is probed as `load_case` probes it, and its
-/// `input.txt` is read within its budget and compared with `inputs` without
-/// being split into new strings. Only a case whose inputs match is loaded
-/// in full, reusing the `input.txt` already read. Any other case is passed
-/// over at once when its `input.txt` is missing. Otherwise every other file
-/// present is read through in pieces within its budget and dropped, and
-/// the case is `Err` with the first failure, in [`CAPTURE_FILES`] order,
-/// only when its `transcript.txt` is present too: so a case is `Err`
-/// exactly when `load_case` would find it `Unreadable`, with the same
-/// cause, and a case `load_case` finds `NotRecorded` is passed over. Its
-/// readiness is not evaluated.
+/// `inputs`, or `None`. `Absent` and `NotRecorded` cases are passed over. A
+/// case met on the way that [`load_case`] would find `Unreadable`, whether
+/// or not its inputs match, ends the lookup as `Err` with that same cause.
+/// The golden folder is read afresh on every call, each file within its
+/// size budget, so new captures need no restart.
 pub fn find_capture(golden_dir: &Path, inputs: &[String]) -> Result<Option<Case>, String> {
     for id in CASE_IDS {
         let case_dir = golden_dir.join(id);
@@ -1352,6 +1358,10 @@ pub fn find_capture(golden_dir: &Path, inputs: &[String]) -> Result<Option<Case>
             Folder::Uninspectable(cause) => return Err(cause),
             Folder::Present => {}
         }
+        // Only a matching case is loaded in full, by `hydrate` reusing this
+        // `input.txt`; any other case with an `input.txt` is only validated
+        // (`Keep::Nothing`) and fails only when it records, so the result
+        // equals `load_case`'s.
         let input = CaptureFile::read(&case_dir, INPUT, true);
         let matches = input
             .text()
@@ -2611,7 +2621,8 @@ mod tests {
         assert_eq!(found.map(|case| case.id), Some("GC-03".to_string()));
         assert_eq!(find_capture(golden, &strings(&["x"])), Ok(None));
         assert_eq!(find_capture(golden, &[]), Ok(None));
-        // An unreadable case is an error at once, before a later match.
+        // An unreadable GC-05 fails, with its cause, a lookup that no earlier
+        // case matched; a lookup GC-02 matches stops there and still answers.
         let files = replaced(ready_files("^\n"), TRANSCRIPT, Some(b"\xff"));
         let dir = write_case(golden, "GC-05", &files)?;
         let cause = format!("{}: not UTF-8", dir.join(TRANSCRIPT).display());
