@@ -98,8 +98,6 @@ fn main() -> ExitCode {
             );
         }
     }
-    // The counts come from the same path that is checked above and then moved
-    // into the mode `serve` receives.
     let counts = status(&golden_dir);
     {
         // One lock for the three lines, released before `serve` runs.

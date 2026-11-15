@@ -121,12 +121,12 @@ const JSON_TYPE: &str = "application/json; charset=utf-8";
 /// against the capture whose inputs equal the request's.
 #[derive(Clone, Debug)]
 pub enum MumpsMode {
-    /// Answer from the recorded captures `GC-01` to `GC-05` under
-    /// `golden_dir`, read afresh on every request.
+    /// Replay adapter of AAP 0.3.5.1: answer from the recorded captures
+    /// `GC-01` to `GC-05` under `golden_dir`, read afresh on every request.
     Replay { golden_dir: PathBuf },
-    /// Run the original with `docker exec -i <container> ...`, using the
-    /// start arguments and context recorded in the captures under
-    /// `golden_dir`.
+    /// Live adapter of AAP 0.3.5.1: run the original with
+    /// `docker exec -i <container> ...`, using the start arguments and
+    /// context recorded in the captures under `golden_dir`.
     Live {
         container: String,
         golden_dir: PathBuf,
@@ -3666,7 +3666,7 @@ mod tests {
             .collect()
     }
 
-    /// The `STUB_CONTEXT` keys with resolved device values, which
+    /// The `STUB_CONTEXT` keys with sample device values, which
     /// `golden::validate_context` accepts.
     const CONTEXT: &str = r##"{"DUZ":".5","IOF":"#","IOSL":"24","STATION":"500"}"##;
 
