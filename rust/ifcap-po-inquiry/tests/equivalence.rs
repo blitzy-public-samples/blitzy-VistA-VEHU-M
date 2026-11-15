@@ -402,35 +402,16 @@ fn disk_digest(rel: &str) -> Result<String, String> {
 }
 
 fn disk_fixtures() -> Result<Store, String> {
-    load_fixtures(&crate_path(FIXTURES_REL)).map_err(|err| crate_relative(err).to_string())
+    load_fixtures(&crate_path(FIXTURES_REL)).map_err(|err| crate_relative(&err.to_string()))
 }
 
-/// `err` with the file it names made relative to the crate folder, so that
-/// its `Display` text, which a report detail quotes, does not depend on
-/// where the crate is checked out. A file outside the crate folder keeps
-/// its path.
-fn crate_relative(err: StoreError) -> StoreError {
-    let dir = crate_dir();
-    let relative = |file: PathBuf| {
-        file.strip_prefix(&dir)
-            .map(Path::to_path_buf)
-            .unwrap_or(file)
-    };
-    match err {
-        StoreError::Parse {
-            file,
-            line,
-            message,
-        } => StoreError::Parse {
-            file: file.map(relative),
-            line,
-            message,
-        },
-        StoreError::Io { file, message } => StoreError::Io {
-            file: relative(file),
-            message,
-        },
-    }
+/// A loader error's `Display` text, which starts with the path it names,
+/// with that path made relative to the crate folder, so that the text,
+/// which a report detail quotes, does not depend on where the crate is
+/// checked out. A path outside the crate folder is kept as it is.
+fn crate_relative(text: &str) -> String {
+    let prefix = format!("{}{}", crate_dir().display(), std::path::MAIN_SEPARATOR);
+    text.strip_prefix(&prefix).unwrap_or(text).to_string()
 }
 
 /// The UTF-8 text of a present file.
@@ -2589,6 +2570,9 @@ fn context_cause_names_only_stub_keys() {
 fn loader_error_names_files_crate_relative() {
     let cases = crate_path(&fixture_rel(RUNTIME_EXPORT));
     let outside = PathBuf::from("/elsewhere/cases.zwr");
+    // The texts `load_fixtures` gives: a parse error's `StoreError` text, or
+    // the path followed by `: cannot read: ` and the cause.
+    let unreadable = |path: &Path| format!("{}: cannot read: synthetic", path.display());
     let table = [
         (
             "parse error in a fixture file",
@@ -2596,8 +2580,9 @@ fn loader_error_names_files_crate_relative() {
                 file: Some(cases.clone()),
                 line: 4,
                 message: "$C() values are not supported".to_string(),
-            },
-            "tests/fixtures/ifcap/cases.zwr: line 4: $C() values are not supported",
+            }
+            .to_string(),
+            "tests/fixtures/ifcap/cases.zwr: MALFORMED ZWR LINE 4: $C() values are not supported",
         ),
         (
             "parse error without a file",
@@ -2605,36 +2590,28 @@ fn loader_error_names_files_crate_relative() {
                 file: None,
                 line: 2,
                 message: "synthetic".to_string(),
-            },
-            "line 2: synthetic",
+            }
+            .to_string(),
+            "MALFORMED ZWR LINE 2: synthetic",
         ),
         (
             "fixture directory not listable",
-            StoreError::Io {
-                file: crate_path(FIXTURES_REL),
-                message: "synthetic".to_string(),
-            },
+            unreadable(&crate_path(FIXTURES_REL)),
             "tests/fixtures/ifcap: cannot read: synthetic",
         ),
         (
             "fixture file not readable",
-            StoreError::Io {
-                file: cases,
-                message: "synthetic".to_string(),
-            },
+            unreadable(&cases),
             "tests/fixtures/ifcap/cases.zwr: cannot read: synthetic",
         ),
         (
             "file outside the crate folder",
-            StoreError::Io {
-                file: outside,
-                message: "synthetic".to_string(),
-            },
+            unreadable(&outside),
             "/elsewhere/cases.zwr: cannot read: synthetic",
         ),
     ];
-    for (label, err, expected) in table {
-        assert_eq!(crate_relative(err).to_string(), expected, "{label}");
+    for (label, text, expected) in table {
+        assert_eq!(crate_relative(&text), expected, "{label}");
     }
 }
 
@@ -3244,7 +3221,7 @@ fn each_capture_defect_fails_with_its_findings() -> Result<(), String> {
             around_context(
                 &[(
                     "MALFORMED CAPTURE tests/golden/ifcap/GC-01/db-before.zwr",
-                    "MALFORMED CAPTURE tests/golden/ifcap/GC-01/db-before.zwr: line 1: ",
+                    "MALFORMED CAPTURE tests/golden/ifcap/GC-01/db-before.zwr: MALFORMED ZWR LINE 1: ",
                 )],
                 &[],
             ),
@@ -3261,7 +3238,7 @@ fn each_capture_defect_fails_with_its_findings() -> Result<(), String> {
             around_context(
                 &[(
                     "MALFORMED CAPTURE tests/golden/ifcap/GC-01/db-after.zwr",
-                    "MALFORMED CAPTURE tests/golden/ifcap/GC-01/db-after.zwr: line 1: ",
+                    "MALFORMED CAPTURE tests/golden/ifcap/GC-01/db-after.zwr: MALFORMED ZWR LINE 1: ",
                 )],
                 &[],
             ),

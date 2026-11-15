@@ -1035,8 +1035,7 @@ fn crate_relative(path: &Path) -> String {
 }
 
 /// The cause of a `StoreError`, from its fields: the crate-relative file and
-/// line of a malformed line, or the file that cannot be read. Never its
-/// message, which may quote fixture content.
+/// line of a malformed line.
 fn store_error_cause(e: &StoreError) -> String {
     match e {
         StoreError::Parse {
@@ -1047,7 +1046,6 @@ fn store_error_cause(e: &StoreError) -> String {
         StoreError::Parse {
             file: None, line, ..
         } => format!("line {line}: malformed"),
-        StoreError::Io { file, .. } => format!("{}: unreadable", crate_relative(file)),
     }
 }
 
@@ -2544,7 +2542,9 @@ fn gc_02_end_to_end_compare() -> Result<(), String> {
             .map_err(|e| fail("reading the capture", format!("{GC_02_CASE}/{name}: {e}")))
     };
     let store = load_fixtures(&crate_dir().join(GC_02_FIXTURES))
-        .map_err(|e| fail("load_fixtures", store_error_cause(&e)))?;
+        // The loader's text names the path and a fixed cause, never fixture
+        // content.
+        .map_err(|e| fail("load_fixtures", e.to_string()))?;
     let inputs = split_input_lines(&read("input.txt")?);
     let captured_transcript = read("transcript.txt")?;
     let captured_returned = read("returned.txt")?;

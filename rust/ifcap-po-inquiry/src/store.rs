@@ -2,10 +2,12 @@
 //! ported `PRCH DISPLAY PO` routines read (`^PRC(442)`, `^PRCD(442.3)`,
 //! `^PRC(440)`, `^PRC(411)` and the rest), loaded from ZWR exports.
 //!
-//! This is the one ZWR loader of the crate: the bridge, the equivalence
-//! harness and the bridge tests all load fixtures through [`Store::from_zwr`]
-//! and [`load_fixtures`]. A [`Store`] is borrowed immutably by the inquiry
-//! and has no public mutator, so nothing an inquiry does can write to it.
+//! This is the one ZWR loader of the crate: the bridge's `serve`, the
+//! equivalence harness and the unit tests load fixtures through
+//! [`Store::from_zwr`] and [`load_fixtures`], and the bridge tests reach the
+//! store only through `bridge::serve`. A [`Store`] is borrowed immutably by
+//! the inquiry and has no mutator: nothing changes it after construction, so
+//! nothing an inquiry does can write to it.
 //!
 //! Keys are subscript vectors whose first element is the global name
 //! without its caret (`^PRC(442,1,0)` is `[Str("PRC"), Num("442"),
@@ -17,6 +19,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::mumps;
@@ -105,7 +108,14 @@ impl Default for Sub {
     }
 }
 
-/// Why a ZWR text or a fixture directory could not be loaded.
+/// A malformed ZWR data line. `Display` gives the line number and, when
+/// known, the file (AAP interface contract): `MALFORMED ZWR LINE <line>:
+/// <message>`, prefixed by `<file>: ` when the text came from a file.
+///
+/// The text never echoes fixture bytes: every `message` this crate builds is
+/// one of the scanner's fixed texts, which name what was expected and quote
+/// nothing from the line, because a malformed fixture line can hold a
+/// person's or vendor's name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreError {
     /// A data line that is not `^name(subscripts)=value`. `line` is 1-based
@@ -116,28 +126,19 @@ pub enum StoreError {
         line: usize,
         message: String,
     },
-    /// A fixture directory that cannot be listed, or a fixture file that
-    /// cannot be read or is not UTF-8.
-    Io { file: PathBuf, message: String },
 }
 
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StoreError::Parse {
-                file: Some(file),
-                line,
-                message,
-            } => write!(f, "{}: line {line}: {message}", file.display()),
-            StoreError::Parse {
-                file: None,
-                line,
-                message,
-            } => write!(f, "line {line}: {message}"),
-            StoreError::Io { file, message } => {
-                write!(f, "{}: cannot read: {message}", file.display())
-            }
+        let StoreError::Parse {
+            file,
+            line,
+            message,
+        } = self;
+        if let Some(file) = file {
+            write!(f, "{}: ", file.display())?;
         }
+        write!(f, "MALFORMED ZWR LINE {line}: {message}")
     }
 }
 
@@ -166,7 +167,7 @@ impl Store {
     /// 1-based and counts every line of `text`, header lines included, and
     /// whose `file` is `None`.
     pub fn from_zwr(text: &str) -> Result<Store, StoreError> {
-        let mut store = Store::default();
+        let mut nodes = BTreeMap::new();
         let mut in_data = false;
         for (index, raw) in text.split('\n').enumerate() {
             let line = raw.strip_suffix('\r').unwrap_or(raw);
@@ -184,9 +185,9 @@ impl Store {
                 line: index.saturating_add(1),
                 message,
             })?;
-            store.nodes.insert(key, value);
+            nodes.insert(key, value);
         }
-        Ok(store)
+        Ok(Store { nodes })
     }
 
     /// The value stored at `key`, or `None` when the node has no value.
@@ -266,13 +267,6 @@ impl Store {
         out.push(')');
         out
     }
-
-    /// Adds every node of `other`, whose values replace equal keys here.
-    /// Private, so that only [`load_fixtures`] ever builds a store from
-    /// several texts.
-    fn absorb(&mut self, other: Store) {
-        self.nodes.extend(other.nodes);
-    }
 }
 
 /// The fixture file that holds the runtime export of the capture snapshot.
@@ -281,25 +275,26 @@ const RUNTIME_EXPORT: &str = "cases.zwr";
 
 /// Loads every regular `*.zwr` file of `dir` into one store. Files load in
 /// byte order of name with `cases.zwr` last, so the runtime export wins on
-/// repeated keys; a missing `cases.zwr` is not an error. Other files, such
-/// as `MANIFEST.txt`, and directories are ignored. A directory that cannot
-/// be listed, or a `*.zwr` file that cannot be read or is not UTF-8, is a
-/// [`StoreError::Io`] naming it; a parse error names its file and line.
-pub fn load_fixtures(dir: &Path) -> Result<Store, StoreError> {
-    let io_error = |file: &Path, err: std::io::Error| StoreError::Io {
-        file: file.to_path_buf(),
-        message: err.to_string(),
-    };
+/// repeated keys; a missing `cases.zwr` is not an error. Symbolic links are
+/// followed; other files and directories are ignored.
+///
+/// A directory that cannot be listed, an entry or its metadata that cannot
+/// be read, or a `*.zwr` file that cannot be read or is not UTF-8 is an
+/// [`io::Error`] of the original kind whose message names the path and says
+/// `cannot read`. A malformed line is an [`io::ErrorKind::InvalidData`]
+/// error carrying the [`StoreError::Parse`] text, which names the file and
+/// line. Either propagates with `?` from a caller returning `io::Result`.
+pub fn load_fixtures(dir: &Path) -> io::Result<Store> {
     let mut files = Vec::new();
-    for entry in fs::read_dir(dir).map_err(|err| io_error(dir, err))? {
-        let entry = entry.map_err(|err| io_error(dir, err))?;
+    for entry in fs::read_dir(dir).map_err(|err| cannot_read(dir, err))? {
+        let entry = entry.map_err(|err| cannot_read(dir, err))?;
         let name = entry.file_name();
         if !name.as_encoded_bytes().ends_with(b".zwr") {
             continue;
         }
         let path = entry.path();
         // Follows symbolic links, so a linked fixture loads like a copy.
-        let metadata = fs::metadata(&path).map_err(|err| io_error(&path, err))?;
+        let metadata = fs::metadata(&path).map_err(|err| cannot_read(&path, err))?;
         if metadata.is_file() {
             files.push((
                 name.as_encoded_bytes() == RUNTIME_EXPORT.as_bytes(),
@@ -313,20 +308,32 @@ pub fn load_fixtures(dir: &Path) -> Result<Store, StoreError> {
             .cmp(b_last)
             .then_with(|| a_name.as_encoded_bytes().cmp(b_name.as_encoded_bytes()))
     });
-    let mut store = Store::default();
+    // A later file's nodes replace equal keys of earlier files. The merge
+    // runs on the map, before the one `Store` is built, so that `Store`
+    // needs no mutator.
+    let mut nodes = BTreeMap::new();
     for (_, _, path) in files {
-        let text = fs::read_to_string(&path).map_err(|err| io_error(&path, err))?;
-        let loaded = Store::from_zwr(&text).map_err(|err| match err {
-            StoreError::Parse { line, message, .. } => StoreError::Parse {
+        let text = fs::read_to_string(&path).map_err(|err| cannot_read(&path, err))?;
+        let loaded = Store::from_zwr(&text).map_err(|err| {
+            let StoreError::Parse { line, message, .. } = err;
+            let named = StoreError::Parse {
                 file: Some(path.clone()),
                 line,
                 message,
-            },
-            other => other,
+            };
+            io::Error::new(io::ErrorKind::InvalidData, named.to_string())
         })?;
-        store.absorb(loaded);
+        nodes.extend(loaded.nodes);
     }
-    Ok(store)
+    Ok(Store { nodes })
+}
+
+/// `err` with its kind kept and its message naming `path`.
+fn cannot_read(path: &Path, err: io::Error) -> io::Error {
+    io::Error::new(
+        err.kind(),
+        format!("{}: cannot read: {err}", path.display()),
+    )
 }
 
 // One ZWR data line is scanned left to right. The scanner state is `rest`,
@@ -567,7 +574,26 @@ mod tests {
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
-        assert!(message.contains("line 4"), "message was {message:?}");
+        assert!(
+            message.contains("MALFORMED ZWR LINE 4"),
+            "message was {message:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_error_display_without_file() -> Result<(), String> {
+        let shown = match Store::from_zwr("ZWR\n^X(1=\"b\"\n") {
+            Err(err) => err.to_string(),
+            Ok(store) => return Err(format!("expected a parse error, got {store:?}")),
+        };
+        assert!(
+            shown.starts_with("MALFORMED ZWR LINE 2"),
+            "message was {shown:?}"
+        );
+        for data in ["^X(1", "=\"b\"", "\"b\""] {
+            assert!(!shown.contains(data), "{shown:?} echoes {data:?}");
+        }
         Ok(())
     }
 
@@ -639,7 +665,7 @@ mod tests {
                 "{line:?} should be rejected on line 2"
             );
             let shown = outcome.err().map(|e| e.to_string()).unwrap_or_default();
-            assert_eq!(shown, format!("line 2: {cause}"), "{line:?}");
+            assert_eq!(shown, format!("MALFORMED ZWR LINE 2: {cause}"), "{line:?}");
             assert!(!shown.contains(data), "{line:?} gave {shown:?}");
         }
     }
@@ -673,7 +699,7 @@ mod tests {
             );
             let shown = outcome.err().map(|e| e.to_string()).unwrap_or_default();
             assert_eq!(
-                shown, "line 1: unquoted subscript is not a canonical number",
+                shown, "MALFORMED ZWR LINE 1: unquoted subscript is not a canonical number",
                 "unquoted subscript {sub:?}"
             );
         }
@@ -767,21 +793,31 @@ mod tests {
             .map(|()| load_fixtures(&dir));
         let _ = fs::remove_dir_all(&dir);
         match outcome? {
-            Err(err @ StoreError::Io { .. }) => {
+            Err(err) => {
                 let message = err.to_string();
                 assert!(message.contains("bad.zwr"), "message was {message:?}");
                 assert!(message.contains("cannot read"), "message was {message:?}");
+                assert_eq!(
+                    err.kind(),
+                    ErrorKind::InvalidData,
+                    "message was {message:?}"
+                );
             }
-            other => return Err(format!("expected an Io error, got {other:?}")),
+            Ok(store) => return Err(format!("expected an io error, got {store:?}")),
         }
         let scratch = scratch_dir()?;
         let missing = scratch.join("absent");
-        let message = load_fixtures(&missing)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+        let outcome = load_fixtures(&missing);
         let _ = fs::remove_dir_all(&scratch);
-        assert!(message.contains("absent"), "message was {message:?}");
+        match outcome {
+            Err(err) => {
+                let message = err.to_string();
+                assert!(message.contains("absent"), "message was {message:?}");
+                assert!(message.contains("cannot read"), "message was {message:?}");
+                assert_eq!(err.kind(), ErrorKind::NotFound, "message was {message:?}");
+            }
+            Ok(store) => return Err(format!("expected an io error, got {store:?}")),
+        }
         Ok(())
     }
 
@@ -793,23 +829,19 @@ mod tests {
             .map(|()| load_fixtures(&dir));
         let _ = fs::remove_dir_all(&dir);
         match outcome? {
-            Err(err @ StoreError::Parse { line: 3, .. }) => {
-                assert!(
-                    matches!(&err, StoreError::Parse { file: Some(file), .. } if *file == broken),
-                    "expected the file {}, got {err:?}",
-                    broken.display()
-                );
+            Err(err) => {
+                assert_eq!(err.kind(), ErrorKind::InvalidData, "got {err:?}");
                 assert_eq!(
                     err.to_string(),
                     format!(
-                        "{}: line 3: unquoted subscript is not a canonical number",
+                        "{}: MALFORMED ZWR LINE 3: unquoted subscript is not a canonical number",
                         broken.display()
                     )
                 );
             }
-            other => {
+            Ok(store) => {
                 return Err(format!(
-                    "expected a parse error naming broken.zwr, got {other:?}"
+                    "expected a parse error naming broken.zwr, got {store:?}"
                 ));
             }
         }
@@ -828,7 +860,7 @@ mod tests {
         .and_then(|()| write_file(&dir, "z.zwr", b"ZWR\n^X(1)=\"z\"\n^X(2)=\"z\"\n"))
         // Valid ZWR under a key no `.zwr` file sets, so loading this
         // non-`.zwr` file would add a node rather than pass unseen.
-        .and_then(|()| write_file(&dir, "MANIFEST.txt", b"ZWR\n^X(4)=\"manifest\"\n"))
+        .and_then(|()| write_file(&dir, "notes.txt", b"ZWR\n^X(4)=\"notes\"\n"))
         .and_then(|()| fs::create_dir(dir.join("sub.zwr")).map_err(|e| e.to_string()))
         .map(|()| load_fixtures(&dir));
         let _ = fs::remove_dir_all(&dir);
@@ -839,7 +871,7 @@ mod tests {
         assert_eq!(
             store.get(&key("X", &["4"])),
             None,
-            "MANIFEST.txt is not a .zwr file and must not load"
+            "notes.txt is not a .zwr file and must not load"
         );
         assert_eq!(store.len(), 3);
         Ok(())
@@ -853,6 +885,32 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let store = outcome?.map_err(|e| e.to_string())?;
         assert_eq!(store.get(&key("PRCD", &["442.3", "1", "0"])), Some("x^1^3"));
+        Ok(())
+    }
+
+    /// Every method takes `&self`, so reads leave a loaded store equal to
+    /// its clone taken before them.
+    #[test]
+    fn store_has_only_shared_methods() -> Result<(), String> {
+        let dir = scratch_dir()?;
+        let outcome = write_file(
+            &dir,
+            "a.zwr",
+            b"ZWR\n^X(1)=\"a\"\n^X(1,2)=\"b\"\n^X(\"B\",\"a\",1)=\"\"\n",
+        )
+        .map(|()| load_fixtures(&dir));
+        let _ = fs::remove_dir_all(&dir);
+        let store = outcome?.map_err(|e| e.to_string())?;
+        let before = store.clone();
+        assert_eq!(store.get(&key("X", &["1"])), Some("a"));
+        assert_eq!(store.get(&key("X", &["9"])), None);
+        assert_eq!(store.get_or_empty(&key("X", &["9"])), "");
+        assert_eq!(store.data(&key("X", &["1"])), 11);
+        assert_eq!(store.data(&key("X", &["9", "1"])), 0);
+        assert_eq!(store.order(&key("X", &[]), None), Some(num("1")));
+        assert_eq!(store.order(&key("X", &[]), Some(&string("B"))), None);
+        assert_eq!(store.iter().count(), 3);
+        assert_eq!(store, before);
         Ok(())
     }
 
