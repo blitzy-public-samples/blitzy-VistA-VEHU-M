@@ -11,7 +11,11 @@
   <!-- No skip link: main is the first and only landmark in body, so there is no block to bypass. -->
   <main class="terminal">
     <h1 class="title">PURCHASE ORDER DISPLAY</h1>
-    <div id="bridge-status" class="status" role="status"></div>
+    <!-- The hidden copy shares the status line's grid cell, so the line is as tall as the zero-captures text wraps to before app.js writes it, and never shorter after, so filling it moves nothing. -->
+    <div style="display: grid">
+      <div id="bridge-status" class="status" role="status" style="grid-area: 1 / 1"></div>
+      <div class="status" style="grid-area: 1 / 1; visibility: hidden">MUMPS BACKEND: REPLAY RECORDED 0 OF 5 READY 0 OF 5</div>
+    </div>
     <div class="controls">
       <label for="backend">BACKEND</label>
       <select id="backend" autocomplete="off">

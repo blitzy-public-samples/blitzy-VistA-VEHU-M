@@ -179,7 +179,7 @@ The verdicts `tests/equivalence.rs` gives:
   - A present capture file that cannot be read, or a case folder that cannot be inspected (section 1), met on the way, gives 502 `NOT RECORDED (unreadable: <path>: <cause>)`.
   - COMPARE puts `MUMPS: ` before a MUMPS-side cause.
 - **COMPARE `match`** is true only when the capture for the inputs is READY, `validate_context` accepts its `context`, the transcripts are equal after its rules, and the `returned` values are equal. Otherwise it is false, inputs with no capture included. Responses always carry the raw transcripts; normalisation applies only inside the comparison.
-- **Status.** `GET /api/status` lists the recorded, READY and INCOMPLETE cases, with each INCOMPLETE case's failed checks, read afresh on every request. The bridge's third startup line reads `RECORDED <n> OF 5 READY <m> OF 5`, and the screen's status line, fetched when the page loads, reads `MUMPS BACKEND: REPLAY RECORDED <n> OF 5 READY <m> OF 5`.
+- **Status.** `GET /api/status` lists the recorded, READY and INCOMPLETE cases, with each INCOMPLETE case's failed checks, read afresh on every request. The bridge's third startup line reads `RECORDED <n> OF 5 READY <m> OF 5`, and the screen's status line, fetched when the page loads, reads `MUMPS BACKEND: REPLAY RECORDED <n> OF 5 READY <m> OF 5`. Reload the page to refresh the status line after adding captures, restart or not.
 
 ### 11. Fixtures and `cases.zwr`
 
@@ -373,7 +373,7 @@ Run each case a second time from the restored snapshot, and compare the two runs
 From `rust/ifcap-po-inquiry/`:
 
 - Run `cargo test --offline --locked`. `REPORT.md` part 2 shows the verdicts and part 3 each case's readiness. The test also prints `GC-0N <verdict>` for each case, which Cargo shows only when the test fails; to see the lines on a passing run, use `cargo test --offline --locked --test equivalence -- --nocapture` (`RUNNING.md` step 2).
-- Restart the bridge with `cargo run --offline --locked --bin bridge`. Confirm its third startup line `RECORDED <n> OF 5 READY <m> OF 5` and the screen's status line `MUMPS BACKEND: REPLAY RECORDED <n> OF 5 READY <m> OF 5`.
+- Restart the bridge with `cargo run --offline --locked --bin bridge`, then reload the page. Confirm the bridge's third startup line `RECORDED <n> OF 5 READY <m> OF 5` and the screen's status line `MUMPS BACKEND: REPLAY RECORDED <n> OF 5 READY <m> OF 5`.
 - Record the capture hashes with these two lines, verbatim:
 
 ```text

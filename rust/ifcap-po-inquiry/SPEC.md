@@ -1604,9 +1604,9 @@ drwxr-sr-x 3 root root   4096 Nov 15 08:14 ..
 
 tests/golden/ifcap/:
 total 48
-drwxr-sr-x 2 root root  4096 Nov 15 17:40 .
+drwxr-sr-x 2 root root  4096 Nov 15 18:26 .
 drwxr-sr-x 3 root root  4096 Nov 15 08:14 ..
--rw-r--r-- 1 root root 37834 Nov 15 17:40 README.md
+-rw-r--r-- 1 root root 37947 Nov 15 18:26 README.md
 ```
 
 `ls tests/fixtures/ifcap/cases.zwr`, exit status 2:

@@ -328,7 +328,9 @@ function statusLine(body) {
 // asked once on load. A failed fetch or body read, a non-2xx answer, or a
 // body statusLine cannot read shows BRIDGE UNREACHABLE. It is not a
 // rejection: no shake, and no other line or request state is touched. It
-// never rejects, so it is fired without waiting or catching.
+// never rejects, so it is fired without waiting or catching. index.html
+// stacks a hidden copy of the zero-captures text in the same grid cell to
+// reserve the line's wrapped height; keep that copy in step with statusLine.
 async function showBridgeStatus() {
   try {
     const res = await fetch("/api/status");

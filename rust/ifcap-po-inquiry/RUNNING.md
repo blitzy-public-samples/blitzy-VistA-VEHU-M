@@ -46,7 +46,7 @@ cargo run --offline --locked --bin bridge
 - Open `http://127.0.0.1:8080/` in current Chrome or Firefox. `file://` is not supported, because the page talks only to the bridge that served it.
 - The bridge binds `127.0.0.1:8080` only, with no other address or port, and has no authentication.
 - The screen shows the title `PURCHASE ORDER DISPLAY`, the status line, the BACKEND selector (MUMPS, RUST, COMPARE), the 80 by 24 transcript, and INPUT with SEND and EXIT.
-- The status line is fetched once, when the page loads. After restarting the bridge, reload the page.
+- The status line is fetched once, when the page loads, and never refreshed: it keeps its counts when captures are added and when the bridge stops. Reload the page to refresh it after adding captures or restarting the bridge.
 
 ## Step 4. With no captures
 
@@ -75,7 +75,7 @@ This is the state of a fresh checkout: `tests/golden/ifcap/` holds only its READ
 - Copy the case folders `GC-01` to `GC-05`, each holding the seven files, into `tests/golden/ifcap/`.
 - Build `tests/fixtures/ifcap/cases.zwr` by README Part B step 6.
 - Run `cargo test --offline --locked`. It judges every recorded case and rewrites `REPORT.md`.
-- **Restart the bridge**, because it loads the fixture Store once, at startup. Replay rereads the capture folders on every request, so new capture folders alone need no restart, but `cases.zwr` and the startup counts do.
+- **Restart the bridge**, because it loads the fixture Store once, at startup. Replay rereads the capture folders on every request, so new capture folders alone need no restart, but `cases.zwr` and the startup counts do. The screen's status line is read only when the page loads, so reload the page to refresh it after adding captures, restart or not.
 - To serve another capture folder, start the bridge with:
 
   ```text
@@ -143,7 +143,7 @@ VEHU_CONTAINER=<container name> cargo run --offline --locked --bin bridge
 | `CANNOT RUN docker: <error>` | 502 in live mode: the bridge could not start the program `docker`. `<error>` is the system's reason, such as `No such file or directory (os error 2)` when Docker is not installed or `docker` is not on the `PATH` the bridge was started with, or `Permission denied (os error 13)`. Nothing ran, and the bridge keeps serving. COMPARE gives `MUMPS: CANNOT RUN docker: <error>` | Install Docker, or start the bridge with `docker` on its `PATH` |
 | `TIMEOUT`, `OUTPUT TOO LARGE`, `NON-UTF8`, `EXIT NONE: <first line of docker's standard error>` | 502 in live mode: no run slot freed or the run passed 10 s, including a run whose output a process `docker` started still held open after `docker` exited (step 7); the output passed 1 MiB; the output is not UTF-8; `docker` was ended by a signal | Check the container and the start arguments in `meta.txt`. Only `docker` itself is killed, so a process it started can outlive the run: find it and stop it by hand |
 | `BRIDGE UNREACHABLE` | The screen's status line: `GET /api/status` failed, answered non-2xx, or returned a body that is not the status JSON | Start the bridge, open the page through `http://127.0.0.1:8080/`, and reload |
-| `REQUEST FAILED: <error>` | The screen's bottom line: a session request failed before a complete answer arrived. Either `fetch` failed, for example because the bridge is not running or the connection broke, or the answer's body could not be read. The request may have reached the bridge and run. `<error>` is the browser's error text, or `UNKNOWN ERROR` when the error cannot be turned into text. The transcript stays as it was, COMPARE's verdict line is emptied, and in RUST mode the transcript shakes as for any rejection | Make sure the bridge is running, and start it if not. The failed input is already in the sequence and SEND would add another, so change the backend and back to resend the sequence as it stands. Resending is safe: every request is read-only and the bridge keeps no session state |
+| `REQUEST FAILED: <error>` | The screen's bottom line: a session request failed before a complete answer arrived. Either `fetch` failed, for example because the bridge is not running or the connection broke, or the answer's body could not be read. The request may have reached the bridge and run. `<error>` is the browser's error text, or `UNKNOWN ERROR` when the error cannot be turned into text. The transcript stays as it was, COMPARE's verdict line is emptied, and in RUST mode the transcript shakes as for any rejection. The status line above is not re-read, so it keeps the counts it read when the page loaded | Make sure the bridge is running, and start it if not. The failed input is already in the sequence and SEND would add another, so change the backend and back to resend the sequence as it stands. Resending is safe: every request is read-only and the bridge keeps no session state |
 
 Other HTTP answers. Every error body is `{"error":"<cause>"}`, and the screen shows it verbatim in its bottom line.
 
