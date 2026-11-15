@@ -39,30 +39,30 @@ warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 
 ### Capture availability
 
-`ls -la tests/golden/ifcap/ tests/fixtures/ifcap/`, exit status 0:
+`ls -la --time-style=+ tests/golden/ifcap/ tests/fixtures/ifcap/`, exit status 0. The empty time style leaves the modification-time field empty. Git sets those times when it writes each file into a checkout, so they differ between checkouts and change whenever a file is rewritten, while the names, modes and sizes listed do not:
 
 ```text
 tests/fixtures/ifcap/:
 total 1208
-drwxr-sr-x 2 root root   4096 Nov 15 08:14 .
-drwxr-sr-x 3 root root   4096 Nov 15 08:14 ..
--rw-r--r-- 1 root root   1250 Nov 15 08:14 411.2.zwr
--rw-r--r-- 1 root root  10664 Nov 15 08:14 411.zwr
--rw-r--r-- 1 root root   8684 Nov 15 08:14 420.5.zwr
--rw-r--r-- 1 root root   1091 Nov 15 08:14 420.8.zwr
--rw-r--r-- 1 root root 783607 Nov 15 08:14 440.zwr
--rw-r--r-- 1 root root   8686 Nov 15 08:14 442.3.zwr
--rw-r--r-- 1 root root   1484 Nov 15 08:14 442.4.zwr
--rw-r--r-- 1 root root   5465 Nov 15 08:14 442.5.zwr
--rw-r--r-- 1 root root    171 Nov 15 08:14 442.8.zwr
--rw-r--r-- 1 root root   8998 Nov 15 08:14 49.zwr
--rw-r--r-- 1 root root 366907 Nov 15 08:14 5.zwr
+drwxr-sr-x 2 root root   4096  .
+drwxr-sr-x 3 root root   4096  ..
+-rw-r--r-- 1 root root   1250  411.2.zwr
+-rw-r--r-- 1 root root  10664  411.zwr
+-rw-r--r-- 1 root root   8684  420.5.zwr
+-rw-r--r-- 1 root root   1091  420.8.zwr
+-rw-r--r-- 1 root root 783607  440.zwr
+-rw-r--r-- 1 root root   8686  442.3.zwr
+-rw-r--r-- 1 root root   1484  442.4.zwr
+-rw-r--r-- 1 root root   5465  442.5.zwr
+-rw-r--r-- 1 root root    171  442.8.zwr
+-rw-r--r-- 1 root root   8998  49.zwr
+-rw-r--r-- 1 root root 366907  5.zwr
 
 tests/golden/ifcap/:
 total 48
-drwxr-sr-x 2 root root  4096 Nov 15 18:26 .
-drwxr-sr-x 3 root root  4096 Nov 15 08:14 ..
--rw-r--r-- 1 root root 37947 Nov 15 18:26 README.md
+drwxr-sr-x 2 root root  4096  .
+drwxr-sr-x 3 root root  4096  ..
+-rw-r--r-- 1 root root 37947  README.md
 ```
 
 `ls tests/fixtures/ifcap/cases.zwr`, exit status 2:
