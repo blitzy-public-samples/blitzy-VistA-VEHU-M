@@ -1,27 +1,31 @@
 //! The loopback bridge: one HTTP/1.1 server that lets a person run one input
 //! sequence against the original MUMPS system and against the Rust port, from
 //! the one-screen front-end. Rust-only infrastructure with no MUMPS
-//! counterpart.
+//! counterpart; it implements the request's HTTP contract as AAP 0.3.5.1
+//! states it.
 //!
 //! - `POST /api/{mumps|rust|compare}/session` with `{"inputs": [string, ...]}`
-//!   runs the whole sequence statelessly. The MUMPS side is a replay of the
-//!   recorded captures or a live `docker exec`, chosen by [`MumpsMode`]; the
-//!   Rust side is [`inquire`] on the fixture [`Store`].
+//!   runs the whole sequence statelessly. The MUMPS side replays the recorded
+//!   capture whose inputs equal the request's, or runs the original live
+//!   through `docker exec`, as [`MumpsMode`] chooses; the Rust side is
+//!   [`inquire`] on the fixture [`Store`]. COMPARE runs both and reports
+//!   `match`, the PASS rule of one case applied to one request.
+//! - `GET /api/status` reports the MUMPS mode and which of the five cases are
+//!   recorded, READY or INCOMPLETE, read afresh on every request.
 //! - `GET /`, `/index.html`, `/style.css` and `/app.js` serve `frontend/`,
 //!   matched exactly and read at request time.
 //!
 //! There is no authentication, TLS or session state: the trust boundary is
 //! the loopback address the caller binds. A request supplies only `inputs`
-//! and, through its path, the backend; the live container comes only from
-//! [`MumpsMode::Live`]. Nothing here writes to either backend's data.
+//! and, through its path, the backend. The live container comes only from
+//! [`MumpsMode::Live`], and the live start arguments and context only from
+//! the captures, so no request field reaches a command line. No endpoint
+//! changes data, and nothing here writes a file.
 //!
-//! This module also owns the capture-format helpers that the adapters and
-//! both integration test files must apply identically: [`split_input_lines`],
-//! [`parse_normalisation`], [`normalise`], [`parse_meta`] and
-//! [`validate_context`]. Only the MUMPS adapters, compare routing and these
-//! helpers touch capture content.
+//! Capture content (inputs, transcripts, return values, normalisation rules,
+//! readiness, the recorded start arguments and context) is read only through
+//! [`crate::golden`]; this module re-implements none of its parsing or checks.
 
-use std::collections::HashSet;
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -35,7 +39,8 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::inquiry::{InquiryError, InquiryOutput, STUB_CONTEXT, inquire};
+use crate::golden::{self, Case, Readiness};
+use crate::inquiry::{InquiryError, InquiryOutput, inquire};
 use crate::store::{Store, load_fixtures};
 
 /// How often the accept loop polls its shutdown flag, a live request tries
@@ -89,43 +94,46 @@ const JSON_TYPE: &str = "application/json; charset=utf-8";
 // Construction
 // ---------------------------------------------------------------------------
 
-/// Where the MUMPS side of a session comes from.
+/// Where the MUMPS side of a session comes from (AAP 0.3.5.1).
 ///
-/// `Live` carries `golden_dir` as well, because live mode reads the capture
-/// command and context from the captures' `meta.txt`, and the directory can
-/// reach the bridge only as an argument: no test sets an environment
-/// variable.
+/// `Live` carries `golden_dir` as well, because live mode takes its start
+/// arguments and context from the captures, and the directory can reach the
+/// bridge only as an argument: no test sets an environment variable. In both
+/// modes `GET /api/status` describes `golden_dir`, and COMPARE judges `match`
+/// against the capture whose inputs equal the request's.
 #[derive(Clone, Debug)]
 pub enum MumpsMode {
     /// Answer from the recorded captures `GC-01` to `GC-05` under
-    /// `golden_dir`.
+    /// `golden_dir`, read afresh on every request.
     Replay { golden_dir: PathBuf },
     /// Run the original with `docker exec -i <container> ...`, using the
-    /// capture command recorded in `golden_dir`.
+    /// start arguments and context recorded in the captures under
+    /// `golden_dir`.
     Live {
         container: String,
         golden_dir: PathBuf,
     },
 }
 
-/// Serves `listener` until serving fails. Loads the fixture store once from
-/// `tests/fixtures/ifcap/` of this crate, before anything is served; a
-/// fixture that cannot be loaded is an `InvalidData` error naming it. Then
-/// hands `listener` to [`serve_until`] with a shutdown flag that is never
-/// set, so this returns only with a serving error of `serve_until`,
-/// unchanged.
+/// Serves `listener` until serving fails (AAP 0.3.5.1). Loads the fixture
+/// store once with [`load_fixtures`] from `tests/fixtures/ifcap/` of this
+/// crate, before anything is served; its error, a fixture that cannot be
+/// read or a malformed line (`InvalidData`), each naming the file, is
+/// returned unchanged. Then hands `listener` to [`serve_until`] with a
+/// shutdown flag that is never set, so this returns only with a serving
+/// error of `serve_until`, unchanged.
 pub fn serve(listener: TcpListener, mumps: MumpsMode) -> io::Result<()> {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("ifcap");
-    let store = load_fixtures(&fixtures)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let store = load_fixtures(&fixtures)?;
     serve_until(listener, store, mumps, Arc::new(AtomicBool::new(false)))
 }
 
-/// Serves `listener` until `shutdown` is set, then returns `Ok(())`. Public
-/// only as the test hook behind [`serve`].
+/// Serves `listener` until `shutdown` is set, then returns `Ok(())`: the
+/// serving loop behind [`serve`]; unit tests in this module drive it with a
+/// shutdown flag.
 ///
 /// The listener is made non-blocking first; a failure to do so is returned
 /// as it is, before anything is served. `shutdown` is polled about every
@@ -146,7 +154,7 @@ pub fn serve(listener: TcpListener, mumps: MumpsMode) -> io::Result<()> {
 /// returned is the serving failure; otherwise the first failure to shut a
 /// connection down, other than `NotConnected`; otherwise the first failure
 /// a connection thread returned. Each keeps its kind and names its stage.
-pub fn serve_until(
+fn serve_until(
     listener: TcpListener,
     store: Store,
     mumps: MumpsMode,
@@ -848,7 +856,6 @@ fn reason_phrase(status: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
-        422 => "Unprocessable Content",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         _ => "Status",
@@ -877,9 +884,10 @@ const GET_REQUIRED: &str = "NOT FOUND: GET REQUIRED";
 /// Answers `request` with `(status, content type, body)`: a static path, an
 /// API path, or 404. A `HEAD` request is answered as a `GET` of the same
 /// target would be, so its headers, `Content-Length` included, are those of
-/// the `GET` (RFC 9110 9.3.2): a static path serves its file, and an API
-/// path, which serves only `POST`, gives the 404 of any other method.
-/// [`write_response`] leaves the content out.
+/// the `GET` (RFC 9110 9.3.2): a static path serves its file,
+/// `/api/status` its JSON, and a session path, which serves only `POST`,
+/// gives the 404 of any other method. [`write_response`] leaves the content
+/// out.
 fn route(request: &HttpRequest, store: &Store, mumps: &MumpsMode) -> (u16, &'static str, Vec<u8>) {
     let (method, target, body) = request;
     if let Some((file, content_type)) = static_file(target) {
@@ -918,9 +926,12 @@ fn serve_static(file: &str, content_type: &'static str) -> (u16, &'static str, V
     }
 }
 
-/// `rest` is the target after `/api/`. Unknown backends and paths, and any
-/// method but POST, are 404; the body is checked only for a known route.
-/// The answer is `(status, JSON body)`.
+/// `rest` is the target after `/api/`. `status` answers `GET`, and `HEAD` as
+/// a `GET`, with [`status_body`], and any other method with 404
+/// `GET REQUIRED`. `<backend>/session` answers only `POST`. Unknown backends
+/// and paths, a query string included, and any other method are 404; the
+/// body is checked only for a known session route. The answer is
+/// `(status, JSON body)`.
 fn route_api(
     method: &str,
     rest: &str,
@@ -929,6 +940,12 @@ fn route_api(
     mumps: &MumpsMode,
 ) -> (u16, String) {
     let not_found = || (404, error_body(NOT_FOUND));
+    if rest == "status" {
+        return match method {
+            "GET" | "HEAD" => (200, status_body(mumps)),
+            _ => (404, error_body(GET_REQUIRED)),
+        };
+    }
     let Some((name, tail)) = rest.split_once('/') else {
         return not_found();
     };
@@ -1288,27 +1305,36 @@ fn write_json_optional(out: &mut String, value: Option<&str>) {
     }
 }
 
+/// Appends `items` as a JSON array of strings, in order.
+fn write_json_strings(out: &mut String, items: &[&str]) {
+    out.push('[');
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        write_json_string(out, item);
+    }
+    out.push(']');
+}
+
 // ---------------------------------------------------------------------------
 // Session backends
 // ---------------------------------------------------------------------------
 
-/// The capture directories, scanned in this order.
-const CASE_DIRS: [&str; 5] = ["GC-01", "GC-02", "GC-03", "GC-04", "GC-05"];
-/// The capture files the bridge reads. Replay and compare read the first
-/// four; live mode reads only `META_FILE`.
-const INPUT_FILE: &str = "input.txt";
-const TRANSCRIPT_FILE: &str = "transcript.txt";
-const RETURNED_FILE: &str = "returned.txt";
-const NORMALISATION_FILE: &str = "normalisation.txt";
-const META_FILE: &str = "meta.txt";
+/// The MUMPS-side cause when no capture's inputs equal the request's.
+const NOT_RECORDED: &str = "NOT RECORDED";
 
-/// One MUMPS-side session result: the transcript; what the original's entry
-/// point returned, as far as the MUMPS side knows; and the normalisation
-/// rules of the capture whose inputs equal the session's (none in live
-/// mode). The return value is `None` when live mode cannot obtain it (open
-/// item O-06), and otherwise `Some` of the recorded value, zero bytes being
-/// `Some(None)`.
-type MumpsSide = (String, Option<Option<String>>, Vec<(String, String)>);
+/// One MUMPS-side session result: the raw transcript and return value
+/// answered with, and the capture whose inputs equal the session's, which
+/// alone decides COMPARE's `match`. In replay the transcript and return value
+/// are that capture's own. In live mode they are the run's standard output
+/// and `None`, because `EN3^PRCHRPT` is entered by `DO` and returns nothing
+/// (open item O-06, closed), and the capture may be absent.
+struct MumpsRun {
+    transcript: String,
+    returned: Option<String>,
+    capture: Option<Case>,
+}
 
 /// `{"transcript": ..., "returned": ...}`.
 fn write_session(out: &mut String, transcript: &str, returned: Option<&str>) {
@@ -1325,7 +1351,38 @@ fn session_body(transcript: &str, returned: Option<&str>) -> String {
     out
 }
 
-/// `(status, JSON body)` of a Rust-side session.
+/// The JSON body of `GET /api/status`:
+/// `{"mumps_mode":"replay"|"live","recorded":[...],"ready":[...],
+/// "incomplete":{"GC-0N":[check names]}}`, from [`golden::status`] of the
+/// mode's golden folder, read afresh on every request. The lists describe
+/// that folder in both modes.
+fn status_body(mumps: &MumpsMode) -> String {
+    let (mode, golden_dir) = match mumps {
+        MumpsMode::Replay { golden_dir } => ("replay", golden_dir),
+        MumpsMode::Live { golden_dir, .. } => ("live", golden_dir),
+    };
+    let status = golden::status(golden_dir);
+    let mut out = String::from("{\"mumps_mode\":");
+    write_json_string(&mut out, mode);
+    out.push_str(",\"recorded\":");
+    write_json_strings(&mut out, &status.recorded);
+    out.push_str(",\"ready\":");
+    write_json_strings(&mut out, &status.ready);
+    out.push_str(",\"incomplete\":{");
+    for (index, (id, failed)) in status.incomplete.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        write_json_string(&mut out, id);
+        out.push(':');
+        write_json_strings(&mut out, failed);
+    }
+    out.push_str("}}");
+    out
+}
+
+/// `(status, JSON body)` of a Rust-side session: 200 with the transcript and
+/// a `null` return value, or the 500 of [`inquiry_error_to_response`].
 fn rust_session(store: &Store, inputs: &[String]) -> (u16, String) {
     match inquire(store, inputs) {
         Ok(output) => (
@@ -1336,177 +1393,137 @@ fn rust_session(store: &Store, inputs: &[String]) -> (u16, String) {
     }
 }
 
-/// `(status, JSON body)` of a MUMPS-side session; its failure is 502.
+/// `(status, JSON body)` of a MUMPS-side session: 200 with the raw
+/// transcript and return value, or 502 with the cause, such as
+/// `NOT RECORDED`.
 fn mumps_session(mumps: &MumpsMode, inputs: &[String]) -> (u16, String) {
     match run_mumps(mumps, inputs) {
-        Ok((transcript, returned, _)) => (
-            200,
-            session_body(&transcript, returned.flatten().as_deref()),
-        ),
+        Ok(run) => (200, session_body(&run.transcript, run.returned.as_deref())),
         Err(cause) => (502, error_body(&cause)),
     }
 }
 
 /// `(status, JSON body)` of a compare session: the MUMPS side first, whose
-/// failure is 502; then the Rust side, whose `CorruptStore` is 500; only
-/// then 200.
+/// failure is 502 `MUMPS: <cause>`; then the Rust side, whose
+/// `CorruptStore` is 502 `RUST: CORRUPT STORE <node>` here, as the request
+/// specifies for COMPARE; only then 200 with both raw outputs, never
+/// normalised, and the boolean `match` of [`decide_match`].
 fn compare_session(store: &Store, mumps: &MumpsMode, inputs: &[String]) -> (u16, String) {
     let original = match run_mumps(mumps, inputs) {
-        Ok(output) => output,
-        Err(cause) => return (502, error_body(&cause)),
+        Ok(run) => run,
+        Err(cause) => return (502, error_body(&format!("MUMPS: {cause}"))),
     };
     let port = match inquire(store, inputs) {
         Ok(output) => output,
-        Err(error) => return inquiry_error_to_response(&error),
+        Err(error) => return (502, error_body(&format!("RUST: {error}"))),
     };
-    let (transcript, returned, _) = &original;
-    let mut out = String::from("{\"mumps\":");
-    write_session(
-        &mut out,
-        transcript,
-        returned.as_ref().and_then(Option::as_deref),
+    let matched = decide_match(
+        original.capture.as_ref(),
+        &original.transcript,
+        original.returned.as_deref(),
+        &port,
     );
+    let mut out = String::from("{\"mumps\":");
+    write_session(&mut out, &original.transcript, original.returned.as_deref());
     out.push_str(",\"rust\":");
     write_session(&mut out, &port.transcript, port.returned.as_deref());
     out.push_str(",\"match\":");
-    out.push_str(match decide_match(&original, &port) {
-        Some(true) => "true",
-        Some(false) => "false",
-        None => "null",
-    });
+    out.push_str(if matched { "true" } else { "false" });
     out.push('}');
     (200, out)
 }
 
-/// `match` of a compare response. `None` when the MUMPS return value is
-/// unavailable. Otherwise `true` only when both the transcripts and the
-/// return values are equal after normalising both sides with the capture's
-/// rules: transcript-only agreement is never a match.
-fn decide_match(original: &MumpsSide, port: &InquiryOutput) -> Option<bool> {
-    let (transcript, returned, rules) = original;
-    let expected = returned.as_ref()?;
-    let rules = rules.as_slice();
-    let transcripts_equal = normalise(transcript, rules) == normalise(&port.transcript, rules);
-    let returns_equal = expected.as_deref().map(|value| normalise(value, rules))
-        == port
-            .returned
-            .as_deref()
-            .map(|value| normalise(value, rules));
-    Some(transcripts_equal && returns_equal)
+/// `match` of a compare response: the PASS rule of AAP 0.7.2 applied to one
+/// request, the same in replay and live mode (AAP 0.3.5.1; conflict K11).
+/// True only when a capture's inputs equal the request's, that capture is
+/// READY, [`golden::validate_context`] accepts its recorded context, both
+/// transcripts are equal after the capture's rules, and both return values
+/// are equal. Otherwise false, inputs with no capture included, which only
+/// live mode answers with 200. The rules apply only inside this comparison;
+/// the response carries the raw outputs.
+fn decide_match(
+    capture: Option<&Case>,
+    mumps_transcript: &str,
+    mumps_returned: Option<&str>,
+    port: &InquiryOutput,
+) -> bool {
+    let Some(case) = capture else {
+        return false;
+    };
+    if case.readiness != Readiness::Ready {
+        return false;
+    }
+    let context_accepted = case
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.context().ok())
+        .is_some_and(|context| golden::validate_context(&context).is_ok());
+    context_accepted
+        && golden::normalise(mumps_transcript, &case.rules)
+            == golden::normalise(&port.transcript, &case.rules)
+        && mumps_returned == port.returned.as_deref()
 }
 
-fn run_mumps(mumps: &MumpsMode, inputs: &[String]) -> Result<MumpsSide, String> {
+/// The MUMPS side of a session. Replay answers with the capture that
+/// [`golden::find_capture`] finds for `inputs`, raw: no capture is
+/// `NOT RECORDED`, and a capture file that cannot be read is
+/// `NOT RECORDED (unreadable: <path>: <cause>)`. Live mode answers with
+/// [`live`], and looks the capture up only for `match`, a lookup that fails
+/// leaving none.
+fn run_mumps(mumps: &MumpsMode, inputs: &[String]) -> Result<MumpsRun, String> {
     match mumps {
-        MumpsMode::Replay { golden_dir } => replay(golden_dir, inputs),
+        MumpsMode::Replay { golden_dir } => match golden::find_capture(golden_dir, inputs) {
+            Ok(Some(case)) => Ok(MumpsRun {
+                transcript: case.transcript.clone(),
+                returned: case.returned.clone(),
+                capture: Some(case),
+            }),
+            Ok(None) => Err(NOT_RECORDED.to_string()),
+            Err(cause) => Err(format!("{NOT_RECORDED} (unreadable: {cause})")),
+        },
         MumpsMode::Live {
             container,
             golden_dir,
-        } => live(container, golden_dir, inputs),
-    }
-}
-
-/// Why a capture file gave no text: it is absent; it is present but not
-/// readable, a directory in its place counting here; or it is not UTF-8.
-const CAPTURE_MISSING: &str = "MISSING";
-const CAPTURE_UNREADABLE: &str = "UNREADABLE";
-const CAPTURE_NON_UTF8: &str = "NON-UTF8";
-
-/// The text of one capture file, or which of `CAPTURE_MISSING`,
-/// `CAPTURE_UNREADABLE` and `CAPTURE_NON_UTF8` it is.
-fn read_capture_file(path: &Path) -> Result<String, &'static str> {
-    match fs::read(path) {
-        Ok(bytes) => String::from_utf8(bytes).map_err(|_| CAPTURE_NON_UTF8),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(CAPTURE_MISSING),
-        Err(_) => Err(CAPTURE_UNREADABLE),
-    }
-}
-
-/// A capture file that must be present, readable and UTF-8.
-fn required_capture_file(path: &Path) -> Result<String, String> {
-    read_capture_file(path).map_err(|problem| format!("CAPTURE FILE {}: {problem}", path.display()))
-}
-
-/// The first capture under `golden_dir` whose input lines equal `inputs`,
-/// used whole or not at all. A directory whose input file is missing is
-/// skipped silently; one whose input file is present but unreadable (a
-/// directory in its place included) or not UTF-8 does not match either, and
-/// its path is listed in the `NOT RECORDED` error when nothing matches.
-fn replay(golden_dir: &Path, inputs: &[String]) -> Result<MumpsSide, String> {
-    let mut unreadable: Vec<String> = Vec::new();
-    for case in CASE_DIRS {
-        let dir = golden_dir.join(case);
-        let input_path = dir.join(INPUT_FILE);
-        match read_capture_file(&input_path) {
-            Ok(text) if split_input_lines(&text) == inputs => {
-                return read_capture(&dir);
-            }
-            Ok(_) | Err(CAPTURE_MISSING) => {}
-            // CAPTURE_UNREADABLE or CAPTURE_NON_UTF8.
-            Err(_) => {
-                unreadable.push(input_path.display().to_string());
-            }
+        } => {
+            let transcript = live(container, golden_dir, inputs)?;
+            Ok(MumpsRun {
+                transcript,
+                returned: None,
+                capture: golden::find_capture(golden_dir, inputs).ok().flatten(),
+            })
         }
     }
-    if unreadable.is_empty() {
-        Err("NOT RECORDED".to_string())
-    } else {
-        Err(format!(
-            "NOT RECORDED (unreadable: {})",
-            unreadable.join(", ")
-        ))
-    }
 }
 
-/// The transcript, return value and normalisation rules of the matching
-/// capture in `dir`. An empty return-value or normalisation file is valid;
-/// a non-empty return value loses one trailing newline.
-fn read_capture(dir: &Path) -> Result<MumpsSide, String> {
-    let transcript = required_capture_file(&dir.join(TRANSCRIPT_FILE))?;
-    let returned = required_capture_file(&dir.join(RETURNED_FILE))?;
-    let normalisation_path = dir.join(NORMALISATION_FILE);
-    let normalisation = required_capture_file(&normalisation_path)?;
-    let rules = parse_normalisation(&normalisation).map_err(|line| {
-        format!(
-            "MALFORMED NORMALISATION {} line {line}",
-            normalisation_path.display()
-        )
-    })?;
-    let returned = if returned.is_empty() {
-        None
-    } else {
-        Some(returned.strip_suffix('\n').unwrap_or(&returned).to_string())
-    };
-    Ok((transcript, Some(returned), rules))
-}
-
-/// Runs the original live: the capture command and context come from the
-/// first capture directory holding a meta file, the context must equal
-/// `STUB_CONTEXT` before anything runs, and the container comes only from
-/// the bridge's own configuration. Standard input is each input followed by
-/// one `\n`, the form of a captured input file. Once the context has
-/// passed, the run takes one of the [`LIVE_SLOTS`] that every connection
-/// shares; a request that gets none within [`LIVE_ADMISSION_WAIT`] starts
-/// nothing and fails as `TIMEOUT`. Output is used only when the run
-/// succeeded, and the return value is unavailable.
-fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<MumpsSide, String> {
-    let meta = live_meta(golden_dir)?;
-    validate_context(&meta.context)?;
+/// Runs the original live: the start arguments and context come from
+/// [`golden::live_start`], the context must pass [`golden::validate_context`]
+/// before anything runs, and the container comes only from the bridge's own
+/// configuration. The one command is `docker exec -i <container>` followed
+/// by the recorded start arguments, run directly, never through a shell.
+/// Standard input is each input followed by one `\n`, the form of a captured
+/// input file. Once the context has passed, the run takes one of the
+/// [`LIVE_SLOTS`] that every connection shares; a request that gets none
+/// within [`LIVE_ADMISSION_WAIT`] starts nothing and fails as `TIMEOUT`.
+/// Standard output is the transcript only when the run succeeded; any other
+/// outcome is the [`LiveFailure`] text, such as `EXIT <code>: <stderr head>`.
+fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<String, String> {
+    let (start_args, context) = golden::live_start(golden_dir)?;
+    golden::validate_context(&context)?;
     let mut args = vec!["exec".to_string(), "-i".to_string(), container.to_string()];
-    args.extend(meta.docker_exec_args);
+    args.extend(start_args);
     let mut stdin = String::new();
     for input in inputs {
         stdin.push_str(input);
         stdin.push('\n');
     }
-    let transcript = run_admitted(
+    run_admitted(
         &LIVE_ADMISSION,
         LIVE_ADMISSION_WAIT,
         "docker",
         &args,
         stdin.as_bytes(),
     )
-    .map_err(|failure| failure.to_string())?;
-    Ok((transcript, None, Vec::new()))
+    .map_err(|failure| failure.to_string())
 }
 
 /// [`run_command`] of `program` with the live limits, decided by
@@ -1553,287 +1570,33 @@ fn admit(slots: &[Mutex<()>], wait: Duration) -> Option<MutexGuard<'_, ()>> {
     }
 }
 
-/// The parsed meta file of the first capture directory that has one. A case
-/// with no meta file is skipped, and so is a case entry that is not a
-/// directory, which can hold none. A meta file that cannot be read for any
-/// other reason, is not UTF-8 or does not parse gives `MALFORMED META`
-/// naming it, never a skip. With none present, the error names where the
-/// first would be.
-fn live_meta(golden_dir: &Path) -> Result<Meta, String> {
-    for case in CASE_DIRS {
-        let dir = golden_dir.join(case);
-        let path = dir.join(META_FILE);
-        let malformed = || format!("MALFORMED META {}", path.display());
-        match read_capture_file(&path) {
-            Err(CAPTURE_MISSING) => {}
-            // Opening a file below a case entry that is not a directory
-            // fails without the file being missing. Only an entry known
-            // not to be a directory is skipped; a failed check fails closed.
-            Err(CAPTURE_UNREADABLE) if fs::metadata(&dir).is_ok_and(|entry| !entry.is_dir()) => {}
-            Ok(text) => return parse_meta(&text).map_err(|_| malformed()),
-            // CAPTURE_UNREADABLE or CAPTURE_NON_UTF8.
-            Err(_) => return Err(malformed()),
-        }
-    }
-    let first = golden_dir
-        .join(CASE_DIRS.first().copied().unwrap_or_default())
-        .join(META_FILE);
-    Err(format!("MALFORMED META {}", first.display()))
-}
-
-// ---------------------------------------------------------------------------
-// Shared capture-format helpers
-// ---------------------------------------------------------------------------
-
-/// The inputs of a captured input file: one per `\n`-terminated line. One
-/// trailing `\n` ends the last line and adds no empty input; inner empty
-/// lines are empty inputs. `""` gives no inputs and `"\n"` one empty input.
-/// A `\r` is part of its line, never stripped.
-pub fn split_input_lines(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let body = text.strip_suffix('\n').unwrap_or(text);
-    body.split('\n').map(str::to_string).collect()
-}
-
-/// Parses a normalisation file into `(open, close)` rules, in file order.
-///
-/// Lines are split on `\n` and nothing is trimmed. A zero-length line is
-/// blank and ignored. Every other line holds exactly one tab, separating two
-/// literal, non-empty delimiters, open then close; a line with no tab, more
-/// than one tab, or an empty delimiter gives `Err` with its 1-based line
-/// number. A `\r` before the line end belongs to the close delimiter.
-pub fn parse_normalisation(text: &str) -> Result<Vec<(String, String)>, usize> {
-    let mut rules = Vec::new();
-    for (index, line) in text.split('\n').enumerate() {
-        if line.is_empty() {
-            continue;
-        }
-        let mut delimiters = line.split('\t');
-        match (delimiters.next(), delimiters.next(), delimiters.next()) {
-            (Some(open), Some(close), None) if !open.is_empty() && !close.is_empty() => {
-                rules.push((open.to_string(), close.to_string()));
-            }
-            _ => return Err(index.saturating_add(1)),
-        }
-    }
-    Ok(rules)
-}
-
-/// Applies normalisation `rules` to `text`, in order, each to the result of
-/// the one before.
-///
-/// For each rule the text is scanned left to right: from each occurrence of
-/// `open` through the next `close` after it, both delimiters included, the
-/// span becomes `<NORM>`, and scanning resumes after the replaced span. An
-/// `open` with no later `close` leaves the rest of the text unchanged. A
-/// rule with an empty delimiter, which [`parse_normalisation`] never
-/// produces, changes nothing. No other transformation exists.
-pub fn normalise(text: &str, rules: &[(String, String)]) -> String {
-    let mut current = text.to_string();
-    for (open, close) in rules {
-        current = apply_rule(&current, open, close);
-    }
-    current
-}
-
-fn apply_rule(text: &str, open: &str, close: &str) -> String {
-    if open.is_empty() || close.is_empty() {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find(open) {
-        let Some((before, from_open)) = rest.split_at_checked(start) else {
-            break;
-        };
-        let after_open = from_open.get(open.len()..).unwrap_or("");
-        let Some(end) = after_open.find(close) else {
-            break;
-        };
-        out.push_str(before);
-        out.push_str("<NORM>");
-        rest = after_open
-            .get(end.saturating_add(close.len())..)
-            .unwrap_or("");
-    }
-    out.push_str(rest);
-    out
-}
-
-/// The parsed meta file of one capture.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Meta {
-    pub image_digest: String,
-    pub source_revision: String,
-    pub snapshot_id: String,
-    pub record_ids: String,
-    pub entry_point: String,
-    /// The capture's context, in document order.
-    pub context: Vec<(String, String)>,
-    /// The arguments after `docker exec -i <container>`.
-    pub docker_exec_args: Vec<String>,
-}
-
-/// Parses a meta file: `key=value` lines, split at the first `=`, with the
-/// seven keys `image_digest`, `source_revision`, `snapshot_id`,
-/// `record_ids`, `entry_point`, `context` and `docker_exec_args`, each
-/// exactly once. Whitespace-only lines are blank and ignored, and one
-/// trailing `\r` per line is dropped, as the ZWR loader does; values are
-/// otherwise kept exactly. `context` must be a JSON object whose values are
-/// all strings, with no repeated key; `docker_exec_args` a JSON array of
-/// strings. A missing, repeated or unknown key, or a line without `=`, is
-/// an error naming it.
-pub fn parse_meta(text: &str) -> Result<Meta, String> {
-    const KEYS: [&str; 7] = [
-        "image_digest",
-        "source_revision",
-        "snapshot_id",
-        "record_ids",
-        "entry_point",
-        "context",
-        "docker_exec_args",
-    ];
-    let mut values: Vec<(&str, &str)> = Vec::new();
-    for (index, raw) in text.split('\n').enumerate() {
-        let number = index.saturating_add(1);
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| format!("line {number}: no '='"))?;
-        if !KEYS.contains(&key) {
-            return Err(format!("line {number}: unknown key {key}"));
-        }
-        if values.iter().any(|(seen, _)| *seen == key) {
-            return Err(format!("line {number}: repeated key {key}"));
-        }
-        values.push((key, value));
-    }
-    for key in KEYS {
-        meta_value(&values, key)?;
-    }
-    Ok(Meta {
-        image_digest: meta_value(&values, "image_digest")?.to_string(),
-        source_revision: meta_value(&values, "source_revision")?.to_string(),
-        snapshot_id: meta_value(&values, "snapshot_id")?.to_string(),
-        record_ids: meta_value(&values, "record_ids")?.to_string(),
-        entry_point: meta_value(&values, "entry_point")?.to_string(),
-        context: parse_context(meta_value(&values, "context")?)?,
-        docker_exec_args: parse_exec_args(meta_value(&values, "docker_exec_args")?)?,
-    })
-}
-
-fn meta_value<'t>(values: &[(&str, &'t str)], key: &str) -> Result<&'t str, String> {
-    values
-        .iter()
-        .find(|(seen, _)| *seen == key)
-        .map(|(_, value)| *value)
-        .ok_or_else(|| format!("missing key {key}"))
-}
-
-fn parse_context(value: &str) -> Result<Vec<(String, String)>, String> {
-    let not_object = || "context: not a JSON object of strings".to_string();
-    let Some(members) = parse_json(value).and_then(json_members) else {
-        return Err(not_object());
-    };
-    let mut seen: HashSet<&str> = HashSet::with_capacity(members.len());
-    let mut context: Vec<(String, String)> = Vec::with_capacity(members.len());
-    for (key, member) in &members {
-        let Some(text) = json_string(member) else {
-            return Err(not_object());
-        };
-        if !seen.insert(key.as_str()) {
-            return Err(format!("context: repeated key {key}"));
-        }
-        context.push((key.clone(), text));
-    }
-    Ok(context)
-}
-
-fn parse_exec_args(value: &str) -> Result<Vec<String>, String> {
-    let not_array = || "docker_exec_args: not a JSON array of strings".to_string();
-    let Some(elements) = parse_json(value).and_then(json_elements) else {
-        return Err(not_array());
-    };
-    elements
-        .into_iter()
-        .map(|element| json_string(element).ok_or_else(not_array))
-        .collect()
-}
-
-/// Compares a capture's context with `STUB_CONTEXT`, key by key: first each
-/// `STUB_CONTEXT` key in its order (`DUZ`, `IOF`, `IOSL`, `STATION`), then
-/// each capture key `STUB_CONTEXT` lacks, in capture order. The first
-/// mismatch is `Err("CONTEXT MISMATCH <key>: expected <value>, actual
-/// <value>")`, where `UNRESOLVED` stands for an unresolved constant, which
-/// matches nothing, `MISSING` for a key the capture lacks, and `ABSENT` for
-/// the expected value of an extra capture key. A key the capture repeats
-/// must match at every occurrence. No capture value overrides a constant.
-pub fn validate_context(ctx: &[(String, String)]) -> Result<(), String> {
-    validate_against(&STUB_CONTEXT, ctx)
-}
-
-/// [`validate_context`] against any constant table, so the unit tests can
-/// reach the extra-key rule, which an unresolved constant in
-/// `STUB_CONTEXT` always pre-empts.
-fn validate_against(
-    constants: &[(&str, Option<&str>)],
-    ctx: &[(String, String)],
-) -> Result<(), String> {
-    for &(key, expected) in constants {
-        let mut occurrences = ctx.iter().filter(|(name, _)| name == key).peekable();
-        if occurrences.peek().is_none() {
-            return Err(mismatch(key, expected.unwrap_or("UNRESOLVED"), "MISSING"));
-        }
-        for (_, actual) in occurrences {
-            if expected != Some(actual.as_str()) {
-                return Err(mismatch(key, expected.unwrap_or("UNRESOLVED"), actual));
-            }
-        }
-    }
-    for (key, actual) in ctx {
-        if !constants.iter().any(|(name, _)| name == key) {
-            return Err(mismatch(key, "ABSENT", actual));
-        }
-    }
-    Ok(())
-}
-
-fn mismatch(key: &str, expected: &str, actual: &str) -> String {
-    format!("CONTEXT MISMATCH {key}: expected {expected}, actual {actual}")
-}
-
 // ---------------------------------------------------------------------------
 // Live execution
 // ---------------------------------------------------------------------------
 
 /// How one [`run_command`] child ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecResult {
+struct ExecResult {
     /// The OS error text when the program could not be started; otherwise,
     /// when the run itself failed (a stream worker that could not start,
     /// failed or panicked, output not read to its end, or a child that could
     /// not be waited on or killed), each failure's stage and cause, joined
     /// by `; `. A run with this set is never a transcript, whatever the
     /// other fields hold.
-    pub spawn_error: Option<String>,
+    spawn_error: Option<String>,
     /// The exit code; `None` when the child was killed or ended by a signal.
-    pub exit_code: Option<i32>,
-    pub timed_out: bool,
-    pub output_limit_exceeded: bool,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    output_limit_exceeded: bool,
     /// At most `output_limit` bytes of standard output.
-    pub stdout: Vec<u8>,
+    stdout: Vec<u8>,
     /// At most `output_limit` bytes of standard error.
-    pub stderr: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 /// Why a live run gives no transcript.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LiveFailure {
+enum LiveFailure {
     Spawn(String),
     NonZeroExit {
         code: Option<i32>,
@@ -1891,7 +1654,7 @@ impl ExecResult {
 /// rather than of the program, such as a thread that could not start or
 /// output that could not be read, is reported in
 /// [`ExecResult::spawn_error`].
-pub fn run_command(
+fn run_command(
     program: &str,
     args: &[String],
     stdin: &[u8],
@@ -2318,7 +2081,7 @@ fn worker_output(
 /// wins: a spawn error, a timeout, too much output, an exit code other than
 /// 0 (with the first 200 bytes of standard error, decoded lossily), then
 /// standard output that is not UTF-8.
-pub fn decide_live_result(r: &ExecResult) -> Result<String, LiveFailure> {
+fn decide_live_result(r: &ExecResult) -> Result<String, LiveFailure> {
     if let Some(os_error) = &r.spawn_error {
         return Err(LiveFailure::Spawn(os_error.clone()));
     }
@@ -2338,11 +2101,12 @@ pub fn decide_live_result(r: &ExecResult) -> Result<String, LiveFailure> {
     String::from_utf8(r.stdout.clone()).map_err(|_| LiveFailure::NonUtf8)
 }
 
-/// The status and complete JSON body for a Rust-side error:
-/// `CorruptStore(record)` is 500, naming the record verbatim.
-pub fn inquiry_error_to_response(e: &InquiryError) -> (u16, String) {
-    let InquiryError::CorruptStore(record) = e;
-    (500, error_body(&format!("CORRUPT STORE {record}")))
+/// The status and complete JSON body for a Rust-side error outside COMPARE:
+/// `CorruptStore(record)` is 500 with its `CORRUPT STORE <record>` text,
+/// naming the record verbatim. The request defines no status for a Rust-side
+/// failure, so 500 is kept (conflict K8).
+fn inquiry_error_to_response(e: &InquiryError) -> (u16, String) {
+    (500, error_body(&e.to_string()))
 }
 
 #[cfg(test)]
@@ -2354,13 +2118,6 @@ mod tests {
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_string()).collect()
-    }
-
-    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
-        items
-            .iter()
-            .map(|(a, b)| ((*a).to_string(), (*b).to_string()))
-            .collect()
     }
 
     /// A child that exited 0 and wrote `T`.
@@ -3391,62 +3148,116 @@ mod tests {
         );
     }
 
-    #[test]
-    fn split_input_lines_trailing_newline() {
-        let cases: [(&str, &[&str]); 8] = [
-            ("", &[]),
-            ("\n", &[""]),
-            ("a", &["a"]),
-            ("a\n", &["a"]),
-            ("a\n\n", &["a", ""]),
-            ("\nA1\n\n\n^\n", &["", "A1", "", "", "^"]),
-            ("\nINVALID!\n^", &["", "INVALID!", "^"]),
-            ("a\r\n", &["a\r"]),
-        ];
-        for (text, expected) in cases {
-            assert_eq!(split_input_lines(text), strings(expected), "for {text:?}");
+    /// A new directory under the system temporary directory, removed with
+    /// everything in it when dropped, on a failed assertion too. Each attempt
+    /// takes the next name `ifcap-bridge-unit-<pid>-<n>` and creates it with
+    /// `fs::create_dir`, which fails on any existing entry, so the directory
+    /// belongs to this test alone.
+    struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new() -> Result<Scratch, String> {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            for _ in 0..100 {
+                let n = NEXT.fetch_add(1, Ordering::SeqCst);
+                let name = format!("ifcap-bridge-unit-{}-{n}", std::process::id());
+                let path = std::env::temp_dir().join(name);
+                match fs::create_dir(&path) {
+                    Ok(()) => return Ok(Scratch { path }),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(format!("creating {}: {e}", path.display())),
+                }
+            }
+            Err("no free scratch directory name".to_string())
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// Writes `text` to the capture file `name` of case `id`, creating
+        /// the case folder when it is missing.
+        fn write(&self, id: &str, name: &str, text: &str) -> Result<(), String> {
+            let dir = self.path.join(id);
+            fs::create_dir_all(&dir)
+                .and_then(|()| fs::write(dir.join(name), text))
+                .map_err(|e| format!("writing {id}/{name}: {e}"))
         }
     }
 
-    #[test]
-    fn normalisation_rules_and_malformed_lines() {
-        type Parsed = Result<Vec<(String, String)>, usize>;
-        let parsed: [(&str, Parsed); 9] = [
-            ("", Ok(Vec::new())),
-            ("\n\n", Ok(Vec::new())),
-            ("@\t#\n", Ok(pairs(&[("@", "#")]))),
-            ("\nT=\t;\n\n@\t#\r", Ok(pairs(&[("T=", ";"), ("@", "#\r")]))),
-            ("no tab", Err(1)),
-            ("@\t#\na\tb\tc", Err(2)),
-            ("\n\tb", Err(2)),
-            ("a\t", Err(1)),
-            (" ", Err(1)),
-        ];
-        for (text, expected) in parsed {
-            assert_eq!(parse_normalisation(text), expected, "for {text:?}");
-        }
-        type Rules<'a> = &'a [(&'a str, &'a str)];
-        let applied: [(&str, Rules, &str); 8] = [
-            ("a@1#b@2#c", &[("@", "#")], "a<NORM>b<NORM>c"),
-            ("a@1#b@2", &[("@", "#")], "a<NORM>b@2"),
-            ("a@1", &[("@", "#")], "a@1"),
-            ("a|1|b|2|c", &[("|", "|")], "a<NORM>b<NORM>c"),
-            ("abab", &[("ab", "b")], "<NORM>"),
-            ("x@1#y", &[("@", "#"), ("x<", "y")], "<NORM>"),
-            ("x@1#y", &[("x<", "y"), ("@", "#")], "x<NORM>y"),
-            ("a@1#b", &[("", "#"), ("@", "")], "a@1#b"),
-        ];
-        for (text, rules, expected) in applied {
-            assert_eq!(normalise(text, &pairs(rules)), expected, "for {text:?}");
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // A folder that cannot be removed stays under the temporary
+            // directory; no assertion depends on its removal.
+            let _ = fs::remove_dir_all(&self.path);
         }
     }
 
-    fn recorded(transcript: &str, returned: Option<&str>, rules: &[(&str, &str)]) -> MumpsSide {
-        (
-            transcript.to_string(),
-            Some(returned.map(str::to_string)),
-            pairs(rules),
-        )
+    /// The capture file of `golden::CAPTURE_FILES` whose name before its
+    /// extension is `stem`, so that this module never spells a capture file
+    /// name itself.
+    fn capture_file(stem: &str) -> Result<&'static str, String> {
+        golden::CAPTURE_FILES
+            .iter()
+            .copied()
+            .find(|name| name.split('.').next() == Some(stem))
+            .ok_or_else(|| format!("no capture file {stem}"))
+    }
+
+    /// A capture's recorded metadata text holding each of the eight
+    /// `golden::META_KEYS` once, `context` set to `context` and every other
+    /// key to `x`.
+    fn meta_text(context: &str) -> String {
+        golden::META_KEYS
+            .iter()
+            .map(|key| {
+                let value = if *key == "context" { context } else { "x" };
+                format!("{key}={value}\n")
+            })
+            .collect()
+    }
+
+    /// The `STUB_CONTEXT` keys with resolved device values, which
+    /// `golden::validate_context` accepts.
+    const CONTEXT: &str = r##"{"DUZ":".5","IOF":"#","IOSL":"24","STATION":"500"}"##;
+
+    /// Site (a) of `SPEC.md` "Contracts": the only order filed under `C` has
+    /// a zero node holding only a descendant, so the lookup's read of
+    /// `^PRC(442,1,0)` [DIC3.m:110] gives `CorruptStore` for the inputs
+    /// `""`, `A12345`, `^`.
+    const CORRUPT_ORDER: &str = r#"^PRC(442,0)="PROCUREMENT & ACCOUNTING TRANSACTIONS^442I^1^1"
+^PRC(442,1,0,1)="x"
+^PRC(442,"C","A12345",1)=""
+"#;
+
+    fn fixture_store() -> Result<Store, String> {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("ifcap");
+        load_fixtures(&fixtures).map_err(io_text)
+    }
+
+    /// A capture held in memory, with `readiness`, `meta` and the
+    /// normalisation `rules` given.
+    fn case(readiness: Readiness, meta: Option<golden::Meta>, rules: &[(&str, &str)]) -> Case {
+        Case {
+            id: "GC-01".to_string(),
+            inputs: strings(&["^"]),
+            transcript: String::new(),
+            returned: None,
+            rules: rules
+                .iter()
+                .map(|(open, close)| golden::Rule {
+                    open: (*open).to_string(),
+                    close: (*close).to_string(),
+                })
+                .collect(),
+            meta,
+            readiness,
+        }
     }
 
     fn port(transcript: &str, returned: Option<&str>) -> InquiryOutput {
@@ -3457,200 +3268,292 @@ mod tests {
     }
 
     #[test]
-    fn compare_match_null_when_mumps_returned_unavailable() {
-        let live: MumpsSide = ("T".to_string(), None, Vec::new());
-        assert_eq!(decide_match(&live, &port("T", None)), None);
-        assert_eq!(decide_match(&live, &port("other", Some("x"))), None);
-    }
-
-    #[test]
-    fn compare_match_needs_transcript_and_returned() {
+    fn decide_match_is_the_pass_rule() -> Result<(), String> {
+        let valid = Some(golden::parse_meta(&meta_text(CONTEXT))?);
+        let duz_one = Some(golden::parse_meta(&meta_text(
+            r##"{"DUZ":"1","IOF":"#","IOSL":"24","STATION":"500"}"##,
+        ))?);
+        let unparsable = Some(golden::parse_meta(&meta_text("not json"))?);
+        let ready = Readiness::Ready;
+        let incomplete = Readiness::Incomplete(vec!["db_before_equals_after"]);
+        let marked = [("@", "#")];
+        // (label, capture, MUMPS transcript, MUMPS return value, Rust output,
+        // expected match)
         let cases = [
-            (recorded("T", None, &[]), port("T", None), Some(true)),
             (
-                recorded("T", Some("1"), &[]),
-                port("T", Some("1")),
-                Some(true),
-            ),
-            (recorded("T", Some("1"), &[]), port("T", None), Some(false)),
-            (recorded("T", None, &[]), port("T", Some("")), Some(false)),
-            (recorded("T", None, &[]), port("U", None), Some(false)),
-            (
-                recorded("at @07# end", Some("@1#"), &[("@", "#")]),
-                port("at @99# end", Some("@2#")),
-                Some(true),
+                "no capture (live, unmatched)",
+                None,
+                "T",
+                None,
+                port("T", None),
+                false,
             ),
             (
-                recorded("at @07# end", None, &[("@", "#")]),
+                "READY, context DUZ 1",
+                Some(case(ready.clone(), duz_one, &[])),
+                "T",
+                None,
+                port("T", None),
+                false,
+            ),
+            (
+                "INCOMPLETE, equal texts",
+                Some(case(incomplete, valid.clone(), &[])),
+                "T",
+                None,
+                port("T", None),
+                false,
+            ),
+            (
+                "READY, no recorded metadata",
+                Some(case(ready.clone(), None, &[])),
+                "T",
+                None,
+                port("T", None),
+                false,
+            ),
+            (
+                "READY, context not an object",
+                Some(case(ready.clone(), unparsable, &[])),
+                "T",
+                None,
+                port("T", None),
+                false,
+            ),
+            (
+                "READY, valid context, equal texts",
+                Some(case(ready.clone(), valid.clone(), &[])),
+                "T",
+                None,
+                port("T", None),
+                true,
+            ),
+            (
+                "READY, differing texts",
+                Some(case(ready.clone(), valid.clone(), &[])),
+                "T",
+                None,
+                port("U", None),
+                false,
+            ),
+            (
+                "READY, differing return values",
+                Some(case(ready.clone(), valid.clone(), &[])),
+                "T",
+                Some("1"),
+                port("T", None),
+                false,
+            ),
+            (
+                "READY, rule makes the texts equal",
+                Some(case(ready.clone(), valid.clone(), &marked)),
+                "at @07# end",
+                None,
+                port("at @99# end", None),
+                true,
+            ),
+            (
+                "READY, rule finds no span on one side",
+                Some(case(ready, valid, &marked)),
+                "at @07# end",
+                None,
                 port("at 99 end", None),
-                Some(false),
+                false,
             ),
         ];
-        for (original, rust, expected) in cases {
-            assert_eq!(decide_match(&original, &rust), expected, "for {original:?}");
-        }
-    }
-
-    /// A well-formed meta file whose context holds resolved device values.
-    const META_TEXT: &str = r##"image_digest=sha256:0123
-source_revision=dd3fd0f3124c8178657d9fff4173c324da30f7ae
-snapshot_id=git:dd3fd0f3124c8178657d9fff4173c324da30f7ae
-
-record_ids=1 500-A12345
-entry_point=EN3^PRCHRPT
-context={"DUZ":".5","IOF":"#","IOSL":"24","STATION":"500"}
-docker_exec_args=["--user","vehu","synthetic","X=1"]
-"##;
-
-    #[test]
-    fn parse_meta_reads_seven_keys_and_rejects_bad_lines() -> Result<(), String> {
-        let meta = parse_meta(META_TEXT)?;
-        assert_eq!(
-            meta,
-            Meta {
-                image_digest: "sha256:0123".to_string(),
-                source_revision: "dd3fd0f3124c8178657d9fff4173c324da30f7ae".to_string(),
-                snapshot_id: "git:dd3fd0f3124c8178657d9fff4173c324da30f7ae".to_string(),
-                record_ids: "1 500-A12345".to_string(),
-                entry_point: "EN3^PRCHRPT".to_string(),
-                context: pairs(&[
-                    ("DUZ", ".5"),
-                    ("IOF", "#"),
-                    ("IOSL", "24"),
-                    ("STATION", "500")
-                ]),
-                docker_exec_args: strings(&["--user", "vehu", "synthetic", "X=1"]),
-            }
-        );
-        assert_eq!(parse_meta(&META_TEXT.replace('\n', "\r\n")), Ok(meta));
-        let replaced = |from: &str, to: &str| parse_meta(&META_TEXT.replacen(from, to, 1));
-        let rejected = [
-            (
-                replaced("record_ids=1 500-A12345\n", ""),
-                "missing key record_ids",
-            ),
-            (
-                replaced("entry_point=", "image_digest="),
-                "line 6: repeated key image_digest",
-            ),
-            (
-                replaced("entry_point=", "entry=point="),
-                "line 6: unknown key entry",
-            ),
-            (replaced("entry_point=", "entry_point "), "line 6: no '='"),
-            (
-                replaced(r#"{"DUZ""#, r#"{"IOSL":"24","DUZ""#),
-                "context: repeated key IOSL",
-            ),
-            (
-                replaced(r#""500"}"#, r#"500}"#),
-                "context: not a JSON object of strings",
-            ),
-            (
-                replaced(r#"={"DUZ"#, r#"=["DUZ"#),
-                "context: not a JSON object of strings",
-            ),
-            (
-                replaced(r#"["--user""#, "not-json"),
-                "docker_exec_args: not a JSON array of strings",
-            ),
-            (
-                replaced(r#""X=1""#, "1"),
-                "docker_exec_args: not a JSON array of strings",
-            ),
-        ];
-        for (result, message) in rejected {
-            assert_eq!(result, Err(message.to_string()));
+        for (label, capture, transcript, returned, rust, expected) in cases {
+            assert_eq!(
+                decide_match(capture.as_ref(), transcript, returned, &rust),
+                expected,
+                "{label}"
+            );
         }
         Ok(())
     }
 
-    /// `parse_context` over 10,000 keys keeps them in document order and
-    /// rejects a key repeated at the end, and a non-string value is reported
-    /// before a repetition. Only results are asserted: that repetitions are
-    /// found with a set lookup, not by rescanning earlier keys, is verified by
-    /// reading `parse_context`, because a timing assertion would be flaky.
     #[test]
-    fn context_keeps_document_order_and_rejects_repeats_at_scale() {
-        let expected: Vec<(String, String)> = (0..10_000)
-            .map(|n| (format!("K{n}"), format!("v{n}")))
-            .collect();
-        let members: Vec<String> = expected
-            .iter()
-            .map(|(key, value)| format!("\"{key}\":\"{value}\""))
-            .collect();
-        let object = format!("{{{}}}", members.join(","));
-        assert_eq!(parse_context(&object), Ok(expected));
-        let repeated = format!("{{{},\"K0\":\"again\"}}", members.join(","));
+    fn status_json_shape() -> Result<(), String> {
+        let scratch = Scratch::new()?;
+        let replay = MumpsMode::Replay {
+            golden_dir: scratch.path().to_path_buf(),
+        };
+        let live = MumpsMode::Live {
+            container: "vehu".to_string(),
+            golden_dir: scratch.path().to_path_buf(),
+        };
         assert_eq!(
-            parse_context(&repeated),
-            Err("context: repeated key K0".to_string())
+            status_body(&replay),
+            r#"{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}"#
         );
-        // A value that is not a string is found before the key's repetition.
         assert_eq!(
-            parse_context(r#"{"A":"1","A":2}"#),
-            Err("context: not a JSON object of strings".to_string())
+            status_body(&live),
+            r#"{"mumps_mode":"live","recorded":[],"ready":[],"incomplete":{}}"#
         );
+        // GC-01 holds only the first two capture files, an input sequence
+        // ending with the exit input and a transcript: recorded, INCOMPLETE.
+        for name in golden::CAPTURE_FILES.iter().take(2) {
+            scratch.write("GC-01", name, "^\n")?;
+        }
+        let incomplete = r#"{"GC-01":["seven_files_present","meta_keys_present","normalisation_parses","db_before_equals_after"]}"#;
+        for (mode, label) in [(&replay, "replay"), (&live, "live")] {
+            assert_eq!(
+                status_body(mode),
+                format!(
+                    r#"{{"mumps_mode":"{label}","recorded":["GC-01"],"ready":[],"incomplete":{incomplete}}}"#
+                )
+            );
+        }
+        Ok(())
     }
 
     #[test]
-    fn validate_context_messages() {
-        let resolved = pairs(&[
-            ("DUZ", ".5"),
-            ("IOF", "#"),
-            ("IOSL", "24"),
-            ("STATION", "500"),
-        ]);
-        let cases = [
-            (
-                resolved.clone(),
-                "CONTEXT MISMATCH IOF: expected UNRESOLVED, actual #",
-            ),
-            (
-                Vec::new(),
-                "CONTEXT MISMATCH DUZ: expected .5, actual MISSING",
-            ),
-            (
-                pairs(&[("DUZ", "1")]),
-                "CONTEXT MISMATCH DUZ: expected .5, actual 1",
-            ),
-            (
-                pairs(&[("DUZ", ".5"), ("DUZ", "1")]),
-                "CONTEXT MISMATCH DUZ: expected .5, actual 1",
-            ),
-            (
-                pairs(&[("DUZ", ".5"), ("STATION", "500")]),
-                "CONTEXT MISMATCH IOF: expected UNRESOLVED, actual MISSING",
-            ),
-            (
-                pairs(&[
-                    ("DUZ", ".5"),
-                    ("IOF", "UNRESOLVED"),
-                    ("IOSL", "UNRESOLVED"),
-                    ("STATION", "500"),
-                ]),
-                "CONTEXT MISMATCH IOF: expected UNRESOLVED, actual UNRESOLVED",
-            ),
-        ];
-        for (context, message) in cases {
-            assert_eq!(validate_context(&context), Err(message.to_string()));
-        }
-        // An unresolved constant matches nothing, its sentinel spelling included.
-        let partial = [("DUZ", Some(".5")), ("IOSL", None)];
-        let sentinel = pairs(&[("DUZ", ".5"), ("IOSL", "UNRESOLVED")]);
+    fn sessions_answer_from_the_capture_whose_inputs_match() -> Result<(), String> {
+        let scratch = Scratch::new()?;
+        let fixtures = fixture_store()?;
+        let mumps = MumpsMode::Replay {
+            golden_dir: scratch.path().to_path_buf(),
+        };
+        let inputs = strings(&["^"]);
+        let other = strings(&["", "^"]);
+        let not_recorded = (502, error_body(NOT_RECORDED));
+        assert_eq!(mumps_session(&mumps, &inputs), not_recorded);
         assert_eq!(
-            validate_against(&partial, &sentinel),
-            Err("CONTEXT MISMATCH IOSL: expected UNRESOLVED, actual UNRESOLVED".to_string())
+            compare_session(&fixtures, &mumps, &inputs),
+            (502, error_body("MUMPS: NOT RECORDED"))
         );
-        // With every constant resolved, the extra-key rule is reachable.
-        let constants = [("DUZ", Some(".5")), ("STATION", Some("500"))];
-        let exact = pairs(&[("STATION", "500"), ("DUZ", ".5")]);
-        assert_eq!(validate_against(&constants, &exact), Ok(()));
-        let extra = pairs(&[("DUZ", ".5"), ("STATION", "500"), ("IOM", "80")]);
+        // GC-01 is recorded but INCOMPLETE: five capture files are missing.
+        let (input, transcript) = (capture_file("input")?, capture_file("transcript")?);
+        scratch.write("GC-01", input, "^\n")?;
+        scratch.write("GC-01", transcript, "RECORDED\n")?;
         assert_eq!(
-            validate_against(&constants, &extra),
-            Err("CONTEXT MISMATCH IOM: expected ABSENT, actual 80".to_string())
+            mumps_session(&mumps, &inputs),
+            (200, session_body("RECORDED\n", None))
         );
+        assert_eq!(mumps_session(&mumps, &other), not_recorded);
+        // COMPARE answers both raw outputs, and `match` is false because the
+        // capture is not READY.
+        let rust = inquire(&fixtures, &inputs).map_err(|e| e.to_string())?;
+        let mut compared = String::from("{\"mumps\":");
+        write_session(&mut compared, "RECORDED\n", None);
+        compared.push_str(",\"rust\":");
+        write_session(&mut compared, &rust.transcript, rust.returned.as_deref());
+        compared.push_str(",\"match\":false}");
+        assert_eq!(compare_session(&fixtures, &mumps, &inputs), (200, compared));
+        assert_eq!(
+            rust_session(&fixtures, &inputs),
+            (200, session_body(&rust.transcript, None))
+        );
+        // A Rust-side `CorruptStore` is 500 alone and 502 inside COMPARE.
+        let corrupt = Store::from_zwr(CORRUPT_ORDER).map_err(|e| e.to_string())?;
+        let corrupt_inputs = strings(&["", "A12345", "^"]);
+        scratch.write("GC-02", input, "\nA12345\n^\n")?;
+        scratch.write("GC-02", transcript, "RECORDED\n")?;
+        assert_eq!(
+            rust_session(&corrupt, &corrupt_inputs),
+            (500, error_body("CORRUPT STORE ^PRC(442,1,0)"))
+        );
+        assert_eq!(
+            compare_session(&corrupt, &mumps, &corrupt_inputs),
+            (502, error_body("RUST: CORRUPT STORE ^PRC(442,1,0)"))
+        );
+        // A directory in place of GC-03's input file cannot be read: inputs
+        // no earlier case matches name it.
+        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
+        let cause = golden::find_capture(scratch.path(), &other)
+            .err()
+            .ok_or_else(|| "the unreadable capture was not reported".to_string())?;
+        assert!(cause.contains("GC-03"), "{cause}");
+        let unreadable = format!("NOT RECORDED (unreadable: {cause})");
+        assert_eq!(
+            mumps_session(&mumps, &other),
+            (502, error_body(&unreadable))
+        );
+        assert_eq!(
+            compare_session(&fixtures, &mumps, &other),
+            (502, error_body(&format!("MUMPS: {unreadable}")))
+        );
+        // A capture found before the unreadable case still answers.
+        assert_eq!(
+            mumps_session(&mumps, &inputs),
+            (200, session_body("RECORDED\n", None))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_checks_the_context_before_any_command() -> Result<(), String> {
+        let scratch = Scratch::new()?;
+        // No container has this name, so a command that ran would fail with
+        // an `EXIT` or spawn cause, never with either cause asserted here.
+        let container = "ifcap-bridge-unit-no-such-container";
+        let mumps = MumpsMode::Live {
+            container: container.to_string(),
+            golden_dir: scratch.path().to_path_buf(),
+        };
+        let store = Store::from_zwr("").map_err(|e| e.to_string())?;
+        let inputs = strings(&["^"]);
+        // No recorded start arguments anywhere: golden's own cause.
+        let none = golden::live_start(scratch.path())
+            .err()
+            .ok_or_else(|| "an empty golden folder gave start arguments".to_string())?;
+        assert_eq!(live(container, scratch.path(), &inputs), Err(none.clone()));
+        assert_eq!(mumps_session(&mumps, &inputs), (502, error_body(&none)));
+        // Recorded start arguments whose context names another user.
+        let duz_one = r##"{"DUZ":"1","IOF":"#","IOSL":"24","STATION":"500"}"##;
+        scratch.write("GC-01", capture_file("meta")?, &meta_text(duz_one))?;
+        let mismatch = "CONTEXT MISMATCH DUZ: expected .5, actual 1";
+        assert_eq!(
+            live(container, scratch.path(), &inputs),
+            Err(mismatch.to_string())
+        );
+        assert_eq!(
+            compare_session(&store, &mumps, &inputs),
+            (502, error_body(&format!("MUMPS: {mismatch}")))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serve_until_answers_until_shutdown_is_set() -> Result<(), String> {
+        let scratch = Scratch::new()?;
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(io_text)?;
+        let addr = listener.local_addr().map_err(io_text)?;
+        let store = Store::from_zwr("").map_err(|e| e.to_string())?;
+        let mumps = MumpsMode::Replay {
+            golden_dir: scratch.path().to_path_buf(),
+        };
+        let status = status_body(&mumps);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let serving = thread::Builder::new()
+            .spawn(move || serve_until(listener, store, mumps, flag))
+            .map_err(io_text)?;
+        let exchanged = (|| -> Result<Vec<u8>, String> {
+            let mut client = TcpStream::connect(addr).map_err(io_text)?;
+            client
+                .set_read_timeout(Some(IO_TIMEOUT))
+                .and_then(|()| client.set_write_timeout(Some(IO_TIMEOUT)))
+                .map_err(io_text)?;
+            client
+                .write_all(b"GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .map_err(io_text)?;
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).map_err(io_text)?;
+            Ok(response)
+        })();
+        // Set on every path, so the serving thread always ends and is joined.
+        shutdown.store(true, Ordering::SeqCst);
+        let served = serving
+            .join()
+            .map_err(|_| "the serving loop panicked".to_string())?;
+        served.map_err(io_text)?;
+        let response = String::from_utf8(exchanged?).map_err(|e| e.to_string())?;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(
+            response.ends_with(&format!("\r\n\r\n{status}")),
+            "{response}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -4118,7 +4021,7 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             golden_dir: PathBuf::new(),
         };
         // `NAME` marks request data that no 404 body may repeat.
-        let cases: [(&str, &str, &str); 12] = [
+        let cases: [(&str, &str, &str); 16] = [
             ("GET", "/missing?patient=NAME", NOT_FOUND),
             ("POST", "/NAME", NOT_FOUND),
             ("POST", "/api/NAME/session", UNKNOWN_BACKEND),
@@ -4131,6 +4034,10 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             ("POST", "/api/NAME", NOT_FOUND),
             ("POST", "/style.css", GET_REQUIRED),
             ("NAME", "/", GET_REQUIRED),
+            ("POST", "/api/status", GET_REQUIRED),
+            ("PUT", "/api/status", GET_REQUIRED),
+            ("NAME", "/api/status", GET_REQUIRED),
+            ("GET", "/api/status?x=NAME", NOT_FOUND),
         ];
         for (method, target, cause) in cases {
             let request = (
@@ -4156,7 +4063,6 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             (200, "OK"),
             (400, "Bad Request"),
             (404, "Not Found"),
-            (422, "Unprocessable Content"),
             (500, "Internal Server Error"),
             (502, "Bad Gateway"),
         ];
@@ -4195,10 +4101,13 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
     #[test]
     fn head_requests_answered_as_get_without_content() -> Result<(), String> {
         let store = Store::from_zwr("").map_err(|e| e.to_string())?;
-        // No case reaches a backend, so no capture is read.
+        // No case reaches a session backend; only `/api/status` reads the
+        // golden folder, an empty scratch folder here.
+        let scratch = Scratch::new()?;
         let mumps = MumpsMode::Replay {
-            golden_dir: PathBuf::new(),
+            golden_dir: scratch.path().to_path_buf(),
         };
+        let status = status_body(&mumps).into_bytes();
         let app_js = fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("frontend")
@@ -4228,6 +4137,20 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 "404 Not Found",
                 JSON_TYPE,
                 &post_required,
+                true,
+            ),
+            (
+                request("GET /api/status"),
+                "200 OK",
+                JSON_TYPE,
+                &status,
+                false,
+            ),
+            (
+                request("HEAD /api/status"),
+                "200 OK",
+                JSON_TYPE,
+                &status,
                 true,
             ),
             // Method tokens are case-sensitive: `head` is not `HEAD`.
