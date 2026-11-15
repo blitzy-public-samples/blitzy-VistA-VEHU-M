@@ -133,18 +133,18 @@ All 11 fixtures are byte-identical to their sources.
 
 ```text
      Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
-test result: ok. 157 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 158 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
-test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
    Doc-tests ifcap_po_inquiry
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-177 tests pass: 157 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
+179 tests pass: 158 unit tests in `src/`, 19 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
 
 `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, exit status 0. Output with the `finished in <seconds>` timings trimmed:
 
@@ -172,27 +172,28 @@ All five cases are NOT COMPARED, because none has a capture. Exit 0 is not accep
     Finished `test` profile [unoptimized + debuginfo] target(s)
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
 
-running 18 tests
+running 19 tests
 test end_to_end_real_captures ... ok
 test compare_match_false_for_incomplete_case ... ok
-test compare_match_true_when_rule_covers_the_difference ... ok
-test compare_match_false_for_context_duz_1 ... ok
-test compare_match_false_when_difference_is_outside_the_rule ... ok
-test compare_match_false_for_differing_ready_case ... ok
-test startup_with_empty_folder ... ok
-test mumps_replay_502_not_recorded ... ok
 test compare_match_true_for_ready_equal_case ... ok
+test compare_match_false_when_difference_is_outside_the_rule ... ok
+test compare_match_true_when_rule_covers_the_difference ... ok
+test mumps_replay_502_not_recorded ... ok
+test mumps_replay_200_when_recorded ... ok
 test rust_session_200 ... ok
 test not_found_404_texts ... ok
-test mumps_replay_200_when_recorded ... ok
+test foreign_host_and_cross_origin_post_400 ... ok
+test compare_match_false_for_differing_ready_case ... ok
 test bad_request_400_on_every_backend ... ok
-test status_incomplete_case ... ok
-test status_ready_case ... ok
+test compare_match_false_for_context_duz_1 ... ok
 test status_empty_folder ... ok
+test startup_with_empty_folder ... ok
+test status_ready_case ... ok
 test static_paths_exact_match ... ok
+test status_incomplete_case ... ok
 test status_and_compare_incomplete_on_cr_or_malformed_rule ... ok
 
-test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ### Format and lint

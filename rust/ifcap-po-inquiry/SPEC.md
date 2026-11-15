@@ -1454,8 +1454,8 @@ Criterion A9. Each search ran on 2026-11-15 from `rust/ifcap-po-inquiry/`, after
 | A9 check | How the design satisfies it | Confirming search or test | Result |
 |---|---|---|---|
 | No public item takes `&mut Store` or returns a mutable `Store`, and `Store` has no mutating method | `Store::from_zwr` returns an owned value; every `Store` method takes `&self`; `load_fixtures` merges each file's map before the `Store` is built | S5 | Both commands print nothing (exit status 1 each) |
-| The live bridge runs one kind of command, `docker exec -i` with the `meta.txt` start arguments | The only production caller of `run_admitted` is `live`, which passes the literal program `"docker"` and the arguments `exec`, `-i`, the container and the `golden::live_start` arguments; `run_admitted` calls `run_command`, which calls `execute`, which builds `Command::new(program)`. No shell runs on the host and no M code comes from a request | S6 | `Command::new(program)` in `execute`, and `Command::new("sleep")` inside `#[cfg(test)] mod tests` (from line 2529 of `src/bridge.rs`). `run_admitted(` hits: the production call in `live`, the definition, and three calls inside `mod tests` |
-| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2529, `src/store.rs` from line 619, `src/golden.rs` from line 1483. Both tests pass (section "Run evidence"). The fixture and capture readers, `open_read_only` in `src/store.rs` and `src/golden.rs`, open each file read-only through `File::options().read(true)`, with `O_NONBLOCK` on Unix, a form S7 does not match; no production code requests write, append, create or truncate access |
+| The live bridge runs one kind of command, `docker exec -i` with the `meta.txt` start arguments | The only production caller of `run_admitted` is `live`, which passes the literal program `"docker"` and the arguments `exec`, `-i`, the container and the `golden::live_start` arguments; `run_admitted` calls `run_command`, which calls `execute`, which builds `Command::new(program)`. No shell runs on the host and no M code comes from a request | S6 | `Command::new(program)` in `execute`, and `Command::new("sleep")` inside `#[cfg(test)] mod tests` (from line 2680 of `src/bridge.rs`). `run_admitted(` hits: the production call in `live`, the definition, and three calls inside `mod tests` |
+| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2680, `src/store.rs` from line 619, `src/golden.rs` from line 1483. Both tests pass (section "Run evidence"). The fixture and capture readers, `open_read_only` in `src/store.rs` and `src/golden.rs`, open each file read-only through `File::options().read(true)`, with `O_NONBLOCK` on Unix, a form S7 does not match; no production code requests write, append, create or truncate access |
 | The front-end has no create, edit, cancel or delete control | The selector, the input, SEND and EXIT only | S8; by hand (section "Front-end checklist", item 7) | No control element: the hits are `createDocumentFragment` and `createElement`, which build transcript rows, and the comments and handler for the `animationcancel` event |
 | No write path in `src/` or `frontend/` | Only reads of `&Store`; `fetch` sends only the session `POST` and the status `GET`; the MUMPS side runs the original's own read-only inquiry | S5, S7, S8 and S9 | S9 prints nothing (exit status 1); S5, S7 and S8 as above |
 
@@ -1469,26 +1469,26 @@ S6, exit status 0 for each command:
 
 ```text
 $ grep -rn 'Command::new' src/
-src/bridge.rs:2094:    let mut child = Command::new(program)
-src/bridge.rs:3348:        let spawned = Command::new("sleep")
+src/bridge.rs:2245:    let mut child = Command::new(program)
+src/bridge.rs:3526:        let spawned = Command::new("sleep")
 $ grep -n 'run_admitted(' src/bridge.rs
-1911:    run_admitted(
-1925:fn run_admitted(
-3641:                        run_admitted(&slots, Duration::from_secs(60), "sleep", &args, b"")
-3670:        let expired = run_admitted(&slots, wait, absent, &[], b"");
-3680:        let attempted = run_admitted(&slots, wait, absent, &[], b"");
+2062:    run_admitted(
+2076:fn run_admitted(
+3819:                        run_admitted(&slots, Duration::from_secs(60), "sleep", &args, b"")
+3848:        let expired = run_admitted(&slots, wait, absent, &[], b"");
+3858:        let attempted = run_admitted(&slots, wait, absent, &[], b"");
 ```
 
 S7, exit status 0:
 
 ```text
 $ grep -rnE 'fs::write|File::create|OpenOptions|create_dir|remove_file|rename\(' src/
-src/bridge.rs:2998:            fs::OpenOptions::new()
-src/bridge.rs:3707:    /// `fs::create_dir`, which fails on any existing entry, so the directory
-src/bridge.rs:3720:                match fs::create_dir(&path) {
-src/bridge.rs:3737:            fs::create_dir_all(&dir)
-src/bridge.rs:3738:                .and_then(|()| fs::write(dir.join(name), text))
-src/bridge.rs:4027:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
+src/bridge.rs:3176:            fs::OpenOptions::new()
+src/bridge.rs:3885:    /// `fs::create_dir`, which fails on any existing entry, so the directory
+src/bridge.rs:3898:                match fs::create_dir(&path) {
+src/bridge.rs:3915:            fs::create_dir_all(&dir)
+src/bridge.rs:3916:                .and_then(|()| fs::write(dir.join(name), text))
+src/bridge.rs:4205:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
 src/store.rs:645:    /// `ifcap-store-unit-<pid>-<n>` and creates it with `fs::create_dir`,
 src/store.rs:657:            match fs::create_dir(&dir) {
 src/store.rs:671:        fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
@@ -1510,7 +1510,7 @@ src/golden.rs:2809:                Made::Bytes(bytes) => fs::write(&path, bytes)
 src/golden.rs:2811:                Made::Directory => fs::create_dir(&path).map_err(|e| e.to_string())?,
 ```
 
-The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2529`, `src/golden.rs:1483`, `src/inquiry.rs:2537`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:619`.
+The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2680`, `src/golden.rs:1483`, `src/inquiry.rs:2537`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:619`.
 
 S8, exit status 0:
 
@@ -1678,18 +1678,18 @@ All 11 fixtures are byte-identical to their sources.
 
 ```text
      Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
-test result: ok. 157 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 158 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
-test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
    Doc-tests ifcap_po_inquiry
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-177 tests pass: 157 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
+179 tests pass: 158 unit tests in `src/`, 19 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
 
 `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, exit status 0. Output with the `finished in <seconds>` timings trimmed:
 
@@ -1717,27 +1717,28 @@ All five cases are NOT COMPARED, because none has a capture. Exit 0 is not accep
     Finished `test` profile [unoptimized + debuginfo] target(s)
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
 
-running 18 tests
+running 19 tests
 test end_to_end_real_captures ... ok
 test compare_match_false_for_incomplete_case ... ok
-test compare_match_true_when_rule_covers_the_difference ... ok
-test compare_match_false_for_context_duz_1 ... ok
-test compare_match_false_when_difference_is_outside_the_rule ... ok
-test compare_match_false_for_differing_ready_case ... ok
-test startup_with_empty_folder ... ok
-test mumps_replay_502_not_recorded ... ok
 test compare_match_true_for_ready_equal_case ... ok
+test compare_match_false_when_difference_is_outside_the_rule ... ok
+test compare_match_true_when_rule_covers_the_difference ... ok
+test mumps_replay_502_not_recorded ... ok
+test mumps_replay_200_when_recorded ... ok
 test rust_session_200 ... ok
 test not_found_404_texts ... ok
-test mumps_replay_200_when_recorded ... ok
+test foreign_host_and_cross_origin_post_400 ... ok
+test compare_match_false_for_differing_ready_case ... ok
 test bad_request_400_on_every_backend ... ok
-test status_incomplete_case ... ok
-test status_ready_case ... ok
+test compare_match_false_for_context_duz_1 ... ok
 test status_empty_folder ... ok
+test startup_with_empty_folder ... ok
+test status_ready_case ... ok
 test static_paths_exact_match ... ok
+test status_incomplete_case ... ok
 test status_and_compare_incomplete_on_cr_or_malformed_rule ... ok
 
-test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ### Format and lint

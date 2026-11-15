@@ -16,11 +16,22 @@
 //!   matched exactly and read at request time.
 //!
 //! There is no authentication, TLS or session state: the trust boundary is
-//! the loopback address the caller binds. A request supplies only `inputs`
-//! and, through its path, the backend. The live container comes only from
-//! [`MumpsMode::Live`], and the live start arguments and context only from
-//! the captures, so no request field reaches a command line. No endpoint
-//! changes data, and nothing here writes a file.
+//! the loopback address the caller binds. A request must also name a
+//! loopback host, `127.0.0.1`, `localhost` or `[::1]` with any port, in its
+//! `Host` (RFC 9110 7.2) or absolute-form authority (RFC 9112 3.2.2), so a
+//! page whose own name an attacker resolves to the loopback address (DNS
+//! rebinding) reaches nothing of it. A session request must come from the
+//! bridge's own page: its `Origin`, when sent, is `http://` and the host it
+//! names (RFC 6454; Fetch Standard), and its `Content-Type` is
+//! `application/json`, which is not CORS-safelisted, so a page of another
+//! origin cannot send it without a preflight, and the bridge grants none:
+//! an `OPTIONS` request to a session path is answered 404 with no
+//! `Access-Control-*` header, so the browser does not send the request
+//! (Fetch Standard, CORS-safelisted request-header). A request supplies
+//! only `inputs` and, through its path, the backend. The live container
+//! comes only from [`MumpsMode::Live`], and the live start arguments and
+//! context only from the captures, so no request field reaches a command
+//! line. No endpoint changes data, and nothing here writes a file.
 //!
 //! Capture content (inputs, transcripts, return values, normalisation rules,
 //! readiness, the recorded start arguments and context) is read only through
@@ -566,10 +577,24 @@ fn drain_reads(
 /// request bytes.
 const BAD_REQUEST: &str = "BAD REQUEST";
 
-/// One request, as far as routing needs it: the method, the target, and the
+/// The causes, after `BAD REQUEST: `, of a session request whose headers do
+/// not show that it comes from the bridge's own page (see [`parse_head`]):
+/// an `Origin` other than the page's, or a `Content-Type` other than
+/// `application/json`.
+const ORIGIN_NOT_ALLOWED: &str = "ORIGIN NOT ALLOWED";
+const JSON_REQUIRED: &str = "CONTENT-TYPE APPLICATION/JSON REQUIRED";
+
+/// One request, as far as routing needs it: the method, the target, the
 /// body read by `Content-Length`, or `None` when the request carried no
-/// `Content-Length`.
-type HttpRequest = (String, String, Option<Vec<u8>>);
+/// `Content-Length`, and the cause a session request with these headers is
+/// refused for, [`ORIGIN_NOT_ALLOWED`] or [`JSON_REQUIRED`], or `None` when
+/// they allow a session.
+type HttpRequest = (String, String, Option<Vec<u8>>, Option<&'static str>);
+
+/// One request's head as [`parse_head`] reads it: the method, the target in
+/// origin-form, the `Content-Length`, whether `Expect: 100-continue` was
+/// sent, and the session refusal cause of [`HttpRequest`].
+type RequestHead<'h> = (&'h str, String, Option<usize>, bool, Option<&'static str>);
 
 /// Reads the request line and headers up to the blank line into `received`,
 /// then the body by `Content-Length`. Empty lines before the request line
@@ -638,7 +663,8 @@ fn read_request(
     let Some((head, rest)) = received.split_at_checked(head_end) else {
         return Ok(Err(bad("INCOMPLETE HEAD")));
     };
-    let (method, target, content_length, expect_continue) = match parse_head(head) {
+    let (method, target, content_length, expect_continue, session_refusal) = match parse_head(head)
+    {
         Ok(parsed) => parsed,
         Err(cause) => return Ok(Err(cause)),
     };
@@ -676,7 +702,12 @@ fn read_request(
             Some(body)
         }
     };
-    Ok(Ok(Some((method.to_string(), target, body))))
+    Ok(Ok(Some((
+        method.to_string(),
+        target,
+        body,
+        session_refusal,
+    ))))
 }
 
 /// One read of `stream` into `buf` that waits at most what is left of
@@ -734,9 +765,30 @@ fn skip_prelude(bytes: &[u8]) -> &[u8] {
 /// must be free of control bytes other than HTAB (see [`is_field_value`]).
 /// A request carries at most one `Host`, whose value must be a host (see
 /// [`is_host`]), and an HTTP/1.1 request must carry one (RFC 9112 3.2).
+/// The host a request names, by its `Host` (RFC 9110 7.2) or by the
+/// authority of an absolute-form target (RFC 9112 3.2.2), each checked
+/// once its syntax is, must be a loopback host (see [`is_loopback_host`]),
+/// or the cause is `HOST NOT ALLOWED`: so a page served under another name
+/// that resolves to the loopback address reaches nothing of the bridge.
+/// An HTTP/1.0 request without `Host` or an absolute-form target names no
+/// host and stays served.
 /// Errors are 400 causes, each naming the rule the head broke: the request
 /// line's first, then each header line's in order, then a missing `Host`.
-fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String> {
+///
+/// The last item is what a session request needs of these headers, which
+/// [`route_api`] applies to the session routes alone: the cause it is
+/// refused for, or `None`. An `Origin` (RFC 6454 7), when sent, must be
+/// sent once and be the page's own origin (see [`is_own_origin`]), or the
+/// cause is [`ORIGIN_NOT_ALLOWED`]; then exactly one `Content-Type` must
+/// have the media type `application/json` (see [`is_json_media_type`]), or
+/// the cause is [`JSON_REQUIRED`]. A page of another origin can send a
+/// request without a CORS preflight only with a CORS-safelisted
+/// `Content-Type`, `text/plain`, `application/x-www-form-urlencoded` or
+/// `multipart/form-data` (Fetch Standard, CORS-safelisted request-header),
+/// and the bridge grants no preflight: [`route_api`] answers its `OPTIONS`
+/// request 404 [`POST_REQUIRED`] with no `Access-Control-*` header, so the
+/// preflight fails and such a page cannot run a session.
+fn parse_head(head: &[u8]) -> Result<RequestHead<'_>, String> {
     let bad = |cause: &str| format!("{BAD_REQUEST}: {cause}");
     let malformed_line = || bad("MALFORMED REQUEST LINE");
     let text = std::str::from_utf8(skip_prelude(head)).map_err(|_| bad("HEAD NOT UTF-8"))?;
@@ -758,10 +810,16 @@ fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String
     if !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
         return Err(bad("UNSUPPORTED HTTP VERSION"));
     }
-    let target = origin_form(target).ok_or_else(|| bad("INVALID REQUEST TARGET"))?;
+    let (target, authority) = origin_form(target).ok_or_else(|| bad("INVALID REQUEST TARGET"))?;
+    if authority.is_some_and(|authority| !is_loopback_host(authority)) {
+        return Err(bad("HOST NOT ALLOWED"));
+    }
     let mut content_length: Option<usize> = None;
     let mut expect_continue = false;
-    let mut host_seen = false;
+    let mut host: Option<&str> = None;
+    // `Some(value)` for a header sent once, `Some(None)` once it repeats.
+    let mut origin: Option<Option<&str>> = None;
+    let mut content_type: Option<Option<&str>> = None;
     for line in lines {
         let (name, value) = line
             .split_once(':')
@@ -775,13 +833,24 @@ fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String
             return Err(bad("INVALID HEADER VALUE"));
         }
         if name.eq_ignore_ascii_case("host") {
-            if host_seen {
+            if host.is_some() {
                 return Err(bad("REPEATED HOST"));
             }
             if !is_host(value) {
                 return Err(bad("INVALID HOST"));
             }
-            host_seen = true;
+            if !is_loopback_host(value) {
+                return Err(bad("HOST NOT ALLOWED"));
+            }
+            host = Some(value);
+        } else if name.eq_ignore_ascii_case("origin") {
+            origin = Some(if origin.is_some() { None } else { Some(value) });
+        } else if name.eq_ignore_ascii_case("content-type") {
+            content_type = Some(if content_type.is_some() {
+                None
+            } else {
+                Some(value)
+            });
         } else if name.eq_ignore_ascii_case("content-length") {
             let length = parse_content_length(value)
                 .ok_or_else(|| format!("{BAD_REQUEST}: INVALID CONTENT-LENGTH"))?;
@@ -798,30 +867,49 @@ fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String
             expect_continue = version == "HTTP/1.1";
         }
     }
-    if version == "HTTP/1.1" && !host_seen {
+    if version == "HTTP/1.1" && host.is_none() {
         return Err(bad("MISSING HOST"));
     }
-    Ok((method, target, content_length, expect_continue))
+    // The authority of an absolute-form target stands in for `Host`
+    // (RFC 9112 3.2.2).
+    let own_authority = authority.or(host);
+    let session_refusal = match (origin, content_type.flatten()) {
+        (Some(origin), _) if !origin.is_some_and(|origin| is_own_origin(origin, own_authority)) => {
+            Some(ORIGIN_NOT_ALLOWED)
+        }
+        (_, Some(media_type)) if is_json_media_type(media_type) => None,
+        _ => Some(JSON_REQUIRED),
+    };
+    Ok((
+        method,
+        target,
+        content_length,
+        expect_continue,
+        session_refusal,
+    ))
 }
 
-/// The origin-form of a request target (RFC 9112 3.2): an origin-form
-/// target as sent, or an `http` absolute-form target reduced to its path
-/// and query, an empty path becoming `/` (RFC 9112 3.2.2). The whole target,
-/// in either form, must be visible ASCII in which each `%` begins a
-/// percent-encoded octet (RFC 9112 3.2, RFC 3986 2.1); visible delimiters
-/// that browsers send raw, such as `|` or `[`, stay accepted (see
-/// [`is_target_text`]). The scheme is matched without regard to case. The
-/// authority ends at the first `/`, `?` or `#` (RFC 3986 3.2) and takes no
-/// part in routing, but it must be a host with an optional port, as a
-/// `Host` value is (see [`is_host`], RFC 3986 3.2.2 and 3.2.3), so it is
-/// never empty (RFC 9110 4.2.1) and never carries userinfo (RFC 9110
-/// 4.2.4). `None` for any other target, such as `*` or another scheme.
-fn origin_form(target: &str) -> Option<String> {
+/// The origin-form of a request target (RFC 9112 3.2), with the authority
+/// of an absolute-form target: an origin-form target as sent, with no
+/// authority, or an `http` absolute-form target reduced to its path and
+/// query, an empty path becoming `/`, with its authority, which stands in
+/// for the request's `Host` (RFC 9112 3.2.2). The whole target, in either
+/// form, must be visible ASCII in which each `%` begins a percent-encoded
+/// octet (RFC 9112 3.2, RFC 3986 2.1); visible delimiters that browsers
+/// send raw, such as `|` or `[`, stay accepted (see [`is_target_text`]). The
+/// scheme is matched without regard to case. The authority ends at the
+/// first `/`, `?` or `#` (RFC 3986 3.2) and must be a host with an optional
+/// port, as a `Host` value is (see [`is_host`], RFC 3986 3.2.2 and 3.2.3),
+/// so it is never empty (RFC 9110 4.2.1) and never carries userinfo
+/// (RFC 9110 4.2.4); [`parse_head`] then holds it to the loopback hosts, as
+/// it does `Host`. `None` for any other target, such as `*` or another
+/// scheme.
+fn origin_form(target: &str) -> Option<(String, Option<&str>)> {
     if !is_target_text(target) {
         return None;
     }
     if target.starts_with('/') {
-        return Some(target.to_string());
+        return Some((target.to_string(), None));
     }
     let (scheme, rest) = target.split_once("://")?;
     if !scheme.eq_ignore_ascii_case("http") {
@@ -833,9 +921,9 @@ fn origin_form(target: &str) -> Option<String> {
         return None;
     }
     if path_and_query.starts_with('/') {
-        Some(path_and_query.to_string())
+        Some((path_and_query.to_string(), Some(authority)))
     } else {
-        Some(format!("/{path_and_query}"))
+        Some((format!("/{path_and_query}"), Some(authority)))
     }
 }
 
@@ -886,8 +974,8 @@ fn is_field_value(value: &str) -> bool {
 /// empty (RFC 9110 4.2.1). The host is an IPv6 address or an IPvFuture
 /// between brackets, or a reg-name, which also covers an IPv4 address
 /// (RFC 3986 3.2.2); the port is digits, possibly none (RFC 3986 3.2.3).
-/// Any host of this form is accepted, since the value takes no part in
-/// routing.
+/// This is the syntax alone: [`is_loopback_host`] then decides whether a
+/// value of this form names the bridge's own host.
 fn is_host(value: &str) -> bool {
     let (host_valid, port) = if let Some(literal) = value.strip_prefix('[') {
         let Some((address, after)) = literal.split_once(']') else {
@@ -907,6 +995,58 @@ fn is_host(value: &str) -> bool {
         (!name.is_empty() && is_reg_name(name), port)
     };
     host_valid && port.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether `value`, a `Host` value or an absolute-form authority that
+/// [`is_host`] accepts, names the loopback interface the bridge binds: the
+/// host `127.0.0.1`, `localhost` without regard to case (RFC 9110 4.2.3), or
+/// `[::1]`, with any port or none, since the port a client reaches the
+/// bridge on may be forwarded. A request naming any other host, such as a
+/// name an attacker made resolve to the loopback address (DNS rebinding),
+/// or a subdomain of `localhost`, is not for this bridge (RFC 9110 7.2).
+fn is_loopback_host(value: &str) -> bool {
+    if let Some(literal) = value.strip_prefix('[') {
+        return literal
+            .split_once(']')
+            .is_some_and(|(address, _)| address == "::1");
+    }
+    let name = value.split_once(':').map_or(value, |(name, _)| name);
+    name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost")
+}
+
+/// Whether `origin`, the value of a request's one `Origin`, is the origin
+/// of the bridge's own page as a browser serializes it (RFC 6454 6.2;
+/// Fetch Standard, serializing a request origin): `http://` followed by
+/// `authority`, the host and port the request names, without regard to
+/// case (RFC 9110 4.2.3). A request that names none, an HTTP/1.0 request
+/// without `Host`, accepts `http://` followed by any loopback host (see
+/// [`is_loopback_host`]). So `null`, an `https` origin, another host, and
+/// a loopback host on another port, a page another local server serves,
+/// are each another origin.
+fn is_own_origin(origin: &str, authority: Option<&str>) -> bool {
+    const SCHEME: &str = "http://";
+    let Some((scheme, rest)) = origin.split_at_checked(SCHEME.len()) else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case(SCHEME)
+        && match authority {
+            Some(authority) => rest.eq_ignore_ascii_case(authority),
+            None => is_host(rest) && is_loopback_host(rest),
+        }
+}
+
+/// Whether `value`, a request's one `Content-Type`, has the media type
+/// `application/json` (RFC 8259 11), its type and subtype matched without
+/// regard to case and its parameters, such as `charset=utf-8`, ignored
+/// (RFC 9110 8.3.1): the body itself must still be UTF-8 JSON (see
+/// [`scan_session_body`]).
+fn is_json_media_type(value: &str) -> bool {
+    let media_type = value
+        .split_once(';')
+        .map_or(value, |(media_type, _)| media_type);
+    media_type
+        .trim_matches(|c| c == ' ' || c == '\t')
+        .eq_ignore_ascii_case("application/json")
 }
 
 /// An IPvFuture address: `v` in either case, one or more hex digits, `.`,
@@ -1059,8 +1199,11 @@ const GET_REQUIRED: &str = "NOT FOUND: GET REQUIRED";
 /// too. A static `HEAD` has its `GET`'s headers, `Content-Length` included
 /// (RFC 9110 9.3.2); [`write_response`] omits every `HEAD` answer's content.
 /// Taking `request` lets [`route_api`] free its body once inputs are decoded.
+/// The session refusal cause its headers give (see [`parse_head`])
+/// reaches only [`route_api`]'s session routes; a static path or
+/// `/api/status` answers whatever that cause.
 fn route(request: HttpRequest, store: &Store, mumps: &MumpsMode) -> (u16, &'static str, Vec<u8>) {
-    let (method, target, body) = request;
+    let (method, target, body, session_refusal) = request;
     if let Some((file, content_type)) = static_file(&target) {
         if method == "GET" || method == "HEAD" {
             return serve_static(file, content_type);
@@ -1068,7 +1211,7 @@ fn route(request: HttpRequest, store: &Store, mumps: &MumpsMode) -> (u16, &'stat
         return error_response(404, GET_REQUIRED);
     }
     if let Some(rest) = target.strip_prefix("/api/") {
-        let (status, json) = route_api(&method, rest, body, store, mumps);
+        let (status, json) = route_api(&method, rest, body, session_refusal, store, mumps);
         return (status, JSON_TYPE, json.into_bytes());
     }
     error_response(404, NOT_FOUND)
@@ -1100,8 +1243,12 @@ fn serve_static(file: &str, content_type: &'static str) -> (u16, &'static str, V
 /// `rest` is the target after `/api/`. `status` answers only `GET`, with
 /// [`status_body`]; any other method, `HEAD` included, is 404
 /// `GET REQUIRED`. `<backend>/session` answers only `POST`. Unknown backends
-/// and paths, a query string included, and any other method are 404; the
-/// body is checked only for a known session route, and a body
+/// and paths, a query string included, and any other method are 404. A
+/// `POST` to a known session route is then refused, before its body is
+/// looked at, as 400 `BAD REQUEST: <cause>` when `session_refusal`, the
+/// cause its headers give (see [`parse_head`]), is set: so a page of
+/// another origin runs no session, live `docker exec` included. The body is
+/// checked only for a known session route, and a body
 /// [`scan_session_body`] rejects is 400 `BAD REQUEST: <cause>`. An accepted
 /// body's inputs are decoded once [`INPUT_BUDGET`] admits their session,
 /// which may wait for heavier sessions to end; the body is freed then,
@@ -1111,6 +1258,7 @@ fn route_api(
     method: &str,
     rest: &str,
     body: Option<Vec<u8>>,
+    session_refusal: Option<&str>,
     store: &Store,
     mumps: &MumpsMode,
 ) -> (u16, String) {
@@ -1135,6 +1283,9 @@ fn route_api(
     };
     if method != "POST" {
         return (404, error_body(POST_REQUIRED));
+    }
+    if let Some(cause) = session_refusal {
+        return (400, error_body(&format!("{BAD_REQUEST}: {cause}")));
     }
     let Some(body) = body else {
         return (
@@ -2555,6 +2706,33 @@ mod tests {
     fn session_inputs(body: &[u8]) -> Result<Vec<String>, String> {
         let (text, array) = scan_session_body(body)?;
         decode_inputs(text, array).ok_or_else(|| "decoding failed after the scan".to_string())
+    }
+
+    /// The request whose request line and header lines, each ending `\r\n`,
+    /// are `head_lines`, followed by `Content-Length` and `body`, as
+    /// [`read_request`] hands it to [`route`]: its head read by
+    /// [`parse_head`], its body taken whole.
+    fn request_of(head_lines: &str, body: &[u8]) -> Result<HttpRequest, String> {
+        let head = format!("{head_lines}Content-Length: {}\r\n\r\n", body.len());
+        let (method, target, _, _, session_refusal) = parse_head(head.as_bytes())?;
+        Ok((
+            method.to_string(),
+            target,
+            Some(body.to_vec()),
+            session_refusal,
+        ))
+    }
+
+    /// `method` on `target` with `body`, sent as the bridge's own page sends
+    /// it: `Host: localhost`, `Content-Type: application/json` and no
+    /// `Origin`.
+    fn page_request(method: &str, target: &str, body: &[u8]) -> Result<HttpRequest, String> {
+        request_of(
+            &format!(
+                "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+            ),
+            body,
+        )
     }
 
     #[test]
@@ -4218,11 +4396,7 @@ mod tests {
             golden_dir: PathBuf::new(),
         };
         // The wire text of one rejection, spelled out.
-        let malformed = (
-            "POST".to_string(),
-            "/api/rust/session".to_string(),
-            Some(br#"{"inputs": ["#.to_vec()),
-        );
+        let malformed = page_request("POST", "/api/rust/session", br#"{"inputs": ["#)?;
         let (status, content_type, answer) = route(malformed, &store, &mumps);
         let answer = String::from_utf8(answer).map_err(|e| e.to_string())?;
         assert_eq!(
@@ -4239,11 +4413,7 @@ mod tests {
             // Each session route answers the cause inside the 400 envelope.
             let expected = error_body(&format!("{BAD_REQUEST}: {cause}"));
             for backend in ["mumps", "rust", "compare"] {
-                let request = (
-                    "POST".to_string(),
-                    format!("/api/{backend}/session"),
-                    Some(body.to_vec()),
-                );
+                let request = page_request("POST", &format!("/api/{backend}/session"), body)?;
                 let (status, content_type, answer) = route(request, &store, &mumps);
                 let answer = String::from_utf8(answer).map_err(|e| e.to_string())?;
                 assert_eq!(
@@ -4264,13 +4434,9 @@ mod tests {
         let mumps = MumpsMode::Replay {
             golden_dir: PathBuf::new(),
         };
-        let session = |body: Vec<u8>| {
-            let request = (
-                "POST".to_string(),
-                "/api/rust/session".to_string(),
-                Some(body),
-            );
-            route(request, &store, &mumps)
+        let session = |body: &[u8]| {
+            page_request("POST", "/api/rust/session", body)
+                .map(|request| route(request, &store, &mumps))
         };
         // As many one-character inputs as fit within `MAX_BODY`, then the
         // exit: a session the budget charges, answered as the session of
@@ -4284,8 +4450,8 @@ mod tests {
         }
         body.extend_from_slice(rest);
         assert!(body.len() <= MAX_BODY && count > FREE_INPUTS);
-        let largest = session(body);
-        let short = session(br#"{"inputs":["a","^"]}"#.to_vec());
+        let largest = session(&body)?;
+        let short = session(br#"{"inputs":["a","^"]}"#)?;
         assert_eq!(largest, short);
         assert_eq!(largest.0, 200);
         // No other test sends a session heavy enough to be charged, so the
@@ -4300,9 +4466,13 @@ mod tests {
 
     #[test]
     fn request_head_parsing() {
+        // No head here carries `Content-Type`, so each gives a session
+        // request the cause `JSON_REQUIRED`, which only a session route
+        // applies (see `session_post_needs_own_origin_and_json`).
+        let refusal = Some(JSON_REQUIRED);
         assert_eq!(
             parse_head(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
-            Ok(("GET", "/".to_string(), None, false))
+            Ok(("GET", "/".to_string(), None, false, refusal))
         );
         // An HTTP/1.0 request needs no `Host`, and its `Expect: 100-continue`
         // is ignored (RFC 9110 10.1.1).
@@ -4310,33 +4480,48 @@ mod tests {
             parse_head(
                 b"POST /api/rust/session HTTP/1.0\r\ncontent-length: 12\r\nContent-Length:12\r\nExpect: 100-continue\r\n\r\n"
             ),
-            Ok(("POST", "/api/rust/session".to_string(), Some(12), false))
+            Ok((
+                "POST",
+                "/api/rust/session".to_string(),
+                Some(12),
+                false,
+                refusal
+            ))
         );
         // An HTTP/1.1 request's `Expect: 100-continue` is reported.
         assert_eq!(
             parse_head(
-                b"POST /api/rust/session HTTP/1.1\r\nHost: h\r\nContent-Length: 12\r\nExpect: 100-continue\r\n\r\n"
+                b"POST /api/rust/session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 12\r\nExpect: 100-continue\r\n\r\n"
             ),
-            Ok(("POST", "/api/rust/session".to_string(), Some(12), true))
+            Ok((
+                "POST",
+                "/api/rust/session".to_string(),
+                Some(12),
+                true,
+                refusal
+            ))
         );
-        // Each head accepted as `GET /`: an empty-line prelude, `Host` values
-        // of every form, any host name included, and a value with an HTAB
-        // and a byte from 0x80.
-        let accepted: [&[u8]; 9] = [
-            b"\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n",
-            b"\r\n\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: h:8080\r\n\r\n",
+        // Each head accepted as `GET /`: an empty-line prelude, each loopback
+        // host in `Host`, with a port, an empty port or none and `localhost`
+        // in any case, an HTTP/1.0 request without `Host`, and a value with
+        // an HTAB and a byte from 0x80.
+        let accepted: [&[u8]; 11] = [
+            b"\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: LOCALHOST\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost:18092\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost:\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n",
             b"GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: [v1.a:b]\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: %41-b~!$&'()*+,;=\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: h:\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\tb \xc3\xa9\r\n\r\n",
+            b"GET / HTTP/1.0\r\nHost: 127.0.0.1:18092\r\n\r\n",
+            b"GET / HTTP/1.0\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: a\tb \xc3\xa9\r\n\r\n",
         ];
         for head in accepted {
             assert_eq!(
                 parse_head(head),
-                Ok(("GET", "/".to_string(), None, false)),
+                Ok(("GET", "/".to_string(), None, false, refusal)),
                 "for {}",
                 String::from_utf8_lossy(head)
             );
@@ -4346,42 +4531,46 @@ mod tests {
         // are left as they are.
         let origin: [&str; 4] = ["/%00", "/%2e%2e/Cargo.toml", "/a|b", "/^[]{}?q=|\"<>`"];
         for target in origin {
-            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            let head = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n");
             assert_eq!(
                 parse_head(head.as_bytes()),
-                Ok(("GET", target.to_string(), None, false)),
+                Ok(("GET", target.to_string(), None, false, refusal)),
                 "for {target}"
             );
         }
-        // Each absolute-form target, and the origin-form it is routed by.
+        // Each absolute-form target, whose authority is a loopback host, and
+        // the origin-form it is routed by.
         let absolute: [(&str, &str); 9] = [
             ("http://127.0.0.1:18221/", "/"),
-            ("http://h", "/"),
-            ("http://h?x", "/?x"),
-            ("HTTP://h/app.js", "/app.js"),
-            ("hTtP://h:1/api/rust/session?q=1", "/api/rust/session?q=1"),
-            ("http://h/a@b", "/a@b"),
-            ("http://h#f", "/#f"),
+            ("http://localhost", "/"),
+            ("http://localhost?x", "/?x"),
+            ("HTTP://LOCALHOST/app.js", "/app.js"),
+            (
+                "hTtP://localhost:1/api/rust/session?q=1",
+                "/api/rust/session?q=1",
+            ),
+            ("http://127.0.0.1/a@b", "/a@b"),
+            ("http://[::1]#f", "/#f"),
             ("http://[::1]:8080/app.js", "/app.js"),
-            ("http://h:/", "/"),
+            ("http://localhost:/", "/"),
         ];
         for (target, origin) in absolute {
-            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            let head = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n");
             assert_eq!(
                 parse_head(head.as_bytes()),
-                Ok(("GET", origin.to_string(), None, false)),
+                Ok(("GET", origin.to_string(), None, false, refusal)),
                 "for {target}"
             );
         }
         // Each rejected head, and the rule its 400 cause names.
-        let rejected: [(&[u8], &str); 62] = [
+        let rejected: [(&[u8], &str); 84] = [
             (b"GET /\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET / HTTP/1.1 x\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET  / HTTP/1.1\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET / \r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"\r\n\r\n", "INCOMPLETE HEAD"),
             (
-                b"\r\n \r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"\r\n \r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "MALFORMED REQUEST LINE",
             ),
             (b"G/T / HTTP/1.1\r\n\r\n", "MALFORMED REQUEST LINE"),
@@ -4404,85 +4593,109 @@ mod tests {
             // that is not a host with an optional port. The heads are
             // otherwise valid.
             (
-                b"GET /a\x00b HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\x00b HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\tb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\tb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\rb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\rb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\nb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\nb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\x01b HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\x01b HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\x1fb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\x1fb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\x7fb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\x7fb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /\xc3\xa9 HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /\xc3\xa9 HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /%zz HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /%zz HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /%4 HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /%4 HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a% HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a% HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /?q=\x00 HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /?q=\x00 HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://[]/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://[]/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://[zz]/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://[zz]/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://localhost:abc/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://localhost:abc/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://h:1:2/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://localhost:1:2/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://h\x01/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://localhost\x01/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://h/a\x00b HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://localhost/a\x00b HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://h/a\x7fb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://localhost/a\x7fb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
+            ),
+            // An absolute-form authority that is a host with an optional
+            // port, but not a loopback host, checked once its syntax is and
+            // before any header, a loopback `Host` included.
+            (
+                b"GET http://evil.example/app.js HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET http://evil.localhost:8080/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET HTTP://127.0.0.2/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET http://[::2]:8080/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (b"GET http://h/ HTTP/1.0\r\n\r\n", "HOST NOT ALLOWED"),
+            (
+                b"GET http://evil.example/ HTTP/1.1\r\nHost: a b\r\n\r\n",
+                "HOST NOT ALLOWED",
             ),
             (b"GET / HTTP/1.1\r\nNoColon\r\n\r\n", "MALFORMED HEADER"),
             (b"GET / HTTP/1.1\r\nBad Name: x\r\n\r\n", "MALFORMED HEADER"),
             (
-                b"GET / HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\n folded\r\n\r\n",
                 "MALFORMED HEADER",
             ),
             (b"GET /\xff HTTP/1.1\r\n\r\n", "HEAD NOT UTF-8"),
@@ -4501,14 +4714,72 @@ mod tests {
                 "TRANSFER-ENCODING NOT SUPPORTED",
             ),
             (b"GET / HTTP/1.1\r\n\r\n", "MISSING HOST"),
-            (b"GET http://h/ HTTP/1.1\r\n\r\n", "MISSING HOST"),
+            (b"GET http://localhost/ HTTP/1.1\r\n\r\n", "MISSING HOST"),
             (
-                b"GET / HTTP/1.1\r\nHost: h\r\nhost: h\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nhost: localhost\r\n\r\n",
                 "REPEATED HOST",
             ),
             (
-                b"GET / HTTP/1.0\r\nHost: h\r\nHost: h\r\n\r\n",
+                b"GET / HTTP/1.0\r\nHost: localhost\r\nHost: 127.0.0.1\r\n\r\n",
                 "REPEATED HOST",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nHost: evil.example\r\n\r\n",
+                "REPEATED HOST",
+            ),
+            // A `Host` that is a host with an optional port, but not a
+            // loopback host, rejected at its own line once its syntax is
+            // checked: another name, a subdomain of `localhost`, another
+            // loopback address, an IPvFuture, or any reg-name.
+            (
+                b"GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: evil.example:8080\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: evil.localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: localhost.\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", "HOST NOT ALLOWED"),
+            (
+                b"GET / HTTP/1.1\r\nHost: h:8080\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: 127.0.0.2\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (b"GET / HTTP/1.1\r\nHost: [::2]\r\n\r\n", "HOST NOT ALLOWED"),
+            (
+                b"GET / HTTP/1.1\r\nHost: [v1.a:b]\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: %41-b~!$&'()*+,;=\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.0\r\nHost: evil.example\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET http://localhost/ HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: evil.example\r\nHost: localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: evil.example\r\nX-Test: \x00\r\n\r\n",
+                "HOST NOT ALLOWED",
             ),
             (b"GET / HTTP/1.1\r\nHost: a b\r\n\r\n", "INVALID HOST"),
             (b"GET / HTTP/1.1\r\nHost: a/b\r\n\r\n", "INVALID HOST"),
@@ -4519,19 +4790,23 @@ mod tests {
             (b"GET / HTTP/1.1\r\nHost: [::1\r\n\r\n", "INVALID HOST"),
             (b"GET / HTTP/1.1\r\nHost: %4g\r\n\r\n", "INVALID HOST"),
             (
-                b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\x00b\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: a\x00b\r\n\r\n",
                 "INVALID HEADER VALUE",
             ),
             (
-                b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\rb\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: a\rb\r\n\r\n",
                 "INVALID HEADER VALUE",
             ),
             (
-                b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\x7fb\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: a\x7fb\r\n\r\n",
                 "INVALID HEADER VALUE",
             ),
             (
                 b"GET / HTTP/1.1\r\nX-Test: \x00\r\nHost: a b\r\n\r\n",
+                "INVALID HEADER VALUE",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nX-Test: \x00\r\nHost: evil.example\r\n\r\n",
                 "INVALID HEADER VALUE",
             ),
         ];
@@ -4588,7 +4863,8 @@ mod tests {
         let trickle = |bytes: &[u8]| -> Vec<(Duration, Vec<u8>)> {
             bytes.iter().map(|byte| (tick, vec![*byte])).collect()
         };
-        let head = b"POST /api/rust/session HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\n\r\n";
+        let head =
+            b"POST /api/rust/session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n";
         let mut trickled_body = now(head);
         trickled_body.extend(trickle(&[b'x'; 100]));
         let oversized = |end: &[u8], filler: usize| {
@@ -4598,26 +4874,31 @@ mod tests {
             vec![(Duration::ZERO, bytes)]
         };
         let bad = |cause: &str| Err(format!("{BAD_REQUEST}: {cause}"));
+        // These heads carry no `Content-Type`, so a session route would
+        // refuse them; reading them is all this test checks.
         let answered = Ok(Some((
             "POST".to_string(),
             "/api/rust/session".to_string(),
             Some(b"{}".to_vec()),
+            Some(JSON_REQUIRED),
         )));
         let request_then_body = vec![
             (
                 Duration::ZERO,
-                b"POST /api/rust/session HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n".to_vec(),
+                b"POST /api/rust/session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n"
+                    .to_vec(),
             ),
             (Duration::from_millis(100), b"{}".to_vec()),
         ];
         // A body followed by a pipelined request, with the head and later.
-        let pipelined = b"GET / HTTP/1.1\r\nHost: h\r\n\r\n";
+        let pipelined = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let mut body_and_more = request_then_body.clone();
         if let Some((_, body)) = body_and_more.last_mut() {
             body.extend_from_slice(pipelined);
         }
         let mut with_the_head =
-            b"POST /api/rust/session HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}".to_vec();
+            b"POST /api/rust/session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
+                .to_vec();
         with_the_head.extend_from_slice(pipelined);
         // (case, what the client sends, whether it then ends its output,
         // the outcome, the least time the outcome takes)
@@ -4639,14 +4920,14 @@ mod tests {
             ),
             (
                 "partial head, then silence",
-                now(b"POST /api/rust/session HTTP/1.1\r\nHost: x\r\n"),
+                now(b"POST /api/rust/session HTTP/1.1\r\nHost: localhost\r\n"),
                 false,
                 bad("READ TIMEOUT"),
                 request_time,
             ),
             (
                 "closed mid-head",
-                now(b"GET / HTTP/1.1\r\nHost: x\r\n"),
+                now(b"GET / HTTP/1.1\r\nHost: localhost\r\n"),
                 true,
                 bad("INCOMPLETE HEAD"),
                 Duration::ZERO,
@@ -4688,9 +4969,14 @@ mod tests {
             ),
             (
                 "empty-line prelude, then a request",
-                now(b"\r\n\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n"),
+                now(b"\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n"),
                 false,
-                Ok(Some(("GET".to_string(), "/".to_string(), None))),
+                Ok(Some((
+                    "GET".to_string(),
+                    "/".to_string(),
+                    None,
+                    Some(JSON_REQUIRED),
+                ))),
                 Duration::ZERO,
             ),
             (
@@ -4737,7 +5023,7 @@ mod tests {
             let outcome = outcome.map_err(|e| format!("{case}: read timeout not set: {e}"))?;
             println!("read_request, {case}: {outcome:?} after {took:?}");
             assert_eq!(outcome, expected, "{case}");
-            if let Ok(Some((_, _, Some(body)))) = &outcome {
+            if let Ok(Some((_, _, Some(body), _))) = &outcome {
                 // Allocated once, at the declared length.
                 assert_eq!(body.capacity(), body.len(), "{case}");
             }
@@ -4778,11 +5064,7 @@ mod tests {
             ("GET", "/api/status?x=NAME", NOT_FOUND),
         ];
         for (method, target, cause) in cases {
-            let request = (
-                method.to_string(),
-                target.to_string(),
-                Some(br#"{"inputs":["NAME"]}"#.to_vec()),
-            );
+            let request = page_request(method, target, br#"{"inputs":["NAME"]}"#)?;
             let (status, content_type, body) = route(request, &store, &mumps);
             let body = String::from_utf8(body).map_err(|e| e.to_string())?;
             assert_eq!(
@@ -4793,6 +5075,266 @@ mod tests {
             assert!(!body.contains("NAME"), "{method} {target} gave {body}");
         }
         Ok(())
+    }
+
+    /// A `POST` to each session route runs its session only when its
+    /// headers show it comes from the bridge's own page: an `Origin`, when
+    /// sent, once and equal to `http://` and the host the request names,
+    /// then exactly one `Content-Type` of media type `application/json`.
+    /// Otherwise it is refused before its `Content-Length` or body is looked
+    /// at, so before any session runs, with the fixed cause of the first
+    /// rule broken. The 404s of routing come first, and `/api/status` and
+    /// the static paths answer whatever these headers are.
+    #[test]
+    fn session_post_needs_own_origin_and_json() -> Result<(), String> {
+        let store = fixture_store()?;
+        // An empty golden folder: a MUMPS session that runs answers 502
+        // `NOT RECORDED`, so its 400 shows it was refused before it ran.
+        let scratch = Scratch::new()?;
+        let mumps = MumpsMode::Replay {
+            golden_dir: scratch.path().to_path_buf(),
+        };
+        let body = br#"{"inputs":["^"]}"#;
+        let inputs = strings(&["^"]);
+        let answer = |request: HttpRequest| {
+            let (status, content_type, answer) = route(request, &store, &mumps);
+            String::from_utf8(answer)
+                .map(|answer| (status, content_type, answer))
+                .map_err(|e| e.to_string())
+        };
+        let refused = |cause: &str| {
+            let cause = format!("{BAD_REQUEST}: {cause}");
+            (400, JSON_TYPE, error_body(&cause))
+        };
+        // What a backend answers once its session runs.
+        let ran = |backend: &str| {
+            let (status, json) = match backend {
+                "mumps" => mumps_session(&mumps, &inputs),
+                "rust" => rust_session(&store, &inputs),
+                _ => compare_session(&store, &mumps, &inputs),
+            };
+            (status, JSON_TYPE, json)
+        };
+        assert_eq!(ran("mumps").0, 502, "a MUMPS session that runs");
+        assert_eq!(ran("rust").0, 200, "a RUST session that runs");
+        // What the headers are, the header lines after
+        // `Host: 127.0.0.1:8080`, and the cause, or `None` for a session
+        // that runs.
+        let cases: [(&str, &str, Option<&str>); 24] = [
+            (
+                "foreign origin",
+                "Origin: http://evil.example\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "null origin",
+                "Origin: null\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "https origin",
+                "Origin: https://127.0.0.1:8080\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "loopback origin on another port",
+                "Origin: http://127.0.0.1:28086\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "another loopback name",
+                "Origin: http://localhost:8080\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "origin with a path",
+                "Origin: http://127.0.0.1:8080/\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "empty origin",
+                "Origin:\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "repeated origin",
+                "Origin: http://127.0.0.1:8080\r\nOrigin: http://127.0.0.1:8080\r\n\
+                 Content-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "foreign origin and text/plain",
+                "Origin: http://evil.example\r\nContent-Type: text/plain\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            ("missing content-type", "", Some(JSON_REQUIRED)),
+            (
+                "text/plain",
+                "Content-Type: text/plain\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "text/plain with a charset",
+                "Content-Type: text/plain;charset=UTF-8\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "form-urlencoded",
+                "Content-Type: application/x-www-form-urlencoded\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "multipart",
+                "Content-Type: multipart/form-data; boundary=b\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "json-patch",
+                "Content-Type: application/json-patch+json\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "json as a parameter",
+                "Content-Type: text/plain; application/json\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "empty content-type",
+                "Content-Type:\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "repeated content-type",
+                "Content-Type: application/json\r\nContent-Type: application/json\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "own origin and text/plain",
+                "Origin: http://127.0.0.1:8080\r\nContent-Type: text/plain\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "application/json",
+                "Content-Type: application/json\r\n",
+                None,
+            ),
+            (
+                "json in another case with a charset",
+                "Content-Type: Application/JSON; charset=utf-8\r\n",
+                None,
+            ),
+            (
+                "json, then a space before the parameter",
+                "Content-Type: application/json ; charset=utf-8\r\n",
+                None,
+            ),
+            (
+                "own origin",
+                "Origin: http://127.0.0.1:8080\r\nContent-Type: application/json\r\n",
+                None,
+            ),
+            (
+                "own origin in another case",
+                "Origin: HTTP://127.0.0.1:8080\r\nContent-Type: application/json\r\n",
+                None,
+            ),
+        ];
+        for backend in ["mumps", "rust", "compare"] {
+            for (what, headers, cause) in cases {
+                let head = format!(
+                    "POST /api/{backend}/session HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n{headers}"
+                );
+                let expected = cause.map_or_else(|| ran(backend), refused);
+                assert_eq!(
+                    answer(request_of(&head, body)?)?,
+                    expected,
+                    "{backend}: {what}"
+                );
+            }
+        }
+        // Heads naming their host otherwise: an absolute-form authority
+        // stands in for `Host` (RFC 9112 3.2.2), and an HTTP/1.0 request
+        // without either takes any loopback origin.
+        let named: [(&str, Option<&str>); 4] = [
+            (
+                "POST http://localhost:8080/api/rust/session HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\
+                 Origin: http://localhost:8080\r\nContent-Type: application/json\r\n",
+                None,
+            ),
+            (
+                "POST http://localhost:8080/api/rust/session HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\
+                 Origin: http://127.0.0.1:8080\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "POST /api/rust/session HTTP/1.0\r\n\
+                 Origin: http://localhost:9999\r\nContent-Type: application/json\r\n",
+                None,
+            ),
+            (
+                "POST /api/rust/session HTTP/1.0\r\n\
+                 Origin: http://evil.example\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+        ];
+        for (head, cause) in named {
+            let expected = cause.map_or_else(|| ran("rust"), refused);
+            assert_eq!(answer(request_of(head, body)?)?, expected, "{head:?}");
+        }
+        // Refused before the `Content-Length` and body checks: whatever the
+        // body, or with none.
+        let without_body = |headers: &str| -> Result<HttpRequest, String> {
+            let head =
+                format!("POST /api/rust/session HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n{headers}\r\n");
+            let (method, target, _, _, session_refusal) = parse_head(head.as_bytes())?;
+            Ok((method.to_string(), target, None, session_refusal))
+        };
+        assert_eq!(
+            answer(without_body("Content-Type: text/plain\r\n")?)?,
+            refused(JSON_REQUIRED)
+        );
+        assert_eq!(
+            answer(without_body("Content-Type: application/json\r\n")?)?,
+            refused("CONTENT-LENGTH REQUIRED")
+        );
+        let malformed = request_of(
+            "POST /api/mumps/session HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\
+             Origin: http://evil.example\r\nContent-Type: application/json\r\n",
+            br#"{"inputs": ["#,
+        )?;
+        assert_eq!(answer(malformed)?, refused(ORIGIN_NOT_ALLOWED));
+        // The 404s of routing, `/api/status` and the static paths answer
+        // as they would with the page's own headers.
+        let foreign = "Origin: http://evil.example\r\nContent-Type: text/plain\r\n";
+        let rows: [(&str, &str, u16, String); 4] = [
+            (
+                "POST",
+                "/api/java/session",
+                404,
+                error_body(UNKNOWN_BACKEND),
+            ),
+            ("GET", "/api/rust/session", 404, error_body(POST_REQUIRED)),
+            ("POST", "/api/rust/other", 404, error_body(NOT_FOUND)),
+            ("GET", "/api/status", 200, status_body(&mumps)),
+        ];
+        for (method, target, status, json) in rows {
+            let head = format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n{foreign}");
+            assert_eq!(
+                answer(request_of(&head, body)?)?,
+                (status, JSON_TYPE, json),
+                "{method} {target}"
+            );
+        }
+        let app_js = request_of(
+            &format!("GET /app.js HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n{foreign}"),
+            b"",
+        )?;
+        let (status, content_type, _) = route(app_js, &store, &mumps);
+        assert_eq!(
+            (status, content_type),
+            (200, "text/javascript; charset=utf-8")
+        );
+        scratch.close()
     }
 
     #[test]
@@ -4944,14 +5486,14 @@ mod tests {
         let post_required = error_body(POST_REQUIRED).into_bytes();
         let malformed = error_body(&format!("{BAD_REQUEST}: MALFORMED REQUEST LINE")).into_bytes();
         let missing_host = error_body(&format!("{BAD_REQUEST}: MISSING HOST")).into_bytes();
-        let request = |line: &str| format!("{line} HTTP/1.1\r\nHost: h\r\n\r\n");
+        let request = |line: &str| format!("{line} HTTP/1.1\r\nHost: localhost\r\n\r\n");
         // (request, status line, content type, the answer's body, whether
         // the answer leaves that body out)
         let cases = [
             (request("GET /app.js"), "200 OK", js_type, &app_js, false),
             (request("HEAD /app.js"), "200 OK", js_type, &app_js, true),
             (
-                request("HEAD http://h/app.js"),
+                request("HEAD http://localhost/app.js"),
                 "200 OK",
                 js_type,
                 &app_js,
@@ -5542,7 +6084,7 @@ mod tests {
             let fail = |what: &str, e: io::Error| format!("{what}: {e}");
             let mut waiting = TcpStream::connect(addr).map_err(|e| fail("connect", e))?;
             waiting
-                .write_all(b"GET /no-such-path HTTP/1.1\r\nHost: x\r\n\r\n")
+                .write_all(b"GET /no-such-path HTTP/1.1\r\nHost: localhost\r\n\r\n")
                 .and_then(|()| waiting.set_read_timeout(Some(Duration::from_millis(500))))
                 .map_err(|e| fail("send the request", e))?;
             let mut buf = [0u8; 4096];
@@ -5670,7 +6212,7 @@ mod tests {
         for _ in 0..2 {
             let mut client = TcpStream::connect(addr).map_err(|e| fail("connect", e))?;
             client
-                .write_all(b"GET /no-such-path HTTP/1.1\r\nHost: x\r\n\r\n")
+                .write_all(b"GET /no-such-path HTTP/1.1\r\nHost: localhost\r\n\r\n")
                 .and_then(|()| client.set_read_timeout(Some(IO_TIMEOUT)))
                 .map_err(|e| fail("send the request", e))?;
             clients.push(client);

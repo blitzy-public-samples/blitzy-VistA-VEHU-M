@@ -1,7 +1,9 @@
 //! The `bridge` binary: serves the one-screen front-end,
 //! `POST /api/{mumps|rust|compare}/session` and `GET /api/status` on
-//! `127.0.0.1:8080`. The loopback address is the only exposure control; there
-//! is no authentication or TLS.
+//! `127.0.0.1:8080`. It binds only that loopback address and, as
+//! `ifcap_po_inquiry::bridge` states, refuses a request naming a host that is
+//! not loopback and runs a session only for a JSON POST whose `Origin`, when
+//! sent, is its own page's; there is no authentication or TLS.
 //!
 //! Configuration comes from two environment variables. This file is their
 //! only reader: each is read once here and never set.

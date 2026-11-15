@@ -396,6 +396,26 @@ fn post_session(addr: SocketAddr, backend: &str, body: &[u8]) -> Result<(u16, Ve
     http(addr, "POST", &format!("/api/{backend}/session"), Some(body))
 }
 
+/// Sends `head`, the request line and header lines each ending `\r\n`, as
+/// given, then `Content-Length`, `Connection: close` and `body`, over a
+/// fresh connection, and reads its response as its status and body: the
+/// requests [`http`] cannot send, with another `Host`, an `Origin` or
+/// another `Content-Type`. Errors name the request line.
+fn http_with_head(addr: SocketAddr, head: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    let line = head.lines().next().unwrap_or_default();
+    let mut stream = connect(addr).map_err(|e| format!("{line}: {e}"))?;
+    let mut request = format!(
+        "{head}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    stream
+        .write_all(&request)
+        .map_err(|e| format!("{line}: send: {e}"))?;
+    read_response(&mut stream).map_err(|e| format!("{line}: {e}"))
+}
+
 /// One `read`, retried on `Interrupted`.
 fn read_some(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize, String> {
     loop {
@@ -1367,6 +1387,77 @@ fn not_found_404_texts() -> Result<(), String> {
         }
         Ok(())
     })
+}
+
+/// The bridge answers only requests for itself, from its own page. A `Host`
+/// or an absolute-form authority naming another host, as a page under a
+/// name rebound to the loopback address sends, is 400
+/// `BAD REQUEST: HOST NOT ALLOWED` on every path. A session `POST` whose
+/// `Content-Type` is not `application/json`, or whose `Origin` is not the
+/// page's own, is 400 on every backend before its session runs: MUMPS
+/// would answer 200 from the READY `GC-01`. The page's own `Origin` with
+/// `application/json` runs the session.
+#[test]
+fn foreign_host_and_cross_origin_post_400() -> Result<(), String> {
+    const HOST_NOT_ALLOWED: &str = "BAD REQUEST: HOST NOT ALLOWED";
+    const JSON_REQUIRED: &str = "BAD REQUEST: CONTENT-TYPE APPLICATION/JSON REQUIRED";
+    const ORIGIN_NOT_ALLOWED: &str = "BAD REQUEST: ORIGIN NOT ALLOWED";
+    const JSON: &str = "Content-Type: application/json\r\n";
+    let body = body_for(&exit_only());
+    with_bridge(
+        "foreign_host_and_cross_origin_post_400",
+        ready_gc01,
+        |addr| {
+            let port = addr.port();
+            let foreign_hosts = [
+                "GET /api/status HTTP/1.1\r\nHost: evil.example\r\n".to_string(),
+                "GET / HTTP/1.1\r\nHost: evil.example\r\n".to_string(),
+                format!("GET http://evil.example/app.js HTTP/1.1\r\nHost: {addr}\r\n"),
+                format!(
+                    "POST /api/mumps/session HTTP/1.1\r\nHost: evil.localhost:{port}\r\n{JSON}"
+                ),
+            ];
+            for head in &foreign_hosts {
+                let context = head.lines().next().unwrap_or_default();
+                let error = expect_error(&http_with_head(addr, head, &body)?, 400, context)?;
+                assert_eq!(error, HOST_NOT_ALLOWED, "{context}: error");
+            }
+            // What the headers are, the header lines after `Host`, and the
+            // cause.
+            let foreign_origin = format!("Origin: http://evil.example\r\n{JSON}");
+            let refused = [
+                ("text/plain", "Content-Type: text/plain\r\n", JSON_REQUIRED),
+                (
+                    "foreign origin",
+                    foreign_origin.as_str(),
+                    ORIGIN_NOT_ALLOWED,
+                ),
+            ];
+            for backend in ["rust", "mumps", "compare"] {
+                for (what, headers, cause) in refused {
+                    let context = format!("{backend}: {what}");
+                    let line = format!("POST /api/{backend}/session HTTP/1.1");
+                    let head = format!("{line}\r\nHost: {addr}\r\n{headers}");
+                    let resp = http_with_head(addr, &head, &body)?;
+                    let error = expect_error(&resp, 400, &context)?;
+                    assert_eq!(error, cause, "{context}: error");
+                }
+            }
+            for backend in ["rust", "mumps"] {
+                let context = format!("{backend}: own origin");
+                let line = format!("POST /api/{backend}/session HTTP/1.1");
+                let head = format!("{line}\r\nHost: {addr}\r\nOrigin: http://{addr}\r\n{JSON}");
+                let session = expect_session(&http_with_head(addr, &head, &body)?, &context)?;
+                assert_same(
+                    &format!("{context}: transcript"),
+                    &session.transcript,
+                    STATION_PROMPT_TRANSCRIPT,
+                );
+                assert_eq!(session.returned, None, "{context}: returned");
+            }
+            Ok(())
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
