@@ -17,10 +17,15 @@
 //! Diagnostics go to standard error. The exit status is 1 when the address
 //! cannot be bound, in which case nothing reaches standard output, and when
 //! `serve` returns an error, such as fixtures that cannot be loaded. A
-//! missing capture directory is reported and serving continues, with no case
-//! recorded.
+//! capture directory that does not exist, or is not a directory, is reported
+//! as `bridge: golden directory missing: <path>`; one whose metadata cannot
+//! be read for any other reason, such as a symbolic-link loop or a parent
+//! folder that cannot be searched, is reported as
+//! `bridge: golden directory unreadable: <path>: <error>`. In both cases
+//! serving continues, with no case recorded.
 
 use std::env;
+use std::fs;
 use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -64,12 +69,31 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if !golden_dir.is_dir() {
-        let _ = writeln!(
-            io::stderr(),
-            "bridge: golden directory missing: {}",
-            golden_dir.display()
-        );
+    // The folder's metadata decides the warning the way the library decides a
+    // case folder: nothing, or something other than a directory, at the path
+    // is a missing folder; any other metadata error, such as a symbolic-link
+    // loop or a parent folder that cannot be searched, leaves it unreadable.
+    match fs::metadata(&golden_dir) {
+        Ok(entry) if entry.is_dir() => {}
+        Err(error)
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            let _ = writeln!(
+                io::stderr(),
+                "bridge: golden directory unreadable: {}: {error}",
+                golden_dir.display()
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                io::stderr(),
+                "bridge: golden directory missing: {}",
+                golden_dir.display()
+            );
+        }
     }
     // The counts come from the same path that is checked above and then moved
     // into the mode `serve` receives.

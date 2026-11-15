@@ -1269,28 +1269,52 @@ fn compare_match_false_for_context_duz_1() -> Result<(), String> {
 // Rejections
 // ---------------------------------------------------------------------------
 
-/// Every backend answers 400 with an error text for malformed JSON, a
-/// missing or non-array `inputs`, a non-string element, and an element
-/// holding a carriage return or a line feed. The cause texts are the
-/// bridge's own and are not pinned here.
+/// Every backend answers 400 for malformed JSON, a missing or non-array
+/// `inputs`, a non-string element, and an element holding a carriage return
+/// or a line feed, with the error text `BAD REQUEST: <cause>`.
 #[test]
 fn bad_request_400_on_every_backend() -> Result<(), String> {
-    const BODIES: [(&str, &str); 7] = [
-        ("malformed JSON", r#"{"inputs": ["#),
-        ("missing inputs", "{}"),
-        ("non-array inputs", r#"{"inputs":"x"}"#),
-        ("number element", r#"{"inputs":[1]}"#),
-        ("null element", r#"{"inputs":[null]}"#),
-        ("carriage return element", r#"{"inputs":["a\rb"]}"#),
-        ("line feed element", r#"{"inputs":["a\nb"]}"#),
+    // What the body is, the body, and the cause after `BAD REQUEST: `.
+    const BODIES: [(&str, &str, &str); 7] = [
+        ("malformed JSON", r#"{"inputs": ["#, "MALFORMED JSON"),
+        ("missing inputs", "{}", "INPUTS MISSING OR REPEATED"),
+        (
+            "non-array inputs",
+            r#"{"inputs":"x"}"#,
+            "INPUTS IS NOT AN ARRAY",
+        ),
+        (
+            "number element",
+            r#"{"inputs":[1]}"#,
+            "INPUT 1 IS NOT A STRING",
+        ),
+        (
+            "null element",
+            r#"{"inputs":[null]}"#,
+            "INPUT 1 IS NOT A STRING",
+        ),
+        (
+            "carriage return element",
+            r#"{"inputs":["a\rb"]}"#,
+            "INPUT 1 CONTAINS A CARRIAGE RETURN OR LINE FEED",
+        ),
+        (
+            "line feed element",
+            r#"{"inputs":["a\nb"]}"#,
+            "INPUT 1 CONTAINS A CARRIAGE RETURN OR LINE FEED",
+        ),
     ];
     with_bridge("bad_request_400_on_every_backend", ready_gc01, |addr| {
         for backend in ["rust", "mumps", "compare"] {
-            for (what, body) in BODIES {
+            for (what, body, cause) in BODIES {
                 let context = format!("{backend}: {what}");
                 let resp = post_session(addr, backend, body.as_bytes())?;
                 let error = expect_error(&resp, 400, &context)?;
-                assert!(!error.is_empty(), "{context}: empty error text");
+                assert!(
+                    error.starts_with("BAD REQUEST: "),
+                    "{context}: error {error:?} lacks the BAD REQUEST prefix"
+                );
+                assert_eq!(error, format!("BAD REQUEST: {cause}"), "{context}: error");
             }
         }
         Ok(())

@@ -26,10 +26,10 @@ cargo run --offline --locked --bin bridge
 - The short forms `cargo test` and `cargo run --bin bridge` are equivalent on a prepared host.
 - **`cargo build`** exits 0.
 - **`cargo test`** runs the unit tests, `tests/bridge.rs` and `tests/equivalence.rs`.
-  - It exits 0 when no case is FAIL. With no capture, all five cases, `GC-01` to `GC-05`, are NOT COMPARED.
+  - It exits 0 when no case is FAIL and nothing else fails. With no capture, all five cases, `GC-01` to `GC-05`, are NOT COMPARED, so none is FAIL and it exits 0.
   - `tests/equivalence.rs` rewrites `REPORT.md` in full on every run. Part 2 holds each case's verdict and part 3 its capture readiness.
   - The test also prints one `GC-0N <verdict>` line per case, such as `GC-01 NOT COMPARED`. Cargo shows test output only for a failing test, so to see the lines on a passing run use `cargo test --offline --locked --test equivalence -- --nocapture`.
-  - It exits non-zero when any case is FAIL, and `REPORT.md` part 2 names the cause.
+  - It exits non-zero when any case is FAIL, and `REPORT.md` part 2 names the cause. With no case FAIL, it still exits non-zero when a harness check fails (`REPORT.md` part 1 lists each under "Harness checks in this run" with PASS or FAIL), when `SPEC.md` lacks a section the report includes (`MISSING SECTION <heading> IN SPEC.md`, with no report written), when `REPORT.md` cannot be written (`cannot write REPORT.md: <error>`), or when any other test or the build fails.
   - Exit 0 is never acceptance. Acceptance needs five PASS.
 - **`cargo run`** starts the bridge, which serves until it is stopped (Ctrl-C). Once listening, it writes three lines to standard output:
 
@@ -58,8 +58,10 @@ This is the state of a fresh checkout: `tests/golden/ifcap/` holds only its READ
 - **RUST** answers 200, and its transcript ends after the station prompt `Select STATION NUMBER ('^' TO EXIT): 500// `, which ends with one space.
   - The repository fixtures hold no file 442 header `^PRC(442,0)`, so the order lookup ends before it writes its prompt (branch PO-09.b15).
   - The original on VEHU never reaches that state (conflict K6), so no Rust transcript reaches the order prompt until `cases.zwr` is loaded.
-- **Once `tests/fixtures/ifcap/cases.zwr` is loaded** and the bridge restarted, the Rust side reaches the order prompt `P.O./REQ.NO.: `.
-  - An order absent from the fixtures gets the original's no-match response: `<BEL> ??`, a blank line, and the re-asked `P.O./REQ.NO.: `. `<BEL>` is byte 0x07.
+- **Once `tests/fixtures/ifcap/cases.zwr` is loaded** and the bridge restarted, the Rust side reaches the order prompt `P.O./REQ.NO.: `. The header `^PRC(442,0)`, with piece 2 `442I`, is what this needs.
+  - The original's no-match response is `<BEL> ??`, a blank line, and the re-asked `P.O./REQ.NO.: `. `<BEL>` is byte 0x07. The Rust side writes it only over a `cases.zwr` built by README Part B step 6, which holds the header and the orders' index nodes. Those give `^PRC(442)` a subscript after `"A["`, such as `"C"`, as the README Part B step 1 fixture profile requires. Over a `cases.zwr` holding only the header, an absent order ends the session after `P.O./REQ.NO.: ` with no no-match response, at branch PO-09.b16, which the port does not implement.
+  - It is written for GC-03's `GC3003`, GC-04's `INVALID!` and any other absent value the O-03 guard admits (`SPEC.md` R5 step 6): a value with no lowercase letter and no comma, of at most 30 characters, that is not a canonical number, is neither `S` nor `1` nor a prefix of `SUPPLY WAREHOUSE` or `INACTIVATED`, and neither equals nor begins any subscript of an index of files 440, 442.5 or 442.3, while `^PRC(442,"G")`, `("M")` and `("MCH")` hold no entry, as the fixture profile requires.
+  - Any other absent order, for example the number `123456` or the lowercase `gc3003`, reaches a branch the port does not implement: PO-09.b11, or PO-09.b13 when the uppercase retry finds a candidate. The session then ends after `P.O./REQ.NO.: `, as when input runs out.
   - While open item O-01 (the HOME device) is unanswered, the Rust session for an order that is found ends after `P.O./REQ.NO.: `.
 
 ## Step 5. Load captures
@@ -101,7 +103,7 @@ This is the state of a fresh checkout: `tests/golden/ifcap/` holds only its READ
   curl -s -X POST -H 'Content-Type: application/json' -d '{"inputs":[""]}' http://127.0.0.1:8080/api/rust/session
   ```
 
-  `GET /api/status` reports the mode and the recorded, READY and INCOMPLETE cases, with each INCOMPLETE case's failed checks. With no captures it answers `{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}`. A session request answers `{"transcript":"…","returned":null}`; replace `rust` with `mumps` or `compare` for the other backends.
+  `GET /api/status` reports the mode and the recorded, READY and INCOMPLETE cases, with each INCOMPLETE case's failed checks. With no captures it answers `{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}`. A RUST session request answers 200 `{"transcript":"…","returned":null}`, and so does a MUMPS one, with `mumps` in place of `rust`. A COMPARE request, with `compare` in place of `rust`, answers 200 `{"mumps":{"transcript":"…","returned":null},"rust":{"transcript":"…","returned":null},"match":false}`: both raw outputs, never normalised, and the boolean `match`, which is `true` when the screen shows `MATCH`. `returned` is always `null`, because the workflow returns nothing. An error answers `{"error":"<cause>"}` (see "Failure messages").
 
 ## Step 7. Live mode
 
@@ -127,22 +129,23 @@ VEHU_CONTAINER=<container name> cargo run --offline --locked --bin bridge
 |---|---|---|
 | `bridge: port 8080 on 127.0.0.1 is already in use` | Standard error at startup. Another process, such as an earlier bridge, holds the port. Exit status 1 | Stop the other process, then start the bridge again |
 | `bridge: cannot listen on 127.0.0.1:8080: <error>` | Standard error at startup. Any other bind failure, named by `<error>`. Exit status 1 | Correct the cause `<error>` names |
-| `bridge: golden directory missing: <path>` | Standard error at startup. `GOLDEN_DIR`, or the default folder, is not a directory. The bridge keeps serving, the third line reads `RECORDED 0 OF 5 READY 0 OF 5`. In replay MUMPS answers 502 `NOT RECORDED`; in live mode it answers 502 `NO META.TXT IN <path>` | Correct `GOLDEN_DIR`, or create the folder, and restart |
+| `bridge: golden directory missing: <path>` | Standard error at startup. `GOLDEN_DIR`, or the default folder, does not exist, or is not a directory. The bridge keeps serving, the third line reads `RECORDED 0 OF 5 READY 0 OF 5`. In replay MUMPS answers 502 `NOT RECORDED`; in live mode it answers 502 `NO META.TXT IN <path>` | Correct `GOLDEN_DIR`, or create the folder, and restart |
+| `bridge: golden directory unreadable: <path>: <error>` | Standard error at startup. The metadata of `GOLDEN_DIR`, or the default folder, cannot be read for a reason other than its absence, named by `<error>`, such as a symbolic-link loop or a parent folder the bridge user cannot search. The bridge keeps serving, the third line reads `RECORDED 0 OF 5 READY 0 OF 5`, and the status lists all five cases INCOMPLETE with all six checks. In replay MUMPS answers 502 `NOT RECORDED (unreadable: <path>/GC-01: <cause>)`, and COMPARE puts `MUMPS: ` before it; in live mode it answers 502 `NO META.TXT IN <path>` | Give the bridge user search access to the folder and its parents, or correct `GOLDEN_DIR`, and restart |
 | `bridge: cannot load fixtures: <error>` | Standard error. A file under `tests/fixtures/ifcap/` cannot be read (`<path>: cannot read: <cause>`) or holds a malformed line (`<path>: MALFORMED ZWR LINE <line>: <message>`). Exit status 1 | Restore the supporting fixture from git. Rebuild `cases.zwr` by README Part B step 6. Never edit an export |
 | `NOT RECORDED` | 502 from MUMPS in replay: no recorded case's inputs equal the whole sequence. COMPARE gives `MUMPS: NOT RECORDED` | Type the full sequence of a recorded case, or record the capture (step 5) |
-| `NOT RECORDED (unreadable: <path>: <cause>)` | 502 in replay: a capture file that is present cannot be read or is not UTF-8 | Copy the capture again as it was recorded. Never edit its content |
+| `NOT RECORDED (unreadable: <path>: <cause>)` | 502 in replay: a capture file that is present cannot be read, is larger than its size limit or is not UTF-8, or its case folder cannot be inspected | Copy the capture again as it was recorded. Never edit its content |
 | `CONTEXT MISMATCH <key>: expected <value or ABSENT>, actual <value or ABSENT>` | The `meta.txt` `context` disagrees with `STUB_CONTEXT`, for example `CONTEXT MISMATCH DUZ: expected .5, actual 1`. In live mode it is 502 before any command runs. In replay COMPARE shows `MISMATCH`, and `cargo test` reports the case FAIL | Check the capture against README Part A section 6, and record it again if it is wrong |
 | `NO META.TXT IN <golden_dir>` | 502 in live mode: no case folder holds a `meta.txt` that parses | Load captures with their `meta.txt` (step 5) |
 | `EXIT <code>: <first line of docker's standard error>` | 502 in live mode: `docker` exited non-zero, for example because the container is not running or not found. The bridge keeps serving | Start the container, or correct `VEHU_CONTAINER`, and restart the bridge |
-| `TIMEOUT`, `OUTPUT TOO LARGE`, `NON-UTF8`, `EXIT NONE: <stderr head>` | 502 in live mode: no run slot freed or the run passed 10 s; the output passed 1 MiB; the output is not UTF-8; `docker` was ended by a signal | Check the container and the start arguments in `meta.txt` |
+| `TIMEOUT`, `OUTPUT TOO LARGE`, `NON-UTF8`, `EXIT NONE: <first line of docker's standard error>` | 502 in live mode: no run slot freed or the run passed 10 s; the output passed 1 MiB; the output is not UTF-8; `docker` was ended by a signal | Check the container and the start arguments in `meta.txt` |
 | `BRIDGE UNREACHABLE` | The screen's status line: `GET /api/status` failed, answered non-2xx, or returned a body that is not the status JSON | Start the bridge, open the page through `http://127.0.0.1:8080/`, and reload |
-| `REQUEST FAILED: <error>` | The screen's bottom line: a session request never reached the bridge | Start the bridge, then SEND again |
+| `REQUEST FAILED: <error>` | The screen's bottom line: a session request failed before a complete answer arrived. Either `fetch` failed, for example because the bridge is not running or the connection broke, or the answer's body could not be read. The request may have reached the bridge and run. `<error>` is the browser's error text, or `UNKNOWN ERROR` when the error cannot be turned into text. The transcript stays as it was, COMPARE's verdict line is emptied, and in RUST mode the transcript shakes as for any rejection | Make sure the bridge is running, and start it if not. The failed input is already in the sequence and SEND would add another, so change the backend and back to resend the sequence as it stands. Resending is safe: every request is read-only and the bridge keeps no session state |
 
 Other HTTP answers. Every error body is `{"error":"<cause>"}`, and the screen shows it verbatim in its bottom line.
 
 - **400.**
   - A malformed request gives `BAD REQUEST: <rule>`, such as `BAD REQUEST: CONTENT-LENGTH REQUIRED`.
-  - A session body that is not `{"inputs":[string, …]}` gives one of: `MALFORMED JSON`, `BODY IS NOT A JSON OBJECT`, `INPUTS MISSING OR REPEATED`, `INPUTS IS NOT AN ARRAY`, `INPUT <n> IS NOT A STRING`, `INPUT <n> CONTAINS A CARRIAGE RETURN OR LINE FEED`.
+  - A session body that is not `{"inputs":[string, …]}` gives one of: `BAD REQUEST: MALFORMED JSON`, `BAD REQUEST: BODY IS NOT A JSON OBJECT`, `BAD REQUEST: INPUTS MISSING OR REPEATED`, `BAD REQUEST: INPUTS IS NOT AN ARRAY`, `BAD REQUEST: INPUT <n> IS NOT A STRING`, `BAD REQUEST: INPUT <n> CONTAINS A CARRIAGE RETURN OR LINE FEED`.
 - **404.** `NOT FOUND` for an unknown path, `UNKNOWN BACKEND` for a backend other than `mumps`, `rust` or `compare`, and `NOT FOUND: POST REQUIRED` or `NOT FOUND: GET REQUIRED` for the wrong method.
 - **500.** `CORRUPT STORE <node>` from RUST: the inquiry read a node that holds no value where the original raises an M `UNDEF` error, such as `CORRUPT STORE ^PRC(442,1,0)`. Check `cases.zwr` against README Part B step 6. COMPARE answers it as 502 `RUST: CORRUPT STORE <node>`.
 - **502.** Every MUMPS-side failure above. COMPARE puts `MUMPS: ` before it.

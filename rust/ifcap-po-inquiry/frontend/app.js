@@ -179,24 +179,36 @@ function showFailure(backend, message) {
   reject();
 }
 
-// A 2xx answer: every pane it names is prepared before any is committed, so
-// either every pane and the verdict change together or, for a body that
-// cannot be shown, only the error line is set and the COMPARE verdict line is
-// emptied.
+// The verdict of one COMPARE 200 body, which the bridge writes as
+// {"mumps": {...}, "rust": {...}, "match": bool} (compare_session in
+// src/bridge.rs). A match that is not a boolean throws, the same as a
+// transcript that is not a string, so it is never shown as a MISMATCH.
+function verdictOf(body) {
+  if (typeof body.match !== "boolean") {
+    throw new TypeError("match is not a boolean");
+  }
+  return body.match ? "MATCH" : "MISMATCH";
+}
+
+// A 2xx answer: every pane it names is prepared, and a COMPARE verdict read,
+// before any pane is committed, so either every pane and the verdict change
+// together or, for a body that cannot be shown, only the error line is set
+// and the COMPARE verdict line is emptied.
 function showSuccess(backend, text) {
   errorStatus.textContent = "";
   try {
     const body = JSON.parse(text);
     if (backend === "compare") {
+      // Only the bridge decides the comparison verdict: the line shows its
+      // boolean match field, and transcripts are never compared here.
+      const verdict = verdictOf(body);
       const mumpsText = transcriptOf(body.mumps);
       const rustText = transcriptOf(body.rust);
       const mumpsRows = prepareRows(mumpsPane, mumpsText, "compare:mumps", false);
       const rustRows = prepareRows(rustPane, rustText, "compare:rust", false);
       commitRows(mumpsRows);
       commitRows(rustRows);
-      // Only the bridge decides the comparison verdict: the line shows its
-      // boolean match field, and transcripts are never compared here.
-      matchStatus.textContent = body.match === true ? "MATCH" : "MISMATCH";
+      matchStatus.textContent = verdict;
     } else {
       commitRows(prepareRows(transcriptEl, transcriptOf(body), backend, reactionsOn()));
     }
@@ -357,9 +369,9 @@ backendSelect.addEventListener("change", () => {
 });
 
 // On load the only request is GET /api/status, for the status line. No
-// session request is sent: an empty sequence matches no capture, so MUMPS
-// replay would answer 502 while RUST showed the station prompt, and the idle
-// MUMPS and RUST screens must differ only in the selector, which holds
-// because the status line reads the same in every mode.
+// session request is sent, since a reload starts a new session. A later
+// selector change does resend the sequence, so at rest with no captures RUST
+// shows the station prompt where MUMPS shows nothing: the idle-screen check
+// masks the transcript box, selector and status line (SPEC.md conflict K13).
 root.dataset.mode = backendSelect.value;
 showBridgeStatus();

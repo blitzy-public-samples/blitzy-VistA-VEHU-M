@@ -239,7 +239,8 @@ struct Literal {
 }
 
 /// The rows of the literals table, header and separator rows skipped. A
-/// missing subsection gives no rows, so every line is `not attributed`.
+/// missing subsection gives no rows, so every expected line is `not
+/// attributed`.
 fn literal_rows(spec: &str) -> Vec<Literal> {
     let Some(table) = slice(spec, LITERALS, |line| {
         line.starts_with("## ") || line.starts_with("### ")
@@ -298,9 +299,10 @@ fn fragments(cell: &str) -> Vec<String> {
         .collect()
 }
 
-/// The writer of the row whose longest fragment contained in the expected
+/// The attribution of the expected line: `attributed to <TAG^ROUTINE>`,
+/// naming the writer of the row whose longest fragment contained in the
 /// line is the longest of all rows, the earliest row on a tie, or `not
-/// attributed`.
+/// attributed` when no row's fragment is in the line or the line is absent.
 ///
 /// The longest match decides rather than the first row that matches,
 /// because a short literal of an earlier row can sit inside a later row's
@@ -323,7 +325,10 @@ fn attribute(rows: &[Literal], expected: Option<&str>) -> String {
                 })
                 .max_by_key(|(length, _)| *length)
         })
-        .map_or_else(|| NOT_ATTRIBUTED.to_string(), |(_, row)| row.writer.clone())
+        .map_or_else(
+            || NOT_ATTRIBUTED.to_string(),
+            |(_, row)| format!("attributed to {}", row.writer),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -536,7 +541,8 @@ fn compare(
 }
 
 /// The first line, 1-based, where two different normalised transcripts
-/// differ, with both texts and the writer of the expected line.
+/// differ, with both texts and the attribution of the expected line:
+/// `attributed to <TAG^ROUTINE>` or `not attributed`.
 fn transcript_cause(expected: &str, actual: &str, literals: &[Literal]) -> String {
     let wanted: Vec<&str> = expected.split('\n').collect();
     let got: Vec<&str> = actual.split('\n').collect();
@@ -550,7 +556,7 @@ fn transcript_cause(expected: &str, actual: &str, literals: &[Literal]) -> Strin
             .map_or_else(|| ABSENT_LINE.to_string(), |text| quote(text))
     };
     format!(
-        "transcript differs at line {}: expected {}, actual {}, attributed to {}",
+        "transcript differs at line {}: expected {}, actual {}, {}",
         index.saturating_add(1),
         line(&wanted),
         line(&got),

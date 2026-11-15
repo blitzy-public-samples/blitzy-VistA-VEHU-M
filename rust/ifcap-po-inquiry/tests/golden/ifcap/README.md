@@ -33,6 +33,19 @@ Each `GC-0N/` folder holds exactly the seven files of `golden::CAPTURE_FILES`, e
 
 A case's content is loaded only through `golden::load_case` and `golden::find_capture`, which read each file once; `golden::status`, `readiness` and `live_start` read only what the status counts and live mode need. Every file that is present, the two exports included, must be readable UTF-8: one that is not makes the whole case `Unreadable`, which is FAIL.
 
+Each file has a size limit, enforced while it is read, and every read is fresh:
+
+| File | Size limit |
+|---|---|
+| `input.txt` | 1048576 bytes (1 MiB), the largest request body the bridge accepts |
+| `transcript.txt` | 1048576 bytes (1 MiB), the live adapter's output cap |
+| `returned.txt`, `meta.txt`, `normalisation.txt` | 65536 bytes (64 KiB) each |
+| `db-before.zwr`, `db-after.zwr` | 67108864 bytes (64 MiB) each; an export of the Part B step 1 scope is about 1.2 MB |
+
+- A file larger than its limit is present but unreadable: the case is `Unreadable` with `<path>: larger than <n> bytes`, which is FAIL, and replay answers 502 `NOT RECORDED (unreadable: <path>: larger than <n> bytes)`. Its readiness fails the checks that read it and `no_carriage_return`.
+- The two exports are read together in 64 KiB pieces, compared and checked piece by piece, and never held whole.
+- A case folder whose metadata cannot be read, for example under a golden folder the bridge user cannot search, is not ABSENT: the case is `Unreadable` with the folder's path and cause, such as `<golden folder>/GC-01: permission denied`, which is FAIL, and its readiness fails all six checks.
+
 ### 2. Capture input and output
 
 - **No pseudo-terminal.** Capture with `docker exec -i`, never `-t`: a pseudo-terminal echoes the typed input into standard output and can rewrite line endings.
@@ -113,7 +126,7 @@ docker_exec_args=<arguments separated by single spaces>
 - Live mode runs the program `docker` directly with the arguments `exec`, `-i`, `<container>` and then these arguments, so the command is `docker exec -i <container> <args…>`. No shell runs on the host. `<container>` comes only from the bridge's `VEHU_CONTAINER`, never from a capture or a request.
 - `golden::live_start` takes the arguments and `context` from the first case folder, in `CASE_IDS` order, whose `meta.txt` is readable UTF-8 and parses. With none, live mode answers 502 `NO META.TXT IN <golden_dir>`.
 - `validate_context` runs before any command. A failure is 502 with its `CONTEXT MISMATCH …` text, and nothing runs.
-- Standard input is each input followed by one `\n`, the framing of `input.txt`, and standard output is the transcript. A non-zero exit is 502 `EXIT <code>: <stderr head>`.
+- Standard input is each input followed by one `\n`, the framing of `input.txt`, and standard output is the transcript. A non-zero exit is 502 `EXIT <code>: <first line of docker's standard error>`.
 - **Open (O-07; conflict K3).** An argument that contains a space cannot be expressed, and the documented start command of Part B step 1 needs one, its `-c` script. Live mode is therefore delivered unverified, and replay is the delivered MUMPS backend. **Question for the team:** supply a start command whose arguments contain no space, or change the convention. This README prescribes no workaround.
 
 ### 8. `normalisation.txt`
@@ -155,7 +168,7 @@ The verdicts `tests/equivalence.rs` gives:
 | PASS | The case is READY, `validate_context` accepts its `context`, the normalised transcripts are equal, the `returned` values are equal, and the store equals its pre-call clone |
 | FAIL | Every other recorded case: an INCOMPLETE one (conflict K12), an unreadable or non-UTF-8 file, a transcript or `returned` difference, a context mismatch, a store change, or `CORRUPT STORE` |
 
-- `cargo test` fails only when a case is FAIL. Exit 0 is not acceptance, which needs five PASS.
+- Of the verdicts, only FAIL fails `cargo test`, and `REPORT.md` part 2 names its cause. With no case FAIL, `cargo test` still fails when a harness check fails (`REPORT.md` part 1 lists each with PASS or FAIL), when `SPEC.md` lacks a section the report includes (`MISSING SECTION <heading> IN SPEC.md`, with no report written), when `REPORT.md` cannot be written (`cannot write REPORT.md: <error>`), or when any other test or the build fails. Exit 0 is not acceptance, which needs five PASS.
 - **While O-01 is open.** With `cases.zwr` loaded, the Rust sessions of GC-01, GC-02 and GC-05 end after `P.O./REQ.NO.: ` (with its one trailing space), because the display's `W:$Y>0 @IOF` depends on the unresolved HOME device [Packages/IFCAP/Routines/PRCHDP1.m:12]. Those cases FAIL once captured, until O-01 is answered. The no-match path of GC-03 and GC-04 never reaches that line.
 
 ### 10. Bridge use
@@ -163,7 +176,7 @@ The verdicts `tests/equivalence.rs` gives:
 - **Replay** (when `VEHU_CONTAINER` is unset or empty) answers `POST /api/mumps/session`, and the MUMPS side of `POST /api/compare/session`, through `golden::find_capture`: the first recorded case, in `CASE_IDS` order, whose inputs equal the request's. It reads the folder on every request, so new captures need no restart.
   - A hit gives 200 with the capture's raw `transcript.txt` and `returned`.
   - No hit gives 502 `NOT RECORDED`.
-  - A present capture file that cannot be read, met on the way, gives 502 `NOT RECORDED (unreadable: <path>: <cause>)`.
+  - A present capture file that cannot be read, or a case folder that cannot be inspected (section 1), met on the way, gives 502 `NOT RECORDED (unreadable: <path>: <cause>)`.
   - COMPARE puts `MUMPS: ` before a MUMPS-side cause.
 - **COMPARE `match`** is true only when the capture for the inputs is READY, `validate_context` accepts its `context`, the transcripts are equal after its rules, and the `returned` values are equal. Otherwise it is false, inputs with no capture included. Responses always carry the raw transcripts; normalisation applies only inside the comparison.
 - **Status.** `GET /api/status` lists the recorded, READY and INCOMPLETE cases, with each INCOMPLETE case's failed checks, read afresh on every request. The bridge's third startup line reads `RECORDED <n> OF 5 READY <m> OF 5`, and the screen's status line, fetched when the page loads, reads `MUMPS BACKEND: REPLAY RECORDED <n> OF 5 READY <m> OF 5`.
@@ -382,5 +395,5 @@ GOLDEN_DIR=<folder> cargo run --offline --locked --bin bridge
 
 - Set `RUSTUP_AUTO_INSTALL=0` when offline, so that a missing pinned toolchain fails instead of downloading.
 - The short forms `cargo test` and `cargo run --bin bridge` are equivalent on a prepared host.
-- The bridge prints three lines to standard output: `http://127.0.0.1:8080/`, then `MUMPS MODE: REPLAY` (or `MUMPS MODE: LIVE <container>`), then `RECORDED <n> OF 5 READY <m> OF 5`. A port already taken gives `bridge: port 8080 on 127.0.0.1 is already in use` on standard error and exit status 1, and a missing golden folder gives `bridge: golden directory missing: <path>`, after which the bridge keeps serving with no case recorded.
+- The bridge prints three lines to standard output: `http://127.0.0.1:8080/`, then `MUMPS MODE: REPLAY` (or `MUMPS MODE: LIVE <container>`), then `RECORDED <n> OF 5 READY <m> OF 5`. A port already taken gives `bridge: port 8080 on 127.0.0.1 is already in use` on standard error and exit status 1, a golden folder that does not exist, or is not a directory, gives `bridge: golden directory missing: <path>`, and one whose metadata cannot be read for another reason, such as a symbolic-link loop or a parent folder that cannot be searched, gives `bridge: golden directory unreadable: <path>: <error>`. After either, the bridge keeps serving with no case recorded.
 

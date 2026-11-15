@@ -803,22 +803,100 @@ fn no_match_guard(st: &Store, x: &str) -> bool {
     {
         return false;
     }
-    // (c): every subscript of each index, numbers included, because numeric
-    // subscripts collate before every string and a walk from `x` would skip them.
+    // (c) by ordered seeks, never a walk of every subscript: (b) has ruled
+    // out the empty `x` and (d) a canonical one, so the string subscripts
+    // that begin with `x` follow the string `x` itself, and the numbers whose
+    // text can begin with it fill one value interval, which collates before
+    // every string and is sought from just below it.
     for (global, number, indexes) in NESTED_LOOKUP_INDEXES {
         let root = key(global, &[number]);
         for name in indexes {
-            let index = child(&root, &Sub::from_text(name));
-            let mut next = st.order(&index, None);
-            while let Some(sub) = next {
-                if sub.text().starts_with(x) {
-                    return false;
-                }
-                next = st.order(&index, Some(&sub));
+            if begins_some_subscript(st, &child(&root, &Sub::from_text(name)), x) {
+                return false;
             }
         }
     }
     true
+}
+
+/// Condition (c) of [`no_match_guard`] for one index: true when a subscript
+/// of `index` equals or begins with `x`, found by one exact probe and at
+/// most two `$ORDER` seeks instead of a walk of every child. `x` must be
+/// non-empty and not a canonical number, as (b) and (d) of the guard
+/// establish before (c) runs, so `Sub::from_text(x)` is the string
+/// subscript `x`.
+///
+/// Strings collate by bytes, so the string subscripts that begin with `x`
+/// directly follow the string `x`: the exact probe, then one `$ORDER` from
+/// it, decides them. Numbers collate before every string, by value. The
+/// canonical text of a number can begin with such an `x` only when `x`
+/// followed by the digit `1` is canonical (`-`, `I.` or `I.F0`, the last two
+/// optionally after `-`), and those numbers fill one open interval of values,
+/// so one `$ORDER` from [`number_prefix_seed`], just below the interval,
+/// decides them. A child that either seek returns and that begins with `x`
+/// is a witness whatever its type.
+fn begins_some_subscript(st: &Store, index: &[Sub], x: &str) -> bool {
+    let begins = |next: Option<Sub>| next.is_some_and(|sub| sub.text().starts_with(x));
+    let probe = Sub::from_text(x);
+    // The exact probe comes first: when `x` is a subscript, the $ORDER from
+    // it would walk every node under it before reaching the next child.
+    if st.data(&child(index, &probe)) != 0 || begins(st.order(index, Some(&probe))) {
+        return true;
+    }
+    is_canonical(&format!("{x}1")) && begins(st.order(index, Some(&number_prefix_seed(x))))
+}
+
+/// The `$ORDER` seed for the numbers whose canonical text begins with `x`,
+/// where `x` is not canonical but `x` followed by the digit `1` is (see
+/// [`begins_some_subscript`]): the subscript just below the values those
+/// numbers fill. The seed never begins with `x` itself, so the first child
+/// after it decides whether such a number exists. Each numeric seed holds
+/// canonical text.
+///
+/// - `-`, with no `.`: every negative number, and negative numbers collate
+///   first, so the seed is the null subscript, from which `$ORDER` gives the
+///   first child.
+/// - `I.F`, where `F` is empty or ends in `0`: the values strictly between
+///   `I.F` and `I.F + 10^-|F|`, so the seed is the number `+x` (`1.` gives
+///   `1`, `.` gives `0`, `1.50` gives `1.5`).
+/// - `-I.F`: the values strictly between `-(I.F + 10^-|F|)` and `-I.F`, so
+///   the seed is that lower bound: `x` with its last `0` made `1` when `F`
+///   ends in `0` (`-1.50` gives `-1.51`, `-.0` gives `-.1`), or `-` and
+///   `I + 1` when `F` is empty (`-.` gives `-1`, `-99.` gives `-100`).
+fn number_prefix_seed(x: &str) -> Sub {
+    let Some((int, frac)) = x.split_once('.') else {
+        return Sub::default();
+    };
+    let Some(magnitude) = int.strip_prefix('-') else {
+        return Sub::Num(num(x));
+    };
+    Sub::Num(match frac.strip_suffix('0') {
+        Some(head) => format!("-{magnitude}.{head}1"),
+        None => format!("-{}", increment_digits(magnitude)),
+    })
+}
+
+/// `digits + 1` as decimal digit text, where `digits` is a run of ASCII
+/// digits and `""` counts as `0`: `""` gives `1`, `12` gives `13` and `99`
+/// gives `100`.
+fn increment_digits(digits: &str) -> String {
+    let mut carry = true;
+    let mut reversed: Vec<u8> = digits
+        .bytes()
+        .rev()
+        .map(|b| match (carry, b) {
+            (true, b'9') => b'0',
+            (true, b'0'..=b'8') => {
+                carry = false;
+                b + 1
+            }
+            _ => b,
+        })
+        .collect();
+    if carry {
+        reversed.push(b'1');
+    }
+    reversed.into_iter().rev().map(char::from).collect()
 }
 
 /// `X?1.N.1"."1.N` with more than 25 integer or 24 fraction digits
@@ -1485,7 +1563,7 @@ fn fob_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     // K ^TMP($J,"W") S %X="^UTILITY($J,""W"",",%Y="^TMP($J,""W""," D %XY^%RCR   [PRCHDP1.m:54]
     v.tmp_w_counts.clear();
     v.tmp_w_lines.clear();
-    pct_xy_pct_rcr(s, st, v)?;
+    pct_rcr(s, st, v)?;
     // W ?40,$G(^TMP($J,"W",1,1,0)),?57,"|AUTHORITY: ",!,"COST CENTER: ",$P(PRCHD0,U,5),
     //  ?29,"|",?40,$G(^TMP($J,"W",1,2,0)),?57,"|  "   [PRCHDP1.m:55]
     s.tab(40);
@@ -1714,7 +1792,7 @@ fn diwp(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
 /// literal `%X="^UTILITY($J,""W"","` and `%Y="^TMP($J,""W"","`
 /// [PRCHDP1.m:54] [PRCHDP2.m:48]: copies every node of the `^UTILITY`
 /// scratch to the same subscripts of the `^TMP` scratch.
-fn pct_xy_pct_rcr(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
+fn pct_rcr(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // F  S %Z=$Q(@%Z) Q:$P(%Z,%A)]""!(%Z="")  S @(%Y_$E(%Z,%B,255))=@%Z   [DIRCR.m:29]
     v.tmp_w_counts.extend(&v.utility_w_counts);
     v.tmp_w_lines.extend(
@@ -2033,7 +2111,7 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
     //  K ^TMP($J,"W") S %X="^UTILITY($J,""W"",",%Y="^TMP($J,""W""," D %XY^%RCR   [PRCHDP2.m:48]
     v.tmp_w_counts.clear();
     v.tmp_w_lines.clear();
-    pct_xy_pct_rcr(s, st, v)?;
+    pct_rcr(s, st, v)?;
     //  S PRCHDCNT=$S($D(^TMP($J,"W",1)):^(1),1:"") W ! I $G(PURCTYPE)="" W ?2,$J(+$P(PRCHDI0,U,1),3)   [PRCHDP2.m:49]
     let count = v
         .tmp_w_counts
@@ -2679,7 +2757,7 @@ mod tests {
         // Every search step finds nothing for these values, but one condition
         // of the O-03 guard fails, so the session ends as PO-09.b11.
         let long = "A".repeat(31);
-        let cases: [(&str, &str, &str); 12] = [
+        let cases: [(&str, &str, &str); 13] = [
             // (a) an unanalysed pointer index holds an entry
             ("(a) M", "^PRC(442,\"M\",77,5)=\"\"\n", "ABC123"),
             ("(a) G", "^PRC(442,\"G\",77,5,1)=\"\"\n", "ABC123"),
@@ -2704,6 +2782,11 @@ mod tests {
                 "(c) numeric 442.3 C subscript",
                 "^PRCD(442.3,\"C\",1.5,20)=\"\"\n",
                 "1.",
+            ),
+            (
+                "(c) negative 442.3 AC subscript",
+                "^PRCD(442.3,\"AC\",-5,20)=\"\"\n",
+                "-",
             ),
             // (d) a comma, a value longer than 30 (canonical numbers and
             // lowercase values have their own tests below)
@@ -2732,6 +2815,102 @@ mod tests {
             assert!(no_match_guard(&store, value), "value {value:?}");
         }
         assert!(!no_match_guard(&store, "S"));
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_seek_agrees_with_a_walk_of_every_subscript() -> Result<(), String> {
+        // Condition (c) as a walk: every child of the index from the first,
+        // each tested for the prefix.
+        fn walk(st: &Store, index: &[Sub], x: &str) -> bool {
+            let mut next = st.order(index, None);
+            while let Some(sub) = next {
+                if sub.text().starts_with(x) {
+                    return true;
+                }
+                next = st.order(index, Some(&sub));
+            }
+            false
+        }
+        const NUMBERS: [&str; 42] = [
+            "-100", "-99.5", "-99", "-20", "-13", "-12.31", "-12.305", "-12.3", "-12", "-10",
+            "-9.5", "-9", "-2", "-1.51", "-1.505", "-1.5", "-1.05", "-1", "-.5", "-.05", "-.01",
+            "-.001", "0", ".001", ".01", ".05", ".5", "1", "1.05", "1.5", "1.501", "1.51", "2",
+            "9", "9.5", "10", "10.5", "12.3", "12.305", "99", "99.5", "100",
+        ];
+        const STRINGS: [&str; 13] = [
+            "-",
+            "-X",
+            "1.",
+            "1.0A",
+            ".",
+            ".5X",
+            "0.5",
+            "01",
+            "A",
+            "AB",
+            "ACME SUPPLY",
+            "GC3003X",
+            "~",
+        ];
+        // Probes beyond the subscripts' own prefixes: number-prefix shapes
+        // such as `-9.` and `1.50`, and near misses no number begins with.
+        const EXTRA_PROBES: [&str; 20] = [
+            "-", "-.", ".", "0.", "-0", "-0.", "1.0", "1.50", "-1.50", "12.30", "-12.30", "9.",
+            "-9.", "99.", "-99.", "+1.", "1..", "1-", "--", "ZZ",
+        ];
+        // Neighbouring indexes, so a seek that left index C would show.
+        const NEIGHBOURS: &str = "^PRCD(442.3,\"B\",\"-1.\",20)=\"\"\n\
+                                  ^PRCD(442.3,\"D\",-1,20)=\"\"\n\
+                                  ^PRCD(442.3,\"D\",\"~~\",20)=\"\"\n";
+        for sub in NUMBERS {
+            assert!(Sub::from_text(sub).is_num(), "number {sub:?}");
+        }
+        for sub in STRINGS {
+            assert!(!Sub::from_text(sub).is_num(), "string {sub:?}");
+        }
+        let store_of = |subs: &[&str]| {
+            let lines: String = subs
+                .iter()
+                .map(|sub| {
+                    if is_canonical(sub) {
+                        format!("^PRCD(442.3,\"C\",{sub},20)=\"\"\n")
+                    } else {
+                        format!("^PRCD(442.3,\"C\",\"{sub}\",20)=\"\"\n")
+                    }
+                })
+                .collect();
+            load(&format!("{NEIGHBOURS}{lines}"))
+        };
+        let every: Vec<&str> = NUMBERS.iter().chain(STRINGS.iter()).copied().collect();
+        let mut stores = vec![
+            ("every subscript".to_string(), store_of(&every)?),
+            ("numbers only".to_string(), store_of(&NUMBERS)?),
+            ("strings only".to_string(), store_of(&STRINGS)?),
+            ("no subscript".to_string(), store_of(&[])?),
+        ];
+        for sub in every.iter().copied() {
+            stores.push((format!("only {sub:?}"), store_of(&[sub])?));
+        }
+        let mut probes: std::collections::BTreeSet<String> =
+            EXTRA_PROBES.iter().map(|probe| probe.to_string()).collect();
+        for sub in &every {
+            let mut prefix = String::new();
+            for c in sub.chars() {
+                prefix.push(c);
+                probes.insert(prefix.clone());
+            }
+        }
+        let index = key("PRCD", &["442.3", "C"]);
+        for (label, store) in &stores {
+            for x in probes.iter().filter(|x| !x.is_empty() && !is_canonical(x)) {
+                assert_eq!(
+                    begins_some_subscript(store, &index, x),
+                    walk(store, &index, x),
+                    "x {x:?}, store {label}"
+                );
+            }
+        }
         Ok(())
     }
 

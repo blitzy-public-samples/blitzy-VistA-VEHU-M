@@ -133,7 +133,7 @@ All 11 fixtures are byte-identical to their sources.
 
 ```text
      Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
-test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 143 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
@@ -144,7 +144,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-152 tests pass: 132 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
+163 tests pass: 143 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
 
 `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, exit status 0. Output with the `finished in <seconds>` timings trimmed:
 
@@ -175,20 +175,20 @@ All five cases are NOT COMPARED, because none has a capture. Exit 0 is not accep
 running 18 tests
 test end_to_end_real_captures ... ok
 test compare_match_false_for_incomplete_case ... ok
-test not_found_404_texts ... ok
-test mumps_replay_502_not_recorded ... ok
-test startup_with_empty_folder ... ok
-test rust_session_200 ... ok
-test mumps_replay_200_when_recorded ... ok
-test compare_match_true_for_ready_equal_case ... ok
-test compare_match_false_for_differing_ready_case ... ok
-test compare_match_false_when_difference_is_outside_the_rule ... ok
 test compare_match_true_when_rule_covers_the_difference ... ok
 test compare_match_false_for_context_duz_1 ... ok
+test compare_match_false_when_difference_is_outside_the_rule ... ok
+test compare_match_false_for_differing_ready_case ... ok
+test startup_with_empty_folder ... ok
+test mumps_replay_502_not_recorded ... ok
+test compare_match_true_for_ready_equal_case ... ok
+test rust_session_200 ... ok
+test not_found_404_texts ... ok
+test mumps_replay_200_when_recorded ... ok
 test bad_request_400_on_every_backend ... ok
-test status_empty_folder ... ok
-test status_ready_case ... ok
 test status_incomplete_case ... ok
+test status_ready_case ... ok
+test status_empty_folder ... ok
 test static_paths_exact_match ... ok
 test status_and_compare_incomplete_on_cr_or_malformed_rule ... ok
 
@@ -220,13 +220,13 @@ src/inquiry.rs:720:        // W:DIC(0)["E" ! ends the line before G ASK [DIC.m:6
 
 S3, `grep -n 'golden' src/inquiry.rs src/store.rs src/mumps.rs`, exit status 1, no output.
 
-S4, `grep -rnE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/`, exit status 0, 47 hits, every one in `src/golden.rs`. Output trimmed to the per-file summary of `grep -rlE` and `grep -cE` with the same pattern:
+S4, `grep -rnE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/`, exit status 0, 75 hits, every one in `src/golden.rs`. Output trimmed to the per-file summary of `grep -rlE` and `grep -cE` with the same pattern:
 
 ```text
 $ grep -rlE '<same pattern>' src/
 src/golden.rs
 $ grep -rcE '<same pattern>' src/golden.rs
-47
+75
 ```
 
 ### Specification counts
@@ -265,41 +265,47 @@ From `Packages/IFCAP/Routines/`, `grep -il "HLCS\|HL7\|DOMAIN" PRCHRPT.m PRCFSIT
 
 ### Bridge runtime (A12)
 
-Several checkouts share this host, so the bridge, which always binds `127.0.0.1:8080`, ran inside a private network namespace (`unshare -n`, loopback brought up), never in the host's. One `bash` script ran there, exit status 0:
+Several checkouts share this host, so the bridge, which always binds `127.0.0.1:8080`, ran inside this checkout's own network namespace, `pf-18087`, whose loopback is up, never in the host's. The command `nsenter --net=/run/netns/pf-18087 bash a12.sh` ran this `a12.sh`, exit status 0. Its last command checks that no socket is left listening on port 8080, and its status is the script's:
 
 ```sh
-ip link set lo up
-cargo run --offline --locked --bin bridge > out1 2> err1 &
+out=$(mktemp -d)
+cargo run --offline --locked --bin bridge > "$out/out1" 2> "$out/err1" &
 cpid=$!
 for i in $(seq 1 120); do curl -s -o /dev/null http://127.0.0.1:8080/ && break; sleep 0.5; done
-curl -s http://127.0.0.1:8080/api/status
-timeout 10 ./target/debug/bridge
-timeout 20 cargo run --offline --locked --bin bridge
+curl -s http://127.0.0.1:8080/api/status; echo " curl=$?"
+timeout 10 ./target/debug/bridge; echo "second=$?"
+timeout 20 cargo run --offline --locked --bin bridge; echo "cargo-second=$?"
 bpid=$(ss -ltnpH "sport = :8080" | sed -n "s/.*pid=\([0-9]*\).*/\1/p" | head -1)
-kill $bpid; wait $cpid
+kill "$bpid"; wait "$cpid"; echo "wait=$?"
+echo "--- first instance stdout"; cat "$out/out1"
+echo "--- first instance stderr"; cat "$out/err1"
+! ss -ltnH "sport = :8080" | grep -q .
 ```
 
-The first instance's standard output, its three startup lines:
+Output, standard error included, with cargo's `in <seconds>` timings trimmed:
 
 ```text
+{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}} curl=0
+bridge: port 8080 on 127.0.0.1 is already in use
+second=1
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+     Running `target/debug/bridge`
+bridge: port 8080 on 127.0.0.1 is already in use
+cargo-second=1
+wait=143
+--- first instance stdout
 http://127.0.0.1:8080/
 MUMPS MODE: REPLAY
 RECORDED 0 OF 5 READY 0 OF 5
+--- first instance stderr
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+     Running `target/debug/bridge`
 ```
 
-Its standard error held only cargo's two status lines, `Finished …` and `` Running `target/debug/bridge` ``. `curl -s http://127.0.0.1:8080/api/status`, exit status 0:
-
-```text
-{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}
-```
-
-The second instance, run as `./target/debug/bridge`, exited with status 1 and wrote nothing to standard output; its standard error:
-
-```text
-bridge: port 8080 on 127.0.0.1 is already in use
-```
-
-Run again as `cargo run --offline --locked --bin bridge`, it exited with status 1 and the same message after cargo's `Finished` and `Running` lines. The first instance was then stopped by `kill` on the pid owning port 8080 in that namespace, cargo reported status 143 (terminated by signal 15), and no socket was left listening.
+- The first instance, run by `cargo run` in the background, wrote the three startup lines to standard output, and to standard error only cargo's two status lines, `Finished …` and `` Running `target/debug/bridge` ``.
+- `curl -s http://127.0.0.1:8080/api/status` exited 0 and printed `{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}`.
+- The second instance, run as `./target/debug/bridge`, exited with status 1, wrote nothing to standard output, and wrote `bridge: port 8080 on 127.0.0.1 is already in use` to standard error. Run again as `cargo run --offline --locked --bin bridge`, it exited with status 1 and the same message after cargo's `Finished` and `Running` lines.
+- The first instance was then stopped by `kill` on the pid owning port 8080 in that namespace. `wait` on the background `cargo run` job returned 143 (128 + 15: it ended on signal 15, SIGTERM). The final check found no socket listening, so the script exited 0.
 
 ### Reconciliation search
 
@@ -336,7 +342,7 @@ Every residual hit, in the `SPEC.md` sections named, is current or marked as his
 - `split_input_lines`, `parse_normalisation`, `parse_meta`: the items of `src/golden.rs`, in "Mapping table" and "Normalisation".
 - `MANIFEST`, `test-results`: the deleted items, in "Existing items outside the layout", "Existing-state verification" and "Source-unchanged verification".
 - `NOT COMPARED`: the verdict, never a front-end `match` display.
-- `predicted`: "the plan's predicted" station echo, history, in "Source corrections and interface departures".
+- `predicted`: "the 2026-11-08 plan predicted" station echo, history, in "Source corrections and interface departures".
 
 ### Harness checks in this run
 
@@ -439,7 +445,7 @@ Rule (conflict K10, superseding C8): every indirection, XECUTE, LOCK or device-c
 | Pre-lookup node `X ^DD(411,.01,7.5)` | [DIC.m:36] [DD.zwr:488792] | requires runtime shim, not converted | Fixed station stub output: the literal `S PRCRI=$P(^PRC(411,0),U,3)` writes nothing, so the `dic` stub writes nothing for it |
 | Pointer-transform screen: `P^DICM0` builds `DIC("S")` from literal index and file names and XECUTEs it inside a nested lookup; `G @Y` dispatches on the literal field type | [DICM0.m:8-41] [DICM1.m:8-11] [DICM.m:30-34] | requires runtime shim, not converted | R6 (`pointer_candidate`) and the O-03 guard of R5 step 6 (`no_match_guard`); PO-09.b11 is n/e |
 | Name indirection `@(DIC_…)` | [DIC1.m:41] [DIC3.m:42, 63, 83, 109-125] | requires runtime shim, not converted | Fixed roots `^PRC(442,` [PRCHPAT.m:79] and `^PRC(411,` [PRCFSITE.m:18] |
-| `%XY^%RCR` indirection `@%Z`, `$Q(@%Z)` | [DIRCR.m:29] (the Kernel copy uses `$N` [ZTRCR.m:24-27]) | requires runtime shim, not converted | A copy of the literal scratch lines: `%X` and `%Y` are literal [PRCHDP1.m:54] [PRCHDP2.m:48] (`pct_xy_pct_rcr`) |
+| `%XY^%RCR` indirection `@%Z`, `$Q(@%Z)` | [DIRCR.m:29] (the Kernel copy uses `$N` [ZTRCR.m:24-27]) | requires runtime shim, not converted | A copy of the literal scratch lines: `%X` and `%Y` are literal [PRCHDP1.m:54] [PRCHDP2.m:48] (`pct_rcr`) |
 | `RCR^DIWW` `\|` windows | [DIWP.m:40] | requires runtime shim, not converted | None: PO-15.b2 is n/e, and a session that reaches it ends after the last prompt written |
 | `D EN^DIQ`; `D Y^DIQ` | [PRCHDP1.m:9] [PRCHUTL.m:76-77] | requires runtime shim, not converted | None: PO-10.b2 and PO-29.b3 are n/e |
 | `G @DIPGM`; `G @^("LOOK")` | [DIC.m:21, 38] [DICM.m:10] | requires runtime shim, not converted | None. Not reached on the `EN3` path: the target nodes are absent from the DD (section "Workflow selection", "Dynamic targets") |
@@ -466,7 +472,7 @@ Citations: `PRC*.m` are `Packages/IFCAP/Routines/`, `DI*.m` are `Packages/VA Fil
 
 - **Decisions:** an `IF`, with its `ELSE`, that governs a `DO` or extrinsic call, a `GOTO`, `QUIT` or `READ`, a loop or a block; a postcondition on a `DO`, `GOTO` or `QUIT`; a loop over stored entries whose body runs a `DO`, `GOTO`, `QUIT` or block, with the outcomes "at least one entry" and "no entry".
 - **Not decisions** (they belong to the enclosing branch and are implemented with it): an `IF` or postcondition governing only `SET`, `WRITE` or `KILL` commands; a `$SELECT` arm; a loop whose body only formats the entries it visits; a fixed-count loop.
-- **Branch IDs:** each outcome of a decision is a branch, numbered `PO-NN.bM` in source order within its contract. PO-09.b15 and PO-09.b16 were found after the plan fixed b1 to b14 and are appended so existing IDs stay stable. An exercised outcome may be described inside its enclosing branch's row; every outcome no case exercises has its own ID, because `Halt::Unexercised` carries it and the unit tests assert it through the private `run`; decisions inside an n/e branch are covered by that branch's ID.
+- **Branch IDs:** each outcome of a decision is a branch, numbered `PO-NN.bM` in source order within its contract. PO-09.b15 and PO-09.b16 were found before this run, after the 2026-11-08 plan fixed b1 to b14, and are appended so existing IDs stay stable. An exercised outcome may be described inside its enclosing branch's row; every outcome no case exercises has its own ID, because `Halt::Unexercised` carries it, so a unit test can assert the branch that ends a session, through the private `run` or on the contract function's own result; decisions inside an n/e branch are covered by that branch's ID.
 - **Coverage words:** "exercised by GC-0N", for an exercised and implemented branch; "exercised by GC-01, GC-02, GC-05; not implemented (O-01)", for an exercised branch whose source cannot be settled while O-01 is open (conflict K9); "not exercised, not implemented" (n/e). A session that reaches either of the last two ends after the last prompt written and writes nothing for the branch. "Unreachable", inside the n/e group, marks an outcome that a fixed constant on this path rules out; it needs no code. The coverage of exercised branches follows from source and the fixture profile; no capture has yet confirmed it.
 - **Columns:** `Tag` is the owning `TAG^ROUTINE`, the contract's tag in the call tree of section "Original structure". `FileMan file/field` is the field the decision reads, as `file,field NAME` with its `^DD(file,field,0)` line, or `none` when the decision tests only a local, an input or a fixed constant, or the row is a single outcome with no decision; a node or file header read whole is named as such.
 
@@ -645,7 +651,7 @@ Parity covers OPTION `PRCH DISPLAY PO` (IEN 1901, `EN3^PRCHRPT`), the five cases
 
 - **Covered:** one read-only VistA workflow, OPTION `PRCH DISPLAY PO` (IEN 1901, action `EN3^PRCHRPT`), as it runs on `worldvista/vehu:202609` from the repository at commit `dd3fd0f3124c8178657d9fff4173c324da30f7ae`, with the fixed context `DUZ` `.5` and station 500.
 - **Not claimed:** no VA-wide equivalence; equivalence with any other image, snapshot, site, user, device or option; or any behaviour the five cases do not exercise. The five cases (GC-01 to GC-05) show only their exercised paths.
-- **Read-only:** the port has no write path. `PRCHQ1` (OPTION 10295, New RFQ, `EN2^PRCHQ2`) was named in the request but creates RFQs, so `PRCH DISPLAY PO` was substituted. The original's own non-business writes (`^DISV`, word-wrap and delivery scratch under `^UTILITY` and `^TMP`) are documented and not reproduced.
+- **Read-only:** the port has no write path. `PRCHQ1` (OPTION 10295, New RFQ, `EN2^PRCHQ2`) was named in the request but creates RFQs, so `PRCH DISPLAY PO` was substituted. The original's own non-business writes (`^DISV`, the device handler's scratch under `^XUTL` and the DEVICE file's open count, word-wrap and delivery scratch under `^UTILITY` and `^TMP`) are documented and not reproduced.
 - **Out of scope:** every write path (creating, editing, receiving, amending or cancelling orders); every other IFCAP function and option; VistA GUI clients, terminal devices and terminal emulators; a Java port; every other VistA package; the earlier GMV vitals slice; and the request's "must not be built" list: a write-guard framework, a CLI or exit-code scheme, git or provenance modules, deterministic-report machinery, Windows or macOS branches, an async runtime, any network service other than the loopback bridge, FFI or C bindings, procedural macros, a second crate or workspace, more than two integration test files, a front-end framework or build tooling, authentication or TLS.
 - **Unexercised branches:** every branch marked "not exercised, not implemented", and every exercised branch marked "not implemented (O-01)", is outside equivalence; a session that reaches one ends after the last prompt written and invents no output.
 

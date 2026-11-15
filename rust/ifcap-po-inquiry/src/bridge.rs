@@ -882,12 +882,12 @@ const POST_REQUIRED: &str = "NOT FOUND: POST REQUIRED";
 const GET_REQUIRED: &str = "NOT FOUND: GET REQUIRED";
 
 /// Answers `request` with `(status, content type, body)`: a static path, an
-/// API path, or 404. A `HEAD` request is answered as a `GET` of the same
-/// target would be, so its headers, `Content-Length` included, are those of
-/// the `GET` (RFC 9110 9.3.2): a static path serves its file,
-/// `/api/status` its JSON, and a session path, which serves only `POST`,
-/// gives the 404 of any other method. [`write_response`] leaves the content
-/// out.
+/// API path, or 404. A static path answers `GET` and `HEAD`, `/api/status`
+/// only `GET`, and a session path only `POST`; any other method, `HEAD` on
+/// an API path included, gets the path's 404, `GET REQUIRED` or
+/// `POST REQUIRED`. The `HEAD` of a static path has the headers,
+/// `Content-Length` included, of its `GET` (RFC 9110 9.3.2), and
+/// [`write_response`] leaves the content of every `HEAD` answer out.
 fn route(request: &HttpRequest, store: &Store, mumps: &MumpsMode) -> (u16, &'static str, Vec<u8>) {
     let (method, target, body) = request;
     if let Some((file, content_type)) = static_file(target) {
@@ -926,12 +926,13 @@ fn serve_static(file: &str, content_type: &'static str) -> (u16, &'static str, V
     }
 }
 
-/// `rest` is the target after `/api/`. `status` answers `GET`, and `HEAD` as
-/// a `GET`, with [`status_body`], and any other method with 404
+/// `rest` is the target after `/api/`. `status` answers only `GET`, with
+/// [`status_body`]; any other method, `HEAD` included, is 404
 /// `GET REQUIRED`. `<backend>/session` answers only `POST`. Unknown backends
 /// and paths, a query string included, and any other method are 404; the
-/// body is checked only for a known session route. The answer is
-/// `(status, JSON body)`.
+/// body is checked only for a known session route, and a body
+/// [`parse_session_request`] rejects is 400 `BAD REQUEST: <cause>`. The
+/// answer is `(status, JSON body)`.
 fn route_api(
     method: &str,
     rest: &str,
@@ -942,7 +943,7 @@ fn route_api(
     let not_found = || (404, error_body(NOT_FOUND));
     if rest == "status" {
         return match method {
-            "GET" | "HEAD" => (200, status_body(mumps)),
+            "GET" => (200, status_body(mumps)),
             _ => (404, error_body(GET_REQUIRED)),
         };
     }
@@ -969,7 +970,7 @@ fn route_api(
     };
     match parse_session_request(body) {
         Ok(inputs) => session(store, mumps, &inputs),
-        Err(cause) => (400, error_body(&cause)),
+        Err(cause) => (400, error_body(&format!("{BAD_REQUEST}: {cause}"))),
     }
 }
 
@@ -1326,14 +1327,46 @@ const NOT_RECORDED: &str = "NOT RECORDED";
 
 /// One MUMPS-side session result: the raw transcript and return value
 /// answered with, and the capture whose inputs equal the session's, which
-/// alone decides COMPARE's `match`. In replay the transcript and return value
-/// are that capture's own. In live mode they are the run's standard output
-/// and `None`, because `EN3^PRCHRPT` is entered by `DO` and returns nothing
-/// (open item O-06, closed), and the capture may be absent.
-struct MumpsRun {
-    transcript: String,
-    returned: Option<String>,
-    capture: Option<Case>,
+/// alone decides COMPARE's `match`. Each variant holds its output once.
+enum MumpsRun {
+    /// Replay: the capture whose inputs equal the session's. The transcript
+    /// and return value are that capture's own, borrowed from it.
+    Replay(Case),
+    /// Live: the run's standard output as the transcript, and the capture
+    /// whose inputs equal the session's, which may be absent. The return
+    /// value is `None`, because `EN3^PRCHRPT` is entered by `DO` and returns
+    /// nothing (open item O-06, closed).
+    Live {
+        transcript: String,
+        capture: Option<Case>,
+    },
+}
+
+impl MumpsRun {
+    /// The raw transcript answered with, never normalised.
+    fn transcript(&self) -> &str {
+        match self {
+            MumpsRun::Replay(case) => &case.transcript,
+            MumpsRun::Live { transcript, .. } => transcript,
+        }
+    }
+
+    /// The return value answered with: the capture's own in replay, and
+    /// `None` in live mode (open item O-06, closed).
+    fn returned(&self) -> Option<&str> {
+        match self {
+            MumpsRun::Replay(case) => case.returned.as_deref(),
+            MumpsRun::Live { .. } => None,
+        }
+    }
+
+    /// The capture that decides COMPARE's `match`; always present in replay.
+    fn capture(&self) -> Option<&Case> {
+        match self {
+            MumpsRun::Replay(case) => Some(case),
+            MumpsRun::Live { capture, .. } => capture.as_ref(),
+        }
+    }
 }
 
 /// `{"transcript": ..., "returned": ...}`.
@@ -1398,7 +1431,7 @@ fn rust_session(store: &Store, inputs: &[String]) -> (u16, String) {
 /// `NOT RECORDED`.
 fn mumps_session(mumps: &MumpsMode, inputs: &[String]) -> (u16, String) {
     match run_mumps(mumps, inputs) {
-        Ok(run) => (200, session_body(&run.transcript, run.returned.as_deref())),
+        Ok(run) => (200, session_body(run.transcript(), run.returned())),
         Err(cause) => (502, error_body(&cause)),
     }
 }
@@ -1418,13 +1451,13 @@ fn compare_session(store: &Store, mumps: &MumpsMode, inputs: &[String]) -> (u16,
         Err(error) => return (502, error_body(&format!("RUST: {error}"))),
     };
     let matched = decide_match(
-        original.capture.as_ref(),
-        &original.transcript,
-        original.returned.as_deref(),
+        original.capture(),
+        original.transcript(),
+        original.returned(),
         &port,
     );
     let mut out = String::from("{\"mumps\":");
-    write_session(&mut out, &original.transcript, original.returned.as_deref());
+    write_session(&mut out, original.transcript(), original.returned());
     out.push_str(",\"rust\":");
     write_session(&mut out, &port.transcript, port.returned.as_deref());
     out.push_str(",\"match\":");
@@ -1473,11 +1506,7 @@ fn decide_match(
 fn run_mumps(mumps: &MumpsMode, inputs: &[String]) -> Result<MumpsRun, String> {
     match mumps {
         MumpsMode::Replay { golden_dir } => match golden::find_capture(golden_dir, inputs) {
-            Ok(Some(case)) => Ok(MumpsRun {
-                transcript: case.transcript.clone(),
-                returned: case.returned.clone(),
-                capture: Some(case),
-            }),
+            Ok(Some(case)) => Ok(MumpsRun::Replay(case)),
             Ok(None) => Err(NOT_RECORDED.to_string()),
             Err(cause) => Err(format!("{NOT_RECORDED} (unreadable: {cause})")),
         },
@@ -1486,9 +1515,8 @@ fn run_mumps(mumps: &MumpsMode, inputs: &[String]) -> Result<MumpsRun, String> {
             golden_dir,
         } => {
             let transcript = live(container, golden_dir, inputs)?;
-            Ok(MumpsRun {
+            Ok(MumpsRun::Live {
                 transcript,
-                returned: None,
                 capture: golden::find_capture(golden_dir, inputs).ok().flatten(),
             })
         }
@@ -1505,7 +1533,8 @@ fn run_mumps(mumps: &MumpsMode, inputs: &[String]) -> Result<MumpsRun, String> {
 /// [`LIVE_SLOTS`] that every connection shares; a request that gets none
 /// within [`LIVE_ADMISSION_WAIT`] starts nothing and fails as `TIMEOUT`.
 /// Standard output is the transcript only when the run succeeded; any other
-/// outcome is the [`LiveFailure`] text, such as `EXIT <code>: <stderr head>`.
+/// outcome is the [`LiveFailure`] text, such as
+/// `EXIT <code>: <first line of docker's standard error>`.
 fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<String, String> {
     let (start_args, context) = golden::live_start(golden_dir)?;
     golden::validate_context(&context)?;
@@ -1600,6 +1629,8 @@ enum LiveFailure {
     Spawn(String),
     NonZeroExit {
         code: Option<i32>,
+        /// The first line of standard error, as [`decide_live_result`]
+        /// takes it.
         stderr_head: String,
     },
     Timeout,
@@ -2079,8 +2110,9 @@ fn worker_output(
 
 /// The transcript of a live run, or why there is none. The first match
 /// wins: a spawn error, a timeout, too much output, an exit code other than
-/// 0 (with the first 200 bytes of standard error, decoded lossily), then
-/// standard output that is not UTF-8.
+/// 0 (with the first line of standard error: the bytes before its first
+/// `\n`, or all of them when it has none, less one trailing `\r`, decoded
+/// lossily), then standard output that is not UTF-8.
 fn decide_live_result(r: &ExecResult) -> Result<String, LiveFailure> {
     if let Some(os_error) = &r.spawn_error {
         return Err(LiveFailure::Spawn(os_error.clone()));
@@ -2092,10 +2124,15 @@ fn decide_live_result(r: &ExecResult) -> Result<String, LiveFailure> {
         return Err(LiveFailure::OutputTooLarge);
     }
     if r.exit_code != Some(0) {
-        let head = r.stderr.get(..200).unwrap_or(r.stderr.as_slice());
+        let line = r
+            .stderr
+            .split(|&byte| byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         return Err(LiveFailure::NonZeroExit {
             code: r.exit_code,
-            stderr_head: String::from_utf8_lossy(head).into_owned(),
+            stderr_head: String::from_utf8_lossy(line).into_owned(),
         });
     }
     String::from_utf8(r.stdout.clone()).map_err(|_| LiveFailure::NonUtf8)
@@ -2266,24 +2303,41 @@ mod tests {
 
     #[test]
     fn decide_live_result_non_zero_exit() {
-        // 251 bytes of standard error: 199 ASCII bytes, then `é` (0xC3 0xA9)
-        // as bytes 200 and 201. The 200-byte cut keeps only 0xC3, which
-        // decodes lossily to U+FFFD; a 200-character cut would keep the
-        // whole `é`.
+        // A first line of 250 bytes, kept whole, then a second line.
+        let mut long = vec![b'L'; 250];
+        long.extend(b"\nrest");
+        // A first line of 251 bytes: 199 ASCII bytes, `é` (0xC3 0xA9) as
+        // bytes 200 and 201, then 50 more, kept whole with the `é` intact.
         let mut crossing = vec![b'a'; 199];
         crossing.extend("é".bytes());
         crossing.extend(std::iter::repeat_n(b'z', 50));
         assert_eq!(crossing.get(199..201), Some([0xC3, 0xA9].as_slice()));
-        // 250 bytes of standard error, the first not UTF-8.
+        crossing.extend(b"\nnext line\n");
+        // A first line whose first byte is not UTF-8.
         let mut invalid_first = vec![0xFF];
-        invalid_first.extend(std::iter::repeat_n(b'e', 249));
+        invalid_first.extend(b"bad byte\nsecond line\n");
         let stderrs = [
-            (crossing, format!("{}\u{fffd}", "a".repeat(199))),
-            (invalid_first, format!("\u{fffd}{}", "e".repeat(199))),
+            (
+                b"first failure\nextra diagnostic\n".to_vec(),
+                "first failure".to_string(),
+            ),
+            (
+                b"first failure\r\nmore\r\n".to_vec(),
+                "first failure".to_string(),
+            ),
+            // Only the one `\r` of the line end goes.
+            (
+                b"first failure\r\r\nmore\n".to_vec(),
+                "first failure\r".to_string(),
+            ),
+            (long, "L".repeat(250)),
+            (crossing, format!("{}é{}", "a".repeat(199), "z".repeat(50))),
+            (invalid_first, "\u{fffd}bad byte".to_string()),
             (
                 b"no such container".to_vec(),
                 "no such container".to_string(),
             ),
+            (Vec::new(), String::new()),
         ];
         // Standard output is not UTF-8 either: the exit code is decided
         // first, so every row is `NonZeroExit`, never `NonUtf8`.
@@ -2439,16 +2493,24 @@ mod tests {
             matches!(&refused, Err(cause) if cause.contains("could not be started")),
             "{refused:?}"
         );
-        let echoed = run_available("cat", &[], b"\nA1\n^\n", Duration::from_secs(10), 4096)?;
-        let Some(echoed) = echoed else {
-            return Ok(());
-        };
-        assert_eq!(decide_live_result(&echoed), Ok("\nA1\n^\n".to_string()));
-        let failed = run_available("false", &[], b"", Duration::from_secs(10), 4096)?;
-        let Some(failed) = failed else {
-            return Ok(());
-        };
-        assert_eq!(failed.exit_code, Some(1));
+        // The `cat` and `false` probes are independent: an absent program
+        // is NOT RUN on its own and leaves the other probe to run.
+        if let Some(echoed) =
+            run_available("cat", &[], b"\nA1\n^\n", Duration::from_secs(10), 4096)?
+        {
+            assert_eq!(decide_live_result(&echoed), Ok("\nA1\n^\n".to_string()));
+        }
+        if let Some(failed) = run_available("false", &[], b"", Duration::from_secs(10), 4096)? {
+            assert_eq!(failed.exit_code, Some(1));
+            let decision = decide_live_result(&failed);
+            assert!(
+                matches!(
+                    decision,
+                    Err(LiveFailure::NonZeroExit { code: Some(1), .. })
+                ),
+                "{decision:?}"
+            );
+        }
         Ok(())
     }
 
@@ -3572,7 +3634,7 @@ mod tests {
     }
 
     #[test]
-    fn session_request_validation() {
+    fn session_request_validation() -> Result<(), String> {
         let accepted =
             parse_session_request(br#"{"other":1,"inputs":[""," A1 ","^","\u0007\t\u00e9"]}"#);
         assert_eq!(accepted, Ok(strings(&["", " A1 ", "^", "\u{7}\t\u{e9}"])));
@@ -3598,9 +3660,45 @@ mod tests {
                 "INPUT 1 CONTAINS A CARRIAGE RETURN OR LINE FEED",
             ),
         ];
+        let store = Store::from_zwr("").map_err(|e| e.to_string())?;
+        // Every rejected body is answered before a backend runs, so no
+        // capture is read.
+        let mumps = MumpsMode::Replay {
+            golden_dir: PathBuf::new(),
+        };
+        // The wire text of one rejection, spelled out.
+        let malformed = (
+            "POST".to_string(),
+            "/api/rust/session".to_string(),
+            Some(br#"{"inputs": ["#.to_vec()),
+        );
+        let (status, content_type, answer) = route(&malformed, &store, &mumps);
+        let answer = String::from_utf8(answer).map_err(|e| e.to_string())?;
+        assert_eq!(
+            (status, content_type, answer.as_str()),
+            (400, JSON_TYPE, r#"{"error":"BAD REQUEST: MALFORMED JSON"}"#)
+        );
         for (body, cause) in rejected {
             assert_eq!(parse_session_request(body), Err(cause.to_string()));
+            // Each session route answers the cause inside the 400 envelope.
+            let expected = error_body(&format!("{BAD_REQUEST}: {cause}"));
+            for backend in ["mumps", "rust", "compare"] {
+                let request = (
+                    "POST".to_string(),
+                    format!("/api/{backend}/session"),
+                    Some(body.to_vec()),
+                );
+                let (status, content_type, answer) = route(&request, &store, &mumps);
+                let answer = String::from_utf8(answer).map_err(|e| e.to_string())?;
+                assert_eq!(
+                    (status, content_type, answer.as_str()),
+                    (400, JSON_TYPE, expected.as_str()),
+                    "POST /api/{backend}/session with {}",
+                    String::from_utf8_lossy(body)
+                );
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -4036,7 +4134,7 @@ mod tests {
             golden_dir: PathBuf::new(),
         };
         // `NAME` marks request data that no 404 body may repeat.
-        let cases: [(&str, &str, &str); 16] = [
+        let cases: [(&str, &str, &str); 17] = [
             ("GET", "/missing?patient=NAME", NOT_FOUND),
             ("POST", "/NAME", NOT_FOUND),
             ("POST", "/api/NAME/session", UNKNOWN_BACKEND),
@@ -4051,6 +4149,7 @@ mod tests {
             ("NAME", "/", GET_REQUIRED),
             ("POST", "/api/status", GET_REQUIRED),
             ("PUT", "/api/status", GET_REQUIRED),
+            ("HEAD", "/api/status", GET_REQUIRED),
             ("NAME", "/api/status", GET_REQUIRED),
             ("GET", "/api/status?x=NAME", NOT_FOUND),
         ];
@@ -4135,7 +4234,7 @@ mod tests {
         let malformed = error_body(&format!("{BAD_REQUEST}: MALFORMED REQUEST LINE")).into_bytes();
         let missing_host = error_body(&format!("{BAD_REQUEST}: MISSING HOST")).into_bytes();
         let request = |line: &str| format!("{line} HTTP/1.1\r\nHost: h\r\n\r\n");
-        // (request, status line, content type, the body a GET gets, whether
+        // (request, status line, content type, the answer's body, whether
         // the answer leaves that body out)
         let cases = [
             (request("GET /app.js"), "200 OK", js_type, &app_js, false),
@@ -4161,11 +4260,13 @@ mod tests {
                 &status,
                 false,
             ),
+            // `/api/status` answers only `GET`: its `HEAD` is the 404
+            // `GET REQUIRED`, written without content.
             (
                 request("HEAD /api/status"),
-                "200 OK",
+                "404 Not Found",
                 JSON_TYPE,
-                &status,
+                &get_required,
                 true,
             ),
             // Method tokens are case-sensitive: `head` is not `HEAD`.

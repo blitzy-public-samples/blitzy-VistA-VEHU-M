@@ -1,6 +1,6 @@
 # SPEC — IFCAP purchase-order display (PRCH DISPLAY PO) Rust port
 
-This document is the source-contract gate for porting OPTION `PRCH DISPLAY PO` (IEN 1901, action `EN3^PRCHRPT`) from MUMPS on YottaDB to the standard-library-only Rust 1.99.1 crate `rust/ifcap-po-inquiry/`. The port is read-only: it reproduces the original's prompts, messages, field order, formatting and return behaviour, and writes no data. Every finding below is cited to a line read at commit `dd3fd0f3124c8178657d9fff4173c324da30f7ae`; where source cannot settle a fact, the fact is an open item (O-NN) and a branch that depends on it is not implemented. A session that reaches an unimplemented branch ends after the last prompt written. `src/inquiry.rs`, `src/golden.rs`, `src/bridge.rs`, the tests and `REPORT.md` follow this document, which supersedes the plan wherever it records a field with evidence. Captures are owned by Rainman Kemp, due November 13, 2026, 5:00 p.m. Eastern.
+This document is the source-contract gate for porting OPTION `PRCH DISPLAY PO` (IEN 1901, action `EN3^PRCHRPT`) from MUMPS on YottaDB to the standard-library-only Rust 1.99.1 crate `rust/ifcap-po-inquiry/`. The port is read-only: it reproduces the original's prompts, messages, field order, formatting and return behaviour, and writes no data. Every finding below is cited to a line read at commit `dd3fd0f3124c8178657d9fff4173c324da30f7ae`; where source cannot settle a fact, the fact is an open item (O-NN) and a branch that depends on it is not implemented. A session that reaches an unimplemented branch ends after the last prompt written. `src/inquiry.rs`, `src/golden.rs`, `src/bridge.rs`, the tests and `REPORT.md` follow this document, which agrees with this run's plan. "The 2026-11-08 plan" below is the plan of the earlier run that first wrote this document; this document superseded that plan wherever it recorded a field with evidence, and those corrections are history, listed in section "Source corrections and interface departures" and already incorporated in this run's plan. Captures are owned by Rainman Kemp, due November 13, 2026, 5:00 p.m. Eastern.
 
 **Citation key.** Routine file names are unique in the repository: `PRC*.m` are `Packages/IFCAP/Routines/`, `DI*.m` are `Packages/VA FileMan/Routines/`, and `Z*.m` and `XUP.m` are `Packages/Kernel/Routines/`. `DD.zwr`, `1+FILE.zwr`, `0.11+INDEX.zwr` and `0.31+KEY.zwr` are `Packages/VA FileMan/Globals/`; `19+OPTION.zwr`, `4+INSTITUTION.zwr`, `200+NEW PERSON.zwr`, `3.2+TERMINAL TYPE.zwr` and `3.5+DEVICE.zwr` are `Packages/Kernel/Globals/`; `411+…`, `442+…`, `442.5+…` and `442.8+…` exports are `Packages/IFCAP/Globals/` (the 411 export is `411+ADMIN. ACTIVITY SITE PARAMETER.zwr`).
 
@@ -15,7 +15,7 @@ This document is the source-contract gate for porting OPTION `PRCH DISPLAY PO` (
 | Entry point | `EN3^PRCHRPT`. Option zero node verbatim `^DIC(19,1901,0)="PRCH DISPLAY PO^Purchase Order Display^^R^11740^^^^^^^"` [19+OPTION.zwr:14687]; action verbatim `^DIC(19,1901,25)="EN3^PRCHRPT"`; entry action `^DIC(19,1901,20)=""` (empty) [19+OPTION.zwr:14690-14691] | SOURCE-RESOLVED |
 | Source location | `Packages/IFCAP/Routines/PRCHRPT.m` lines 70-75 [PRCHRPT.m:70-75] | SOURCE-RESOLVED |
 | Dependencies | PO-02 to PO-41 (section "Contracts"), including FileMan `DICM0` and `DICQ1` and `^%DT` called at [PRCFSITE.m:15]. The only unresolved dynamic target is `@IOF` [PRCHDP1.m:12] | IFCAP SOURCE-RESOLVED; O-01 and O-04 open; O-03 closed for the five cases' values (R4) |
-| Data dependencies | The 29 files and subfiles of section "FileMan definitions read", plus the two pointer-target files of its source-correction supplement, 445 `^PRCP(445,` and 440.5 `^PRC(440.5,`, read only by the PO-09 pointer-candidate rule (R6). Written or killed by the original, none of it business data: `^DISV` [DIC2.m:65]; `^UTILITY($J,"W")` and `^TMP($J,"W")` [PRCHDP1.m:53-54] [PRCHDP2.m:95]; `K ^TMP($J,"PRCHDP6")` [PRCHDP2.m:25]; `K ^TMP($J,"MDEL")` [PRCHDP4.m:8, 13]. `^XUTL("XQ",$J)` is read by `^%ZIS` for the HOME device [ZIS.m:28]; its `IO*` nodes are written by `SAVEVAR^%ZIS` at sign-on [ZIS.m:82-86], not on this path | SOURCE-RESOLVED |
+| Data dependencies | The 29 files and subfiles of section "FileMan definitions read", plus the two pointer-target files of its source-correction supplement, 445 `^PRCP(445,` and 440.5 `^PRC(440.5,`, read only by the PO-09 pointer-candidate rule (R6). Written or killed by the original, none of it business data: `^DISV` [DIC2.m:65]; `^UTILITY($J,"W")` and `^TMP($J,"W")` [PRCHDP1.m:53-54] [PRCHDP2.m:95]; `K ^TMP($J,"PRCHDP6")` [PRCHDP2.m:25]; `K ^TMP($J,"MDEL")` [PRCHDP4.m:8, 13]; `^XUTL("XQ",$J,"MIXED OS")`, which `^%ZIS` sets when it is undefined [ZIS.m:13] and reads back [ZIS.m:14]. `^XUTL("XQ",$J,"IO")` is read by `^%ZIS` for the HOME device [ZIS.m:28]; the sign-on `IO*` nodes are written by `SAVEVAR^%ZIS` at sign-on [ZIS.m:82-86], not on this path. Without `^XUTL("XQ",$J,"IO")`, the device-lookup branch of `^%ZIS` (O-01) can also add 1 to the device's OPEN COUNT, `^%ZIS(1,ios,5)` piece 1 (file 3.5 field 51 [DD.zwr:33135]) [ZIS1.m:27-28], and, for a device with GLOBAL LOCK set (field 36 [DD.zwr:33117]) [ZIS3.m:10], set `^XUTL("XQ",$J,"lock",ios)` [ZIS1.m:30]; neither is business data | SOURCE-RESOLVED |
 | Capture mapping | GC-01, GC-02, GC-05: PO-01 to PO-05, PO-41, PO-06 to PO-08, PO-09 (b8), PO-10 to PO-40, then PO-09 (b3) at the closing `^`. GC-03, GC-04: PO-01 to PO-05, PO-41, PO-06 to PO-08, PO-09 (b14), then PO-09 (b3). The Rust side's end points: without `tests/fixtures/ifcap/cases.zwr`, every session ends after the station prompt (PO-09.b15); with it, GC-01, GC-02 and GC-05 end after `P.O./REQ.NO.: ` (PO-12.b1, not implemented, O-01), and GC-03 and GC-04 run the implemented no-match sequence (PO-09.b14) and then exit on `^` | Predicted from source; OPEN until runtime |
 
 **Closure criteria still unmet.** The workflow has not executed in the matching VEHU environment; the HOME device context (O-01) is unresolved; the image digest (O-05) is unrecorded. The Source verification finding stays OPEN.
@@ -226,12 +226,12 @@ The display does no arithmetic on amounts; it formats stored values with `$JUSTI
 | 420.8 (`^PRCD(420.8,`) | [DD.zwr:496634-496712] | .01 CODE `0;1` (496661) | PO-17 |
 | 5 (`^DIC(5,`) | [DD.zwr:43753-44267] | 1 ABBREVIATION `0;2` (44198) | PO-10 |
 | 49 (`^DIC(49,`) | [DD.zwr:88042-88391] | .01 NAME `0;1` (88181) | PO-10 |
-| 200 (`^VA(200,`) | [DD.zwr:344722-352033] | .01 NAME `0;1` (349371), read by PO-18 for the buyer or agent; 20.2 `20;2` (350238), 20.3 `20;3` (350250) and .132 `.13;2` (349644), read by the `DUZ` stub (PO-04); 400 SUPPLY EMPLOYEE `400;1` (351120), read by PO-03 through `$G(^VA(200,+PRC("PER"),400))` [PRCFSITE.m:12], not by the `DUZ` stub as in the plan | PO-03, PO-04, PO-18 |
+| 200 (`^VA(200,`) | [DD.zwr:344722-352033] | .01 NAME `0;1` (349371), read by PO-18 for the buyer or agent; 20.2 `20;2` (350238), 20.3 `20;3` (350250) and .132 `.13;2` (349644), read by the `DUZ` stub (PO-04); 400 SUPPLY EMPLOYEE `400;1` (351120), read by PO-03 through `$G(^VA(200,+PRC("PER"),400))` [PRCFSITE.m:12], not by the `DUZ` stub as the 2026-11-08 plan had it | PO-03, PO-04, PO-18 |
 | 4 (`^DIC(4,`) | [DD.zwr:37266-38572] | .01 NAME `0;1`, type `R` (38111), through the station identifier | PO-05 |
 
 **Presence-only multiples of 442** (their fields are read only on n/e branches): 442.03 DISCOUNT, node 3 [DD.zwr:514730]; 442.04 COMMENTS, node 4 [DD.zwr:514819]; 442.06 PROMPT PAYMENT TERMS, node 5 [DD.zwr:514680]; 442.07 AMENDMENT, node 6 [DD.zwr:514981]; 442.11 PARTIAL, node 11 [DD.zwr:514467]; 442.14 2237 REFERENCE NUMBER, node 13 [DD.zwr:514364]; 442.15 ADMINISTRATIVE CERTIFICATIONS, node 15 [DD.zwr:514843]; 442.08 DATE RECEIVED, item node 3 [DD.zwr:516311].
 
-**Source-correction supplement: pointer targets read by the PO-09 stub.** The plan's 29 omit two files that the pointer-candidate rule (R6) reads, each the target of a pointer index of file 442 after `C`. The global root is the file's `^DIC(file,0,"GL")` node.
+**Source-correction supplement: pointer targets read by the PO-09 stub.** Before this run, the 2026-11-08 plan's 29 omitted two files that the pointer-candidate rule (R6) reads, each the target of a pointer index of file 442 after `C`; this run's plan names both among the files read. The global root is the file's `^DIC(file,0,"GL")` node.
 
 | File (global root) | Definition | Fields read (DD line) | Reached from file 442 (DD line) | Read by |
 |---|---|---|---|---|
@@ -248,9 +248,9 @@ The stub reads each of the two only when `$O(^PRC(442,0))` and `$O(^PRC(442,inde
 
 One contract per `TAG^ROUTINE` reached from `EN3^PRCHRPT`. Every location is at commit `dd3fd0f3124c8178657d9fff4173c324da30f7ae` (written `@dd3fd0f3` below). IDs are stable identifiers, not call order; section "Original structure" gives the call order. Kinds: **Ported** (logic converted), **Stub** (an out-of-slice dependency reproduced only for the fixed context and the exercised outcomes), **Repro** (a generic FileMan or Kernel utility reproduced only for the forms the cases exercise). Every Rust item except `inquire` is a private function in `src/inquiry.rs`, and every private signature is `fn name(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>` unless stated. Each **Rust item** gives the function's path and its declaration exactly as `src/inquiry.rs` writes it; a parameter whose name begins with `_` is one that function does not use, and it keeps the type and position this convention, or the contract's formal arguments, give it. No contract on this path has a return value: each is called by `DO`. Branch IDs are defined in section "Unexercised branches". The private `Halt` has three variants. `Halt::InputExhausted` is a READ that finds no input left. `Halt::Unexercised("<branch ID>")` is returned by every n/e branch, and by every exercised branch that is not implemented while O-01 is open, at the point the original decides it and before anything is written for it. `Halt::Corrupt(<node>)` is an M `UNDEF` on an exercised path. `inquire` turns the first two into `Ok`, with the transcript cut after the last prompt written (`Session::into_transcript_at_prompt`) and `returned` `None`, so no output is invented after that prompt; it turns the third into `Err(InquiryError::CorruptStore(<node>))`. No contract writes business data, and none writes `Store`.
 
-**Test names.** The unit tests are in `src/inquiry.rs`; a test that names the branch ending a session asserts it through the private `run`, whose branch ID never leaves the crate.
+**Test names.** The unit tests are in `src/inquiry.rs`; a test that names the branch ending a session asserts it through the private `run`, whose branch ID never leaves the crate, or, when it calls a contract function directly, on that function's own `Halt::Unexercised` result.
 - T-SESSION: `input_exhaustion_returns_partial_transcript`, `leftover_input_ignored`, `non_empty_station_answer_ends_session`, `store_unchanged_after_session`.
-- T-LOOKUP: `help_at_order_prompt_ends_session`, `order_prompt_read_checks`, `missing_file_header_ends_session_at_station_prompt`, `absent_identifiers_follow_no_match_path`, `no_match_sequence_asks_again`, `no_match_guard_fails_on_each_condition`, `no_match_guard_holds_for_case_values_over_repository_fixtures`, `numeric_value_naming_no_ien_fails_no_match_guard`, `lowercase_value_whose_retry_fails_fails_no_match_guard`, `lowercase_value_whose_retry_matches_ends_session`, `candidates_all_rejected_by_screen_follow_no_match_path`, `several_candidates_end_session`, `single_partial_match_ends_session`, `order_filed_under_two_indexes_is_one_candidate`, `later_index_candidate_is_counted`, `pointer_index_is_skipped_for_numeric_value`, `unreferenced_vendor_with_matching_name_is_not_a_candidate`, `referenced_vendor_whose_orders_fail_screen_is_not_a_candidate`, `referenced_vendor_with_qualifying_order_is_a_candidate`, `pointed_to_file_without_header_value_is_not_searched`, `unique_order_match_writes_identifier_echo`, `corrupt_store_is_error`.
+- T-LOOKUP: `help_at_order_prompt_ends_session`, `order_prompt_read_checks`, `missing_file_header_ends_session_at_station_prompt`, `absent_identifiers_follow_no_match_path`, `no_match_sequence_asks_again`, `no_match_guard_fails_on_each_condition`, `no_match_guard_holds_for_case_values_over_repository_fixtures`, `prefix_seek_agrees_with_a_walk_of_every_subscript`, `numeric_value_naming_no_ien_fails_no_match_guard`, `lowercase_value_whose_retry_fails_fails_no_match_guard`, `lowercase_value_whose_retry_matches_ends_session`, `candidates_all_rejected_by_screen_follow_no_match_path`, `several_candidates_end_session`, `single_partial_match_ends_session`, `order_filed_under_two_indexes_is_one_candidate`, `later_index_candidate_is_counted`, `pointer_index_is_skipped_for_numeric_value`, `unreferenced_vendor_with_matching_name_is_not_a_candidate`, `referenced_vendor_whose_orders_fail_screen_is_not_a_candidate`, `referenced_vendor_with_qualifying_order_is_a_candidate`, `pointed_to_file_without_header_value_is_not_searched`, `unique_order_match_writes_identifier_echo`, `corrupt_store_is_error`.
 - T-DEVICE: `found_order_stops_at_device_gate` (PO-12.b1), `page_one_block_runs_to_column_header_gate` (PO-13 to PO-26, ending at PO-26.b1), `item_line_runs_to_paging_gate` (PO-27 to PO-30, ending at PO-30.b1).
 - T-EST: `estimated_flag_decides_est_branch`.
 - T-DISPLAY (PO-14, PO-15, PO-19, PO-27): `word_wrap_reproduces_plain_text_rules`, `word_wrap_unconverted_forms_are_unexercised_branches`, `word_wrap_wrapper_restores_caller_da`, `date_prints_month_day_year_unpadded`, `unit_cost_format_follows_stored_decimals`.
@@ -450,10 +450,10 @@ No other contract has a `CorruptStore` site. Tests: `src/inquiry.rs` `corrupt_st
   ```
 - **Rust item:** `crate::inquiry::pct_zis`, `fn pct_zis(_s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt>`; Stub.
 - **Inputs:** `IOP="HOME"`, `%ZIS=""`.
-- **Reads (original):** `^XUTL("XQ",$J,"IO")` [ZIS.m:28]; the device and terminal-type entries that set `IOF`, `IOSL` [ZIS1.m:103-106, 113].
+- **Reads (original):** `^XUTL("XQ",$J,"MIXED OS")` [ZIS.m:13-14]; `^XUTL("XQ",$J,"IO")` [ZIS.m:28]; the device and terminal-type entries that set `IOF`, `IOSL` [ZIS1.m:103-106, 113].
 - **Branches:** PO-12.b1, exercised by GC-01, GC-02, GC-05; not implemented (O-01).
 - **Outputs:** the original writes whatever the HOME device set-up writes; unresolved. `pct_zis` always returns `Halt::Unexercised("PO-12.b1")`, so the session ends after the last prompt written, `P.O./REQ.NO.: `, and the order echo written after it is dropped.
-- **Side effects (original):** `IO*` variables.
+- **Side effects (original):** `IO*` variables; the scratch node `^XUTL("XQ",$J,"MIXED OS")`, set when it is undefined [ZIS.m:13], not business data. Without `^XUTL("XQ",$J,"IO")`, the device-lookup branch (O-01) can also add 1 to the device's OPEN COUNT `^%ZIS(1,ios,5)` [ZIS1.m:27-28] and set `^XUTL("XQ",$J,"lock",ios)` [ZIS1.m:30] [ZIS3.m:10]. `pct_zis` reproduces none of them.
 - **Dependencies and coverage:** called at [PRCHDP1.m:12]. GC-01, 02, 05. Tests: T-DEVICE (`found_order_stops_at_device_gate` asserts, through `run`, the transcript cut at the order prompt and branch ID `PO-12.b1` while O-01 is open), GC-FOUND. Exercised by GC-01, GC-02, GC-05; not implemented (O-01).
 
 ### PO-13 FOB^PRCHDP1
@@ -513,7 +513,7 @@ No other contract has a `CorruptStore` site. Tests: `src/inquiry.rs` `corrupt_st
    N %A,%B,%Q,%Z
    S %A=$$R(%X),%Q=""""""
   ```
-- **Rust item:** `crate::inquiry::pct_xy_pct_rcr`, `fn pct_xy_pct_rcr(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>`; Repro.
+- **Rust item:** `crate::inquiry::pct_rcr`, `fn pct_rcr(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt>`; Repro.
 - **Inputs:** literal `%X="^UTILITY($J,""W"","` and `%Y="^TMP($J,""W"","` [PRCHDP1.m:54] [PRCHDP2.m:48].
 - **Reads:** none from `Store`.
 - **Branches:** PO-16.b1 (copy every descendant node of `^UTILITY($J,"W")` to the same subscripts under `^TMP($J,"W")`, after the caller's `K ^TMP($J,"W")`) [DIRCR.m:29].
@@ -879,7 +879,7 @@ This section closes the gate that open items O-02 and O-03 set on `prcfsite`, `d
 | Identifier `.1` | `  CAMP MASTER` | The identifier writes `"  "`, then `Y` = piece 1 of `^DIC(4,+$P(^PRC(411,500,0),U,10),0)` [DD.zwr:488724] [411 export:4] [4+INSTITUTION.zwr:494], unchanged by `Y^DIQ` for type `R` [DD.zwr:38111] [DIQ.m:154-160], then `$E(^PRC(411,500,0),0)`, which is empty |
 | No confirmation | nothing | `DO(2)="411I"` has no `O` and `DIASKOK` is undefined [DIC2.m:54-58] [DIC0.m:26] [411 export:3]; the file `ACT` node writes nothing because `$P(Y,"^",3)` is empty [DIC2.m:59-60] [DICM1.m:102-110] [DD.zwr:488721] |
 
-Result, SOURCE-RESOLVED: `\n\n\nSelect STATION NUMBER ('^' TO EXIT): 500// `, one READ, and for an empty answer `      CAMP MASTER` (six spaces, no newline); `PRC("SITE")=500`. The plan's prediction `  500  CAMP MASTER` is superseded: the `.01` value is not echoed because the user typed nothing and `DIY` holds only the untyped remainder. A non-empty answer is the n/e PO-05.b2 and ends the session after the station prompt; the answer is classified inside the lookup, before `^PRCFSITE` sees its result, so PO-03.b7 is never the branch that ends it.
+Result, SOURCE-RESOLVED: `\n\n\nSelect STATION NUMBER ('^' TO EXIT): 500// `, one READ, and for an empty answer `      CAMP MASTER` (six spaces, no newline); `PRC("SITE")=500`. The 2026-11-08 plan's prediction `  500  CAMP MASTER` was superseded before this run: the `.01` value is not echoed because the user typed nothing and `DIY` holds only the untyped remainder. A non-empty answer is the n/e PO-05.b2 and ends the session after the station prompt; the answer is classified inside the lookup, before `^PRCFSITE` sees its result, so PO-03.b7 is never the branch that ends it.
 
 ### R2 Unique order match (PO-09.b8)
 
@@ -905,7 +905,7 @@ Result, SOURCE-RESOLVED: `  <.01>  <Z.01>  <Z.02>  \n` + 13 spaces + `FCP: <fcp>
 | Newline | `\n` | `D^DIC0` writes nothing [DIC0.m:8-13]; `W:DIC(0)["E" !` [DIC.m:63] |
 | Re-ask | `\n`, `P.O./REQ.NO.: ` | `G ASK`, `W !` [DIC.m:63, 25]; prompt [DIC11.m:15-17] |
 
-Bytes SOURCE-RESOLVED: `<BEL> ??\n\nP.O./REQ.NO.: `, then one READ. The plan's "a newline and the re-asked prompt" omitted the `W !` at `ASK`. `ix_dic` emits these bytes for GC-03 and GC-04 under the O-03 guard of R5 step 6. The re-asked prompt is the same prompt step, not text appended to a finished lookup: after it the lookup READs the next input and applies the same read checks in source order [DIC11.m:15-34], the `^` exit [DIC11.m:23] and the same search. A further non-match repeats the sequence; for GC-03 and GC-04 the next input is `^`, which ends the lookup with no output, and `EN30` quits [PRCHRPT.m:72].
+Bytes SOURCE-RESOLVED: `<BEL> ??\n\nP.O./REQ.NO.: `, then one READ. The 2026-11-08 plan's "a newline and the re-asked prompt", corrected before this run, omitted the `W !` at `ASK`. `ix_dic` emits these bytes for GC-03 and GC-04 under the O-03 guard of R5 step 6. The re-asked prompt is the same prompt step, not text appended to a finished lookup: after it the lookup READs the next input and applies the same read checks in source order [DIC11.m:15-34], the `^` exit [DIC11.m:23] and the same search. A further non-match repeats the sequence; for GC-03 and GC-04 the next input is `^`, which ends the lookup with no output, and `EN30` quits [PRCHRPT.m:72].
 
 ### R4 Transforms (O-03)
 
@@ -956,17 +956,18 @@ For each pointer index of file 442 after `C`, in `^DD(442,0,"IX")` order (D to 4
 | R4 file-442 own indexes | SOURCE-RESOLVED | PO-09.b12 is unreachable and has no return site: after the pointer route the search goes to the uppercase retry |
 | R4 nested date and set-of-codes transforms | CLOSED (O-03) for the five cases' values under the fixture profile | The guard decides: a value it rejects ends the session as the n/e PO-09.b11 |
 
-Unit-test assertions in this state, each through the private `run`, which also returns the branch ID that ended the session:
+Unit-test assertions in this state. Each session outcome is asserted through the private `run`, which also returns the branch ID that ended the session; the four pointer-candidate tests also call `pointer_candidate` directly, and the fixture-profile guard test calls `no_match_guard` and the prefix-seek test `begins_some_subscript` directly, both without `run`:
 - `absent_identifiers_follow_no_match_path` asserts, for `ABC123`, `INVALID!` and `XYZ999`, `Ok` with the R3 transcript (the order prompt, then `<BEL> ??\n\nP.O./REQ.NO.: ` once) and no ending branch: the `^` exits at the re-asked prompt. `candidates_all_rejected_by_screen_follow_no_match_path` asserts the same for `B22222`, whose two orders fail the screen.
 - `no_match_sequence_asks_again` asserts that a second non-matching value repeats the sequence, that input running out at the re-asked prompt ends the session there, that the re-asked prompt applies the same read checks (`?` ends at PO-09.b4; `^ABC` exits), and that a found order there reaches the device gate PO-12.b1.
 - `no_match_guard_fails_on_each_condition` asserts that each failed guard condition, (a) to (d), ends the session after the order prompt at PO-09.b11. `numeric_value_naming_no_ien_fails_no_match_guard` (`999` and `1`, canonical numbers) and `lowercase_value_whose_retry_fails_fails_no_match_guard` (`abc123`) assert the same.
-- `no_match_guard_holds_for_case_values_over_repository_fixtures` asserts that the guard holds for `GC3003` and `INVALID!` over the eleven repository fixtures, and fails for `S`.
+- `no_match_guard_holds_for_case_values_over_repository_fixtures` calls `no_match_guard` directly on the `Store` that `load_fixtures` loads from the eleven repository fixtures, and asserts that the guard holds for `GC3003` and `INVALID!` and fails for `S`.
+- `prefix_seek_agrees_with_a_walk_of_every_subscript` calls `begins_some_subscript`, guard condition (c) for one index, directly on `^PRCD(442.3,"C")`, and asserts that it gives the same answer as a walk testing every child of that index, from the first, for a subscript beginning with the value. The subscripts are 42 numbers from `-100` to `100`, negatives and fractions among them, and 13 strings, among them `-`, `1.`, `.`, `0.5` and `01`; the test first asserts that each number is a numeric subscript and each string is not. The stores hold all of them, the numbers only, the strings only, none, and each one alone, each store beside entries of the neighbouring indexes `^PRCD(442.3,"B")` and `^PRCD(442.3,"D")`. The values tried, leaving out the empty value and canonical numbers, are every prefix of every subscript and 20 extra probes: number-prefix shapes such as `-9.` and `1.50`, and near misses no number begins with, such as `+1.` and `1..`.
 - `unreferenced_vendor_with_matching_name_is_not_a_candidate`, `referenced_vendor_whose_orders_fail_screen_is_not_a_candidate` and `pointed_to_file_without_header_value_is_not_searched` assert that `pointer_candidate` finds no candidate for `ACME`, and that the session ends at PO-09.b11 because vendor 7's `B` subscript begins with `ACME`, so guard condition (c) fails. The last asserts this, never `CorruptStore`, when `^PRC(440,0)` is absent, holds only a descendant or is empty, and for a vendor zero node holding only a descendant under an absent header (R6).
 - `referenced_vendor_with_qualifying_order_is_a_candidate` asserts that `pointer_candidate` finds the candidate and that the session ends at PO-09.b11. `lowercase_value_whose_retry_matches_ends_session` asserts PO-09.b13 for `a12345`.
 - `missing_file_header_ends_session_at_station_prompt` asserts the station-prompt transcript and PO-09.b15, never `CorruptStore`, for a `^PRC(442,0)` that is absent, holds only a descendant, or has piece 2 `442` (R5 step 1), with the inputs `""`, `^` and with `""` alone.
 - `found_order_stops_at_device_gate` asserts the transcript cut at the order prompt and branch ID `PO-12.b1` while O-01 is open. `help_at_order_prompt_ends_session` asserts PO-09.b4.
 
-Every synthetic store these tests use holds `^PRC(442,0)` with piece 2 `442I` and at least one `^PRC(442,"C")` entry, except where the test is about the header; the stores of the vendor tests also hold `^PRC(440,0)` with a value, which `pointed_to_file_without_header_value_is_not_searched` withholds.
+Every synthetic store these tests use holds `^PRC(442,0)` with piece 2 `442I` and at least one `^PRC(442,"C")` entry, except where the test is about the header and in the prefix-seek test, whose stores hold only file 442.3 index entries; the stores of the vendor tests also hold `^PRC(440,0)` with a value, which `pointed_to_file_without_header_value_is_not_searched` withholds.
 
 Transcripts that are `Ok` in this state:
 - No input gives `\n\n\nSelect STATION NUMBER ('^' TO EXIT): 500// ` for any `Store`, because the station stage reads nothing from it.
@@ -994,7 +995,7 @@ Transcripts that are `Ok` in this state:
 | PO-13 | `FOB^PRCHDP1` | `fob_prchdp1` | Ported | 442 6.4, 8.2, 8.1, 2, 48; 442.12 .01; 442.4 1 |
 | PO-14 | `DIWP^PRCUTL` | `diwp_prcutl` | Ported | none |
 | PO-15 | `^DIWP` | `diwp` | Repro | none |
-| PO-16 | `%XY^%RCR` | `pct_xy_pct_rcr` | Repro | none |
+| PO-16 | `%XY^%RCR` | `pct_rcr` | Repro | none |
 | PO-17 | `TY^PRCHDP1` | `ty_prchdp1` | Ported | 442 8; 420.8 .01 |
 | PO-18 | `DIS^PRCHDP1` | `dis_prchdp1` | Ported | 442 7, 16; 200 .01; 442.06 presence |
 | PO-19 | `DT^PRCHDP1` | `dt_prchdp1` | Ported | none |
@@ -1032,7 +1033,7 @@ Transcripts that are `Ok` in this state:
 | OPTION 1901 action `EN3^PRCHRPT`; routines `PRCHRPT`, `PRCHPAT`, `PRCHDP1`, `PRCHDP2`, `PRCHDP4`, `PRCHDP6`, `PRCHUTL`, `PRCHFPNT`, `PRCUTL` | `inquiry::inquire` (PO-01) plus one private function per contract in `src/inquiry.rs`, as in the table above |
 | FileMan globals `^PRC(442)`, `^PRCD(442.3)`, `^PRC(440)` and others, as ZWR | `store::Store` (`src/store.rs`), a `BTreeMap<Vec<Sub>, String>` keyed by subscript sequence, the global name first, with numeric-before-string collation: `Sub::Num` before `Sub::Str` (section "Collation rule"). `store::load_fixtures` loads every `*.zwr` file of `tests/fixtures/ifcap/`, parsing each with `Store::from_zwr`: the eleven repository exports, then the capture owner's `cases.zwr` last when it is present. The inquiry reads it only through `&Store` |
 | Device I/O (`R X:DTIME`, `W !`, `W ?n`, `$C(7)`) | `mumps::Session` (`src/mumps.rs`): input cursor, transcript, `$X`/`$Y` tracking, through `Session::read`, `Session::nl`, `Session::tab` and `Session::bell` |
-| `^PRCFSITE`, `^DIC`, `IX^DIC`, `^%ZIS`, `^DIWP`, `%XY^%RCR` | Stub or reproduction functions in `src/inquiry.rs`: Stub `prcfsite`, `dic`, `ix_dic`, `pct_zis`; Repro `diwp`, `pct_xy_pct_rcr` (sections "Stubs" and "Flagged hard-MUMPS features") |
+| `^PRCFSITE`, `^DIC`, `IX^DIC`, `^%ZIS`, `^DIWP`, `%XY^%RCR` | Stub or reproduction functions in `src/inquiry.rs`: Stub `prcfsite`, `dic`, `ix_dic`, `pct_zis`; Repro `diwp`, `pct_rcr` (sections "Stubs" and "Flagged hard-MUMPS features") |
 | Terminal session | `bridge` HTTP endpoints on `127.0.0.1:8080` and the front-end screen. `main` in `src/bin/bridge.rs` binds `127.0.0.1:8080`, prints its three startup lines and calls `serve` in `src/bridge.rs`, which loads the fixture `Store` once and runs its private accept loop. `GET /api/status` reports the MUMPS mode and the recorded, READY and INCOMPLETE cases from `golden::status`. `POST /api/{backend}/session`, with `{backend}` one of `mumps`, `rust` or `compare` and the body `{"inputs": [string, …]}`, runs one input sequence; `GET` on exactly `/` or `/index.html`, `/style.css` and `/app.js` serves the one-screen front-end, `frontend/index.html`, `frontend/style.css` and `frontend/app.js` respectively |
 
 These rows map capabilities, not contracts: `Store` and the bridge stay the Rust-only infrastructure listed above, and neither is given an invented `TAG^ROUTINE` counterpart.
@@ -1100,7 +1101,7 @@ Rule (conflict K10, superseding C8): every indirection, XECUTE, LOCK or device-c
 | Pre-lookup node `X ^DD(411,.01,7.5)` | [DIC.m:36] [DD.zwr:488792] | requires runtime shim, not converted | Fixed station stub output: the literal `S PRCRI=$P(^PRC(411,0),U,3)` writes nothing, so the `dic` stub writes nothing for it |
 | Pointer-transform screen: `P^DICM0` builds `DIC("S")` from literal index and file names and XECUTEs it inside a nested lookup; `G @Y` dispatches on the literal field type | [DICM0.m:8-41] [DICM1.m:8-11] [DICM.m:30-34] | requires runtime shim, not converted | R6 (`pointer_candidate`) and the O-03 guard of R5 step 6 (`no_match_guard`); PO-09.b11 is n/e |
 | Name indirection `@(DIC_…)` | [DIC1.m:41] [DIC3.m:42, 63, 83, 109-125] | requires runtime shim, not converted | Fixed roots `^PRC(442,` [PRCHPAT.m:79] and `^PRC(411,` [PRCFSITE.m:18] |
-| `%XY^%RCR` indirection `@%Z`, `$Q(@%Z)` | [DIRCR.m:29] (the Kernel copy uses `$N` [ZTRCR.m:24-27]) | requires runtime shim, not converted | A copy of the literal scratch lines: `%X` and `%Y` are literal [PRCHDP1.m:54] [PRCHDP2.m:48] (`pct_xy_pct_rcr`) |
+| `%XY^%RCR` indirection `@%Z`, `$Q(@%Z)` | [DIRCR.m:29] (the Kernel copy uses `$N` [ZTRCR.m:24-27]) | requires runtime shim, not converted | A copy of the literal scratch lines: `%X` and `%Y` are literal [PRCHDP1.m:54] [PRCHDP2.m:48] (`pct_rcr`) |
 | `RCR^DIWW` `\|` windows | [DIWP.m:40] | requires runtime shim, not converted | None: PO-15.b2 is n/e, and a session that reaches it ends after the last prompt written |
 | `D EN^DIQ`; `D Y^DIQ` | [PRCHDP1.m:9] [PRCHUTL.m:76-77] | requires runtime shim, not converted | None: PO-10.b2 and PO-29.b3 are n/e |
 | `G @DIPGM`; `G @^("LOOK")` | [DIC.m:21, 38] [DICM.m:10] | requires runtime shim, not converted | None. Not reached on the `EN3` path: the target nodes are absent from the DD (section "Workflow selection", "Dynamic targets") |
@@ -1127,7 +1128,7 @@ Citations: `PRC*.m` are `Packages/IFCAP/Routines/`, `DI*.m` are `Packages/VA Fil
 
 - **Decisions:** an `IF`, with its `ELSE`, that governs a `DO` or extrinsic call, a `GOTO`, `QUIT` or `READ`, a loop or a block; a postcondition on a `DO`, `GOTO` or `QUIT`; a loop over stored entries whose body runs a `DO`, `GOTO`, `QUIT` or block, with the outcomes "at least one entry" and "no entry".
 - **Not decisions** (they belong to the enclosing branch and are implemented with it): an `IF` or postcondition governing only `SET`, `WRITE` or `KILL` commands; a `$SELECT` arm; a loop whose body only formats the entries it visits; a fixed-count loop.
-- **Branch IDs:** each outcome of a decision is a branch, numbered `PO-NN.bM` in source order within its contract. PO-09.b15 and PO-09.b16 were found after the plan fixed b1 to b14 and are appended so existing IDs stay stable. An exercised outcome may be described inside its enclosing branch's row; every outcome no case exercises has its own ID, because `Halt::Unexercised` carries it and the unit tests assert it through the private `run`; decisions inside an n/e branch are covered by that branch's ID.
+- **Branch IDs:** each outcome of a decision is a branch, numbered `PO-NN.bM` in source order within its contract. PO-09.b15 and PO-09.b16 were found before this run, after the 2026-11-08 plan fixed b1 to b14, and are appended so existing IDs stay stable. An exercised outcome may be described inside its enclosing branch's row; every outcome no case exercises has its own ID, because `Halt::Unexercised` carries it, so a unit test can assert the branch that ends a session, through the private `run` or on the contract function's own result; decisions inside an n/e branch are covered by that branch's ID.
 - **Coverage words:** "exercised by GC-0N", for an exercised and implemented branch; "exercised by GC-01, GC-02, GC-05; not implemented (O-01)", for an exercised branch whose source cannot be settled while O-01 is open (conflict K9); "not exercised, not implemented" (n/e). A session that reaches either of the last two ends after the last prompt written and writes nothing for the branch. "Unreachable", inside the n/e group, marks an outcome that a fixed constant on this path rules out; it needs no code. The coverage of exercised branches follows from source and the fixture profile; no capture has yet confirmed it.
 - **Columns:** `Tag` is the owning `TAG^ROUTINE`, the contract's tag in the call tree of section "Original structure". `FileMan file/field` is the field the decision reads, as `file,field NAME` with its `^DD(file,field,0)` line, or `none` when the decision tests only a local, an input or a fixed constant, or the row is a single outcome with no decision; a node or file header read whole is named as such.
 
@@ -1262,7 +1263,7 @@ Parity covers OPTION `PRCH DISPLAY PO` (IEN 1901, `EN3^PRCHRPT`), the five cases
 
 - **Covered:** one read-only VistA workflow, OPTION `PRCH DISPLAY PO` (IEN 1901, action `EN3^PRCHRPT`), as it runs on `worldvista/vehu:202609` from the repository at commit `dd3fd0f3124c8178657d9fff4173c324da30f7ae`, with the fixed context `DUZ` `.5` and station 500.
 - **Not claimed:** no VA-wide equivalence; equivalence with any other image, snapshot, site, user, device or option; or any behaviour the five cases do not exercise. The five cases (GC-01 to GC-05) show only their exercised paths.
-- **Read-only:** the port has no write path. `PRCHQ1` (OPTION 10295, New RFQ, `EN2^PRCHQ2`) was named in the request but creates RFQs, so `PRCH DISPLAY PO` was substituted. The original's own non-business writes (`^DISV`, word-wrap and delivery scratch under `^UTILITY` and `^TMP`) are documented and not reproduced.
+- **Read-only:** the port has no write path. `PRCHQ1` (OPTION 10295, New RFQ, `EN2^PRCHQ2`) was named in the request but creates RFQs, so `PRCH DISPLAY PO` was substituted. The original's own non-business writes (`^DISV`, the device handler's scratch under `^XUTL` and the DEVICE file's open count, word-wrap and delivery scratch under `^UTILITY` and `^TMP`) are documented and not reproduced.
 - **Out of scope:** every write path (creating, editing, receiving, amending or cancelling orders); every other IFCAP function and option; VistA GUI clients, terminal devices and terminal emulators; a Java port; every other VistA package; the earlier GMV vitals slice; and the request's "must not be built" list: a write-guard framework, a CLI or exit-code scheme, git or provenance modules, deterministic-report machinery, Windows or macOS branches, an async runtime, any network service other than the loopback bridge, FFI or C bindings, procedural macros, a second crate or workspace, more than two integration test files, a front-end framework or build tooling, authentication or TLS.
 - **Unexercised branches:** every branch marked "not exercised, not implemented", and every exercised branch marked "not implemented (O-01)", is outside equivalence; a session that reaches one ends after the last prompt written and invents no output.
 
@@ -1282,15 +1283,15 @@ Each is reflected identically in this document, the implementation and the tests
   - Paging rule: if paging under the unresolved `IOSL` inserts an `ENTER '^' TO HALT: ` pause [PRCHDP2.m:31], the first capture shows it, and the team adds one empty line per pause before the `^` and records the change in `meta.txt` `setup` (O-01). The exit stays `^`. These sequences replace the request's two-line convention (conflict K2).
 - **Order identifier.** The text typed is the common-numbering part after `500-`, the `C` value [DD.zwr:514318-514320] [PRCHPAT.m:80]. `meta.txt` `record_ids` records both the IEN and the full PO number.
 - **Context keys.** `{"DUZ":".5","IOF":"<IOF>","IOSL":"<IOSL>","STATION":"500"}`. `IOF` and `IOSL` are added to the user's `{"DUZ":".5","STATION":"500"}` because the display reads them (section "Stubs"). `<IOF>` and `<IOSL>` are placeholders, not capture values: they stand for the HOME-device values that open item O-01 leaves unresolved, which `STUB_CONTEXT` holds unresolved (`None`).
-- **Station echo.** `      CAMP MASTER`, not the plan's predicted `  500  CAMP MASTER` (R1).
+- **Station echo.** `      CAMP MASTER` (R1). Before this run, the 2026-11-08 plan predicted `  500  CAMP MASTER`.
 - **No-match re-ask.** `<BEL> ??\n\nP.O./REQ.NO.: `: two newlines, not one (R3).
 - **No IEN attempt at the order prompt.** PO-09.b7 is unreachable (R5 step 4); a numeric value is searched like any other.
 - **PO-09.b12 unreachable; PO-09.b15 and PO-09.b16 appended** (R4, R5).
 - **`^`-prefixed values** exit like `^` and are reported as PO-09.b3 (R5 step 3).
-- **`^XUTL("XQ",$J)`** is read, not written, on this path [ZIS.m:28, 82-86].
-- **File 200 field 400** (SUPPLY EMPLOYEE, `400;1` [DD.zwr:351120]) is read by PO-03 through `$G(^VA(200,+PRC("PER"),400))` [PRCFSITE.m:12], not by the `DUZ` stub (PO-04) as the plan's table of FileMan definitions states; section "FileMan definitions read" attributes it so. Neither stub reads `^VA(200)` from `Store`, so the implementation and tests are unaffected.
-- **Pointer-target supplement.** The plan's 29 files and subfiles omit 445 `^PRCP(445,` and 440.5 `^PRC(440.5,`, the targets of 442 indexes `G` and `M`, whose header, `B` index, zero node and `-9` node only the pointer-candidate rule reads (R6). Section "FileMan definitions read" adds them as a source-correction supplement [1+FILE.zwr:31965, 32562] [DD.zwr:511963-511967, 525062-525066].
-- **`CorruptStore` is reachable before PO-12.b1.** The plan says HTTP 500 cannot be reached end to end because every `CorruptStore` site on the Rust path lies after PO-12.b1, which is not implemented while O-01 is open. Source places sites (a) to (f) of section "Contracts", "`CorruptStore` sites", on the PO-09 lookup, before it: the lookup and the order echo read a node after a bare `$D` test [DIC3.m:94, 110] [DICM0.m:32, 36] [DD.zwr:514202-514203], and a node holding only descendants passes that test but holds no value. `rust` therefore answers HTTP 500 for such a store and `compare` answers 502 `RUST: CORRUPT STORE <node>`; `src/inquiry.rs` `corrupt_store_is_error` and `src/bridge.rs` `sessions_answer_from_the_capture_whose_inputs_match` cover it.
+- **`^XUTL("XQ",$J)`** is written on this path only as device-handler scratch, never as business data. `^%ZIS` sets the node `"MIXED OS"` when it is undefined [ZIS.m:13] and reads it back [ZIS.m:14], before the HOME test [ZIS.m:28]; without `^XUTL("XQ",$J,"IO")`, the device-lookup branch (O-01) can also set `"lock"` [ZIS1.m:30] [ZIS3.m:10]. The sign-on `IO*` nodes are only read on this path, by `^%ZIS` and `HOME` [ZIS.m:28, 32, 58-81]; `SAVEVAR^%ZIS` writes them at sign-on [ZIS.m:82-86]. The capture exports leave `^XUTL` out of `db-before.zwr` and `db-after.zwr` (`tests/golden/ifcap/README.md`).
+- **File 200 field 400** (SUPPLY EMPLOYEE, `400;1` [DD.zwr:351120]) is read by PO-03 through `$G(^VA(200,+PRC("PER"),400))` [PRCFSITE.m:12], not by the `DUZ` stub (PO-04). Before this run, the 2026-11-08 plan's table of FileMan definitions attributed it to the `DUZ` stub; section "FileMan definitions read" carries the correction, and this run's plan takes its file list from that section. Neither stub reads `^VA(200)` from `Store`, so the implementation and tests are unaffected.
+- **Pointer-target supplement.** Before this run, the 2026-11-08 plan's 29 files and subfiles omitted 445 `^PRCP(445,` and 440.5 `^PRC(440.5,`, the targets of 442 indexes `G` and `M`, whose header, `B` index, zero node and `-9` node only the pointer-candidate rule reads (R6). Section "FileMan definitions read" adds them as a source-correction supplement [1+FILE.zwr:31965, 32562] [DD.zwr:511963-511967, 525062-525066], and this run's plan names both among the files read.
+- **`CorruptStore` is reachable before PO-12.b1.** Before this run, the 2026-11-08 plan said HTTP 500 could not be reached end to end because every `CorruptStore` site on the Rust path lay after PO-12.b1, which is not implemented while O-01 is open. Source places sites (a) to (f) of section "Contracts", "`CorruptStore` sites", on the PO-09 lookup, before it: the lookup and the order echo read a node after a bare `$D` test [DIC3.m:94, 110] [DICM0.m:32, 36] [DD.zwr:514202-514203], and a node holding only descendants passes that test but holds no value. `rust` therefore answers HTTP 500 for such a store and `compare` answers 502 `RUST: CORRUPT STORE <node>`, the contract of this run's plan; `src/inquiry.rs` `corrupt_store_is_error` and `src/bridge.rs` `sessions_answer_from_the_capture_whose_inputs_match` cover it.
 - **`PRCHQ1` substitution** by `PRCH DISPLAY PO` (section "Workflow selection").
 - **C12, public helpers.** "No other public operation exists" governs inquiry operations only. Capture-format and loader helpers that two components must apply identically are public, each in one home: the capture helpers in `src/golden.rs` (section "Mapping table", "Rust-only infrastructure"), and `load_fixtures` and `Store::format_ref` in `src/store.rs`. Before this run the capture helpers were public in `src/bridge.rs`; they moved to `src/golden.rs`, and `src/bridge.rs` now exposes only `MumpsMode` and `serve`. `serve_until`, the live helpers (`run_command`, `decide_live_result`, `ExecResult`, `LiveFailure`) and `inquiry_error_to_response` are private. The 422 status and its `UNSUPPORTED BRANCH` body are removed with `InquiryError::UnsupportedBranch`, and `StoreError` keeps only its `Parse` variant, displayed as `MALFORMED ZWR LINE <line>` with the file when known; `load_fixtures` returns `std::io::Result<Store>`, an unreadable file being an `io::Error` and a malformed line `io::ErrorKind::InvalidData` carrying the `StoreError` text. `Store` has no `&mut self` method.
 - **C17, `MumpsMode::Live { container: String, golden_dir: PathBuf }`.** Live mode must read `meta.txt` from the capture directories, `tests/bridge.rs` must cover that with synthetic directories, and no test may set an environment variable, so the directory reaches the bridge only as an argument.
@@ -1353,6 +1354,7 @@ Each is reflected identically in this document, the implementation and the tests
 | K10 | Hard-feature flagging versus the C8 "resolved" exception | Every feature is flagged "requires runtime shim, not converted", with cited rule equivalents for literal operands (section "Flagged hard-MUMPS features"). The request requires the flag, and the cases cannot run without the rule equivalents |
 | K11 | Endpoint equality "after the matching capture's normalisation, none without one" versus "MATCH only for READY cases whose two sides pass" | The READY-only rule governs eligibility, and the normalisation rule governs the outputs: `match` is true only for a READY capture whose context is accepted and whose two sides are equal after its rules; the response carries the raw transcripts. MATCH then attests what PASS attests |
 | K12 | "No case READY: every case ends NOT COMPARED" versus the equivalence procedure, which compares every recorded case | The equivalence procedure governs: a recorded case that is not READY ends FAIL. It defines the per-case verdicts and the exit status, and B2 reserves NOT COMPARED for cases with no capture |
+| K13 | Every selector change resends the current sequence, the empty one included, versus MUMPS and RUST idle screenshots pixel-identical with the selector and status line masked | The screen keeps the resend, and the idle-screen identity is checked in two forms. With zero captures, the MUMPS screen as loaded and the RUST screen after selecting RUST are pixel-identical with the backend selector, the status line and the transcript box masked, and the transcript box's computed styles are equal except `grid-template-rows`, which lists the row tracks its content creates, because RUST answers the empty sequence with the station prompt while MUMPS has sent nothing. With a READY case whose two raw transcripts are equal, sending its inputs with `SEND` in MUMPS and then selecting RUST shows the same transcript in both, and the screens are pixel-identical with only the selector and the status line masked. The check exists to show that no RUST style applies at rest; the transcript content is the backend's answer, not style |
 
 ## Source-unchanged verification
 
@@ -1377,7 +1379,9 @@ Result: A7 holds. `HEAD` is the branch tip this document was edited on; its own 
 
 Checked by the team (B3, B4) in current Chrome and Firefox; this run reports each item NOT RUN. Each check records the browser versions, OS, timestamp, case and mode, expected and observed behaviour, screenshot locations, and PASS, FAIL or NOT RUN.
 
-1. **Idle-screen identity:** at rest, MUMPS and RUST screenshots are pixel-identical with the backend selector box masked, per browser; no RUST style applies without hover, focus or a request in flight.
+1. **Idle-screen identity:** at rest, per browser, in two forms (conflict K13); no RUST style applies without hover, focus or a request in flight.
+   - With zero captures: the MUMPS screen as loaded, which has sent nothing, and the RUST screen after selecting RUST, which resends the empty sequence and shows the station prompt, are pixel-identical with the backend selector, the status line and the transcript box masked, and the transcript box's computed styles are equal except `grid-template-rows`, which lists the row tracks its content creates.
+   - With a READY case whose two raw transcripts are equal: after its inputs are sent with `SEND` in MUMPS and RUST is then selected, both screens show the same transcript and are pixel-identical with the backend selector and the status line masked.
 2. **RUST reactions, in RUST mode only**, each behind `[data-mode="rust"]` and `prefers-reduced-motion: no-preference`:
    - a 150 ms focus glow on the input, select and buttons, done as an `outline` colour transition;
    - a hover highlight on `.ln` (inverted green and black);
@@ -1445,8 +1449,8 @@ Criterion A9. Each search ran on 2026-11-15 from `rust/ifcap-po-inquiry/`, after
 | A9 check | How the design satisfies it | Confirming search or test | Result |
 |---|---|---|---|
 | No public item takes `&mut Store` or returns a mutable `Store`, and `Store` has no mutating method | `Store::from_zwr` returns an owned value; every `Store` method takes `&self`; `load_fixtures` merges each file's map before the `Store` is built | S5 | Both commands print nothing (exit status 1 each) |
-| The live bridge runs one kind of command, `docker exec -i` with the `meta.txt` start arguments | The only production caller of `run_admitted` is `live`, which passes the literal program `"docker"` and the arguments `exec`, `-i`, the container and the `golden::live_start` arguments; `run_admitted` calls `run_command`, which calls `execute`, which builds `Command::new(program)`. No shell runs on the host and no M code comes from a request | S6 | `Command::new(program)` in `execute`, and `Command::new("sleep")` inside `#[cfg(test)] mod tests` (from line 2112 of `src/bridge.rs`). `run_admitted(` hits: the production call in `live`, the definition, and three calls inside `mod tests` |
-| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2112, `src/store.rs` from line 480, `src/golden.rs` from line 860. Both tests pass (section "Run evidence") |
+| The live bridge runs one kind of command, `docker exec -i` with the `meta.txt` start arguments | The only production caller of `run_admitted` is `live`, which passes the literal program `"docker"` and the arguments `exec`, `-i`, the container and the `golden::live_start` arguments; `run_admitted` calls `run_command`, which calls `execute`, which builds `Command::new(program)`. No shell runs on the host and no M code comes from a request | S6 | `Command::new(program)` in `execute`, and `Command::new("sleep")` inside `#[cfg(test)] mod tests` (from line 2149 of `src/bridge.rs`). `run_admitted(` hits: the production call in `live`, the definition, and three calls inside `mod tests` |
+| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2149, `src/store.rs` from line 480, `src/golden.rs` from line 1359. Both tests pass (section "Run evidence") |
 | The front-end has no create, edit, cancel or delete control | The selector, the input, SEND and EXIT only | S8; by hand (section "Front-end checklist", item 7) | No control element: the hits are `createDocumentFragment` and `createElement`, which build transcript rows, and the comments and handler for the `animationcancel` event |
 | No write path in `src/` or `frontend/` | Only reads of `&Store`; `fetch` sends only the session `POST` and the status `GET`; the MUMPS side runs the original's own read-only inquiry | S5, S7, S8 and S9 | S9 prints nothing (exit status 1); S5, S7 and S8 as above |
 
@@ -1460,39 +1464,42 @@ S6, exit status 0 for each command:
 
 ```text
 $ grep -rn 'Command::new' src/
-src/bridge.rs:1692:    let mut child = Command::new(program)
-src/bridge.rs:2866:        let spawned = Command::new("sleep")
+src/bridge.rs:1723:    let mut child = Command::new(program)
+src/bridge.rs:2928:        let spawned = Command::new("sleep")
 $ grep -n 'run_admitted(' src/bridge.rs
-1519:    run_admitted(
-1533:fn run_admitted(
-3091:                        run_admitted(&slots, Duration::from_secs(60), "sleep", &args, b"")
-3120:        let expired = run_admitted(&slots, wait, absent, &[], b"");
-3130:        let attempted = run_admitted(&slots, wait, absent, &[], b"");
+1548:    run_admitted(
+1562:fn run_admitted(
+3153:                        run_admitted(&slots, Duration::from_secs(60), "sleep", &args, b"")
+3182:        let expired = run_admitted(&slots, wait, absent, &[], b"");
+3192:        let attempted = run_admitted(&slots, wait, absent, &[], b"");
 ```
 
 S7, exit status 0:
 
 ```text
 $ grep -rnE 'fs::write|File::create|OpenOptions|create_dir|remove_file|rename\(' src/
-src/bridge.rs:2516:            fs::OpenOptions::new()
-src/bridge.rs:3156:    /// `fs::create_dir`, which fails on any existing entry, so the directory
-src/bridge.rs:3169:                match fs::create_dir(&path) {
-src/bridge.rs:3186:            fs::create_dir_all(&dir)
-src/bridge.rs:3187:                .and_then(|()| fs::write(dir.join(name), text))
-src/bridge.rs:3476:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
+src/bridge.rs:2578:            fs::OpenOptions::new()
+src/bridge.rs:3218:    /// `fs::create_dir`, which fails on any existing entry, so the directory
+src/bridge.rs:3231:                match fs::create_dir(&path) {
+src/bridge.rs:3248:            fs::create_dir_all(&dir)
+src/bridge.rs:3249:                .and_then(|()| fs::write(dir.join(name), text))
+src/bridge.rs:3538:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
 src/store.rs:506:    /// `ifcap-store-unit-<pid>-<n>` and creates it with `fs::create_dir`,
 src/store.rs:518:            match fs::create_dir(&dir) {
 src/store.rs:532:        fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
 src/store.rs:878:            fs::create_dir(&sub).map_err(|e| format!("cannot create {}: {e}", sub.display()))
-src/golden.rs:871:    /// `ifcap-golden-unit-<pid>-<n>` and creates it with `fs::create_dir`,
-src/golden.rs:884:                match fs::create_dir(&dir) {
-src/golden.rs:992:        fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-src/golden.rs:995:            fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-src/golden.rs:1318:        fs::create_dir(dir.join(TRANSCRIPT)).map_err(|e| e.to_string())?;
-src/golden.rs:1452:        fs::create_dir(dir.join(META)).map_err(|e| e.to_string())?;
+src/golden.rs:1370:    /// `ifcap-golden-unit-<pid>-<n>` and creates it with `fs::create_dir`,
+src/golden.rs:1383:                match fs::create_dir(&dir) {
+src/golden.rs:1499:        File::create(path)
+src/golden.rs:1507:        fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+src/golden.rs:1510:            fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+src/golden.rs:1844:        fs::create_dir(dir.join(TRANSCRIPT)).map_err(|e| e.to_string())?;
+src/golden.rs:1981:        fs::create_dir(dir.join(META)).map_err(|e| e.to_string())?;
+src/golden.rs:2486:                Made::Bytes(bytes) => fs::write(&path, bytes).map_err(|e| e.to_string())?,
+src/golden.rs:2488:                Made::Directory => fs::create_dir(&path).map_err(|e| e.to_string())?,
 ```
 
-The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2112`, `src/golden.rs:860`, `src/inquiry.rs:2418`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:480`.
+The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2149`, `src/golden.rs:1359`, `src/inquiry.rs:2496`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:480`.
 
 S8, exit status 0:
 
@@ -1660,7 +1667,7 @@ All 11 fixtures are byte-identical to their sources.
 
 ```text
      Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
-test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 143 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
@@ -1671,7 +1678,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-152 tests pass: 132 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
+163 tests pass: 143 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
 
 `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, exit status 0. Output with the `finished in <seconds>` timings trimmed:
 
@@ -1702,20 +1709,20 @@ All five cases are NOT COMPARED, because none has a capture. Exit 0 is not accep
 running 18 tests
 test end_to_end_real_captures ... ok
 test compare_match_false_for_incomplete_case ... ok
-test not_found_404_texts ... ok
-test mumps_replay_502_not_recorded ... ok
-test startup_with_empty_folder ... ok
-test rust_session_200 ... ok
-test mumps_replay_200_when_recorded ... ok
-test compare_match_true_for_ready_equal_case ... ok
-test compare_match_false_for_differing_ready_case ... ok
-test compare_match_false_when_difference_is_outside_the_rule ... ok
 test compare_match_true_when_rule_covers_the_difference ... ok
 test compare_match_false_for_context_duz_1 ... ok
+test compare_match_false_when_difference_is_outside_the_rule ... ok
+test compare_match_false_for_differing_ready_case ... ok
+test startup_with_empty_folder ... ok
+test mumps_replay_502_not_recorded ... ok
+test compare_match_true_for_ready_equal_case ... ok
+test rust_session_200 ... ok
+test not_found_404_texts ... ok
+test mumps_replay_200_when_recorded ... ok
 test bad_request_400_on_every_backend ... ok
-test status_empty_folder ... ok
-test status_ready_case ... ok
 test status_incomplete_case ... ok
+test status_ready_case ... ok
+test status_empty_folder ... ok
 test static_paths_exact_match ... ok
 test status_and_compare_incomplete_on_cr_or_malformed_rule ... ok
 
@@ -1747,13 +1754,13 @@ src/inquiry.rs:720:        // W:DIC(0)["E" ! ends the line before G ASK [DIC.m:6
 
 S3, `grep -n 'golden' src/inquiry.rs src/store.rs src/mumps.rs`, exit status 1, no output.
 
-S4, `grep -rnE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/`, exit status 0, 47 hits, every one in `src/golden.rs`. Output trimmed to the per-file summary of `grep -rlE` and `grep -cE` with the same pattern:
+S4, `grep -rnE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/`, exit status 0, 75 hits, every one in `src/golden.rs`. Output trimmed to the per-file summary of `grep -rlE` and `grep -cE` with the same pattern:
 
 ```text
 $ grep -rlE '<same pattern>' src/
 src/golden.rs
 $ grep -rcE '<same pattern>' src/golden.rs
-47
+75
 ```
 
 ### Specification counts
@@ -1792,41 +1799,47 @@ From `Packages/IFCAP/Routines/`, `grep -il "HLCS\|HL7\|DOMAIN" PRCHRPT.m PRCFSIT
 
 ### Bridge runtime (A12)
 
-Several checkouts share this host, so the bridge, which always binds `127.0.0.1:8080`, ran inside a private network namespace (`unshare -n`, loopback brought up), never in the host's. One `bash` script ran there, exit status 0:
+Several checkouts share this host, so the bridge, which always binds `127.0.0.1:8080`, ran inside this checkout's own network namespace, `pf-18087`, whose loopback is up, never in the host's. The command `nsenter --net=/run/netns/pf-18087 bash a12.sh` ran this `a12.sh`, exit status 0. Its last command checks that no socket is left listening on port 8080, and its status is the script's:
 
 ```sh
-ip link set lo up
-cargo run --offline --locked --bin bridge > out1 2> err1 &
+out=$(mktemp -d)
+cargo run --offline --locked --bin bridge > "$out/out1" 2> "$out/err1" &
 cpid=$!
 for i in $(seq 1 120); do curl -s -o /dev/null http://127.0.0.1:8080/ && break; sleep 0.5; done
-curl -s http://127.0.0.1:8080/api/status
-timeout 10 ./target/debug/bridge
-timeout 20 cargo run --offline --locked --bin bridge
+curl -s http://127.0.0.1:8080/api/status; echo " curl=$?"
+timeout 10 ./target/debug/bridge; echo "second=$?"
+timeout 20 cargo run --offline --locked --bin bridge; echo "cargo-second=$?"
 bpid=$(ss -ltnpH "sport = :8080" | sed -n "s/.*pid=\([0-9]*\).*/\1/p" | head -1)
-kill $bpid; wait $cpid
+kill "$bpid"; wait "$cpid"; echo "wait=$?"
+echo "--- first instance stdout"; cat "$out/out1"
+echo "--- first instance stderr"; cat "$out/err1"
+! ss -ltnH "sport = :8080" | grep -q .
 ```
 
-The first instance's standard output, its three startup lines:
+Output, standard error included, with cargo's `in <seconds>` timings trimmed:
 
 ```text
+{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}} curl=0
+bridge: port 8080 on 127.0.0.1 is already in use
+second=1
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+     Running `target/debug/bridge`
+bridge: port 8080 on 127.0.0.1 is already in use
+cargo-second=1
+wait=143
+--- first instance stdout
 http://127.0.0.1:8080/
 MUMPS MODE: REPLAY
 RECORDED 0 OF 5 READY 0 OF 5
+--- first instance stderr
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+     Running `target/debug/bridge`
 ```
 
-Its standard error held only cargo's two status lines, `Finished …` and `` Running `target/debug/bridge` ``. `curl -s http://127.0.0.1:8080/api/status`, exit status 0:
-
-```text
-{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}
-```
-
-The second instance, run as `./target/debug/bridge`, exited with status 1 and wrote nothing to standard output; its standard error:
-
-```text
-bridge: port 8080 on 127.0.0.1 is already in use
-```
-
-Run again as `cargo run --offline --locked --bin bridge`, it exited with status 1 and the same message after cargo's `Finished` and `Running` lines. The first instance was then stopped by `kill` on the pid owning port 8080 in that namespace, cargo reported status 143 (terminated by signal 15), and no socket was left listening.
+- The first instance, run by `cargo run` in the background, wrote the three startup lines to standard output, and to standard error only cargo's two status lines, `Finished …` and `` Running `target/debug/bridge` ``.
+- `curl -s http://127.0.0.1:8080/api/status` exited 0 and printed `{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}`.
+- The second instance, run as `./target/debug/bridge`, exited with status 1, wrote nothing to standard output, and wrote `bridge: port 8080 on 127.0.0.1 is already in use` to standard error. Run again as `cargo run --offline --locked --bin bridge`, it exited with status 1 and the same message after cargo's `Finished` and `Running` lines.
+- The first instance was then stopped by `kill` on the pid owning port 8080 in that namespace. `wait` on the background `cargo run` job returned 143 (128 + 15: it ended on signal 15, SIGTERM). The final check found no socket listening, so the script exited 0.
 
 ### Reconciliation search
 
@@ -1863,7 +1876,7 @@ Every residual hit, in the `SPEC.md` sections named, is current or marked as his
 - `split_input_lines`, `parse_normalisation`, `parse_meta`: the items of `src/golden.rs`, in "Mapping table" and "Normalisation".
 - `MANIFEST`, `test-results`: the deleted items, in "Existing items outside the layout", "Existing-state verification" and "Source-unchanged verification".
 - `NOT COMPARED`: the verdict, never a front-end `match` display.
-- `predicted`: "the plan's predicted" station echo, history, in "Source corrections and interface departures".
+- `predicted`: "the 2026-11-08 plan predicted" station echo, history, in "Source corrections and interface departures".
 
 ## Acceptance record
 
