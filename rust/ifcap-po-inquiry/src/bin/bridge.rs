@@ -16,13 +16,16 @@
 //! `MUMPS MODE: LIVE <container>`, then `RECORDED <n> OF 5 READY <m> OF 5`.
 //! Diagnostics go to standard error. The exit status is 1 when the address
 //! cannot be bound, in which case nothing reaches standard output, and when
-//! `serve` returns an error, such as fixtures that cannot be loaded. A
-//! capture directory that does not exist, or is not a directory, is reported
-//! as `bridge: golden directory missing: <path>`; one whose metadata cannot
-//! be read for any other reason, such as a symbolic-link loop or a parent
-//! folder that cannot be searched, is reported as
+//! `serve` returns an error, whose text names its stage: the bridge prints
+//! `bridge: cannot load fixtures: <error>` when the fixtures fail to load,
+//! and `bridge: serving failed: <error>` when serving fails after they
+//! loaded. A capture directory that does not exist, or is not a directory,
+//! is reported as `bridge: golden directory missing: <path>`; one whose
+//! metadata cannot be read for any other reason, such as a symbolic-link
+//! loop or a parent folder that cannot be searched, is reported as
 //! `bridge: golden directory unreadable: <path>: <error>`. In both cases
-//! serving continues, with no case recorded.
+//! serving continues: a missing directory records no case, and in an
+//! unreadable one every case counts as recorded but unreadable.
 
 use std::env;
 use std::fs;
@@ -123,14 +126,15 @@ fn main() -> ExitCode {
     };
     // Errors are printed with their Display text and end the process with a
     // failure status; returning them from `main` would print their Debug form.
-    // `serve` loads the fixtures before serving anything, and the startup
-    // convention gives every error it returns this one text. A fixture error's
-    // text names the file and, for a malformed line, its number; a later
-    // serving error's text names its stage.
+    // `serve` loads the fixtures before serving anything, and the text of
+    // every error it returns begins with its stage: `cannot load fixtures: `
+    // when the fixtures fail to load, then the file and, for a malformed
+    // line, its number; `serving failed: ` when serving fails after they
+    // loaded, then the step that failed.
     match serve(listener, mode) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let _ = writeln!(io::stderr(), "bridge: cannot load fixtures: {error}");
+            let _ = writeln!(io::stderr(), "bridge: {error}");
             ExitCode::FAILURE
         }
     }

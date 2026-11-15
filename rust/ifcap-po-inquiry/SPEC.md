@@ -1449,8 +1449,8 @@ Criterion A9. Each search ran on 2026-11-15 from `rust/ifcap-po-inquiry/`, after
 | A9 check | How the design satisfies it | Confirming search or test | Result |
 |---|---|---|---|
 | No public item takes `&mut Store` or returns a mutable `Store`, and `Store` has no mutating method | `Store::from_zwr` returns an owned value; every `Store` method takes `&self`; `load_fixtures` merges each file's map before the `Store` is built | S5 | Both commands print nothing (exit status 1 each) |
-| The live bridge runs one kind of command, `docker exec -i` with the `meta.txt` start arguments | The only production caller of `run_admitted` is `live`, which passes the literal program `"docker"` and the arguments `exec`, `-i`, the container and the `golden::live_start` arguments; `run_admitted` calls `run_command`, which calls `execute`, which builds `Command::new(program)`. No shell runs on the host and no M code comes from a request | S6 | `Command::new(program)` in `execute`, and `Command::new("sleep")` inside `#[cfg(test)] mod tests` (from line 2166 of `src/bridge.rs`). `run_admitted(` hits: the production call in `live`, the definition, and three calls inside `mod tests` |
-| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2166, `src/store.rs` from line 480, `src/golden.rs` from line 1359. Both tests pass (section "Run evidence") |
+| The live bridge runs one kind of command, `docker exec -i` with the `meta.txt` start arguments | The only production caller of `run_admitted` is `live`, which passes the literal program `"docker"` and the arguments `exec`, `-i`, the container and the `golden::live_start` arguments; `run_admitted` calls `run_command`, which calls `execute`, which builds `Command::new(program)`. No shell runs on the host and no M code comes from a request | S6 | `Command::new(program)` in `execute`, and `Command::new("sleep")` inside `#[cfg(test)] mod tests` (from line 2185 of `src/bridge.rs`). `run_admitted(` hits: the production call in `live`, the definition, and three calls inside `mod tests` |
+| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2185, `src/store.rs` from line 490, `src/golden.rs` from line 1410. Both tests pass (section "Run evidence") |
 | The front-end has no create, edit, cancel or delete control | The selector, the input, SEND and EXIT only | S8; by hand (section "Front-end checklist", item 7) | No control element: the hits are `createDocumentFragment` and `createElement`, which build transcript rows, and the comments and handler for the `animationcancel` event |
 | No write path in `src/` or `frontend/` | Only reads of `&Store`; `fetch` sends only the session `POST` and the status `GET`; the MUMPS side runs the original's own read-only inquiry | S5, S7, S8 and S9 | S9 prints nothing (exit status 1); S5, S7 and S8 as above |
 
@@ -1464,42 +1464,47 @@ S6, exit status 0 for each command:
 
 ```text
 $ grep -rn 'Command::new' src/
-src/bridge.rs:1731:    let mut child = Command::new(program)
-src/bridge.rs:2947:        let spawned = Command::new("sleep")
+src/bridge.rs:1750:    let mut child = Command::new(program)
+src/bridge.rs:2966:        let spawned = Command::new("sleep")
 $ grep -n 'run_admitted(' src/bridge.rs
-1548:    run_admitted(
-1562:fn run_admitted(
-3172:                        run_admitted(&slots, Duration::from_secs(60), "sleep", &args, b"")
-3201:        let expired = run_admitted(&slots, wait, absent, &[], b"");
-3211:        let attempted = run_admitted(&slots, wait, absent, &[], b"");
+1567:    run_admitted(
+1581:fn run_admitted(
+3191:                        run_admitted(&slots, Duration::from_secs(60), "sleep", &args, b"")
+3220:        let expired = run_admitted(&slots, wait, absent, &[], b"");
+3230:        let attempted = run_admitted(&slots, wait, absent, &[], b"");
 ```
 
 S7, exit status 0:
 
 ```text
 $ grep -rnE 'fs::write|File::create|OpenOptions|create_dir|remove_file|rename\(' src/
-src/bridge.rs:2597:            fs::OpenOptions::new()
-src/bridge.rs:3238:    /// `fs::create_dir`, which fails on any existing entry, so the directory
-src/bridge.rs:3251:                match fs::create_dir(&path) {
-src/bridge.rs:3268:            fs::create_dir_all(&dir)
-src/bridge.rs:3269:                .and_then(|()| fs::write(dir.join(name), text))
-src/bridge.rs:3558:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
-src/store.rs:506:    /// `ifcap-store-unit-<pid>-<n>` and creates it with `fs::create_dir`,
-src/store.rs:518:            match fs::create_dir(&dir) {
-src/store.rs:532:        fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
-src/store.rs:878:            fs::create_dir(&sub).map_err(|e| format!("cannot create {}: {e}", sub.display()))
-src/golden.rs:1370:    /// `ifcap-golden-unit-<pid>-<n>` and creates it with `fs::create_dir`,
-src/golden.rs:1383:                match fs::create_dir(&dir) {
-src/golden.rs:1499:        File::create(path)
-src/golden.rs:1507:        fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-src/golden.rs:1510:            fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-src/golden.rs:1844:        fs::create_dir(dir.join(TRANSCRIPT)).map_err(|e| e.to_string())?;
-src/golden.rs:1981:        fs::create_dir(dir.join(META)).map_err(|e| e.to_string())?;
-src/golden.rs:2486:                Made::Bytes(bytes) => fs::write(&path, bytes).map_err(|e| e.to_string())?,
-src/golden.rs:2488:                Made::Directory => fs::create_dir(&path).map_err(|e| e.to_string())?,
+src/bridge.rs:2616:            fs::OpenOptions::new()
+src/bridge.rs:3257:    /// `fs::create_dir`, which fails on any existing entry, so the directory
+src/bridge.rs:3270:                match fs::create_dir(&path) {
+src/bridge.rs:3287:            fs::create_dir_all(&dir)
+src/bridge.rs:3288:                .and_then(|()| fs::write(dir.join(name), text))
+src/bridge.rs:3577:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
+src/store.rs:516:    /// `ifcap-store-unit-<pid>-<n>` and creates it with `fs::create_dir`,
+src/store.rs:528:            match fs::create_dir(&dir) {
+src/store.rs:542:        fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
+src/store.rs:889:            fs::create_dir(&sub).map_err(|e| format!("cannot create {}: {e}", sub.display()))
+src/store.rs:912:            fs::create_dir(entry).map_err(|e| format!("cannot create {}: {e}", entry.display()))
+src/store.rs:916:            fs::create_dir(&target)
+src/golden.rs:1421:    /// `ifcap-golden-unit-<pid>-<n>` and creates it with `fs::create_dir`,
+src/golden.rs:1434:                match fs::create_dir(&dir) {
+src/golden.rs:1550:        File::create(path)
+src/golden.rs:1558:        fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+src/golden.rs:1561:            fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+src/golden.rs:1895:        fs::create_dir(dir.join(TRANSCRIPT)).map_err(|e| e.to_string())?;
+src/golden.rs:2032:        fs::create_dir(dir.join(META)).map_err(|e| e.to_string())?;
+src/golden.rs:2099:                    Bad::Bytes(bytes) => fs::write(&path, bytes),
+src/golden.rs:2100:                    Bad::Directory => fs::create_dir(&path),
+src/golden.rs:2162:            fs::create_dir(&path).map_err(|e| e.to_string())?;
+src/golden.rs:2685:                Made::Bytes(bytes) => fs::write(&path, bytes).map_err(|e| e.to_string())?,
+src/golden.rs:2687:                Made::Directory => fs::create_dir(&path).map_err(|e| e.to_string())?,
 ```
 
-The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2166`, `src/golden.rs:1359`, `src/inquiry.rs:2496`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:480`.
+The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2185`, `src/golden.rs:1410`, `src/inquiry.rs:2496`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:490`.
 
 S8, exit status 0:
 
@@ -1667,7 +1672,7 @@ All 11 fixtures are byte-identical to their sources.
 
 ```text
      Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
-test result: ok. 143 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 148 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
      Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
@@ -1678,7 +1683,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-163 tests pass: 143 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
+168 tests pass: 148 unit tests in `src/`, 18 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
 
 `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, exit status 0. Output with the `finished in <seconds>` timings trimmed:
 
@@ -1754,13 +1759,13 @@ src/inquiry.rs:720:        // W:DIC(0)["E" ! ends the line before G ASK [DIC.m:6
 
 S3, `grep -n 'golden' src/inquiry.rs src/store.rs src/mumps.rs`, exit status 1, no output.
 
-S4, `grep -rnE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/`, exit status 0, 75 hits, every one in `src/golden.rs`. Output trimmed to the per-file summary of `grep -rlE` and `grep -cE` with the same pattern:
+S4, `grep -rnE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/`, exit status 0, 81 hits, every one in `src/golden.rs`. Output trimmed to the per-file summary of `grep -rlE` and `grep -cE` with the same pattern:
 
 ```text
 $ grep -rlE '<same pattern>' src/
 src/golden.rs
 $ grep -rcE '<same pattern>' src/golden.rs
-75
+81
 ```
 
 ### Specification counts

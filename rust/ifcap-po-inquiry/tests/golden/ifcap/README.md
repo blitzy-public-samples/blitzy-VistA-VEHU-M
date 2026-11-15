@@ -31,7 +31,7 @@ Each `GC-0N/` folder holds exactly the seven files of `golden::CAPTURE_FILES`, e
 | `meta.txt` | Eight `key=value` lines describing the run | `parse_meta`, `Meta` |
 | `normalisation.txt` | The case's normalisation rules, zero bytes for none | `parse_normalisation`, `normalise` |
 
-A case's content is loaded only through `golden::load_case` and `golden::find_capture`, which read each file once; `golden::status`, `readiness` and `live_start` read only what the status counts and live mode need. Every file that is present, the two exports included, must be readable UTF-8: one that is not makes the whole case `Unreadable`, which is FAIL.
+A case's content is loaded only through `golden::load_case` and `golden::find_capture`, which read each file once; `golden::status`, `readiness` and `live_start` read only what the status counts and live mode need. In a case whose `input.txt` and `transcript.txt` are both present, every file that is present, the two exports included, must be readable UTF-8: one that is not makes the whole case `Unreadable`, which is FAIL. A case lacking either file is NOT COMPARED, whatever its other files hold.
 
 Each file has a size limit, enforced while it is read, and every read is fresh:
 
@@ -44,7 +44,7 @@ Each file has a size limit, enforced while it is read, and every read is fresh:
 
 - A file larger than its limit is present but unreadable: the case is `Unreadable` with `<path>: larger than <n> bytes`, which is FAIL, and replay answers 502 `NOT RECORDED (unreadable: <path>: larger than <n> bytes)`. Its readiness fails the checks that read it and `no_carriage_return`.
 - The two exports are read together in 64 KiB pieces, compared and checked piece by piece, and never held whole.
-- A case folder whose metadata cannot be read, for example under a golden folder the bridge user cannot search, is not ABSENT: the case is `Unreadable` with the folder's path and cause, such as `<golden folder>/GC-01: permission denied`, which is FAIL, and its readiness fails all six checks.
+- A case folder whose metadata cannot be read, for example under a golden folder the bridge user cannot search, is not ABSENT: it counts as recorded, the case is `Unreadable` with the folder's path and cause, such as `<golden folder>/GC-01: permission denied`, which is FAIL, and its readiness fails all six checks.
 
 ### 2. Capture input and output
 
@@ -158,7 +158,7 @@ A check passes only when the files it reads exist and satisfy it; `no_carriage_r
 - **READY**: all six checks pass.
 - **INCOMPLETE**: at least one check fails, and each failed check is listed by name.
 - **ABSENT**: the `GC-0N` folder does not exist.
-- A case is recorded when its `input.txt` and `transcript.txt` both exist (`golden::is_recorded`).
+- A case is recorded when its `input.txt` and `transcript.txt` both exist (`golden::is_recorded`): present at all, readable or not, so a directory at either path counts. A case folder that cannot be inspected counts as recorded too. These are the cases `golden::load_case` finds `Recorded` or `Unreadable`.
 
 The verdicts `tests/equivalence.rs` gives:
 
@@ -184,7 +184,7 @@ The verdicts `tests/equivalence.rs` gives:
 ### 11. Fixtures and `cases.zwr`
 
 - `tests/fixtures/ifcap/*.zwr` are the 11 supporting fixtures, unchanged copies of repository exports: `411.zwr`, `411.2.zwr`, `420.5.zwr`, `420.8.zwr`, `440.zwr`, `442.3.zwr`, `442.4.zwr`, `442.5.zwr`, `442.8.zwr`, `5.zwr` and `49.zwr`.
-- `tests/fixtures/ifcap/cases.zwr` is the file Part B step 6 builds. `store::load_fixtures` loads every `*.zwr` file in byte order of name with `cases.zwr` last, so it wins on a repeated node; a missing `cases.zwr` is not an error [src/store.rs:274-326].
+- `tests/fixtures/ifcap/cases.zwr` is the file Part B step 6 builds. `store::load_fixtures` loads every `*.zwr` file in byte order of name with `cases.zwr` last, so it wins on a repeated node; a missing `cases.zwr` is not an error [src/store.rs:274-339].
 - The bridge loads the Store once, when it starts, so restart it after adding `cases.zwr`.
 - Without `cases.zwr` the fixtures hold no `^PRC(442,0)` header, so the order lookup ends before writing its prompt [Packages/VA FileMan/Routines/DIC.m:14] and a Rust session ends after the station prompt (PO-09.b15; conflict K6). The original on VEHU never reaches that state.
 - No hash or listing file is kept beside the fixtures.
@@ -347,7 +347,7 @@ Run each case a second time from the restored snapshot, and compare the two runs
 - It is the union, over the five `db-before.zwr` files, of the nodes under `^PRC(442)` for the synthetic orders, the `^PRC(442,0)` header, their index nodes, and the synthetic vendor's `^PRC(440)` nodes.
 - Omit any line already present verbatim in a supporting fixture.
 - Keep the lines in ZWR collation order under the two ZWR header lines.
-- Save it as `tests/fixtures/ifcap/cases.zwr`. It loads last and wins on a repeated node [src/store.rs:274-326].
+- Save it as `tests/fixtures/ifcap/cases.zwr`. It loads last and wins on a repeated node [src/store.rs:274-339].
 - Add no other file.
 
 **Conditional path: a run that finds new case folders.** A run that changes the port and finds `GC-0N` folders that were absent when it was planned takes these steps, in order:
@@ -395,5 +395,5 @@ GOLDEN_DIR=<folder> cargo run --offline --locked --bin bridge
 
 - Set `RUSTUP_AUTO_INSTALL=0` when offline, so that a missing pinned toolchain fails instead of downloading.
 - The short forms `cargo test` and `cargo run --bin bridge` are equivalent on a prepared host.
-- The bridge prints three lines to standard output: `http://127.0.0.1:8080/`, then `MUMPS MODE: REPLAY` (or `MUMPS MODE: LIVE <container>`), then `RECORDED <n> OF 5 READY <m> OF 5`. A port already taken gives `bridge: port 8080 on 127.0.0.1 is already in use` on standard error and exit status 1, a golden folder that does not exist, or is not a directory, gives `bridge: golden directory missing: <path>`, and one whose metadata cannot be read for another reason, such as a symbolic-link loop or a parent folder that cannot be searched, gives `bridge: golden directory unreadable: <path>: <error>`. After either, the bridge keeps serving with no case recorded.
+- The bridge prints three lines to standard output: `http://127.0.0.1:8080/`, then `MUMPS MODE: REPLAY` (or `MUMPS MODE: LIVE <container>`), then `RECORDED <n> OF 5 READY <m> OF 5`. A port already taken gives `bridge: port 8080 on 127.0.0.1 is already in use` on standard error and exit status 1, a golden folder that does not exist, or is not a directory, gives `bridge: golden directory missing: <path>`, and one whose metadata cannot be read for another reason, such as a symbolic-link loop or a parent folder that cannot be searched, gives `bridge: golden directory unreadable: <path>: <error>`. After either, the bridge keeps serving: with the folder missing no case is recorded, and with it unreadable every case counts as recorded but unreadable (`RECORDED 5 OF 5 READY 0 OF 5`).
 

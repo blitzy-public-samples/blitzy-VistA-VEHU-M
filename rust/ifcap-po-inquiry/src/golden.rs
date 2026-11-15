@@ -634,6 +634,14 @@ impl CaptureFile {
         Some(format!("{}: {cause}", self.path.display()))
     }
 
+    /// Whether something exists at its path, readable or not: a directory,
+    /// a FIFO, or a file that cannot be read, is too large or is not UTF-8
+    /// is present. Only a path whose metadata reports it missing
+    /// (`NotFound`, as [`open_regular`] gives it) is not.
+    fn present(&self) -> bool {
+        !matches!(self.content, Content::Missing)
+    }
+
     /// The file's text, when it was kept and is UTF-8.
     fn text(&self) -> Option<&str> {
         match &self.content {
@@ -762,6 +770,17 @@ impl Snapshot {
         }
     }
 
+    /// Whether the case is recorded, by the request capture convention (AAP
+    /// 0.3.2): its `input.txt` and `transcript.txt` both exist, readable or
+    /// not ([`CaptureFile::present`]). A case that is not recorded is NOT
+    /// COMPARED whatever its other files hold, so [`Snapshot::failure`]
+    /// counts only for a recorded case.
+    fn records(&self) -> bool {
+        [INPUT, TRANSCRIPT]
+            .into_iter()
+            .all(|name| self.file(name).is_some_and(CaptureFile::present))
+    }
+
     /// The first file, in [`CAPTURE_FILES`] order, that stops the case from
     /// loading ([`CaptureFile::failure`]), as `<path>: <cause>`.
     fn failure(&self) -> Option<String> {
@@ -770,7 +789,8 @@ impl Snapshot {
 
     /// Moves the kept UTF-8 text of `name` out of the snapshot, without
     /// copying it, and leaves that file `Missing`. Only a snapshot whose
-    /// checks and [`Snapshot::failure`] are already evaluated is emptied so.
+    /// checks, and [`Snapshot::records`] with [`Snapshot::failure`] for a
+    /// recorded case, are already evaluated is emptied so.
     fn take_text(&mut self, name: &str) -> Option<String> {
         let file = self.files.iter_mut().find(|file| file.name == name)?;
         match std::mem::replace(&mut file.content, Content::Missing) {
@@ -1092,8 +1112,11 @@ fn probe_folder(case_dir: &Path) -> Folder {
     }
 }
 
-fn is_file(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|entry| entry.is_file())
+/// Whether something exists at `path`, readable or not, by the rule
+/// [`open_regular`] applies: only metadata that reports the path missing
+/// (`NotFound`) means nothing is there.
+fn exists(path: &Path) -> bool {
+    !fs::metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,10 +1152,20 @@ pub fn readiness(case_dir: &Path) -> Readiness {
 }
 
 /// Whether the case folder `case_dir` is recorded, by the request capture
-/// convention (AAP 0.3.2): its `input.txt` and `transcript.txt` both exist
-/// as files. A case that is not recorded is NOT COMPARED.
+/// convention (AAP 0.3.2): its `input.txt` and `transcript.txt` both exist,
+/// readable or not, so a directory at either path counts. A case folder
+/// whose metadata cannot be read is recorded too, since its capture cannot
+/// be confirmed absent. These are exactly the cases [`load_case`] finds
+/// `Recorded` or `Unreadable`, which are PASS or FAIL; a case that is not
+/// recorded is NOT COMPARED.
 pub fn is_recorded(case_dir: &Path) -> bool {
-    is_file(&case_dir.join(INPUT)) && is_file(&case_dir.join(TRANSCRIPT))
+    match probe_folder(case_dir) {
+        Folder::Absent => false,
+        Folder::Uninspectable(_) => true,
+        Folder::Present => [INPUT, TRANSCRIPT]
+            .into_iter()
+            .all(|name| exists(&case_dir.join(name))),
+    }
 }
 
 /// The capture state of the five cases (AAP 0.3.2), each list in
@@ -1148,10 +1181,12 @@ pub struct Status {
 /// The [`Status`] of the golden folder `golden_dir`, read afresh on every
 /// call (AAP 0.3.2): what `GET /api/status` reports and what the bridge
 /// binary counts as `RECORDED <n> OF 5 READY <m> OF 5`. A missing folder
-/// gives three empty lists. A case folder whose metadata cannot be read is
-/// not recorded and is INCOMPLETE with all six checks, as [`readiness`]
-/// gives it. Only the files the checks parse are held, each within its
-/// budget; the others are read through in pieces and dropped.
+/// gives three empty lists. The recorded ids are those [`is_recorded`]
+/// accepts, the cases [`load_case`] finds `Recorded` or `Unreadable`, so a
+/// case folder whose metadata cannot be read, as in a golden folder that
+/// cannot be searched, is recorded and INCOMPLETE with all six checks, as
+/// [`readiness`] gives it. Only the files the checks parse are held, each
+/// within its budget; the others are read through in pieces and dropped.
 pub fn status(golden_dir: &Path) -> Status {
     let mut status = Status {
         recorded: Vec::new(),
@@ -1204,14 +1239,16 @@ pub enum CaseLoad {
     /// The case folder does not exist: nothing, or something other than a
     /// directory, is at its path. NOT COMPARED.
     Absent,
-    /// The folder exists but `input.txt` or `transcript.txt` is missing: NOT
-    /// COMPARED. The failed checks are carried for the readiness report.
+    /// The folder exists but `input.txt` or `transcript.txt` is missing,
+    /// whatever the other files hold, readable or not: NOT COMPARED. The
+    /// failed checks are carried for the readiness report.
     NotRecorded(Vec<&'static str>),
     Recorded(Case),
-    /// A capture file that is present cannot be read or is not UTF-8, or
-    /// the case folder's own metadata cannot be read, so that whether it
-    /// exists is unknown: that file's or folder's path, `: ` and the cause,
-    /// free of parentheses. The case is FAIL.
+    /// The case is recorded, its `input.txt` and `transcript.txt` both
+    /// present, but a capture file that is present cannot be read or is not
+    /// UTF-8; or the case folder's own metadata cannot be read, so that
+    /// whether it exists is unknown: that file's or folder's path, `: ` and
+    /// the cause, free of parentheses. The case is FAIL.
     Unreadable(String),
 }
 
@@ -1223,10 +1260,11 @@ pub enum CaseLoad {
 /// be read for another reason is `Unreadable` with the folder's path and
 /// cause. Then each of the seven files is read once within its budget, the
 /// two exports in pieces that are compared and checked but never held
-/// whole. Every file present must be readable within its budget and UTF-8,
-/// else the first that is not, in [`CAPTURE_FILES`] order, makes the case
-/// `Unreadable`; then a case missing `input.txt` or `transcript.txt` is
-/// `NotRecorded`, and any other is `Recorded`.
+/// whole. A case missing `input.txt` or `transcript.txt` is `NotRecorded`,
+/// whatever its other files hold. Of any other case, every file present
+/// must be readable within its budget and UTF-8, else the first that is
+/// not, in [`CAPTURE_FILES`] order, makes the case `Unreadable`; a case
+/// whose files all are is `Recorded`.
 pub fn load_case(golden_dir: &Path, case_id: &str) -> CaseLoad {
     let case_dir = golden_dir.join(case_id);
     match probe_folder(&case_dir) {
@@ -1243,14 +1281,21 @@ pub fn load_case(golden_dir: &Path, case_id: &str) -> CaseLoad {
 /// reading of a whole case that [`load_case`] and [`find_capture`] share.
 /// `input` is the folder's `input.txt` as already read and kept, which is
 /// not read again. The other files are read in [`CAPTURE_FILES`] order,
-/// keeping what a [`Case`] holds; the texts then move into the case
-/// uncopied.
+/// keeping what a [`Case`] holds. A case missing `input.txt` or
+/// `transcript.txt` is `NotRecorded` before any file is judged unreadable;
+/// of a recorded case, the first file that fails makes it `Unreadable`.
+/// The texts of a loaded case then move into it uncopied.
 fn hydrate(case_id: &str, case_dir: &Path, input: CaptureFile) -> CaseLoad {
     let mut snapshot = Snapshot::read(case_dir, Keep::Loaded, Some(input));
-    if let Some(cause) = snapshot.failure() {
+    if snapshot.records()
+        && let Some(cause) = snapshot.failure()
+    {
         return CaseLoad::Unreadable(cause);
     }
     let readiness = snapshot.readiness();
+    // Both texts of a recorded case are held and UTF-8 by now, so the `else`
+    // is taken only for a case that is not recorded, whichever of its input
+    // and transcript is present then being readable or not.
     let (Some(input), Some(transcript)) =
         (snapshot.take_text(INPUT), snapshot.take_text(TRANSCRIPT))
     else {
@@ -1291,10 +1336,14 @@ fn hydrate(case_id: &str, case_dir: &Path, input: CaptureFile) -> CaseLoad {
 /// less work. Its folder is probed as `load_case` probes it, and its
 /// `input.txt` is read within its budget and compared with `inputs` without
 /// being split into new strings. Only a case whose inputs match is loaded
-/// in full, reusing the `input.txt` already read. Of any other case, every
-/// other present file is read through in pieces within its budget and
-/// dropped, so that the case is `Err` exactly when `load_case` would find it
-/// `Unreadable`; its readiness is not evaluated.
+/// in full, reusing the `input.txt` already read. Any other case is passed
+/// over at once when its `input.txt` is missing. Otherwise every other file
+/// present is read through in pieces within its budget and dropped, and
+/// the case is `Err` with the first failure, in [`CAPTURE_FILES`] order,
+/// only when its `transcript.txt` is present too: so a case is `Err`
+/// exactly when `load_case` would find it `Unreadable`, with the same
+/// cause, and a case `load_case` finds `NotRecorded` is passed over. Its
+/// readiness is not evaluated.
 pub fn find_capture(golden_dir: &Path, inputs: &[String]) -> Result<Option<Case>, String> {
     for id in CASE_IDS {
         let case_dir = golden_dir.join(id);
@@ -1313,11 +1362,13 @@ pub fn find_capture(golden_dir: &Path, inputs: &[String]) -> Result<Option<Case>
                 CaseLoad::Unreadable(cause) => return Err(cause),
                 CaseLoad::Absent | CaseLoad::NotRecorded(_) => {}
             }
-        } else if let Some(cause) = input.failure() {
-            return Err(cause);
-        } else if let Some(cause) = Snapshot::read(&case_dir, Keep::Nothing, Some(input)).failure()
-        {
-            return Err(cause);
+        } else if input.present() {
+            let snapshot = Snapshot::read(&case_dir, Keep::Nothing, Some(input));
+            if snapshot.records()
+                && let Some(cause) = snapshot.failure()
+            {
+                return Err(cause);
+            }
         }
     }
     Ok(None)
@@ -1985,6 +2036,153 @@ mod tests {
     }
 
     #[test]
+    fn a_case_missing_its_input_or_transcript_is_not_recorded_whatever_else_it_holds()
+    -> Result<(), String> {
+        /// What GC-01's bad file is made.
+        #[derive(Clone, Copy)]
+        enum Bad {
+            Bytes(&'static [u8]),
+            Directory,
+        }
+        // The file left out, the file then made bad, how, its cause once the
+        // case is recorded, and the checks that fail while it is not.
+        type Variant<'a> = (&'a str, &'a str, Bad, &'a str, Vec<&'static str>);
+        let variants: [Variant; 4] = [
+            (
+                TRANSCRIPT,
+                DB_AFTER,
+                Bad::Bytes(b"\xff"),
+                "not UTF-8",
+                vec![SEVEN_FILES_PRESENT, DB_BEFORE_EQUALS_AFTER],
+            ),
+            (
+                INPUT,
+                META,
+                Bad::Bytes(b"\xff"),
+                "not UTF-8",
+                vec![SEVEN_FILES_PRESENT, META_KEYS_PRESENT, INPUT_ENDS_WITH_EXIT],
+            ),
+            (
+                TRANSCRIPT,
+                INPUT,
+                Bad::Bytes(b"\xff\n"),
+                "not UTF-8",
+                vec![SEVEN_FILES_PRESENT, INPUT_ENDS_WITH_EXIT],
+            ),
+            (
+                TRANSCRIPT,
+                NORMALISATION,
+                Bad::Directory,
+                "not a regular file",
+                vec![
+                    SEVEN_FILES_PRESENT,
+                    NORMALISATION_PARSES,
+                    NO_CARRIAGE_RETURN,
+                ],
+            ),
+        ];
+        for (missing, name, bad, cause, failed) in variants {
+            // Without `missing` the case has no capture, so the bad file does
+            // not count; with it, the same bad file makes the case unreadable.
+            for recorded in [false, true] {
+                let scratch = Scratch::new()?;
+                let golden = scratch.path();
+                let files = replaced(ready_files("^\n"), name, None);
+                let files = if recorded {
+                    files
+                } else {
+                    replaced(files, missing, None)
+                };
+                let dir = write_case(golden, "GC-01", &files)?;
+                let path = dir.join(name);
+                match bad {
+                    Bad::Bytes(bytes) => fs::write(&path, bytes),
+                    Bad::Directory => fs::create_dir(&path),
+                }
+                .map_err(|e| e.to_string())?;
+                // A READY case whose inputs the request equals, after GC-01.
+                write_case(golden, "GC-02", &ready_files("^\n"))?;
+                let label = format!("{name} {cause}, {missing} present: {recorded}");
+                if recorded {
+                    let cause = format!("{}: {cause}", path.display());
+                    assert_eq!(
+                        load_case(golden, "GC-01"),
+                        CaseLoad::Unreadable(cause.clone()),
+                        "{label}"
+                    );
+                    assert!(is_recorded(&dir), "{label}");
+                    for inputs in [strings(&["^"]), strings(&["x"])] {
+                        assert_eq!(find_capture(golden, &inputs), Err(cause.clone()), "{label}");
+                    }
+                } else {
+                    assert_eq!(
+                        load_case(golden, "GC-01"),
+                        CaseLoad::NotRecorded(failed.clone()),
+                        "{label}"
+                    );
+                    assert_eq!(
+                        readiness(&dir),
+                        Readiness::Incomplete(failed.clone()),
+                        "{label}"
+                    );
+                    assert!(!is_recorded(&dir), "{label}");
+                    let found = find_capture(golden, &strings(&["^"]))?;
+                    assert_eq!(
+                        found.map(|case| case.id),
+                        Some("GC-02".to_string()),
+                        "{label}"
+                    );
+                    assert_eq!(find_capture(golden, &strings(&["x"])), Ok(None), "{label}");
+                }
+                scratch.close()?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_directory_at_the_input_or_transcript_is_recorded_and_unreadable() -> Result<(), String> {
+        // The file made a directory, and the checks that then fail.
+        let cases = [
+            (
+                INPUT,
+                vec![
+                    SEVEN_FILES_PRESENT,
+                    INPUT_ENDS_WITH_EXIT,
+                    NO_CARRIAGE_RETURN,
+                ],
+            ),
+            (TRANSCRIPT, vec![SEVEN_FILES_PRESENT, NO_CARRIAGE_RETURN]),
+        ];
+        for (name, failed) in cases {
+            let scratch = Scratch::new()?;
+            let golden = scratch.path();
+            let dir = write_case(golden, "GC-01", &replaced(ready_files("^\n"), name, None))?;
+            let path = dir.join(name);
+            fs::create_dir(&path).map_err(|e| e.to_string())?;
+            let cause = format!("{}: not a regular file", path.display());
+            assert_eq!(
+                load_case(golden, "GC-01"),
+                CaseLoad::Unreadable(cause.clone()),
+                "{name}"
+            );
+            assert!(is_recorded(&dir), "{name}");
+            assert_eq!(
+                status(golden),
+                Status {
+                    recorded: vec!["GC-01"],
+                    ready: Vec::new(),
+                    incomplete: vec![("GC-01", failed)],
+                },
+                "{name}"
+            );
+            assert_eq!(find_capture(golden, &strings(&["^"])), Err(cause), "{name}");
+            scratch.close()?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn capture_files_load_at_their_budget_and_are_unreadable_past_it() -> Result<(), String> {
         let scratch = Scratch::new()?;
         let golden = scratch.path();
@@ -2315,11 +2513,12 @@ mod tests {
             CaseLoad::Unreadable(cause.clone())
         );
         assert_eq!(readiness(&looped), Readiness::Incomplete(CHECKS.to_vec()));
-        assert!(!is_recorded(&looped));
+        // It cannot be confirmed absent, so it counts as recorded, as FAIL.
+        assert!(is_recorded(&looped));
         assert_eq!(
             status(golden),
             Status {
-                recorded: vec!["GC-02"],
+                recorded: vec!["GC-01", "GC-02"],
                 ready: vec!["GC-02"],
                 incomplete: vec![("GC-01", CHECKS.to_vec())],
             }
@@ -2368,18 +2567,18 @@ mod tests {
             return scratch.close();
         }
         // In a golden folder the reader may not search, no case can be
-        // confirmed absent either.
+        // confirmed absent either, so each is recorded and unreadable.
         for id in CASE_IDS {
             let case_dir = golden.join(id);
             let cause = format!("{}: permission denied", case_dir.display());
             assert_eq!(load_case(golden, id), CaseLoad::Unreadable(cause));
             assert_eq!(readiness(&case_dir), Readiness::Incomplete(CHECKS.to_vec()));
-            assert!(!is_recorded(&case_dir));
+            assert!(is_recorded(&case_dir));
         }
         assert_eq!(
             status(golden),
             Status {
-                recorded: Vec::new(),
+                recorded: CASE_IDS.to_vec(),
                 ready: Vec::new(),
                 incomplete: CASE_IDS.iter().map(|&id| (id, CHECKS.to_vec())).collect(),
             }

@@ -115,20 +115,39 @@ pub enum MumpsMode {
     },
 }
 
-/// Serves `listener` until serving fails (AAP 0.3.5.1). Loads the fixture
-/// store once with [`load_fixtures`] from `tests/fixtures/ifcap/` of this
-/// crate, before anything is served; its error, a fixture that cannot be
-/// read or a malformed line (`InvalidData`), each naming the file, is
-/// returned unchanged. Then hands `listener` to `serve_until` with a
-/// shutdown flag that is never set, so this returns only with a serving
-/// error of `serve_until`, unchanged.
+/// Serves `listener` until serving fails (AAP 0.3.5.1). The text of each
+/// error names the stage that failed, and its kind is that of the failure.
+///
+/// - Loads the fixture store once with [`load_fixtures`] from
+///   `tests/fixtures/ifcap/` of this crate, before anything is served. Its
+///   error, a fixture that cannot be read or a malformed line
+///   (`InvalidData`), each naming the file, is returned as
+///   `cannot load fixtures: <error>`.
+/// - Then hands `listener` to `serve_until` with a shutdown flag that is
+///   never set, so this returns only when serving fails after the store
+///   loaded, as `serving failed: <error>`, where `<error>` names the step,
+///   such as `accepting a connection failed: <cause>`.
 pub fn serve(listener: TcpListener, mumps: MumpsMode) -> io::Result<()> {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("ifcap");
-    let store = load_fixtures(&fixtures)?;
-    serve_until(listener, store, mumps, Arc::new(AtomicBool::new(false)))
+    let store = load_store(&fixtures)?;
+    serve_until(listener, store, mumps, Arc::new(AtomicBool::new(false))).map_err(serving_failed)
+}
+
+/// The fixture store of [`serve`], loaded from `fixtures` by
+/// [`load_fixtures`]. An error keeps its kind and its text, which names the
+/// file, behind `cannot load fixtures: `.
+fn load_store(fixtures: &Path) -> io::Result<Store> {
+    load_fixtures(fixtures)
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot load fixtures: {e}")))
+}
+
+/// A failure of `serve_until` in [`serve`], after the store loaded, with its
+/// kind and its text, which names the step, kept behind `serving failed: `.
+fn serving_failed(e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("serving failed: {e}"))
 }
 
 /// Serves `listener` until `shutdown` is set, then returns `Ok(())`: the
@@ -3553,9 +3572,10 @@ mod tests {
             compare_session(&corrupt, &mumps, &corrupt_inputs),
             (502, error_body("RUST: CORRUPT STORE ^PRC(442,1,0)"))
         );
-        // A directory in place of GC-03's input file cannot be read: inputs
-        // no earlier case matches name it.
+        // GC-03 is recorded, but a directory in place of its input file
+        // cannot be read: inputs no earlier case matches name it.
         fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
+        scratch.write("GC-03", transcript, "RECORDED\n")?;
         let cause = golden::find_capture(scratch.path(), &other)
             .err()
             .ok_or_else(|| "the unreadable capture was not reported".to_string())?;
@@ -4363,6 +4383,64 @@ mod tests {
             );
         }
         scratch.close()
+    }
+
+    /// A fixture failure of `serve` keeps the kind and the text of
+    /// `load_fixtures`, which name the file, behind `cannot load fixtures: `:
+    /// a malformed line, and a fixtures folder that does not exist.
+    #[test]
+    fn fixture_failure_labelled_cannot_load_fixtures() -> Result<(), String> {
+        let scratch = Scratch::new()?;
+        scratch.write("fixtures", "bad.zwr", "ZWR\n^X(1)=\"a\"\n^X(01)=\"b\"\n")?;
+        let malformed = scratch.path().join("fixtures");
+        let absent = scratch.path().join("absent");
+        let cases = [
+            (
+                &malformed,
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cannot load fixtures: {}: MALFORMED ZWR LINE 3: ",
+                    malformed.join("bad.zwr").display()
+                ),
+            ),
+            (
+                &absent,
+                io::ErrorKind::NotFound,
+                format!("cannot load fixtures: {}: cannot read: ", absent.display()),
+            ),
+        ];
+        for (fixtures, kind, start) in cases {
+            match load_store(fixtures) {
+                Err(e) => {
+                    assert_eq!(e.kind(), kind, "{e:?}");
+                    let text = e.to_string();
+                    assert!(text.starts_with(&start), "{text:?} should start {start:?}");
+                }
+                Ok(store) => {
+                    return Err(format!("{} loaded as {store:?}", fixtures.display()));
+                }
+            }
+        }
+        scratch.close()
+    }
+
+    /// A failure of `serve_until` after the store loaded keeps its kind and
+    /// its text, which names the step, behind `serving failed: `.
+    #[test]
+    fn serving_failure_labelled_serving_failed() -> Result<(), String> {
+        // EMFILE, a full descriptor table, as the accept loop returns it.
+        let Err(accept) = accept_retry_delay(io::Error::from_raw_os_error(24)) else {
+            return Err("EMFILE was retried".to_string());
+        };
+        // A listener that cannot be made non-blocking, returned as it is.
+        let nonblocking = io::Error::from(io::ErrorKind::PermissionDenied);
+        for failure in [accept, nonblocking] {
+            let (kind, text) = (failure.kind(), failure.to_string());
+            let labelled = serving_failed(failure);
+            assert_eq!(labelled.kind(), kind, "kind kept");
+            assert_eq!(labelled.to_string(), format!("serving failed: {text}"));
+        }
+        Ok(())
     }
 
     #[test]

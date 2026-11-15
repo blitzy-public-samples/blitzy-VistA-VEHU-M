@@ -273,17 +273,22 @@ impl Store {
 /// It loads last, so its values win over the repository exports.
 const RUNTIME_EXPORT: &str = "cases.zwr";
 
-/// Loads every regular `*.zwr` file of `dir` into one store. Files load in
-/// byte order of name with `cases.zwr` last, so the runtime export wins on
+/// Loads every `*.zwr` file of `dir` into one store. Files load in byte
+/// order of name with `cases.zwr` last, so the runtime export wins on
 /// repeated keys; a missing `cases.zwr` is not an error. Symbolic links are
-/// followed; other files and directories are ignored.
+/// followed. Entries whose names do not end in `.zwr`, files and
+/// directories alike, are ignored.
 ///
 /// A directory that cannot be listed, an entry or its metadata that cannot
 /// be read, or a `*.zwr` file that cannot be read or is not UTF-8 is an
 /// [`io::Error`] of the original kind whose message names the path and says
-/// `cannot read`. A malformed line is an [`io::ErrorKind::InvalidData`]
-/// error carrying the [`StoreError::Parse`] text, which names the file and
-/// line. Either propagates with `?` from a caller returning `io::Result`.
+/// `cannot read`. A `*.zwr` entry that is not a regular file once links are
+/// followed, such as a directory or a FIFO, is never opened: it is an
+/// [`io::ErrorKind::InvalidInput`] error reading
+/// `<path>: cannot read: not a regular file`. A malformed line is an
+/// [`io::ErrorKind::InvalidData`] error carrying the [`StoreError::Parse`]
+/// text, which names the file and line. Each propagates with `?` from a
+/// caller returning `io::Result`.
 pub fn load_fixtures(dir: &Path) -> io::Result<Store> {
     let mut files = Vec::new();
     for entry in fs::read_dir(dir).map_err(|err| cannot_read(dir, err))? {
@@ -295,13 +300,18 @@ pub fn load_fixtures(dir: &Path) -> io::Result<Store> {
         let path = entry.path();
         // Follows symbolic links, so a linked fixture loads like a copy.
         let metadata = fs::metadata(&path).map_err(|err| cannot_read(&path, err))?;
-        if metadata.is_file() {
-            files.push((
-                name.as_encoded_bytes() == RUNTIME_EXPORT.as_bytes(),
-                name,
-                path,
+        // Decided before any open, so a FIFO is never waited on.
+        if !metadata.is_file() {
+            return Err(cannot_read(
+                &path,
+                io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"),
             ));
         }
+        files.push((
+            name.as_encoded_bytes() == RUNTIME_EXPORT.as_bytes(),
+            name,
+            path,
+        ));
     }
     files.sort_by(|(a_last, a_name, _), (b_last, b_name, _)| {
         a_last
@@ -863,7 +873,8 @@ mod tests {
     #[test]
     fn load_fixtures_order_puts_cases_last() -> Result<(), String> {
         let dir = scratch_dir()?;
-        let sub = dir.join("sub.zwr");
+        // A directory whose name does not end in `.zwr` is ignored.
+        let sub = dir.join("sub");
         let outcome = write_file(
             &dir,
             "a.zwr",
@@ -889,6 +900,44 @@ mod tests {
             "notes.txt is not a .zwr file and must not load"
         );
         assert_eq!(store.len(), 3);
+        Ok(())
+    }
+
+    /// A `*.zwr` entry that is not a regular file once symbolic links are
+    /// followed fails the load, naming the entry, even beside a valid
+    /// fixture, and is never opened.
+    #[test]
+    fn load_fixtures_rejects_non_regular_zwr_entry() -> Result<(), String> {
+        let directory: fn(&Path) -> Result<(), String> = |entry| {
+            fs::create_dir(entry).map_err(|e| format!("cannot create {}: {e}", entry.display()))
+        };
+        let link_to_directory: fn(&Path) -> Result<(), String> = |entry| {
+            let target = entry.with_file_name("linked");
+            fs::create_dir(&target)
+                .and_then(|()| std::os::unix::fs::symlink(&target, entry))
+                .map_err(|e| format!("cannot link {}: {e}", entry.display()))
+        };
+        for (what, make) in [
+            ("a directory", directory),
+            ("a link to a directory", link_to_directory),
+        ] {
+            let dir = scratch_dir()?;
+            let entry = dir.join("x.zwr");
+            let outcome = write_file(&dir, "a.zwr", b"ZWR\n^X(1)=\"a\"\n")
+                .and_then(|()| make(&entry))
+                .map(|()| load_fixtures(&dir));
+            match remove_scratch(&dir, outcome)? {
+                Err(err) => {
+                    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{what}: got {err:?}");
+                    assert_eq!(
+                        err.to_string(),
+                        format!("{}: cannot read: not a regular file", entry.display()),
+                        "{what}"
+                    );
+                }
+                Ok(store) => return Err(format!("{what} named x.zwr loaded as {store:?}")),
+            }
+        }
         Ok(())
     }
 
