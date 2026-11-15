@@ -69,6 +69,14 @@ const MAX_BODY: usize = 1024 * 1024;
 /// no connection is taken: further ones wait in the listener's kernel
 /// backlog.
 const MAX_CONNECTIONS: usize = 64;
+/// The longest one pause of accepting lasts after the process or the system
+/// ran out of descriptors, memory or threads for a connection (accept(2),
+/// "Errors"). The pauses of one shortage start at [`POLL`] and double, so a
+/// lasting shortage costs about one failed attempt a second. Only open
+/// connections ending relieve it, and an idle one ends [`IO_TIMEOUT`] after
+/// it was accepted; a pause of at most a fifth of that takes the connections
+/// waiting in the backlog within a second of the shortage ending.
+const MAX_BACKOFF: Duration = Duration::from_secs(1);
 /// How long, and how much, unread client data is discarded after a response,
 /// so that closing a socket with unread input does not reset the connection
 /// and destroy the response before the client reads it.
@@ -144,7 +152,9 @@ pub enum MumpsMode {
 /// - Then hands `listener` to `serve_until` with a shutdown flag that is
 ///   never set, so this returns only when serving fails after the store
 ///   loaded, as `serving failed: <error>`, where `<error>` names the step,
-///   such as `accepting a connection failed: <cause>`.
+///   such as `accepting a connection failed: <cause>` for a failure of
+///   `accept` that no retry mends. Running out of descriptors, memory or
+///   threads does not end serving: accepting pauses until connections end.
 pub fn serve(listener: TcpListener, mumps: MumpsMode) -> io::Result<()> {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -174,16 +184,21 @@ fn serving_failed(e: io::Error) -> io::Error {
 ///
 /// The listener is made non-blocking first; a failure to do so is returned
 /// as it is, before anything is served. `shutdown` is polled about every
-/// 10 ms: between attempts to accept while no connection is pending, and
-/// while `MAX_CONNECTIONS` connections are open. At that bound no connection
-/// is accepted, so further ones wait in the listener's kernel backlog, given
-/// no status, until an open one ends. Each connection is handled on its own
-/// thread, so an idle one never blocks another.
+/// 10 ms: between attempts to accept while no connection is pending, while
+/// `MAX_CONNECTIONS` connections are open, and while accepting is paused. At
+/// that bound no connection is accepted, so further ones wait in the
+/// listener's kernel backlog, given no status, until an open one ends. Each
+/// connection is handled on its own thread, so an idle one never blocks
+/// another.
 ///
-/// Serving fails when `accept` fails in a way no retry mends, when a
-/// connection cannot be given its socket clone or its thread, which closes
-/// that connection without a response, or with the failure a finished
-/// connection thread returned because its socket could not be configured.
+/// Serving fails when `accept` fails in a way no retry mends, or with the
+/// failure a finished connection thread returned because its socket could
+/// not be configured. Running out of descriptors or memory, which `accept`
+/// reports (accept(2), "Errors"), does not end it, nor does a connection
+/// that cannot be given its socket clone or its thread, which is closed
+/// without a response: accepting pauses instead, for 10 ms at first and
+/// twice as long after each further shortage, up to [`MAX_BACKOFF`], and
+/// further connections wait in the backlog until open ones end.
 /// Once the flag is set or serving fails, every connection still open is
 /// shut down, which wakes a thread waiting to read or write and cuts off a
 /// response not yet fully written, though bytes already written stay sent,
@@ -213,15 +228,8 @@ fn serve_until(
     served.and(stopped)
 }
 
-/// The accept loop of [`serve_until`]. It polls `shutdown` about every
-/// [`POLL`], joins the workers that have finished, so that `workers` holds
-/// only open connections, and starts one worker per connection while fewer
-/// than `limit` are open. At `limit` it does not accept, so further
-/// connections wait in the listener's backlog, untouched, until a worker
-/// finishes. `Ok` once the flag is set. `Err` when `accept` fails in a way no
-/// retry mends, when a connection cannot be given its worker, or with the
-/// first failure of the finished workers, once all of them are joined; the
-/// workers still open stay in `workers`.
+/// The accept loop of [`serve_until`]: [`accept_loop`] taking each
+/// connection from `listener`.
 fn accept_until(
     listener: &TcpListener,
     store: &Arc<Store>,
@@ -230,6 +238,47 @@ fn accept_until(
     workers: &mut Vec<(JoinHandle<io::Result<()>>, TcpStream)>,
     limit: usize,
 ) -> io::Result<()> {
+    accept_loop(
+        || listener.accept().map(|(stream, _)| stream),
+        store,
+        mumps,
+        shutdown,
+        workers,
+        limit,
+    )
+}
+
+/// The loop of [`accept_until`], taking each connection from `accept`. It
+/// polls `shutdown` about every [`POLL`], joins the workers that have
+/// finished, so that `workers` holds only open connections, and starts one
+/// worker per connection while fewer than `limit` are open. At `limit` it
+/// does not accept, so further connections wait in the listener's backlog,
+/// untouched, until a worker finishes.
+///
+/// When `accept` reports that the process or the system has run out of
+/// descriptors or memory (accept(2), "Errors"), or a connection cannot be
+/// given its worker, which closes it without a response, the loop pauses
+/// accepting: for [`POLL`] after the first such shortage, and twice as long
+/// after each further one, up to [`MAX_BACKOFF`], until a connection gets its
+/// worker again. A pause sleeps at most [`POLL`] at a time, polling
+/// `shutdown` and joining finished workers in between, so further
+/// connections wait in the backlog, untouched, while open ones end.
+///
+/// `Ok` once the flag is set. `Err` when `accept` fails in a way no retry
+/// mends, or with the first failure of the finished workers, once all of
+/// them are joined; the workers still open stay in `workers`.
+fn accept_loop(
+    mut accept: impl FnMut() -> io::Result<TcpStream>,
+    store: &Arc<Store>,
+    mumps: &Arc<MumpsMode>,
+    shutdown: &AtomicBool,
+    workers: &mut Vec<(JoinHandle<io::Result<()>>, TcpStream)>,
+    limit: usize,
+) -> io::Result<()> {
+    // The last pause of the shortage in progress, `ZERO` when none is, and
+    // when that pause began.
+    let mut backoff = Duration::ZERO;
+    let mut paused = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
         let mut joined = Ok(());
         for (finished, _) in workers.extract_if(.., |(handle, _)| handle.is_finished()) {
@@ -240,17 +289,45 @@ fn accept_until(
             thread::sleep(POLL);
             continue;
         }
-        match listener.accept() {
-            Ok((stream, _)) => workers.push(start_worker(stream, store, mumps)?),
-            Err(e) => {
-                let delay = accept_retry_delay(e)?;
-                if !delay.is_zero() {
-                    thread::sleep(delay);
+        let pause_left = backoff.saturating_sub(paused.elapsed());
+        if !pause_left.is_zero() {
+            thread::sleep(pause_left.min(POLL));
+            continue;
+        }
+        let short = match accept() {
+            Ok(stream) => match start_worker(stream, store, mumps) {
+                Ok(worker) => {
+                    workers.push(worker);
+                    backoff = Duration::ZERO;
+                    false
                 }
-            }
+                // `start_worker` has closed the connection without a
+                // response, and its failure concerns that connection alone.
+                Err(_) => true,
+            },
+            Err(e) => match accept_retry_delay(e)? {
+                AcceptRetry::After(delay) => {
+                    if !delay.is_zero() {
+                        thread::sleep(delay);
+                    }
+                    false
+                }
+                AcceptRetry::BackOff => true,
+            },
+        };
+        if short {
+            backoff = next_backoff(backoff);
+            paused = Instant::now();
         }
     }
     Ok(())
+}
+
+/// The pause of accepting that follows `previous`, the last pause of the
+/// same shortage, or `ZERO` at its start: [`POLL`] first, then twice the one
+/// before, never more than [`MAX_BACKOFF`].
+fn next_backoff(previous: Duration) -> Duration {
+    previous.saturating_mul(2).max(POLL).min(MAX_BACKOFF)
 }
 
 /// Linux `errno` values with no `io::ErrorKind` of their own that `accept`
@@ -259,36 +336,56 @@ fn accept_until(
 /// ENOPROTOOPT, EOPNOTSUPP and EHOSTDOWN.
 const PENDING_CONNECTION_ERRNOS: [i32; 5] = [64, 71, 92, 95, 112];
 
-/// How long the accept loop waits after `accept` failed with `e` before it
-/// tries again: [`POLL`] when no connection is pending, and no time when one
-/// pending connection failed but the listener is sound. Any other failure
-/// ends serving, with an error that keeps `e`'s kind and names the stage.
-fn accept_retry_delay(e: io::Error) -> io::Result<Duration> {
+/// Linux `errno` values that `accept` reports when the process or the system
+/// has run out of what a new connection needs, the listener staying sound
+/// (accept(2), "Errors"): ENOMEM and ENOBUFS, not enough free memory, and
+/// ENFILE and EMFILE, the system-wide and per-process limits on open files.
+const EXHAUSTION_ERRNOS: [i32; 4] = [12, 105, 23, 24];
+
+/// What the accept loop does after a failure of `accept` that a retry mends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptRetry {
+    /// Accept again once this delay has passed.
+    After(Duration),
+    /// Pause accepting by the loop's backoff: only connections ending can
+    /// relieve the shortage.
+    BackOff,
+}
+
+/// How the accept loop waits after `accept` failed with `e` before it tries
+/// again: [`POLL`] when no connection is pending; no time when one pending
+/// connection failed but the listener is sound; and the loop's backoff when
+/// the process or the system has run out of descriptors or memory (accept(2),
+/// "Errors"). Any other failure ends serving, with an error that keeps `e`'s
+/// kind and names the stage.
+fn accept_retry_delay(e: io::Error) -> io::Result<AcceptRetry> {
     match e.kind() {
-        io::ErrorKind::WouldBlock => return Ok(POLL),
+        io::ErrorKind::WouldBlock => return Ok(AcceptRetry::After(POLL)),
         io::ErrorKind::Interrupted
         | io::ErrorKind::ConnectionAborted
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::NetworkDown
         | io::ErrorKind::NetworkUnreachable
-        | io::ErrorKind::HostUnreachable => return Ok(Duration::ZERO),
+        | io::ErrorKind::HostUnreachable => return Ok(AcceptRetry::After(Duration::ZERO)),
         _ => {}
     }
-    if e.raw_os_error()
-        .is_some_and(|code| PENDING_CONNECTION_ERRNOS.contains(&code))
-    {
-        return Ok(Duration::ZERO);
+    match e.raw_os_error() {
+        Some(code) if PENDING_CONNECTION_ERRNOS.contains(&code) => {
+            Ok(AcceptRetry::After(Duration::ZERO))
+        }
+        Some(code) if EXHAUSTION_ERRNOS.contains(&code) => Ok(AcceptRetry::BackOff),
+        _ => Err(io::Error::new(
+            e.kind(),
+            format!("accepting a connection failed: {e}"),
+        )),
     }
-    Err(io::Error::new(
-        e.kind(),
-        format!("accepting a connection failed: {e}"),
-    ))
 }
 
 /// Starts the thread that answers `stream`, and returns it with a clone of
 /// the socket, which [`stop_workers`] uses to wake it. When the clone or the
 /// thread cannot be had, there is no worker: the connection is closed
-/// without a response, and the failure is returned, naming that stage.
+/// without a response, and the failure is returned, naming that stage, for
+/// the accept loop to pause accepting on.
 fn start_worker(
     stream: TcpStream,
     store: &Arc<Store>,
@@ -313,8 +410,7 @@ fn start_worker(
 /// Closes a connection the bridge cannot serve, writing nothing to it: each
 /// response status names an outcome of a request, and none names a failure
 /// of the bridge's own resources, so the client sees a closed connection.
-/// Returns the error that ends serving, which keeps `cause`'s kind and
-/// names `stage`.
+/// Returns the failure, which keeps `cause`'s kind and names `stage`.
 fn abandon(stream: &TcpStream, stage: &str, cause: io::Error) -> io::Error {
     // `NotConnected`, a peer that has already reset the connection, is the
     // only way this fails, and leaves nothing to close.
@@ -5003,9 +5099,10 @@ mod tests {
     /// its text, which names the step, behind `serving failed: `.
     #[test]
     fn serving_failure_labelled_serving_failed() -> Result<(), String> {
-        // EMFILE, a full descriptor table, as the accept loop returns it.
-        let Err(accept) = accept_retry_delay(io::Error::from_raw_os_error(24)) else {
-            return Err("EMFILE was retried".to_string());
+        // EBADF, a listener descriptor that is no longer valid, as the accept
+        // loop returns it.
+        let Err(accept) = accept_retry_delay(io::Error::from_raw_os_error(9)) else {
+            return Err("EBADF was retried".to_string());
         };
         // A listener that cannot be made non-blocking, returned as it is.
         let nonblocking = io::Error::from(io::ErrorKind::PermissionDenied);
@@ -5021,24 +5118,41 @@ mod tests {
     #[test]
     fn accept_errors_retried_or_returned() -> Result<(), String> {
         let retried = [
-            (io::Error::from(io::ErrorKind::WouldBlock), POLL),
-            (io::Error::from(io::ErrorKind::Interrupted), Duration::ZERO),
+            (
+                io::Error::from(io::ErrorKind::WouldBlock),
+                AcceptRetry::After(POLL),
+            ),
+            (
+                io::Error::from(io::ErrorKind::Interrupted),
+                AcceptRetry::After(Duration::ZERO),
+            ),
             (
                 io::Error::from(io::ErrorKind::ConnectionAborted),
-                Duration::ZERO,
+                AcceptRetry::After(Duration::ZERO),
             ),
             // EPROTO: one pending connection failed a protocol check.
-            (io::Error::from_raw_os_error(71), Duration::ZERO),
+            (
+                io::Error::from_raw_os_error(71),
+                AcceptRetry::After(Duration::ZERO),
+            ),
+            // ENOMEM, ENOBUFS, ENFILE and EMFILE: memory, or the system's or
+            // the process's open files, ran out.
+            (io::Error::from_raw_os_error(12), AcceptRetry::BackOff),
+            (io::Error::from_raw_os_error(105), AcceptRetry::BackOff),
+            (io::Error::from_raw_os_error(23), AcceptRetry::BackOff),
+            (io::Error::from_raw_os_error(24), AcceptRetry::BackOff),
         ];
         for (error, expected) in retried {
-            let kind = error.kind();
-            let delay =
-                accept_retry_delay(error).map_err(|e| format!("{kind:?} not retried: {e}"))?;
-            assert_eq!(delay, expected, "retry delay after {kind:?}");
+            let described = error.to_string();
+            let retry =
+                accept_retry_delay(error).map_err(|e| format!("{described} not retried: {e}"))?;
+            assert_eq!(retry, expected, "retry after {described}");
         }
-        // EMFILE, a full descriptor table, and a refused permission.
+        // EBADF, a listener descriptor no longer valid, EINVAL, a socket
+        // that is not listening, and a refused permission.
         let unexpected = [
-            io::Error::from_raw_os_error(24),
+            io::Error::from_raw_os_error(9),
+            io::Error::from_raw_os_error(22),
             io::Error::from(io::ErrorKind::PermissionDenied),
         ];
         for error in unexpected {
@@ -5054,6 +5168,34 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn exhaustion_pauses_double_from_poll_up_to_their_cap() {
+        let ms = Duration::from_millis;
+        // The pause after `previous`, at the edges of the range.
+        let cases = [
+            (Duration::ZERO, POLL),
+            (ms(600), MAX_BACKOFF),
+            (MAX_BACKOFF, MAX_BACKOFF),
+            (Duration::MAX, MAX_BACKOFF),
+        ];
+        for (previous, expected) in cases {
+            assert_eq!(
+                next_backoff(previous),
+                expected,
+                "the pause after {previous:?}"
+            );
+        }
+        // One shortage from its start: doubling from `POLL`, then the cap.
+        let mut pause = Duration::ZERO;
+        let mut pauses = Vec::new();
+        for _ in 0..12 {
+            pause = next_backoff(pause);
+            pauses.push(pause);
+        }
+        let expected = [10, 20, 40, 80, 160, 320, 640, 1000, 1000, 1000, 1000, 1000].map(ms);
+        assert_eq!(pauses, expected, "the pauses of one shortage");
     }
 
     #[test]
@@ -5484,6 +5626,291 @@ mod tests {
         assert!(
             still_open <= LIMIT,
             "{still_open} workers open past the bound"
+        );
+        Ok(())
+    }
+
+    /// The store and the MUMPS mode of the accept-loop tests: an empty
+    /// store, and replay from no captures.
+    fn empty_backends() -> Result<(Arc<Store>, Arc<MumpsMode>), String> {
+        let store = Store::from_zwr("").map_err(|e| e.to_string())?;
+        let mumps = MumpsMode::Replay {
+            golden_dir: PathBuf::new(),
+        };
+        Ok((Arc::new(store), Arc::new(mumps)))
+    }
+
+    /// The status line of the response on `stream`, read up to its CRLF or
+    /// the end of input.
+    fn status_line(stream: &mut TcpStream) -> Result<String, String> {
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !received.windows(2).any(|pair| pair == b"\r\n") {
+            let n = read_some(stream, &mut buf).map_err(|e| format!("read the response: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+        }
+        let text = String::from_utf8_lossy(&received);
+        Ok(text.lines().next().unwrap_or_default().to_string())
+    }
+
+    #[test]
+    fn accept_loop_serves_once_a_shortage_passes() -> Result<(), String> {
+        let fail = |what: &str, e: io::Error| format!("{what}: {e}");
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| fail("bind", e))?;
+        let addr = listener.local_addr().map_err(|e| fail("local_addr", e))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| fail("set nonblocking", e))?;
+        // Pending before the loop starts, in this order, so the first two
+        // accepts that reach the listener take them.
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut client = TcpStream::connect(addr).map_err(|e| fail("connect", e))?;
+            client
+                .write_all(b"GET /no-such-path HTTP/1.1\r\nHost: x\r\n\r\n")
+                .and_then(|()| client.set_read_timeout(Some(IO_TIMEOUT)))
+                .map_err(|e| fail("send the request", e))?;
+            clients.push(client);
+        }
+        let (store, mumps) = empty_backends()?;
+        let shutdown = AtomicBool::new(false);
+        let mut workers = Vec::new();
+        // The pauses of the shortages before the first client is taken; the
+        // next one would be the cap.
+        let pauses = [1u32, 2, 4, 8, 16, 32, 64].map(|n| POLL.saturating_mul(n));
+        // ENOMEM, ENOBUFS, ENFILE and EMFILE in turn, then the listener with
+        // the first client, then EMFILE again, then the listener.
+        let mut script = EXHAUSTION_ERRNOS
+            .into_iter()
+            .cycle()
+            .take(pauses.len())
+            .map(Some)
+            .chain([None, Some(24)]);
+        let mut calls: Vec<Instant> = Vec::new();
+        let started = Instant::now();
+        let (answered, served) = thread::scope(|scope| -> Result<_, String> {
+            let serving = thread::Builder::new()
+                .spawn_scoped(scope, || {
+                    let accept = || -> io::Result<TcpStream> {
+                        calls.push(Instant::now());
+                        match script.next().flatten() {
+                            Some(code) => Err(io::Error::from_raw_os_error(code)),
+                            None => listener.accept().map(|(stream, _)| stream),
+                        }
+                    };
+                    accept_loop(
+                        accept,
+                        &store,
+                        &mumps,
+                        &shutdown,
+                        &mut workers,
+                        MAX_CONNECTIONS,
+                    )
+                })
+                .map_err(io_text)?;
+            let answered: Result<Vec<(String, Duration)>, String> = clients
+                .iter_mut()
+                .map(|client| status_line(client).map(|line| (line, started.elapsed())))
+                .collect();
+            // Set on every path, so the loop always ends and is joined.
+            shutdown.store(true, Ordering::SeqCst);
+            let served = serving
+                .join()
+                .map_err(|_| "the accept loop panicked".to_string())?;
+            Ok((answered, served))
+        })?;
+        let stopped = stop_workers(workers);
+        served.map_err(|e| format!("the accept loop ended: {e}"))?;
+        stopped.map_err(io_text)?;
+        let answered = answered?;
+        println!("answered after {answered:?}");
+        assert_eq!(answered.len(), 2, "both clients answered");
+        for (line, _) in &answered {
+            assert!(line.starts_with("HTTP/1.1 404 "), "status line {line:?}");
+        }
+        // The gap from each accept to the next: the first `pauses.len()`
+        // follow the shortages before the first client, and the one after
+        // the first client's accept follows the shortage after it.
+        let gaps: Vec<Duration> = calls
+            .iter()
+            .zip(calls.iter().skip(1))
+            .map(|(before, after)| after.duration_since(*before))
+            .collect();
+        assert!(
+            gaps.len() > pauses.len() + 1,
+            "{} accepts, too few to reach the second client",
+            calls.len()
+        );
+        for (gap, pause) in gaps.iter().zip(pauses) {
+            assert!(*gap >= pause, "accepted {gap:?} into a {pause:?} pause");
+        }
+        let paused: Duration = pauses.iter().sum();
+        let first = answered.first().map(|(_, took)| *took);
+        // The margin allows for a loaded host.
+        assert!(
+            first.is_some_and(|took| took >= paused && took < IO_TIMEOUT),
+            "first answered after {first:?}, with {paused:?} of pauses"
+        );
+        // Once the first client got its worker, a shortage starts its pauses
+        // again at `POLL`; without that reset this pause would be the cap.
+        let after_reset = gaps.get(pauses.len() + 1).copied();
+        assert!(
+            after_reset.is_some_and(|gap| gap >= POLL && gap < MAX_BACKOFF / 2),
+            "accepted {after_reset:?} after the shortage that followed a worker"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accept_loop_pause_ends_within_a_poll_of_shutdown_or_a_worker_failure() -> Result<(), String>
+    {
+        // The pause after the eighth shortage in a row is the cap.
+        const SHORTAGES: usize = 8;
+        let (store, mumps) = empty_backends()?;
+        for worker_fails in [false, true] {
+            let trigger = if worker_fails {
+                "a worker failure"
+            } else {
+                "shutdown"
+            };
+            let shutdown = AtomicBool::new(false);
+            let release = Arc::new(AtomicBool::new(false));
+            let mut workers = Vec::new();
+            // The worker's client stays open, so only `release` ends it.
+            let mut peer = None;
+            if worker_fails {
+                let (client, control) = loopback_pair()?;
+                peer = Some(client);
+                let release = Arc::clone(&release);
+                let worker = thread::Builder::new()
+                    .spawn(move || -> io::Result<()> {
+                        let started = Instant::now();
+                        while !release.load(Ordering::SeqCst) && started.elapsed() < IO_TIMEOUT * 2
+                        {
+                            thread::sleep(POLL);
+                        }
+                        Err(io::Error::new(io::ErrorKind::PermissionDenied, "worker"))
+                    })
+                    .map_err(io_text)?;
+                workers.push((worker, control));
+            }
+            let calls = AtomicUsize::new(0);
+            let (seen, took, served) = thread::scope(|scope| -> Result<_, String> {
+                let serving = thread::Builder::new()
+                    .spawn_scoped(scope, || {
+                        let accept = || -> io::Result<TcpStream> {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Err(io::Error::from_raw_os_error(24))
+                        };
+                        accept_loop(
+                            accept,
+                            &store,
+                            &mumps,
+                            &shutdown,
+                            &mut workers,
+                            MAX_CONNECTIONS,
+                        )
+                    })
+                    .map_err(io_text)?;
+                let started = Instant::now();
+                while calls.load(Ordering::SeqCst) < SHORTAGES && started.elapsed() < IO_TIMEOUT {
+                    thread::sleep(POLL / 2);
+                }
+                let seen = calls.load(Ordering::SeqCst);
+                let triggered = Instant::now();
+                if worker_fails {
+                    release.store(true, Ordering::SeqCst);
+                } else {
+                    shutdown.store(true, Ordering::SeqCst);
+                }
+                while !serving.is_finished() && triggered.elapsed() < IO_TIMEOUT {
+                    thread::sleep(POLL / 2);
+                }
+                let took = triggered.elapsed();
+                // Set on every path, so the loop always ends and is joined.
+                shutdown.store(true, Ordering::SeqCst);
+                let served = serving
+                    .join()
+                    .map_err(|_| "the accept loop panicked".to_string())?;
+                Ok((seen, took, served))
+            })?;
+            let stopped = stop_workers(workers);
+            drop(peer);
+            stopped.map_err(io_text)?;
+            println!("{trigger} after {seen} shortages ended the loop in {took:?}");
+            assert!(
+                seen >= SHORTAGES,
+                "{trigger}: only {seen} shortages before it"
+            );
+            let expected = if worker_fails {
+                Err((io::ErrorKind::PermissionDenied, "worker".to_string()))
+            } else {
+                Ok(())
+            };
+            assert_eq!(
+                served.map_err(|e| (e.kind(), e.to_string())),
+                expected,
+                "{trigger} ends the loop"
+            );
+            // A pause slept out whole would end near `MAX_BACKOFF`; the
+            // margin allows for a loaded host.
+            assert!(
+                took < MAX_BACKOFF / 2,
+                "{trigger}: the loop ended {took:?} after it, in a {MAX_BACKOFF:?} pause"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn accept_loop_fatal_failure_after_a_pause_ends_serving() -> Result<(), String> {
+        let (store, mumps) = empty_backends()?;
+        let shutdown = AtomicBool::new(false);
+        let mut workers = Vec::new();
+        let mut calls: Vec<Instant> = Vec::new();
+        let ebadf = io::Error::from_raw_os_error(9);
+        let (kind, text) = (
+            ebadf.kind(),
+            format!("accepting a connection failed: {ebadf}"),
+        );
+        // EMFILE, then EBADF; a loop that retried EBADF ends at the next
+        // accept.
+        let accept = || -> io::Result<TcpStream> {
+            calls.push(Instant::now());
+            match calls.len() {
+                1 => Err(io::Error::from_raw_os_error(24)),
+                2 => Err(io::Error::from_raw_os_error(9)),
+                _ => {
+                    shutdown.store(true, Ordering::SeqCst);
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                }
+            }
+        };
+        let served = accept_loop(
+            accept,
+            &store,
+            &mumps,
+            &shutdown,
+            &mut workers,
+            MAX_CONNECTIONS,
+        );
+        assert_eq!(
+            served.map_err(|e| (e.kind(), e.to_string())),
+            Err((kind, text)),
+            "EBADF ends the loop"
+        );
+        assert_eq!(calls.len(), 2, "no accept after EBADF");
+        let gap = calls
+            .iter()
+            .zip(calls.iter().skip(1))
+            .map(|(before, after)| after.duration_since(*before))
+            .next();
+        assert!(
+            gap.is_some_and(|gap| gap >= POLL),
+            "EBADF {gap:?} after EMFILE, within its {POLL:?} pause"
         );
         Ok(())
     }

@@ -184,7 +184,7 @@ The verdicts `tests/equivalence.rs` gives:
 ### 11. Fixtures and `cases.zwr`
 
 - `tests/fixtures/ifcap/*.zwr` are the 11 supporting fixtures, unchanged copies of repository exports: `411.zwr`, `411.2.zwr`, `420.5.zwr`, `420.8.zwr`, `440.zwr`, `442.3.zwr`, `442.4.zwr`, `442.5.zwr`, `442.8.zwr`, `5.zwr` and `49.zwr`.
-- `tests/fixtures/ifcap/cases.zwr` is the file Part B step 6 builds. `store::load_fixtures` loads every `*.zwr` file in byte order of name with `cases.zwr` last, so it wins on a repeated node; a missing `cases.zwr` is not an error [src/store.rs:274-339].
+- `tests/fixtures/ifcap/cases.zwr` is the file Part B step 6 builds. `store::load_fixtures` loads every `*.zwr` file in byte order of name with `cases.zwr` last, so it wins on a repeated node; a missing `cases.zwr` is not an error [src/store.rs:323-387].
 - The bridge loads the Store once, when it starts, so restart it after adding `cases.zwr`.
 - Without `cases.zwr` the fixtures hold no `^PRC(442,0)` header, so the order lookup ends before writing its prompt [Packages/VA FileMan/Routines/DIC.m:14] and a Rust session ends after the station prompt (PO-09.b15; conflict K6). The original on VEHU never reaches that state.
 - No hash or listing file is kept beside the fixtures.
@@ -347,7 +347,7 @@ Run each case a second time from the restored snapshot, and compare the two runs
 - It is the union, over the five `db-before.zwr` files, of the nodes under `^PRC(442)` for the synthetic orders, the `^PRC(442,0)` header, their index nodes, and the synthetic vendor's `^PRC(440)` nodes.
 - Omit any line already present verbatim in a supporting fixture.
 - Keep the lines in ZWR collation order under the two ZWR header lines.
-- Save it as `tests/fixtures/ifcap/cases.zwr`. It loads last and wins on a repeated node [src/store.rs:274-339].
+- Save it as `tests/fixtures/ifcap/cases.zwr`. It loads last and wins on a repeated node [src/store.rs:323-387].
 - Add no other file.
 
 **Conditional path: a run that finds new case folders.** A run that changes the port and finds `GC-0N` folders that were absent when it was planned takes these steps, in order:

@@ -806,10 +806,14 @@ impl Snapshot {
 
 /// Whether `path` is a regular file, and what reading it within `budget`
 /// bytes gave: its bytes when `keep` holds, else a [`Content::Scanned`]
-/// summary of them. Only a regular file is opened, once its metadata shows
-/// one, so a FIFO or device in a case folder can never block a reader. The
-/// budget is enforced while reading, never by the metadata length alone, so
-/// a file that grows meanwhile is still cut off. Nothing is written.
+/// summary of them. A path whose metadata already shows something other
+/// than a regular file, such as a FIFO or device in a case folder, is never
+/// opened. Otherwise the open does not wait for a FIFO writer on a platform
+/// whose `O_NONBLOCK` value is known, and the opened descriptor's own type
+/// decides ([`admit`]), so an object swapped in after that inspection is
+/// refused unread. The budget is enforced while reading, never by the
+/// metadata length alone, so a file that grows meanwhile is still cut off.
+/// Nothing is written.
 fn read_capture_file(path: &Path, budget: u64, keep: bool) -> (bool, Content) {
     match open_regular(path) {
         Err(found) => found,
@@ -821,10 +825,10 @@ fn read_capture_file(path: &Path, budget: u64, keep: bool) -> (bool, Content) {
     }
 }
 
-/// Opens `path` for reading once its metadata shows a regular file, with
-/// the length that metadata gives. `Err` is what [`read_capture_file`]
-/// reports for anything else: whether a regular file exists, and the
-/// content.
+/// Opens `path` for reading once its metadata, links followed, shows a
+/// regular file, and keeps what was opened only as [`admit`] does. `Err` is
+/// what [`read_capture_file`] reports for anything else: whether a regular
+/// file exists, and the content.
 fn open_regular(path: &Path) -> Result<(File, u64), (bool, Content)> {
     let entry = match fs::metadata(path) {
         Ok(entry) => entry,
@@ -834,12 +838,71 @@ fn open_regular(path: &Path) -> Result<(File, u64), (bool, Content)> {
     if !entry.is_file() {
         return Err((false, Content::Unreadable("not a regular file".to_string())));
     }
-    match File::open(path) {
-        Ok(file) => Ok((file, entry.len())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err((false, Content::Missing)),
+    admit(path)
+}
+
+/// Opens `path` without waiting ([`open_read_only`]) and keeps the opened
+/// file, with the length its own metadata gives, only when that metadata
+/// shows a regular file: whatever stood at `path` when it was inspected, an
+/// object that is not a regular file once opened is refused unread, as
+/// `not a regular file`. Nothing at `path` is `Missing`. A failed open, or
+/// a failed read of the opened file's metadata, is unreadable with its
+/// cause and counts as a regular file, which the inspection saw.
+fn admit(path: &Path) -> Result<(File, u64), (bool, Content)> {
+    let file = match open_read_only(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err((false, Content::Missing)),
+        Err(e) => return Err((true, Content::Unreadable(io_cause(&e)))),
+    };
+    match file.metadata() {
+        Ok(opened) if opened.is_file() => Ok((file, opened.len())),
+        Ok(_) => Err((false, Content::Unreadable("not a regular file".to_string()))),
         Err(e) => Err((true, Content::Unreadable(io_cause(&e)))),
     }
 }
+
+/// Opens `path` for reading only, requesting no write, append, create or
+/// truncate access, and with `O_NONBLOCK` on Unix, so that opening a FIFO
+/// does not wait for a writer where that flag's value is known.
+fn open_read_only(path: &Path) -> io::Result<File> {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::prelude::*;
+        options.custom_flags(O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+/// The `O_NONBLOCK` open flag, the platform's `<fcntl.h>` value, which std
+/// does not export: opening a FIFO with it returns at once instead of
+/// waiting for a writer, and reads of a regular file ignore it. It is 0, a
+/// plain read-only open, on a platform whose value is not known here.
+#[cfg(unix)]
+const O_NONBLOCK: i32 = if cfg!(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "mips32r6",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    ))
+)) {
+    0o4000
+} else if cfg!(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)) {
+    0x0004
+} else {
+    0
+};
 
 /// The bytes of the open capture file `file`, read to its end through a
 /// limit of one byte past `budget`, so that a file over budget is detected
@@ -2484,6 +2547,56 @@ mod tests {
         }
         assert_eq!(read, data);
         Ok(())
+    }
+
+    /// The opened file's own type decides admission, whatever its path
+    /// showed when inspected: an object that is not a regular file once
+    /// opened is refused unread, and a regular file is kept with its length
+    /// and read through the same handle.
+    #[test]
+    fn admit_keeps_only_what_is_a_regular_file_once_opened() -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        use std::os::fd::AsRawFd;
+        // A pipe whose writer is closed: its `/proc` path opens as a FIFO.
+        #[cfg(target_os = "linux")]
+        let (reader, writer) = io::pipe().map_err(|e| format!("cannot create a pipe: {e}"))?;
+        #[cfg(target_os = "linux")]
+        drop(writer);
+        #[cfg(target_os = "linux")]
+        let fifo = Some((
+            "a FIFO",
+            PathBuf::from(format!("/proc/self/fd/{}", reader.as_raw_fd())),
+        ));
+        #[cfg(not(target_os = "linux"))]
+        let fifo = None;
+        let scratch = Scratch::new()?;
+        let refused = [
+            ("a directory", scratch.path().to_path_buf()),
+            ("a character device", PathBuf::from("/dev/null")),
+        ];
+        for (what, path) in refused.into_iter().chain(fifo) {
+            let unread = matches!(
+                admit(&path),
+                Err((false, Content::Unreadable(cause))) if cause == "not a regular file"
+            );
+            assert!(
+                unread,
+                "{what} at {} was not refused as not a regular file",
+                path.display()
+            );
+        }
+        let regular = scratch.path().join("regular");
+        let written = b"ZWR\n^X(1)=\"a\"\n";
+        fs::write(&regular, written)
+            .map_err(|e| format!("cannot write {}: {e}", regular.display()))?;
+        let (mut file, length) = admit(&regular)
+            .map_err(|(found, _)| format!("{} was refused, regular {found}", regular.display()))?;
+        let mut read = Vec::new();
+        file.read_to_end(&mut read)
+            .map_err(|e| format!("cannot read {}: {e}", regular.display()))?;
+        assert_eq!(usize::try_from(length).ok(), Some(written.len()));
+        assert_eq!(read, written);
+        scratch.close()
     }
 
     #[test]

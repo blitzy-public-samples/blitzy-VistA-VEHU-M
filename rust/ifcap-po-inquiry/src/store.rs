@@ -1,46 +1,57 @@
 //! The read-only global store that stands in for the FileMan globals the
 //! ported `PRCH DISPLAY PO` routines read (`^PRC(442)`, `^PRCD(442.3)`,
-//! `^PRC(440)`, `^PRC(411)` and the rest), loaded from ZWR exports.
+//! `^PRC(440)`, `^PRC(411)` and the rest), loaded from ZWR exports: ZWR
+//! parsing and the immutable ordered map with M collation (AAP 0.3.1). The
+//! exports follow the fixture ZWR convention: header lines, such as
+//! `OSEHRA ZGO Export: PURCHASE ORDER STATUS` and `ZWR` at
+//! tests/fixtures/ifcap/442.3.zwr:1-2, then one `^name(subscripts)=value`
+//! line per node.
 //!
-//! This is the one ZWR loader of the crate: the bridge's `serve`, the
-//! equivalence harness and the unit tests load fixtures through
-//! [`Store::from_zwr`] and [`load_fixtures`], and the bridge tests reach the
-//! store only through `bridge::serve`. A [`Store`] is borrowed immutably by
-//! the inquiry and has no mutator: nothing changes it after construction, so
-//! nothing an inquiry does can write to it.
+//! This is the one ZWR loader of the crate (AAP 0.3.3 Shared components and
+//! Data reach): the bridge's `serve`, the equivalence harness and the unit
+//! tests load fixtures through [`Store::from_zwr`] and [`load_fixtures`],
+//! and the bridge tests reach the store only through `bridge::serve`. A
+//! [`Store`] is borrowed immutably by the inquiry and has no mutator (AAP
+//! 0.3.2): nothing changes it after construction, so nothing an inquiry
+//! does can write to it.
 //!
 //! Keys are subscript vectors whose first element is the global name
 //! without its caret (`^PRC(442,1,0)` is `[Str("PRC"), Num("442"),
-//! Num("1"), Num("0")]`). They order by M default collation: every number
-//! before every string, numbers by exact value, strings by bytes. Values are
-//! the node data exactly as exported, with only the ZWR quoting removed.
+//! Num("1"), Num("0")]`). They order by M default collation (AAP 0.3.4
+//! Collation rule): every number before every string, numbers by exact
+//! value, strings by bytes. Values are the node data exactly as exported,
+//! with only the ZWR quoting removed.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::mumps;
 
 /// One subscript of a global reference, or the global name in the first
-/// position of a key.
+/// position of a key, as the AAP 0.3.4 Collation rule defines a `Store`
+/// key.
 ///
 /// Invariant: `Num` holds the canonical text of a number (`.5`, `500`,
-/// `10000000044`; never `0.5`, `01` or `1.0`), and `Str` holds text that is
-/// not a canonical number. [`Sub::from_text`] and the loader keep it, and
-/// callers must construct subscripts through them unless the text is a
-/// literal already known to meet it. A `Num` built from non-canonical text,
-/// or a `Str` from canonical text, violates the invariant and is not the
-/// subscript M names for that text. The order stays consistent with the
-/// derived `Eq` and `Hash` for every value, because a numeric tie is broken
-/// on the raw text.
+/// `10000000044`, the last at tests/fixtures/ifcap/411.zwr:124; never
+/// `0.5`, `01` or `1.0`), and `Str` holds text that is not a canonical
+/// number. [`Sub::from_text`] and the loader keep it, and callers must
+/// construct subscripts through them unless the text is a literal already
+/// known to meet it. A `Num` built from non-canonical text, or a `Str` from
+/// canonical text, violates the invariant and is not the subscript M names
+/// for that text. The order stays consistent with the derived `Eq` and
+/// `Hash` for every value, because a numeric tie is broken on the raw text.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Sub {
-    /// A canonical number, as its canonical text.
+    /// A canonical number, as its canonical text, such as the IENs of
+    /// `^PRC(411)` at tests/fixtures/ifcap/411.zwr:4-288.
     Num(String),
-    /// A string subscript, or the global name.
+    /// A string subscript, or the global name, such as `"AC"` at
+    /// tests/fixtures/ifcap/411.zwr:290 or the quoted `"008202226"` at
+    /// tests/fixtures/ifcap/440.zwr:14411.
     Str(String),
 }
 
@@ -48,7 +59,10 @@ impl Sub {
     /// The subscript that `text` names. In M a subscript's identity is its
     /// text: canonical number text is a number, anything else is a string,
     /// so the quoted subscript `"500"` is the number 500 while `"001"` and
-    /// `"04"` stay strings.
+    /// `"04"` stay strings (`^DIC(49,"D","04",1013)` at
+    /// tests/fixtures/ifcap/49.zwr:269). It is the canonical-number test
+    /// FileMan applies as `+$P(X,"E")=X` under tag `GRV` at DIC.m:48 before
+    /// `BYIEN2^DIC5` (DIC5.m:21) tries a lookup value as an IEN (PO-09).
     pub fn from_text(text: &str) -> Sub {
         if mumps::is_canonical(text) {
             Sub::Num(text.to_string())
@@ -57,25 +71,34 @@ impl Sub {
         }
     }
 
-    /// The subscript's text: the canonical number text or the string.
+    /// The subscript's text: the canonical number text or the string, the
+    /// value `$ORDER` gives M code, as it gives `PRCHDI` in the item loop of
+    /// `^PRCHDP2` at PRCHDP2.m:11 (PO-25).
     pub fn text(&self) -> &str {
         match self {
             Sub::Num(text) | Sub::Str(text) => text,
         }
     }
 
-    /// True for a numeric subscript.
+    /// True for a numeric subscript, which sorts before every string under
+    /// the AAP 0.3.4 Collation rule.
     pub fn is_num(&self) -> bool {
         matches!(self, Sub::Num(_))
     }
 }
 
 impl Ord for Sub {
-    /// M default collation: numbers before strings, numbers by exact
-    /// decimal value, strings by bytes. The 411 export lists its numeric
-    /// IENs before `"AC"` and `"B"` in this order, and the item loop
-    /// `Q:PRCHDI'>0` at PRCHDP2.m:11 relies on numeric items preceding
-    /// the `"B"` subscript.
+    /// M default collation (AAP 0.3.4 Collation rule): numbers before
+    /// strings, numbers by exact decimal value, strings by bytes. The 411
+    /// export lists its numeric IENs before `"AC"` and `"B"` in this order
+    /// (tests/fixtures/ifcap/411.zwr:4-297). The item loop
+    /// `$O(^PRC(442,D0,2,PRCHDI)) Q:PRCHDI'>0` of `^PRCHDP2` at
+    /// PRCHDP2.m:11 (PO-25), over file 442 field 40 ITEM at node 2
+    /// (DD.zwr:514888), relies on numeric items preceding the string
+    /// subscripts, such as the `"AC"` index `CON^PRCHDP1` reads at
+    /// PRCHDP1.m:61 (PO-20). The lookup's `"A["` test under tag `W` at
+    /// DICM.m:71 and its next-index walk under tag `M` at DIC3.m:63 rely on
+    /// byte order (PO-09).
     ///
     /// Two numbers of equal value are then ordered by the bytes of their
     /// text. Canonical texts of equal value are identical, so this never
@@ -100,9 +123,10 @@ impl PartialOrd for Sub {
 }
 
 impl Default for Sub {
-    /// The null subscript `""`, M's `$ORDER` seed and end value.
-    /// [`Store::order`] starts at the first child from it and never returns
-    /// it.
+    /// The null subscript `""`, M's `$ORDER` seed and end value: the `"AC"`
+    /// walk of `CON^PRCHDP1` at PRCHDP1.m:61 (PO-20) advances only while
+    /// `X'=""`. [`Store::order`] starts at the first child from it and never
+    /// returns it.
     fn default() -> Sub {
         Sub::Str(String::new())
     }
@@ -118,7 +142,8 @@ impl Default for Sub {
 /// person's or vendor's name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreError {
-    /// A data line that is not `^name(subscripts)=value`. `line` is 1-based
+    /// A data line that is not `^name(subscripts)=value` under the fixture
+    /// ZWR convention ([`Store::from_zwr`]; AAP 0.3.2). `line` is 1-based
     /// and counts every line of the text, header lines included. `file` is
     /// `None` when the text did not come from a file.
     Parse {
@@ -144,19 +169,23 @@ impl fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-/// The globals of one database snapshot, in M collation order.
+/// The globals of one database snapshot, in M collation order (AAP 0.3.4
+/// Collation rule). Nothing changes it once built, and every method takes
+/// `&self` (AAP 0.3.2; check A9 of AAP 0.7.4).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Store {
     nodes: BTreeMap<Vec<Sub>, String>,
 }
 
 impl Store {
-    /// Loads ZWR text: every line before the first line that starts with
-    /// `^` is a header line and is ignored, blank lines are ignored, and
-    /// every other line must be `^name(subscripts)=value`. A repeated key
-    /// replaces the earlier value, as `SET` does. Text with no data lines
-    /// gives an empty store. One trailing carriage return per line is
-    /// dropped, so a CRLF export loads like an LF one.
+    /// Loads ZWR text by the fixture ZWR convention (AAP 0.3.2 contract):
+    /// every line before the first line that starts with `^` is a header
+    /// line and is ignored, as `OSEHRA ZGO Export: PURCHASE ORDER STATUS`
+    /// and `ZWR` are at tests/fixtures/ifcap/442.3.zwr:1-2, blank lines are
+    /// ignored, and every other line must be `^name(subscripts)=value`. A
+    /// repeated key replaces the earlier value, as `SET` does. Text with no
+    /// data lines gives an empty store. One trailing carriage return per
+    /// line is dropped, so a CRLF export loads like an LF one.
     ///
     /// Subscripts are canonical numbers or quoted strings (`""` stands for
     /// one `"`), and a quoted canonical number is stored as a number, as M
@@ -192,21 +221,26 @@ impl Store {
 
     /// The value stored at `key`, or `None` when the node has no value.
     /// `None` is how an unguarded reference finds a missing node, where M
-    /// raises an `UNDEF` error.
+    /// raises an `UNDEF` error: the item loop's `^(PRCHDI,0)` of `^PRCHDP2`
+    /// at PRCHDP2.m:11 (PO-25), or `$P(^(0),U)` after a bare `$D` under tag
+    /// `S` at DIC3.m:110 (PO-09).
     pub fn get(&self, key: &[Sub]) -> Option<&str> {
         mumps::get_opt(&self.nodes, key)
     }
 
     /// M `$GET`: the value stored at `key`, or `""` when the node has no
-    /// value. A guarded read goes through this accessor, an unguarded one
-    /// through [`Store::get`], so every `$G` shares the one `$GET` model in
-    /// `mumps.rs`.
+    /// value, as `$G(^PRC(442,D0,0))` of `^PRCHDP1` reads the order's zero
+    /// node at PRCHDP1.m:4 (PO-10). A guarded read goes through this
+    /// accessor, an unguarded one through [`Store::get`], so every `$G`
+    /// shares the one `$GET` model in `mumps.rs`.
     pub fn get_or_empty(&self, key: &[Sub]) -> String {
         mumps::get(&self.nodes, key)
     }
 
     /// M `$DATA`: 0 for no value and no descendants, 1 for a value only,
-    /// 10 for descendants only, 11 for both.
+    /// 10 for descendants only, 11 for both, as `$D(^PRC(442,D0,4,1,0))` of
+    /// `^PRCHDP1` tests at PRCHDP1.m:9 (PO-10) and `$D(^PRC(442,D0,6,0))` of
+    /// `^PRCHDP2` at PRCHDP2.m:9 (PO-25).
     pub fn data(&self, key: &[Sub]) -> u8 {
         mumps::data(&self.nodes, key)
     }
@@ -216,28 +250,43 @@ impl Store {
     /// `None` or of the null subscript `""` is the seed and gives the first
     /// child. Null subscripts are invisible to it, as to M's `$ORDER`; a
     /// null node is still read through [`Store::get`] and [`Store::data`].
+    ///
+    /// Uses: the item loop `$O(^PRC(442,D0,2,PRCHDI))` of `^PRCHDP2` at
+    /// PRCHDP2.m:11 (PO-25), the node-14 walk `$O(^PRC(442,D0,14,Y))` of
+    /// `FOB^PRCHDP1` (tag at PRCHDP1.m:53) at PRCHDP1.m:56 (PO-13), and the
+    /// `"AC"` walk `$O(^PRC(442,D0,2,"AC",X))` of `CON^PRCHDP1` at
+    /// PRCHDP1.m:61 (PO-20).
     pub fn order(&self, parent: &[Sub], after: Option<&Sub>) -> Option<Sub> {
         mumps::order(&self.nodes, parent, after)
     }
 
-    /// Every node with its value, in collation order.
+    /// Every node with its value, in collation order (AAP 0.3.4 Collation
+    /// rule). No M construct on the path walks the whole store: the
+    /// inquiry reads only through `get`, `get_or_empty`, `data` and `order`
+    /// (AAP 0.3.3 Data reach).
     pub fn iter(&self) -> impl Iterator<Item = (&[Sub], &str)> {
         self.nodes
             .iter()
             .map(|(key, value)| (key.as_slice(), value.as_str()))
     }
 
-    /// The number of nodes holding a value.
+    /// The number of nodes holding a value: one per distinct key of the
+    /// loaded ZWR data lines (fixture ZWR convention, [`Store::from_zwr`]).
+    /// Like [`Store::iter`], it serves no M construct (AAP 0.3.3 Data
+    /// reach).
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
-    /// True when the store holds no node.
+    /// True when the store holds no node, as ZWR text without data lines
+    /// gives ([`Store::len`]).
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
-    /// The ZWR-style global reference of `key`: `^PRC(442,1,2,1,0)`,
+    /// The ZWR-style global reference of `key`, written as a fixture ZWR
+    /// line writes it before its `=` (fixture ZWR convention), and the
+    /// `<node>` of `CORRUPT STORE <node>` (AAP 0.3.2): `^PRC(442,1,2,1,0)`,
     /// `^PRC(442,"C","A12345",1)`. Numbers are written bare, and strings in
     /// quotes with each `"` doubled. A key holding only the global name
     /// gives `^NAME`, and an empty key gives `^`.
@@ -273,22 +322,26 @@ impl Store {
 /// It loads last, so its values win over the repository exports.
 const RUNTIME_EXPORT: &str = "cases.zwr";
 
-/// Loads every `*.zwr` file of `dir` into one store. Files load in byte
-/// order of name with `cases.zwr` last, so the runtime export wins on
-/// repeated keys; a missing `cases.zwr` is not an error. Symbolic links are
-/// followed. Entries whose names do not end in `.zwr`, files and
-/// directories alike, are ignored.
+/// Loads every `*.zwr` file of `dir`, `tests/fixtures/ifcap` for the
+/// bridge and the equivalence harness, into one store (AAP 0.3.3 Data
+/// reach). Files load in byte order of name with `cases.zwr` last, so the
+/// runtime export wins on repeated keys; a missing `cases.zwr` is not an
+/// error. Symbolic links are followed. Entries whose names do not end in
+/// `.zwr`, files and directories alike, are ignored.
 ///
-/// A directory that cannot be listed, an entry or its metadata that cannot
-/// be read, or a `*.zwr` file that cannot be read or is not UTF-8 is an
-/// [`io::Error`] of the original kind whose message names the path and says
-/// `cannot read`. A `*.zwr` entry that is not a regular file once links are
-/// followed, such as a directory or a FIFO, is never opened: it is an
-/// [`io::ErrorKind::InvalidInput`] error reading
-/// `<path>: cannot read: not a regular file`. A malformed line is an
-/// [`io::ErrorKind::InvalidData`] error carrying the [`StoreError::Parse`]
-/// text, which names the file and line. Each propagates with `?` from a
-/// caller returning `io::Result`.
+/// Errors follow the AAP 0.3.2 contract. A directory that cannot be listed,
+/// an entry or its metadata that cannot be read, or a `*.zwr` file that
+/// cannot be read or is not UTF-8 is an [`io::Error`] of the original kind
+/// whose message names the path and says `cannot read`. A `*.zwr` entry
+/// that is not a regular file once links are followed, such as a directory
+/// or a FIFO, is an [`io::ErrorKind::InvalidInput`] error reading
+/// `<path>: cannot read: not a regular file`. An entry whose metadata
+/// already shows it is not a regular file is never opened. Any other is
+/// opened without waiting for a FIFO writer on a platform whose
+/// `O_NONBLOCK` value is known, and the opened file's own type decides, so
+/// an object swapped in after that inspection is refused unread. A
+/// malformed line is an [`io::ErrorKind::InvalidData`] error carrying the
+/// [`StoreError::Parse`] text, which names the file and line.
 pub fn load_fixtures(dir: &Path) -> io::Result<Store> {
     let mut files = Vec::new();
     for entry in fs::read_dir(dir).map_err(|err| cannot_read(dir, err))? {
@@ -298,22 +351,15 @@ pub fn load_fixtures(dir: &Path) -> io::Result<Store> {
             continue;
         }
         let path = entry.path();
-        // Follows symbolic links, so a linked fixture loads like a copy.
-        let metadata = fs::metadata(&path).map_err(|err| cannot_read(&path, err))?;
-        // Decided before any open, so a FIFO is never waited on.
-        if !metadata.is_file() {
-            return Err(cannot_read(
-                &path,
-                io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"),
-            ));
-        }
+        let file = open_fixture(&path)?;
         files.push((
             name.as_encoded_bytes() == RUNTIME_EXPORT.as_bytes(),
             name,
             path,
+            file,
         ));
     }
-    files.sort_by(|(a_last, a_name, _), (b_last, b_name, _)| {
+    files.sort_by(|(a_last, a_name, ..), (b_last, b_name, ..)| {
         a_last
             .cmp(b_last)
             .then_with(|| a_name.as_encoded_bytes().cmp(b_name.as_encoded_bytes()))
@@ -322,8 +368,10 @@ pub fn load_fixtures(dir: &Path) -> io::Result<Store> {
     // runs on the map, before the one `Store` is built, so that `Store`
     // needs no mutator.
     let mut nodes = BTreeMap::new();
-    for (_, _, path) in files {
-        let text = fs::read_to_string(&path).map_err(|err| cannot_read(&path, err))?;
+    for (_, _, path, mut file) in files {
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .map_err(|err| cannot_read(&path, err))?;
         let loaded = Store::from_zwr(&text).map_err(|err| {
             let StoreError::Parse { line, message, .. } = err;
             let named = StoreError::Parse {
@@ -345,6 +393,87 @@ fn cannot_read(path: &Path, err: io::Error) -> io::Error {
         format!("{}: cannot read: {err}", path.display()),
     )
 }
+
+/// The `*.zwr` entry at `path`, opened for reading once its metadata shows
+/// a regular file and kept only as [`admit`] keeps it.
+fn open_fixture(path: &Path) -> io::Result<File> {
+    // Follows symbolic links, so a linked fixture loads like a copy.
+    let metadata = fs::metadata(path).map_err(|err| cannot_read(path, err))?;
+    // An entry already known not to be a regular file is refused unopened.
+    // One swapped in after this inspection is refused by `admit`, whose open
+    // does not wait for a FIFO writer where `O_NONBLOCK` is known.
+    if !metadata.is_file() {
+        return Err(not_regular(path));
+    }
+    admit(path)
+}
+
+/// Opens `path` without waiting ([`open_read_only`]) and keeps the opened
+/// file only when its own metadata shows a regular file: whatever stood at
+/// `path` when it was inspected, an object that is not a regular file once
+/// opened is refused unread ([`not_regular`]). A failed open or metadata
+/// read keeps its kind, and every error names `path` ([`cannot_read`]).
+fn admit(path: &Path) -> io::Result<File> {
+    let file = open_read_only(path).map_err(|err| cannot_read(path, err))?;
+    let opened = file.metadata().map_err(|err| cannot_read(path, err))?;
+    if opened.is_file() {
+        Ok(file)
+    } else {
+        Err(not_regular(path))
+    }
+}
+
+/// The [`io::ErrorKind::InvalidInput`] error of an entry at `path` that is
+/// not a regular file: `<path>: cannot read: not a regular file`.
+fn not_regular(path: &Path) -> io::Error {
+    cannot_read(
+        path,
+        io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"),
+    )
+}
+
+/// Opens `path` for reading only, requesting no write, append, create or
+/// truncate access, and with `O_NONBLOCK` on Unix, so that opening a FIFO
+/// does not wait for a writer where that flag's value is known.
+fn open_read_only(path: &Path) -> io::Result<File> {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::prelude::*;
+        options.custom_flags(O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+/// The `O_NONBLOCK` open flag, the platform's `<fcntl.h>` value, which std
+/// does not export: opening a FIFO with it returns at once instead of
+/// waiting for a writer, and reads of a regular file ignore it. It is 0, a
+/// plain read-only open, on a platform whose value is not known here.
+#[cfg(unix)]
+const O_NONBLOCK: i32 = if cfg!(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "mips32r6",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    ))
+)) {
+    0o4000
+} else if cfg!(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)) {
+    0x0004
+} else {
+    0
+};
 
 // One ZWR data line is scanned left to right. The scanner state is `rest`,
 // the unconsumed text of the line, and each function below consumes from
@@ -938,6 +1067,60 @@ mod tests {
                 Ok(store) => return Err(format!("{what} named x.zwr loaded as {store:?}")),
             }
         }
+        Ok(())
+    }
+
+    /// The opened file's own type decides admission, whatever its path
+    /// showed when inspected: an object that is not a regular file once
+    /// opened is refused unread, and a regular file is kept and read through
+    /// the same handle.
+    #[test]
+    fn admit_keeps_only_what_is_a_regular_file_once_opened() -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        use std::os::fd::AsRawFd;
+        // A pipe whose writer is closed: its `/proc` path opens as a FIFO.
+        #[cfg(target_os = "linux")]
+        let (reader, writer) = io::pipe().map_err(|e| format!("cannot create a pipe: {e}"))?;
+        #[cfg(target_os = "linux")]
+        drop(writer);
+        #[cfg(target_os = "linux")]
+        let fifo = Some((
+            "a FIFO",
+            PathBuf::from(format!("/proc/self/fd/{}", reader.as_raw_fd())),
+        ));
+        #[cfg(not(target_os = "linux"))]
+        let fifo = None;
+        let dir = scratch_dir()?;
+        let refused = [
+            ("a directory", dir.clone()),
+            ("a character device", PathBuf::from("/dev/null")),
+        ];
+        let outcome = refused
+            .into_iter()
+            .chain(fifo)
+            .try_for_each(|(what, path)| match admit(&path) {
+                Err(err) => {
+                    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{what}: got {err:?}");
+                    assert_eq!(
+                        err.to_string(),
+                        format!("{}: cannot read: not a regular file", path.display()),
+                        "{what}"
+                    );
+                    Ok(())
+                }
+                Ok(file) => Err(format!("{what} was admitted as {file:?}")),
+            })
+            .and_then(|()| write_file(&dir, "a.zwr", b"ZWR\n^X(1)=\"a\"\n"))
+            .and_then(|()| {
+                let path = dir.join("a.zwr");
+                let mut text = String::new();
+                admit(&path)
+                    .and_then(|mut file| file.read_to_string(&mut text))
+                    .map_err(|e| format!("a regular file was refused: {e}"))?;
+                Ok(text)
+            });
+        let text = remove_scratch(&dir, outcome)?;
+        assert_eq!(text, "ZWR\n^X(1)=\"a\"\n");
         Ok(())
     }
 
