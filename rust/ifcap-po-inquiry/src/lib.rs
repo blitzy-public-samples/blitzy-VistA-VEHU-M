@@ -11,6 +11,7 @@
 // `mumps` is private: nothing in it is wider than `pub(crate)`, so it forms no
 // part of the public API.
 pub mod bridge;
+pub mod golden;
 pub mod inquiry;
 mod mumps;
 pub mod store;
