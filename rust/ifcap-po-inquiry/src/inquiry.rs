@@ -10,12 +10,15 @@
 //! globals are only read, through the borrowed [`Store`]; output goes to the
 //! transcript of a `Session`, which never echoes input.
 //!
-//! A branch that no case exercises, or whose source cannot be settled
-//! (BLOCKED), returns `UnsupportedBranch` with its `SPEC.md` branch ID at the
-//! point the original decides it, before that branch writes anything. A read
-//! of a missing node where M raises `UNDEF` returns `CorruptStore`. No M
-//! code is interpreted: the screens and identifiers FileMan XECUTEs are
-//! literal source and DD text, reproduced as fixed logic.
+//! A branch that no case exercises, or one that open item O-01 (the HOME
+//! device's `IOF` and `IOSL`) leaves unresolved, is not implemented. Reaching
+//! it, at the point the original decides it, ends the session after the last
+//! prompt written, as input running out does: the transcript is cut there
+//! and nothing is invented. Validation, no-match and cancellation messages
+//! are transcript text under `Ok`. Only a read of a node holding no value
+//! where M raises `UNDEF` is an error, `CorruptStore`. No M code is
+//! interpreted: the screens and identifiers FileMan XECUTEs are literal
+//! source and DD text, reproduced as fixed logic.
 //!
 //! The original's non-business writes are not reproduced: FileMan's
 //! `^DISV(DUZ,...)` after each selection [DIC2.m:65], the word-wrap scratch
@@ -28,8 +31,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::mumps::{
-    Session, add, contains, extract, follows, int_div, justify, modulo, num, num_cmp, piece,
-    piece_range,
+    Session, add, contains, extract, follows, int_div, is_canonical, justify, modulo, num, num_cmp,
+    piece, piece_range,
 };
 use crate::store::{Store, Sub};
 
@@ -43,28 +46,28 @@ pub struct InquiryOutput {
     /// Everything the original writes, in order, with `\n` line endings and
     /// no echo of input.
     pub transcript: String,
-    /// The entry point's return value. Always `None`: the option reaches
-    /// `EN3^PRCHRPT` by `DO`, not as an extrinsic function.
+    /// The entry point's return value. Always `None`: OPTION 1901 enters
+    /// `EN3^PRCHRPT` by `DO` [19+OPTION.zwr:14691], and the routine quits
+    /// without a value [PRCHRPT.m:70-75].
     pub returned: Option<String>,
 }
 
 /// Why a session could not be reproduced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InquiryError {
-    /// A read of a missing node on an exercised path, where the original
-    /// raises an M `UNDEF` error. Carries the global reference.
+    /// A read of a node holding no value on an exercised path, where the
+    /// original raises an M `UNDEF` error: a node holding only descendants
+    /// that passed a bare `$D` test, at sites (a) to (f) of `SPEC.md`
+    /// "Contracts", for example the candidate order's zero node at
+    /// `S DIY=$P(^(0),U)` [DIC3.m:110]. Carries the node's global reference
+    /// as [`Store::format_ref`] writes it, such as `^PRC(442,1,0)`.
     CorruptStore(String),
-    /// A branch that is not exercised (n/e) or is BLOCKED, and so is not
-    /// implemented. Carries its `SPEC.md` branch ID, `PO-NN.bM`.
-    UnsupportedBranch(String),
 }
 
 impl fmt::Display for InquiryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            InquiryError::CorruptStore(reference) => write!(f, "CORRUPT STORE {reference}"),
-            InquiryError::UnsupportedBranch(id) => write!(f, "UNSUPPORTED BRANCH {id}"),
-        }
+        let InquiryError::CorruptStore(reference) = self;
+        write!(f, "CORRUPT STORE {reference}")
     }
 }
 
@@ -76,9 +79,13 @@ impl std::error::Error for InquiryError {}
 /// `DUZ` is POSTMASTER, `.5`, as the Kernel test code signs on with
 /// `D DUZ^XUP(.5)` [ZOSVGUT1.m:13]. `STATION` is the snapshot's primary
 /// station, `$O(^PRC(411,"AC","Y",0))` = 500 [PRCFSITE.m:14]. `IOF` and
-/// `IOSL` come from the HOME device that `^%ZIS` opens [ZIS1.m:103-113] and
-/// are unresolved (`None`) while open item O-01 stands. Capture contexts are
-/// validated against this table key by key.
+/// `IOSL` come from the HOME device that `^%ZIS` opens [PRCHDP1.m:12]
+/// [ZIS1.m:103-113] and are unresolved (`None`) while open item O-01 stands.
+///
+/// The capture reader validates each capture's recorded context against this
+/// table key by key: every key must be present and no other, a resolved
+/// value must be equal, and a `None` key accepts any capture value and is
+/// reported unresolved.
 pub const STUB_CONTEXT: [(&str, Option<&str>); 4] = [
     ("DUZ", Some(".5")),
     ("IOF", None),
@@ -90,21 +97,50 @@ pub const STUB_CONTEXT: [(&str, Option<&str>); 4] = [
 /// `PRCH DISPLAY PO` against `store`, answering its READs from `inputs`,
 /// each one typed line without its terminator.
 ///
-/// Input that runs out at a prompt ends the session after the last prompt
-/// written, as `Ok`. Lines left over when `EN3` returns are ignored. An
-/// unexercised or BLOCKED branch, or a read of a missing node where M raises
-/// `UNDEF`, gives `Err` and no transcript. `store` is never written.
+/// Input that runs out at a prompt, or a branch that is not implemented
+/// (exercised by no case, or left unresolved by open item O-01), ends the
+/// session after the last prompt written, as `Ok`, with nothing invented
+/// after it. Lines left over when `EN3` returns are ignored. `Err` is only
+/// [`InquiryError::CorruptStore`], at the unguarded reads of a node holding
+/// no value where M raises `UNDEF`. `store` is never written.
 pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, InquiryError> {
+    run(store, inputs).0
+}
+
+/// The session of [`inquire`], also returning the `SPEC.md` branch ID of the
+/// unimplemented branch that ended it, if one did. It exists so unit tests
+/// can assert which branch ended a session; the ID never leaves the crate.
+fn run(
+    store: &Store,
+    inputs: &[String],
+) -> (Result<InquiryOutput, InquiryError>, Option<&'static str>) {
     let mut s = Session::new(inputs);
     let mut v = Locals::default();
     let result =
         st_prchrpt(&mut s, store, &mut v).and_then(|()| en30_prchrpt(&mut s, store, &mut v));
     match result {
-        Ok(()) | Err(Halt::InputExhausted) => Ok(InquiryOutput {
-            transcript: s.into_transcript(),
-            returned: None,
-        }),
-        Err(Halt::Error(error)) => Err(error),
+        Ok(()) => (
+            Ok(InquiryOutput {
+                transcript: s.into_transcript(),
+                returned: None,
+            }),
+            None,
+        ),
+        Err(Halt::InputExhausted) => (
+            Ok(InquiryOutput {
+                transcript: s.into_transcript_at_prompt(),
+                returned: None,
+            }),
+            None,
+        ),
+        Err(Halt::Unexercised(id)) => (
+            Ok(InquiryOutput {
+                transcript: s.into_transcript_at_prompt(),
+                returned: None,
+            }),
+            Some(id),
+        ),
+        Err(Halt::Corrupt(node)) => (Err(InquiryError::CorruptStore(node)), None),
     }
 }
 
@@ -116,18 +152,19 @@ pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, Inquir
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Halt {
     /// A READ found no input left. The session ends after the last prompt
-    /// written, and `inquire` returns the transcript so far.
+    /// written.
     InputExhausted,
-    /// The session cannot be reproduced; `inquire` returns the error.
-    Error(InquiryError),
-}
-
-fn unsupported(id: &str) -> Halt {
-    Halt::Error(InquiryError::UnsupportedBranch(id.to_string()))
+    /// An unimplemented branch, by its `SPEC.md` branch ID `PO-NN.bM`,
+    /// reached before it writes anything. The session ends after the last
+    /// prompt written.
+    Unexercised(&'static str),
+    /// M `UNDEF` on an exercised path: the [`Store::format_ref`] reference
+    /// of the node holding no value. The session gives `CorruptStore`.
+    Corrupt(String),
 }
 
 fn corrupt(key: &[Sub]) -> Halt {
-    Halt::Error(InquiryError::CorruptStore(Store::format_ref(key)))
+    Halt::Corrupt(Store::format_ref(key))
 }
 
 /// M `READ X:DTIME`: the next input line, or `InputExhausted` when none is
@@ -201,11 +238,12 @@ fn set_first_piece(text: &str, value: &str) -> String {
 /// column-header WRITE [PRCHDP2.m:42]. With `$Y` at 0 nothing is written.
 /// Otherwise the form feed runs: the HOME device's `IOF`
 /// ([`STUB_CONTEXT`]), the bytes `W @IOF` writes for it and `$Y` after it
-/// are all open item O-01, and `Session` models no form feed, so the
-/// outcome is the BLOCKED branch `id` whatever value `IOF` is given.
-fn form_feed(s: &Session, id: &str) -> Result<(), Halt> {
+/// are all open item O-01, and `Session` models no form feed, so the branch
+/// `id` is not implemented while O-01 stands and the session ends at the
+/// last prompt written, whatever value `IOF` is given.
+fn form_feed(s: &Session, id: &'static str) -> Result<(), Halt> {
     if s.y() > 0 {
-        return Err(unsupported(id));
+        return Err(Halt::Unexercised(id));
     }
     Ok(())
 }
@@ -416,7 +454,7 @@ fn prcfsite(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     //  G:+Y<0 Q S PRC("SITE")=+Y
     let y = num(v.y.as_deref().unwrap_or(""));
     if num_cmp(&y, "0") == Ordering::Less {
-        return Err(unsupported("PO-03.b7"));
+        return Err(Halt::Unexercised("PO-03.b7"));
     }
     v.prc_site = Some(y);
     // OUT S %=1 K %DT,DIC,PRC("SP"),PRC("MDIV"),PRC("L"),PRC("I"),PRCF("X"),%F,A,B,X,Y Q   [PRCFSITE.m:29]
@@ -435,7 +473,7 @@ fn duz_prcfsite(_s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Ha
     // DUZ K PRCFDEL,PRC("PER") S %=1 I $D(DUZ)#2,+DUZ>0 S PRC("PER")=+DUZ
     //  I '$D(PRC("PER")) S %=0 W !,$C(7),"YOU ARE NOT IN THE 'NEW PERSON' FILE. ..." Q
     if !stub_value("DUZ").is_some_and(positive) {
-        return Err(unsupported("PO-04.b2"));
+        return Err(Halt::Unexercised("PO-04.b2"));
     }
     Ok(())
 }
@@ -468,7 +506,7 @@ fn dic(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
     }
     let answer = read(s)?;
     if !answer.is_empty() {
-        return Err(unsupported("PO-05.b2"));
+        return Err(Halt::Unexercised("PO-05.b2"));
     }
     //  I X="",$G(DIY(DISUB))]"" S DIVAL(DISUB)=DIY(DISUB)   [DIC11.m:30]
     let Some(station) = default else {
@@ -538,7 +576,7 @@ fn en3_prchpat(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     v.dic_s = None;
     v.d0 = None;
     if v.prc_site.is_none() {
-        return Err(unsupported("PO-08.b1"));
+        return Err(Halt::Unexercised("PO-08.b1"));
     }
     //  S D=$S($G(PRCHPC)=1:"APCS",$G(PRCHPC)=2:"APCP",$G(PRCHDELV):"APCD",1:"C")
     v.d = Some("C".to_string());
@@ -585,7 +623,10 @@ const AFTER_INDEX_NAMES: &str = "A\u{5b}";
 /// file 442, starting on the index the local `D` names (`C`), with
 /// `DIC(0)="QEAMZ"`, following `SPEC.md` R2 to R6. It applies
 /// FileMan's lookup rules to whatever the store holds, never a list of known
-/// identifiers. On a selection `Y` is `ien^.01`; on `^` it is `-1`.
+/// identifiers. On a selection `Y` is `ien^.01`; on `^` it is `-1`. A value
+/// that matches nothing, where [`no_match_guard`] holds, writes the no-match
+/// sequence `<BEL> ??\n` and asks again (PO-09.b14, R3), applying the same
+/// read checks and search to the next answer.
 fn ix_dic(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // IX N DINDEX,DF S (DF,DINDEX,DINDEX("START"))=D G EN
     // EN ... D INIT^DIC0: GETFILE^DIC0 and FILENUM^DILIBF read ^PRC(442,0)
@@ -596,78 +637,188 @@ fn ix_dic(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // which decide the prompt and the identifiers [DIC0.m:23] [DIC1.m:41-49].
     let header = st.get_or_empty(&key("PRC", &["442", "0"]));
     if piece(&header, "^", 2) != FILE_442_ATTRIBUTES {
-        return Err(unsupported("PO-09.b15"));
+        return Err(Halt::Unexercised("PO-09.b15"));
     }
-    s.nl();
-    s.write(v.dic_a.as_deref().unwrap_or(""));
-    let x = read(s)?;
-    // The read checks of PR1^DIC11, in source order [DIC11.m:19-33]; the
-    // timeout [DIC11.m:18] (PO-09.b1) cannot occur.
-    if x.chars().any(|c| !(' '..='~').contains(&c)) || overlong_number(&x) {
-        return Err(unsupported("PO-09.b2"));
-    }
-    if x == "^" {
-        v.y = Some("-1".to_string());
-        return Ok(());
-    }
-    if x.chars().count() > 250 {
-        return Err(unsupported("PO-09.b2"));
-    }
-    if !x.is_empty() && x.chars().all(|c| c == '?') {
-        return Err(unsupported("PO-09.b4"));
-    }
-    if x == " " || backtick_value(&x) {
-        return Err(unsupported("PO-09.b5"));
-    }
-    if x.is_empty() {
-        return Err(unsupported("PO-09.b6"));
-    }
-    //  S:$E(X)="^" (DIOUT,DUOUT)=1   [DIC11.m:33]; RTN ... I $G(DUOUT) S Y=-1   [DIC.m:45]
-    if x.starts_with('^') {
-        v.y = Some("-1".to_string());
-        return Ok(());
-    }
-    v.x = Some(x.clone());
-    // RTN: no IEN attempt, because IX^DIC defines DF [DIC.m:48, 84-85] [DIC5.m:22]
-    // F ... D SEARCH^DIC3   [DIC.m:56]
-    let (candidates, exact_on_start) = search(st, v, &x)?;
-    if let Some(ien) = candidates.first() {
-        // I DS=1 S DS("DD")=1 D G^DIC2 Q  /  I DS D Y^DIC1 ...   [DIC3.m:71-72]
-        if candidates.len() > 1 {
-            return Err(unsupported("PO-09.b10"));
+    // ASK: each pass writes the prompt and reads one answer; the no-match
+    // sequence (PO-09.b14) goes back here with G ASK [DIC.m:63].
+    loop {
+        s.nl();
+        s.write(v.dic_a.as_deref().unwrap_or(""));
+        let x = read(s)?;
+        // The read checks of PR1^DIC11, in source order [DIC11.m:19-33]; the
+        // timeout [DIC11.m:18] (PO-09.b1) cannot occur.
+        if x.chars().any(|c| !(' '..='~').contains(&c)) || overlong_number(&x) {
+            return Err(Halt::Unexercised("PO-09.b2"));
         }
-        if exact_on_start != 1 {
-            return Err(unsupported("PO-09.b9"));
+        if x == "^" {
+            v.y = Some("-1".to_string());
+            return Ok(());
         }
-        let node0 = write_order_echo(s, st, ien)?;
-        // GOT ... S Y=Y_"^"_DIY   [DIC2.m:53]. ACT's ^DISV write [DIC2.m:65] is not reproduced.
-        v.y = Some(format!("{}^{}", ien.text(), piece(&node0, "^", 1)));
-        return Ok(());
-    }
-    // No candidate: ^DICM's transforms and retries [DICM.m:13-66]
-    if pointer_candidate(st, v, &x)? {
-        return Err(unsupported("PO-09.b11"));
-    }
-    if x.chars().any(|c| c.is_ascii_lowercase()) {
-        let upper = x.to_ascii_uppercase();
-        let (upper_candidates, _) = search(st, v, &upper)?;
-        if !upper_candidates.is_empty() || pointer_candidate(st, v, &upper)? {
-            return Err(unsupported("PO-09.b13"));
+        if x.chars().count() > 250 {
+            return Err(Halt::Unexercised("PO-09.b2"));
         }
+        if !x.is_empty() && x.chars().all(|c| c == '?') {
+            return Err(Halt::Unexercised("PO-09.b4"));
+        }
+        if x == " " || backtick_value(&x) {
+            return Err(Halt::Unexercised("PO-09.b5"));
+        }
+        if x.is_empty() {
+            return Err(Halt::Unexercised("PO-09.b6"));
+        }
+        //  S:$E(X)="^" (DIOUT,DUOUT)=1   [DIC11.m:33]; RTN ... I $G(DUOUT) S Y=-1   [DIC.m:45]
+        if x.starts_with('^') {
+            v.y = Some("-1".to_string());
+            return Ok(());
+        }
+        v.x = Some(x.clone());
+        // RTN: no IEN attempt, because IX^DIC defines DF [DIC.m:48, 84-85] [DIC5.m:22]
+        // F ... D SEARCH^DIC3   [DIC.m:56]
+        let (candidates, exact_on_start) = search(st, v, &x)?;
+        if let Some(ien) = candidates.first() {
+            // I DS=1 S DS("DD")=1 D G^DIC2 Q  /  I DS D Y^DIC1 ...   [DIC3.m:71-72]
+            if candidates.len() > 1 {
+                return Err(Halt::Unexercised("PO-09.b10"));
+            }
+            if exact_on_start != 1 {
+                return Err(Halt::Unexercised("PO-09.b9"));
+            }
+            let node0 = write_order_echo(s, st, ien)?;
+            // GOT ... S Y=Y_"^"_DIY   [DIC2.m:53]. ACT's ^DISV write [DIC2.m:65] is not reproduced.
+            v.y = Some(format!("{}^{}", ien.text(), piece(&node0, "^", 1)));
+            return Ok(());
+        }
+        // No candidate: ^DICM's transforms and retries [DICM.m:13-66]
+        if pointer_candidate(st, v, &x)? {
+            return Err(Halt::Unexercised("PO-09.b11"));
+        }
+        if x.chars().any(|c| c.is_ascii_lowercase()) {
+            let upper = x.to_ascii_uppercase();
+            let (upper_candidates, _) = search(st, v, &upper)?;
+            if !upper_candidates.is_empty() || pointer_candidate(st, v, &upper)? {
+                return Err(Halt::Unexercised("PO-09.b13"));
+            }
+        }
+        // With no subscript after AFTER_INDEX_NAMES FileMan scans the whole file [DICM.m:71-81]
+        let file = key("PRC", &["442"]);
+        if st
+            .order(&file, Some(&Sub::Str(AFTER_INDEX_NAMES.to_string())))
+            .is_none()
+        {
+            return Err(Halt::Unexercised("PO-09.b16"));
+        }
+        // The pointer rule and the retries above leave out what the nested
+        // pointer lookups search beyond their `B` index (SPEC.md R6), so the
+        // no-match sequence is written only where the O-03 guard shows that
+        // nothing else could have been found or written; any other value
+        // ends the session as the n/e PO-09.b11.
+        if !no_match_guard(st, &x) {
+            return Err(Halt::Unexercised("PO-09.b11"));
+        }
+        // PO-09.b14 (SPEC.md R3): BAD^DIC1 sets DS(0)="1^" [DIC1.m:157-159];
+        // DING writes $C(7)_" ??" [DIC.m:65, 80-81]; D^DIC0 writes nothing and
+        // W:DIC(0)["E" ! ends the line before G ASK [DIC.m:63], whose W ! and
+        // prompt the next pass writes [DIC.m:25] [DIC11.m:15-17].
+        s.bell();
+        s.write(" ??");
+        s.nl();
     }
-    // With no subscript after AFTER_INDEX_NAMES FileMan scans the whole file [DICM.m:71-81]
+}
+
+/// The pointer-field indexes of file 442 whose pointed-to files the O-03
+/// analysis did not cover: `G` on subfile 442.14 field 11
+/// INVENTORY/DISTRIBUTION POINT, pointing to 445 [DD.zwr:517723]; `M` on
+/// field 46 PURCHASE CARD NUMBER, pointing to 440.5 [DD.zwr:514943]; and
+/// `MCH` on field 61 PURCHASE CARD HOLDER, pointing to 200 [DD.zwr:515047].
+/// A nested lookup runs only for an index that holds entries [DICM0.m:26, 32].
+const UNANALYSED_POINTER_INDEXES: [&str; 3] = ["G", "M", "MCH"];
+
+/// The internal codes of file 440's set-typed indexes: `AC` on field .05
+/// SUPPLY WHSE. INDICATOR, `S:SUPPLY WAREHOUSE` [DD.zwr:509908, 510071],
+/// and `AE` on field 31.5 INACTIVATED VENDOR, `1:INACTIVATED`
+/// [DD.zwr:509910, 510441]. `S^DICM1` matches a value equal to an internal
+/// code [DICM1.m:30-32].
+const VENDOR_SET_CODES: [&str; 2] = ["S", "1"];
+
+/// The external values of [`VENDOR_SET_CODES`] [DD.zwr:510071, 510441],
+/// which `S^DICM1` matches when the value is a prefix of one
+/// [DICM1.m:34-39].
+const VENDOR_SET_VALUES: [&str; 2] = ["SUPPLY WAREHOUSE", "INACTIVATED"];
+
+/// The files the nested pointer lookups visit when [`UNANALYSED_POINTER_INDEXES`]
+/// are empty, each as (global, file number, every index of the file): 440
+/// VENDOR through `D` (field 5 [DD.zwr:514589]) [DD.zwr:509908-509917],
+/// 442.5 PAT TYPE through `F` (field .02 [DD.zwr:514331])
+/// [DD.zwr:518127-518128], and 442.3 PURCHASE ORDER STATUS through `ST`
+/// (field .5 [DD.zwr:514433]) [DD.zwr:517989-517991].
+const NESTED_LOOKUP_INDEXES: [(&str, &str, &[&str]); 3] = [
+    (
+        "PRC",
+        "440",
+        &["AC", "AD", "AE", "AF", "AG", "B", "C", "D", "DB", "E"],
+    ),
+    ("PRCD", "442.5", &["B", "C"]),
+    ("PRCD", "442.3", &["AC", "B", "C"]),
+];
+
+/// The O-03 guard (`SPEC.md` R4 to R6): true only when the no-match sequence
+/// PO-09.b14 is what the original writes for `x`, which every search step
+/// has already failed to match. All four conditions must hold:
+///
+/// - (a) [`UNANALYSED_POINTER_INDEXES`] hold no entry, so no nested lookup
+///   runs on a file the analysis did not cover;
+/// - (b) `x` is not one of [`VENDOR_SET_CODES`] nor a prefix of one of
+///   [`VENDOR_SET_VALUES`], so `S^DICM1` matches nothing and writes nothing;
+/// - (c) no subscript of any index in [`NESTED_LOOKUP_INDEXES`] equals or
+///   begins with `x`, so no nested index search can find a candidate;
+/// - (d) `x` has no lowercase letter [DICM.m:44] and no comma [DICM.m:48],
+///   is at most 30 characters long [DICM.m:57] and is not a canonical
+///   number, so none of the uppercase, comma-piecing and long-input retries
+///   or a numeric lookup runs.
+///
+/// The guard ignores screens, so it over-approximates: whenever it lets the
+/// sequence through, the original also finds no candidate. Under the
+/// fixture profile the nested lookups visit only 440 (`D`), 442.5 (`F`) and
+/// 442.3 (`ST`); none of them has a date, pointer or variable-pointer index
+/// or a node-7 field, so no `%DT` echo [DICM1.m:15-23] can occur, and a
+/// nested miss writes nothing because `A` and `Q` are stripped [DICM.m:107].
+fn no_match_guard(st: &Store, x: &str) -> bool {
+    // (a)
     let file = key("PRC", &["442"]);
-    if st
-        .order(&file, Some(&Sub::Str(AFTER_INDEX_NAMES.to_string())))
-        .is_none()
+    if UNANALYSED_POINTER_INDEXES
+        .iter()
+        .any(|name| st.data(&child(&file, &Sub::from_text(name))) != 0)
     {
-        return Err(unsupported("PO-09.b16"));
+        return false;
     }
-    // BAD^DIC1, then DING and the re-ask [DIC1.m:157-159] [DIC.m:63-65, 80-81, 25]
-    // would write <BEL> ??, two newlines and the prompt (SPEC.md R3). Whether
-    // the nested pointer lookups' own transforms write first is open item
-    // O-03 (SPEC.md R4), so this outcome is BLOCKED for every value alike.
-    Err(unsupported("PO-09.b14"))
+    // (b)
+    if VENDOR_SET_CODES.contains(&x) || VENDOR_SET_VALUES.iter().any(|value| value.starts_with(x)) {
+        return false;
+    }
+    // (d), ahead of (c) because it reads nothing
+    if x.chars().any(|c| c.is_ascii_lowercase())
+        || x.contains(',')
+        || x.chars().count() > LOOKUP_LENGTH
+        || is_canonical(x)
+    {
+        return false;
+    }
+    // (c): every subscript of each index, numbers included, because numeric
+    // subscripts collate before every string and a walk from `x` would skip them.
+    for (global, number, indexes) in NESTED_LOOKUP_INDEXES {
+        let root = key(global, &[number]);
+        for name in indexes {
+            let index = child(&root, &Sub::from_text(name));
+            let mut next = st.order(&index, None);
+            while let Some(sub) = next {
+                if sub.text().starts_with(x) {
+                    return false;
+                }
+                next = st.order(&index, Some(&sub));
+            }
+        }
+    }
+    true
 }
 
 /// `X?1.N.1"."1.N` with more than 25 integer or 24 fraction digits
@@ -975,8 +1126,9 @@ fn write_order_echo(s: &mut Session, st: &Store, ien: &Sub) -> Result<String, Ha
 
 /// PO-10 `^PRCHDP1` [PRCHDP1.m:4-52]: the page-1 header of order `D0`,
 /// falling into the FOB block (PO-13) and from there through the rest of
-/// page 1 into the line items. It stops at `^%ZIS` (PO-12, BLOCKED by open
-/// item O-01); the header after it is ported as source gives it.
+/// page 1 into the line items. `^%ZIS` (PO-12) is not implemented while
+/// open item O-01 stands, so the session ends there at the last prompt
+/// written; the header after it is ported as source gives it.
 fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     let d0 = v.d0.clone().unwrap_or_default();
     // S PRCHD0=$G(^PRC(442,D0,0)),PRCHD1=$G(^(1)),X=0   [PRCHDP1.m:4]; ^(1) is ^PRC(442,D0,1)
@@ -998,19 +1150,19 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // S PRCHDSHP="" Q:PRCHD0']""  S:'$D(PRCHPO) PRCHPO=D0   [PRCHDP1.m:8]
     v.prchdshp = Some(String::new());
     if !follows(&prchd0, "") {
-        return Err(unsupported("PO-10.b1"));
+        return Err(Halt::Unexercised("PO-10.b1"));
     }
     if v.prchpo.is_none() {
         v.prchpo = Some(d0.clone());
     }
     // I PRCHD1']"",$D(^PRC(442,D0,4,1,0)) S DIC="^PRC(442,",DA=PRCHPO D EN^DIQ Q   [PRCHDP1.m:9]
     if !follows(&prchd1, "") && st.data(&key("PRC", &["442", &d0, "4", "1", "0"])) != 0 {
-        return Err(unsupported("PO-10.b2"));
+        return Err(Halt::Unexercised("PO-10.b2"));
     }
     // Q:PRCHD1']""  S PRCHDS=0 I +$P(PRCHD0,U,2)'=4,$P(PRCHD1,U,12)=""
     //  S PRCHDSHP=$G(^PRC(411,PRCHSIT1,1,+$P(PRCHD1,U,3),0))   [PRCHDP1.m:10]
     if !follows(&prchd1, "") {
-        return Err(unsupported("PO-10.b3"));
+        return Err(Halt::Unexercised("PO-10.b3"));
     }
     v.prchds = Some("0".to_string());
     let patient = piece(&prchd1, "^", 12);
@@ -1071,7 +1223,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     s.write("LAST PARTIAL RECD.: ");
     v.x = Some("0".to_string());
     if st.data(&key("PRC", &["442", &d0, "11", "0"])) != 0 {
-        return Err(unsupported("PO-10.b5"));
+        return Err(Halt::Unexercised("PO-10.b5"));
     }
     // S:X>0 ... W:X>0 X W !,?37,"REQUESTING SERVICE: ",$S($D(^DIC(49,+$P(PRCHD1,U,2),0)):$P(^(0),U,1),1:"")   [PRCHDP1.m:17]
     s.nl();
@@ -1186,7 +1338,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     let edi = st.get_or_empty(&key("PRC", &["440", &vendor, "3"]));
     let node12 = st.get_or_empty(&key("PRC", &["442", &d0, "12"]));
     if follows(&edi, "") && piece(&edi, "^", 2) == "Y" && piece(&node12, "^", 16) != "n" {
-        return Err(unsupported("PO-10.b6"));
+        return Err(Halt::Unexercised("PO-10.b6"));
     }
     // S:$P(PRCHDSHP,U,2)]"" S(S)=$P(PRCHDSHP,U,2),S=S+1 S:$P(PRCHDSHP,U,3)]"" ... S:$P(PRCHDSHP,U,4)]"" ...   [PRCHDP1.m:36]
     for field in 2..=4 {
@@ -1259,7 +1411,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // I $P($G(^PRC(442,D0,24)),U,3)="RMPR" D  K RMPRPO,RMPR664,RMPRR3   [PRCHDP1.m:45-52]
     let prosthetics = st.get_or_empty(&key("PRC", &["442", &d0, "24"]));
     if piece(&prosthetics, "^", 3) == "RMPR" {
-        return Err(unsupported("PO-10.b7"));
+        return Err(Halt::Unexercised("PO-10.b7"));
     }
     fob_prchdp1(s, st, v)
 }
@@ -1281,7 +1433,7 @@ fn ftyp_prchfpnt(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Hal
     // I $P($G(^PRC(442,D0,23)),U,7)]"" S PRCSUB=$P(^(23),U,7) D  ...   [PRCHFPNT.m:46-47]
     let node23 = st.get_or_empty(&key("PRC", &["442", &d0, "23"]));
     if follows(piece(&node23, "^", 7), "") {
-        return Err(unsupported("PO-11.b2"));
+        return Err(Halt::Unexercised("PO-11.b2"));
     }
     // I '$D(PRCHFTP2) S PRCHFTYP=$P($G(^PRC(411.2,+X,0)),U,2)   [PRCHFPNT.m:49]
     let facility = st.get_or_empty(&key("PRC", &["411.2", &num(&x), "0"]));
@@ -1294,10 +1446,11 @@ fn ftyp_prchfpnt(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Hal
 /// PO-12 `^%ZIS` [ZIS.m:28-37] [ZIS1.m:103-113], stub: opens the HOME
 /// device (`IOP="HOME"`, `%ZIS=""`). What the HOME device set-up writes, and
 /// the `IOF` and `IOSL` it sets, depend on the runtime device and are open
-/// item O-01 ([`STUB_CONTEXT`] holds them unresolved), so the device open is
-/// BLOCKED: requires a runtime shim, not converted.
+/// item O-01 ([`STUB_CONTEXT`] holds them unresolved). The device open
+/// requires a runtime shim, not converted: PO-12.b1 is not implemented (O-01),
+/// and the session ends at the last prompt written.
 fn pct_zis(_s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt> {
-    Err(unsupported("PO-12.b1"))
+    Err(Halt::Unexercised("PO-12.b1"))
 }
 
 /// PO-13 `FOB^PRCHDP1` [PRCHDP1.m:53-57]: the FOB point, the proposal
@@ -1508,7 +1661,7 @@ fn diwp(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
     }
     // S DIWTC=X contains $C(124)_"TAB" S:'$D(DN) DN=1   [DIWP.m:29]
     if contains(&x, "|TAB") {
-        return Err(unsupported("PO-15.b3"));
+        return Err(Halt::Unexercised("PO-15.b3"));
     }
     let mut diwtc = false;
     if v.dn.is_none() {
@@ -1517,11 +1670,11 @@ fn diwp(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // LN S:'$D(DIWF) DIWF="" S:'DIWTC DIWTC=DIWF contains "N" S DIWX=X,DIW=$C(124),
     //  I=$P(DIWF,"C",2) I I S DIWR=DIWL+I-1   [DIWP.m:30]
     if !v.diwf.get_or_insert_with(String::new).is_empty() {
-        return Err(unsupported("PO-15.b3"));
+        return Err(Halt::Unexercised("PO-15.b3"));
     }
     // A "|" in DIWX opens a window [DIWP.m:37-41]
     if contains(&x, "|") {
-        return Err(unsupported("PO-15.b2"));
+        return Err(Halt::Unexercised("PO-15.b2"));
     }
     let diwx = x.clone();
     // I '$D(^UTILITY($J,"W",DIWL)) S ^(DIWL)=1 K DIWFU,DIWFWU,DIWLL D DIWI
@@ -1619,7 +1772,7 @@ fn dis_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     s.write("DISCOUNT TERM: ");
     v.x = Some("0".to_string());
     if st.data(&key("PRC", &["442", &d0, "5", "0"])) != 0 {
-        return Err(unsupported("PO-18.b2"));
+        return Err(Halt::Unexercised("PO-18.b2"));
     }
     con_prchdp1(s, st, v)
 }
@@ -1663,7 +1816,7 @@ fn con_prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
             v.x = Some(x.clone());
         }
         if !x.is_empty() {
-            return Err(unsupported("PO-20.b1"));
+            return Err(Halt::Unexercised("PO-20.b1"));
         }
         if row == 2 {
             app_prchdp1(s, st, v)?;
@@ -1717,7 +1870,7 @@ fn est_prchdp1(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
     let estimated = flag == "Y";
     v.y = Some(flag);
     if estimated {
-        return Err(unsupported("PO-23.b2"));
+        return Err(Halt::Unexercised("PO-23.b2"));
     }
     Ok(())
 }
@@ -1757,7 +1910,7 @@ fn prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     let halted = contains(&answer, "^");
     v.x = Some(answer);
     if halted {
-        return Err(unsupported("PO-25.b1"));
+        return Err(Halt::Unexercised("PO-25.b1"));
     }
     hdr_prchdp2(s, st, v)?;
     // S (N,PRCHDI)=0 F I=0:0 S PRCHDI=$O(^PRC(442,D0,2,PRCHDI)) Q:PRCHDI'>0  S PRCHDI0=^(PRCHDI,0),
@@ -1789,17 +1942,17 @@ fn prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
         v.prchdi2 = Some(item2);
         item_prchdp2(s, st, v)?;
         if truthy(v.prchdq.as_deref().unwrap_or("")) {
-            return Err(unsupported("PO-25.b4"));
+            return Err(Halt::Unexercised("PO-25.b4"));
         }
         item = entry;
     }
     if !any_item {
-        return Err(unsupported("PO-25.b3"));
+        return Err(Halt::Unexercised("PO-25.b3"));
     }
     // S PRCHDI=0 F I=0:0 S PRCHDI=$O(^PRC(442,D0,3,PRCHDI)) Q:PRCHDI'>0  ... D DIS   [PRCHDP2.m:12]
     if first_after_zero(st, &key("PRC", &["442", &d0, "3"])).is_some_and(|sub| positive(sub.text()))
     {
-        return Err(unsupported("PO-25.b5"));
+        return Err(Halt::Unexercised("PO-25.b5"));
     }
     // I $P(PRCHD0,U,13)>0 W !?2,$J(N+1,3),?7,"EST. SHIPPING AND/OR HANDLING",?58,$J($P(PRCHD0,U,13),7,2)   [PRCHDP2.m:13]
     let shipping = piece(v.prchd0.as_deref().unwrap_or(""), "^", 13).to_string();
@@ -1815,14 +1968,15 @@ fn prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     }
     // G:'$D(^PRC(442,D0,15,0)) COM ...   [PRCHDP2.m:14-18]
     if st.data(&key("PRC", &["442", &d0, "15", "0"])) != 0 {
-        return Err(unsupported("PO-25.b7"));
+        return Err(Halt::Unexercised("PO-25.b7"));
     }
     com_prchdp2(s, st, v)
 }
 
 /// PO-26 `HDR^PRCHDP2` [PRCHDP2.m:42-43]: the form feed and the column
-/// header, all one WRITE under `$Y>0`, then 80 dashes. The form feed is
-/// BLOCKED by open item O-01 (see [`form_feed`]).
+/// header, all one WRITE under `$Y>0`, then 80 dashes. The form feed is not
+/// implemented (O-01); the session ends at the last prompt written (see
+/// [`form_feed`]).
 fn hdr_prchdp2(s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt> {
     // HDR W:$Y>0 @IOF,!!?55,"UNIT",?70,"TOTAL",!,"ITEM",?15,"DESCRIPTION",?42,"QTY",?46,"UNIT",
     //  ?55,"COST",?70,"COST",! F I=1:1:80 W "-"
@@ -1874,7 +2028,7 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
         line = next;
     }
     if !any_line {
-        return Err(unsupported("PO-27.b2"));
+        return Err(Halt::Unexercised("PO-27.b2"));
     }
     //  K ^TMP($J,"W") S %X="^UTILITY($J,""W"",",%Y="^TMP($J,""W""," D %XY^%RCR   [PRCHDP2.m:48]
     v.tmp_w_counts.clear();
@@ -1929,11 +2083,11 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
     s.write(&justify(piece(&item2, "^", 1), 7, Some(2)));
     //  I PRCHDCNT>1 S K=1 F  S K=$O(^TMP($J,"W",1,K)) Q:K=""!(K'>0)  D:$Y+5>IOSL ASK Q:PRCHDQ  W !?8,^(K,0)   [PRCHDP2.m:54]
     if num_cmp(&count, "1") == Ordering::Greater {
-        return Err(unsupported("PO-27.b3"));
+        return Err(Halt::Unexercised("PO-27.b3"));
     }
     //  Q:PRCHDQ   [PRCHDP2.m:55]
     if truthy(v.prchdq.as_deref().unwrap_or("")) {
-        return Err(unsupported("PO-27.b4"));
+        return Err(Halt::Unexercised("PO-27.b4"));
     }
     //  W:$P(PRCHDI0,U,6)]"" !?8,"STK#: ",$P(PRCHDI0,U,6) W:$P(PRCHDI0,U,13)]"" !,?8,"NSN:  ",$P(PRCHDI0,U,13)
     //  W:$P($G(^PRC(442,D0,2,PRCHDI,4)),U,12)]"" !,?8,"FOOD GROUP: ",$P(^(4),U,12)   [PRCHDP2.m:56]
@@ -1960,7 +2114,7 @@ fn item_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt>
         s.write(&justify(received, 5, None));
     }
     if st.data(&key("PRC", &["442", &d0, "2", &item, "3", "AC"])) != 0 {
-        return Err(unsupported("PO-27.b5"));
+        return Err(Halt::Unexercised("PO-27.b5"));
     }
     let mut zz = "0".to_string();
     edistat_prchutl(s, st, v, &d0, &item, &mut zz)?;
@@ -2047,12 +2201,12 @@ fn pipeck_prchdp2(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Ha
             v.x = Some(x);
             if pipe_in {
                 v.purpipe = Some("1".to_string());
-                return Err(unsupported("PO-28.b2"));
+                return Err(Halt::Unexercised("PO-28.b2"));
             }
             line = entry;
         }
         if !any_line {
-            return Err(unsupported("PO-28.b3"));
+            return Err(Halt::Unexercised("PO-28.b3"));
         }
         item = next;
     }
@@ -2077,26 +2231,27 @@ fn edistat_prchutl(
     //  I $D(^PRC(442,D0,2,D1,2)) S X=$P(^(2),"^",9,12) D   [PRCHUTL.m:73]
     //  .I $P(X,"^",1)=""&($P(X,"^",3)="") Q   [PRCHUTL.m:74]
     let Some(node2) = defined(st, &key("PRC", &["442", d0, "2", d1, "2"]))? else {
-        return Err(unsupported("PO-29.b1"));
+        return Err(Halt::Unexercised("PO-29.b1"));
     };
     let x = piece_range(&node2, "^", 9, 12);
     if piece(&x, "^", 1).is_empty() && piece(&x, "^", 3).is_empty() {
         return Ok(());
     }
-    Err(unsupported("PO-29.b3"))
+    Err(Halt::Unexercised("PO-29.b3"))
 }
 
 /// PO-30 `ASK^PRCHDP2` [PRCHDP2.m:31-32]: the paging test `$Y+5>IOSL`. The
 /// HOME device's `IOSL` ([`STUB_CONTEXT`]) is open item O-01, so the test
-/// cannot be decided and its exercised outcome, no prompt, is BLOCKED.
+/// cannot be decided: its exercised outcome, no prompt, is not implemented
+/// (O-01), and the session ends at the last prompt written.
 fn ask_prchdp2(s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt> {
     // ASK I $Y+5>IOSL W !?8,"ENTER '^' TO HALT: " R X:DTIME S:X contains "^" PRCHDQ=1 D:'PRCHDQ HDR Q
     let Some(iosl) = stub_value("IOSL") else {
-        return Err(unsupported("PO-30.b1"));
+        return Err(Halt::Unexercised("PO-30.b1"));
     };
     let line = add(&s.y().to_string(), "5");
     if num_cmp(&line, iosl) == Ordering::Greater {
-        return Err(unsupported("PO-30.b2"));
+        return Err(Halt::Unexercised("PO-30.b2"));
     }
     Ok(())
 }
@@ -2107,7 +2262,7 @@ fn com_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     // COM G:'$D(^PRC(442,D0,4,0)) PT ...
     let d0 = v.d0.clone().unwrap_or_default();
     if st.data(&key("PRC", &["442", &d0, "4", "0"])) != 0 {
-        return Err(unsupported("PO-31.b2"));
+        return Err(Halt::Unexercised("PO-31.b2"));
     }
     pt_prchdp2(s, st, v)
 }
@@ -2120,12 +2275,12 @@ fn pt_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // PT I $O(^PRC(442,D0,13,0)) W !!?8,"V.A. TRANSACTION NUMBERS: " ...   [PRCHDP2.m:22]
     if first_after_zero(st, &key("PRC", &["442", &d0, "13"])).is_some_and(|sub| truthy(sub.text()))
     {
-        return Err(unsupported("PO-32.b2"));
+        return Err(Halt::Unexercised("PO-32.b2"));
     }
     amends_prchdp6(s, st, v)?;
     //  I $D(^PRC(442,D0,6,0)) F PRCHI=0:0 ...   [PRCHDP2.m:24]
     if st.data(&key("PRC", &["442", &d0, "6", "0"])) != 0 {
-        return Err(unsupported("PO-32.b3"));
+        return Err(Halt::Unexercised("PO-32.b3"));
     }
     //  K ^TMP($J,"PRCHDP6")   [PRCHDP2.m:25]: only the amendment history (PO-33.b2) builds that scratch.
     // ASK2 ... (fall-through)
@@ -2139,7 +2294,7 @@ fn amends_prchdp6(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Ha
     //  Q:'$D(^PRC(442,D0,6))
     let d0 = v.d0.clone().unwrap_or_default();
     if st.data(&key("PRC", &["442", &d0, "6"])) != 0 {
-        return Err(unsupported("PO-33.b2"));
+        return Err(Halt::Unexercised("PO-33.b2"));
     }
     Ok(())
 }
@@ -2150,13 +2305,13 @@ fn amends_prchdp6(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Ha
 fn ask2_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // ASK2 D:'PRCHDQ EN^PRCHDP4 G:'$O(^PRC(442,D0,11,0)) ASK1 W ! S %A="   Review a Receiving Report " ...
     if truthy(v.prchdq.as_deref().unwrap_or("")) {
-        return Err(unsupported("PO-34.b3"));
+        return Err(Halt::Unexercised("PO-34.b3"));
     }
     en_prchdp4(s, st, v)?;
     let d0 = v.d0.clone().unwrap_or_default();
     if first_after_zero(st, &key("PRC", &["442", &d0, "11"])).is_some_and(|sub| truthy(sub.text()))
     {
-        return Err(unsupported("PO-34.b2"));
+        return Err(Halt::Unexercised("PO-34.b2"));
     }
     ask1_prchdp2(s, st, v)
 }
@@ -2181,12 +2336,12 @@ fn en2_prchdp4(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> 
     };
     let number = piece(node0, "^", 1);
     if number.is_empty() {
-        return Err(unsupported("PO-36.b2"));
+        return Err(Halt::Unexercised("PO-36.b2"));
     }
     //  F PRCHI=0:0 S PRCHI=$O(^PRC(442.8,"B",PRCHPONO,PRCHI)) Q:'PRCHI  I $D(^PRC(442.8,PRCHI,0)) S Y(0)=^(0) D BLD   [PRCHDP4.m:9]
     let schedule = key("PRC", &["442.8", "B", number]);
     if first_after_zero(st, &schedule).is_some_and(|sub| truthy(sub.text())) {
-        return Err(unsupported("PO-36.b3"));
+        return Err(Halt::Unexercised("PO-36.b3"));
     }
     //  G:'$D(^TMP($J,"MDEL")) EXDELV   [PRCHDP4.m:10]: only BLD fills that scratch
     exdelv_prchdp4(s, st, v)
@@ -2205,13 +2360,13 @@ fn exdelv_prchdp4(s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Ha
 fn ask1_prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // ASK1 I $G(PRCHAMNT)=2 D  ...   [PRCHDP2.m:33-40]
     if v.prchamnt.as_deref() == Some("2") {
-        return Err(unsupported("PO-38.b1"));
+        return Err(Halt::Unexercised("PO-38.b1"));
     }
     //  W !,$C(7) G:PRCHDQ Q W "END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: " R X:DTIME G Q   [PRCHDP2.m:41]
     s.nl();
     s.bell();
     if truthy(v.prchdq.as_deref().unwrap_or("")) {
-        return Err(unsupported("PO-38.b2"));
+        return Err(Halt::Unexercised("PO-38.b2"));
     }
     s.write("END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: ");
     v.x = Some(read(s)?);
@@ -2272,13 +2427,17 @@ mod tests {
     const ORDER_PROMPT_BYTES: &str =
         "\n\n\nSelect STATION NUMBER ('^' TO EXIT): 500//       CAMP MASTER\n\n\nP.O./REQ.NO.: ";
 
-    /// `SPEC.md` R4 and "Consequences": the exhausted search is BLOCKED by
-    /// open item O-03. Once O-03 closes, every assertion on this constant
-    /// becomes an `Ok` holding the R3 bytes after the order prompt.
-    const NO_MATCH: &str = "PO-09.b14";
+    /// `SPEC.md` R3: what the no-match sequence PO-09.b14 writes after the
+    /// answer, up to and including the re-asked order prompt
+    /// [DIC.m:25, 63-65, 80-81] [DIC11.m:15-17].
+    const NO_MATCH_BYTES: &str = "\u{7} ??\n\nP.O./REQ.NO.: ";
 
-    /// `SPEC.md` "Consequences": a found order stops at `^%ZIS` while open
-    /// item O-01 stands.
+    /// The branch a value ends on when every search step finds nothing but
+    /// the O-03 guard does not hold: the n/e pointer-candidate branch.
+    const GUARD_FAILS: &str = "PO-09.b11";
+
+    /// `SPEC.md` "Consequences": a found order ends at `^%ZIS`, not
+    /// implemented while open item O-01 stands.
     const DEVICE_GATE: &str = "PO-12.b1";
 
     /// File 442 with one order, `500-A12345`, that passes the lookup screen,
@@ -2324,15 +2483,34 @@ mod tests {
         lines.iter().map(|line| (*line).to_string()).collect()
     }
 
-    fn unsupported_branch(id: &str) -> Result<InquiryOutput, InquiryError> {
-        Err(InquiryError::UnsupportedBranch(id.to_string()))
-    }
-
     fn ok_transcript(transcript: &str) -> Result<InquiryOutput, InquiryError> {
         Ok(InquiryOutput {
             transcript: transcript.to_string(),
             returned: None,
         })
+    }
+
+    /// The session-end outcome: `transcript`, ended by branch `id`, or by
+    /// running out of input or returning normally when `id` is `None`.
+    fn ended(
+        transcript: &str,
+        id: Option<&'static str>,
+    ) -> (Result<InquiryOutput, InquiryError>, Option<&'static str>) {
+        (ok_transcript(transcript), id)
+    }
+
+    /// The session-end outcome of unimplemented branch `id` after `transcript`.
+    fn ends_at(
+        transcript: &str,
+        id: &'static str,
+    ) -> (Result<InquiryOutput, InquiryError>, Option<&'static str>) {
+        ended(transcript, Some(id))
+    }
+
+    /// The order prompt, the no-match sequence `times` times, then the exit
+    /// at the last re-asked prompt (GC-03 and GC-04).
+    fn no_match_transcript(times: usize) -> String {
+        format!("{ORDER_PROMPT_BYTES}{}", NO_MATCH_BYTES.repeat(times))
     }
 
     /// `Locals` for order 1 of [`ORDER_FILE`], for tests that call a display contract
@@ -2347,6 +2525,17 @@ mod tests {
             prchpo: Some("1".to_string()),
             prchd0: Some(store.get_or_empty(&key("PRC", &["442", "1", "0"]))),
             prchd1: Some(store.get_or_empty(&key("PRC", &["442", "1", "1"]))),
+            ..Locals::default()
+        }
+    }
+
+    /// `Locals` as `EN3^PRCHPAT` leaves them for `IX^DIC` [PRCHPAT.m:79-81]:
+    /// station 500, starting index `C`, and the station and MOP screen.
+    fn lookup_locals() -> Locals {
+        Locals {
+            prc_site: Some("500".to_string()),
+            d: Some("C".to_string()),
+            dic_s: Some(true),
             ..Locals::default()
         }
     }
@@ -2372,21 +2561,26 @@ mod tests {
     }
 
     #[test]
-    fn non_empty_station_answer_is_unsupported_branch() -> Result<(), String> {
+    fn non_empty_station_answer_ends_session() -> Result<(), String> {
+        // Any answer but RETURN, the exit `^` included, is the n/e PO-05.b2:
+        // the session ends at the station prompt.
         let store = order_store("")?;
-        assert_eq!(
-            inquire(&store, &inputs(&["500"])),
-            unsupported_branch("PO-05.b2")
-        );
+        for answer in ["500", "^"] {
+            assert_eq!(
+                run(&store, &inputs(&[answer])),
+                ends_at(STATION_PROMPT_BYTES, "PO-05.b2"),
+                "answer {answer:?}"
+            );
+        }
         Ok(())
     }
 
     #[test]
-    fn help_at_order_prompt_is_unsupported_branch() -> Result<(), String> {
+    fn help_at_order_prompt_ends_session() -> Result<(), String> {
         let store = order_store("")?;
         assert_eq!(
-            inquire(&store, &inputs(&["", "?"])),
-            unsupported_branch("PO-09.b4")
+            run(&store, &inputs(&["", "?"])),
+            ends_at(ORDER_PROMPT_BYTES, "PO-09.b4")
         );
         Ok(())
     }
@@ -2396,20 +2590,20 @@ mod tests {
         let store = order_store("")?;
         let long = "A".repeat(251);
         let long_number = "1".repeat(26);
-        let cases: [(&str, Result<InquiryOutput, InquiryError>); 8] = [
-            ("\u{1}A", unsupported_branch("PO-09.b2")),
-            (&long_number, unsupported_branch("PO-09.b2")),
-            (&long, unsupported_branch("PO-09.b2")),
-            ("??", unsupported_branch("PO-09.b4")),
-            ("`12", unsupported_branch("PO-09.b5")),
-            (" ", unsupported_branch("PO-09.b5")),
-            ("", unsupported_branch("PO-09.b6")),
-            ("^ABC", ok_transcript(ORDER_PROMPT_BYTES)),
+        let cases: [(&str, Option<&'static str>); 8] = [
+            ("\u{1}A", Some("PO-09.b2")),
+            (&long_number, Some("PO-09.b2")),
+            (&long, Some("PO-09.b2")),
+            ("??", Some("PO-09.b4")),
+            ("`12", Some("PO-09.b5")),
+            (" ", Some("PO-09.b5")),
+            ("", Some("PO-09.b6")),
+            ("^ABC", None),
         ];
-        for (answer, expected) in cases {
+        for (answer, id) in cases {
             assert_eq!(
-                inquire(&store, &inputs(&["", answer])),
-                expected,
+                run(&store, &inputs(&["", answer])),
+                ended(ORDER_PROMPT_BYTES, id),
                 "answer {answer:?}"
             );
         }
@@ -2417,44 +2611,38 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_header_is_unsupported_branch() -> Result<(), String> {
+    fn missing_file_header_ends_session_at_station_prompt() -> Result<(), String> {
         // The header is read with $G [DIC0.m:83-87] [DILIBF.m:141, 147]: absent,
         // or holding only a descendant, it ends the lookup with Y=-1 before
         // the prompt [DIC.m:14], never CorruptStore; piece 2 `442` gives other
-        // identifiers [DIC1.m:46-49].
+        // identifiers [DIC1.m:46-49]. Either way PO-09.b15 ends the session at
+        // the station prompt, and the station echo written after it is dropped.
         for header in [
             "",
             "^PRC(442,0,1)=\"x\"\n",
             "^PRC(442,0)=\"PROCUREMENT & ACCOUNTING TRANSACTIONS^442^1^1\"\n",
         ] {
             let store = load(&format!("{header}^PRC(442,\"C\",\"A12345\",1)=\"\"\n"))?;
-            assert_eq!(
-                inquire(&store, &inputs(&["", "^"])),
-                unsupported_branch("PO-09.b15"),
-                "header {header:?}"
-            );
+            for answers in [inputs(&["", "^"]), inputs(&[""])] {
+                assert_eq!(
+                    run(&store, &answers),
+                    ends_at(STATION_PROMPT_BYTES, "PO-09.b15"),
+                    "header {header:?}, answers {answers:?}"
+                );
+            }
         }
         Ok(())
     }
 
     #[test]
     fn absent_identifiers_follow_no_match_path() -> Result<(), String> {
+        // GC-03 and GC-04: a value no index holds, then the exit at the
+        // re-asked prompt (SPEC.md R3).
         let store = order_store("")?;
-        let first = inquire(&store, &inputs(&["", "ABC123", "^"]));
-        let second = inquire(&store, &inputs(&["", "XYZ999", "^"]));
-        assert_eq!(first, second);
-        assert_eq!(first, unsupported_branch(NO_MATCH));
-        Ok(())
-    }
-
-    #[test]
-    fn numeric_value_naming_no_ien_follows_no_match_path() -> Result<(), String> {
-        let store = order_store("")?;
-        // 999 names no entry; 1 names order 1, which IX^DIC never tries as an IEN.
-        for value in ["999", "1"] {
+        for value in ["ABC123", "INVALID!", "XYZ999"] {
             assert_eq!(
-                inquire(&store, &inputs(&["", value, "^"])),
-                unsupported_branch(NO_MATCH),
+                run(&store, &inputs(&["", value, "^"])),
+                ended(&no_match_transcript(1), None),
                 "value {value:?}"
             );
         }
@@ -2462,21 +2650,122 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_value_whose_retry_fails_follows_no_match_path() -> Result<(), String> {
+    fn no_match_sequence_asks_again() -> Result<(), String> {
+        let store = order_store("")?;
+        let cases: [(&[&str], usize, Option<&'static str>); 5] = [
+            // A further value that matches nothing repeats the sequence.
+            (&["", "ABC123", "XYZ999", "^"], 2, None),
+            // Input running out at the re-asked prompt ends the session there.
+            (&["", "ABC123"], 1, None),
+            // The re-asked prompt applies the same read checks [DIC11.m:19-33]
+            (&["", "ABC123", "?"], 1, Some("PO-09.b4")),
+            (&["", "ABC123", "^ABC"], 1, None),
+            // and the same search: a found order is selected and reaches the
+            // device gate, its echo dropped.
+            (&["", "ABC123", "A12345", "", "", "^"], 1, Some(DEVICE_GATE)),
+        ];
+        for (answers, times, id) in cases {
+            assert_eq!(
+                run(&store, &inputs(answers)),
+                ended(&no_match_transcript(times), id),
+                "answers {answers:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn no_match_guard_fails_on_each_condition() -> Result<(), String> {
+        // Every search step finds nothing for these values, but one condition
+        // of the O-03 guard fails, so the session ends as PO-09.b11.
+        let long = "A".repeat(31);
+        let cases: [(&str, &str, &str); 12] = [
+            // (a) an unanalysed pointer index holds an entry
+            ("(a) M", "^PRC(442,\"M\",77,5)=\"\"\n", "ABC123"),
+            ("(a) G", "^PRC(442,\"G\",77,5,1)=\"\"\n", "ABC123"),
+            ("(a) MCH", "^PRC(442,\"MCH\",77,5)=\"\"\n", "ABC123"),
+            // (b) a 440 set code, or a prefix of its external value
+            ("(b) internal code", "", "S"),
+            ("(b) SUPPLY WAREHOUSE prefix", "", "SUPPLY"),
+            ("(b) INACTIVATED prefix", "", "INACT"),
+            // (c) a nested index subscript equals or begins with the value
+            ("(c) 440 B prefix", VENDORS, "ACME"),
+            (
+                "(c) 442.3 B equal",
+                "^PRCD(442.3,\"B\",\"ABC123\",20)=\"\"\n",
+                "ABC123",
+            ),
+            (
+                "(c) 442.5 C prefix",
+                "^PRCD(442.5,\"C\",\"RQX\",2)=\"\"\n",
+                "RQ",
+            ),
+            (
+                "(c) numeric 442.3 C subscript",
+                "^PRCD(442.3,\"C\",1.5,20)=\"\"\n",
+                "1.",
+            ),
+            // (d) a comma, a value longer than 30 (canonical numbers and
+            // lowercase values have their own tests below)
+            ("(d) comma", "", "A,B"),
+            ("(d) longer than 30", "", &long),
+        ];
+        for (label, extra, value) in cases {
+            let store = order_store(extra)?;
+            assert_eq!(
+                run(&store, &inputs(&["", value, "^"])),
+                ends_at(ORDER_PROMPT_BYTES, GUARD_FAILS),
+                "{label}, value {value:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn no_match_guard_holds_for_case_values_over_repository_fixtures() -> Result<(), String> {
+        // AAP fixture profile: no subscript of a 440, 442.5 or 442.3 index in
+        // the eleven repository fixtures equals or begins with the GC-03 or
+        // GC-04 value, and they hold no file 442 node.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ifcap");
+        let store = crate::store::load_fixtures(&dir).map_err(|error| error.to_string())?;
+        for value in ["GC3003", "INVALID!"] {
+            assert!(no_match_guard(&store, value), "value {value:?}");
+        }
+        assert!(!no_match_guard(&store, "S"));
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_value_naming_no_ien_fails_no_match_guard() -> Result<(), String> {
+        let store = order_store("")?;
+        // 999 names no entry; 1 names order 1, which IX^DIC never tries as an
+        // IEN. Both are canonical numbers, so the guard does not hold.
+        for value in ["999", "1"] {
+            assert_eq!(
+                run(&store, &inputs(&["", value, "^"])),
+                ends_at(ORDER_PROMPT_BYTES, GUARD_FAILS),
+                "value {value:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lowercase_value_whose_retry_fails_fails_no_match_guard() -> Result<(), String> {
         let store = order_store("")?;
         assert_eq!(
-            inquire(&store, &inputs(&["", "abc123", "^"])),
-            unsupported_branch(NO_MATCH)
+            run(&store, &inputs(&["", "abc123", "^"])),
+            ends_at(ORDER_PROMPT_BYTES, GUARD_FAILS)
         );
         Ok(())
     }
 
     #[test]
-    fn lowercase_value_whose_retry_matches_is_unsupported_branch() -> Result<(), String> {
+    fn lowercase_value_whose_retry_matches_ends_session() -> Result<(), String> {
         let store = order_store("")?;
         assert_eq!(
-            inquire(&store, &inputs(&["", "a12345", "^"])),
-            unsupported_branch("PO-09.b13")
+            run(&store, &inputs(&["", "a12345", "^"])),
+            ends_at(ORDER_PROMPT_BYTES, "PO-09.b13")
         );
         Ok(())
     }
@@ -2485,41 +2774,41 @@ mod tests {
     fn candidates_all_rejected_by_screen_follow_no_match_path() -> Result<(), String> {
         let store = order_store(SCREENED_ORDERS)?;
         assert_eq!(
-            inquire(&store, &inputs(&["", "B22222", "^"])),
-            unsupported_branch(NO_MATCH)
+            run(&store, &inputs(&["", "B22222", "^"])),
+            ended(&no_match_transcript(1), None)
         );
         Ok(())
     }
 
     #[test]
-    fn several_candidates_are_unsupported_branch() -> Result<(), String> {
+    fn several_candidates_end_session() -> Result<(), String> {
         let store = order_store(
             r#"^PRC(442,4,0)="500-A123456^2^101 GENERAL"
 ^PRC(442,"C","A123456",4)=""
 "#,
         )?;
         assert_eq!(
-            inquire(&store, &inputs(&["", "A12345", "^"])),
-            unsupported_branch("PO-09.b10")
+            run(&store, &inputs(&["", "A12345", "^"])),
+            ends_at(ORDER_PROMPT_BYTES, "PO-09.b10")
         );
         assert_eq!(
-            inquire(&store, &inputs(&["", "A1234", "^"])),
-            unsupported_branch("PO-09.b10")
+            run(&store, &inputs(&["", "A1234", "^"])),
+            ends_at(ORDER_PROMPT_BYTES, "PO-09.b10")
         );
         // The exact match alone is selected; order 4 has no node 1 (PO-10.b3).
         assert_eq!(
-            inquire(&store, &inputs(&["", "A123456", "^"])),
-            unsupported_branch("PO-10.b3")
+            run(&store, &inputs(&["", "A123456", "^"])),
+            ends_at(ORDER_PROMPT_BYTES, "PO-10.b3")
         );
         Ok(())
     }
 
     #[test]
-    fn single_partial_match_is_unsupported_branch() -> Result<(), String> {
+    fn single_partial_match_ends_session() -> Result<(), String> {
         let store = order_store("")?;
         assert_eq!(
-            inquire(&store, &inputs(&["", "A123", "^"])),
-            unsupported_branch("PO-09.b9")
+            run(&store, &inputs(&["", "A123", "^"])),
+            ends_at(ORDER_PROMPT_BYTES, "PO-09.b9")
         );
         Ok(())
     }
@@ -2532,8 +2821,8 @@ mod tests {
         // than the choose list (PO-09.b10).
         let store = order_store("^PRC(442,\"E\",\"A12345\",1)=\"\"\n")?;
         assert_eq!(
-            inquire(&store, &inputs(&["", "A12345", "", "", "^"])),
-            unsupported_branch(DEVICE_GATE)
+            run(&store, &inputs(&["", "A12345", "", "", "^"])),
+            ends_at(ORDER_PROMPT_BYTES, DEVICE_GATE)
         );
         Ok(())
     }
@@ -2557,8 +2846,8 @@ mod tests {
 "#
             ))?;
             assert_eq!(
-                inquire(&store, &inputs(&["", value, "^"])),
-                unsupported_branch(expected),
+                run(&store, &inputs(&["", value, "^"])),
+                ends_at(ORDER_PROMPT_BYTES, expected),
                 "order 5 under E as {filed:?}, value {value:?}"
             );
         }
@@ -2573,16 +2862,16 @@ mod tests {
         // other value, is searched on the raw value. Order 5 passes the screen
         // and is filed only under the index node given. Skipped, it leaves no
         // candidate, and with no pointed-to `B` entry the pointer-candidate
-        // rule (R6) finds none either: the no-match path. Searched, it is one
-        // candidate not from `C` (PO-09.b9). `G` files the order before its
-        // 442.14 subrecord.
+        // rule (R6) finds none either; 77 is a canonical number, so the O-03
+        // guard does not hold (PO-09.b11). Searched, it is one candidate not
+        // from `C` (PO-09.b9). `G` files the order before its 442.14 subrecord.
         for (node, value, expected) in [
-            (r#""D","77",5"#, "77", NO_MATCH),
-            (r#""F","77",5"#, "77", NO_MATCH),
-            (r#""G","77",5,1"#, "77", NO_MATCH),
-            (r#""M","77",5"#, "77", NO_MATCH),
-            (r#""MCH","77",5"#, "77", NO_MATCH),
-            (r#""ST","77",5"#, "77", NO_MATCH),
+            (r#""D","77",5"#, "77", GUARD_FAILS),
+            (r#""F","77",5"#, "77", GUARD_FAILS),
+            (r#""G","77",5,1"#, "77", GUARD_FAILS),
+            (r#""M","77",5"#, "77", GUARD_FAILS),
+            (r#""MCH","77",5"#, "77", GUARD_FAILS),
+            (r#""ST","77",5"#, "77", GUARD_FAILS),
             // Not numeric: text, and digits that are not a canonical number.
             (r#""D","Z55555",5"#, "Z55555", "PO-09.b9"),
             (r#""D","077",5"#, "077", "PO-09.b9"),
@@ -2596,20 +2885,34 @@ mod tests {
 "#
             ))?;
             assert_eq!(
-                inquire(&store, &inputs(&["", value, "^"])),
-                unsupported_branch(expected),
+                run(&store, &inputs(&["", value, "^"])),
+                ends_at(ORDER_PROMPT_BYTES, expected),
                 "order 5 filed as ^PRC(442,{node}), value {value:?}"
             );
+            if expected == GUARD_FAILS {
+                assert_eq!(
+                    pointer_candidate(&store, &lookup_locals(), value),
+                    Ok(false),
+                    "order 5 filed as ^PRC(442,{node})"
+                );
+            }
         }
         Ok(())
     }
 
     #[test]
     fn unreferenced_vendor_with_matching_name_is_not_a_candidate() -> Result<(), String> {
+        // Vendor 7 matches `ACME` but no order is filed under it, so R6 finds
+        // no candidate; its `B` subscript begins with `ACME`, so the O-03
+        // guard does not hold.
         let store = order_store(VENDORS)?;
         assert_eq!(
-            inquire(&store, &inputs(&["", "ACME", "^"])),
-            unsupported_branch(NO_MATCH)
+            pointer_candidate(&store, &lookup_locals(), "ACME"),
+            Ok(false)
+        );
+        assert_eq!(
+            run(&store, &inputs(&["", "ACME", "^"])),
+            ends_at(ORDER_PROMPT_BYTES, GUARD_FAILS)
         );
         Ok(())
     }
@@ -2620,18 +2923,26 @@ mod tests {
             "{VENDORS}{SCREENED_ORDERS}^PRC(442,\"D\",7,2)=\"\"\n^PRC(442,\"D\",7,3)=\"\"\n"
         ))?;
         assert_eq!(
-            inquire(&store, &inputs(&["", "ACME", "^"])),
-            unsupported_branch(NO_MATCH)
+            pointer_candidate(&store, &lookup_locals(), "ACME"),
+            Ok(false)
+        );
+        assert_eq!(
+            run(&store, &inputs(&["", "ACME", "^"])),
+            ends_at(ORDER_PROMPT_BYTES, GUARD_FAILS)
         );
         Ok(())
     }
 
     #[test]
-    fn referenced_vendor_with_qualifying_order_is_unsupported_branch() -> Result<(), String> {
+    fn referenced_vendor_with_qualifying_order_is_a_candidate() -> Result<(), String> {
         let store = order_store(&format!("{VENDORS}^PRC(442,\"D\",7,1)=\"\"\n"))?;
         assert_eq!(
-            inquire(&store, &inputs(&["", "ACME", "^"])),
-            unsupported_branch("PO-09.b11")
+            pointer_candidate(&store, &lookup_locals(), "ACME"),
+            Ok(true)
+        );
+        assert_eq!(
+            run(&store, &inputs(&["", "ACME", "^"])),
+            ends_at(ORDER_PROMPT_BYTES, "PO-09.b11")
         );
         Ok(())
     }
@@ -2643,8 +2954,9 @@ mod tests {
         // Absent, holding only a descendant, or empty, that header ends the
         // nested lookup with Y=-1 before the `B` index is read. Vendor 7
         // matches `ACME` and the qualifying order 1 is filed under it, yet it
-        // is no candidate (not PO-09.b11), and a vendor zero node holding only
-        // a descendant is never read (not CorruptStore): the no-match path.
+        // is no candidate, and a vendor zero node holding only a descendant is
+        // never read (not CorruptStore). The vendor's `B` subscript still
+        // begins with `ACME`, so the O-03 guard does not hold.
         const REFERENCED_VENDOR: &str = r#"^PRC(440,"B","ACME SUPPLY CO",7)=""
 ^PRC(442,"D",7,1)=""
 "#;
@@ -2665,8 +2977,13 @@ mod tests {
         ] {
             let store = order_store(&format!("{records}{REFERENCED_VENDOR}"))?;
             assert_eq!(
-                inquire(&store, &inputs(&["", "ACME", "^"])),
-                unsupported_branch(NO_MATCH),
+                pointer_candidate(&store, &lookup_locals(), "ACME"),
+                Ok(false),
+                "{label}"
+            );
+            assert_eq!(
+                run(&store, &inputs(&["", "ACME", "^"])),
+                ends_at(ORDER_PROMPT_BYTES, GUARD_FAILS),
                 "{label}"
             );
         }
@@ -2675,10 +2992,38 @@ mod tests {
 
     #[test]
     fn found_order_stops_at_device_gate() -> Result<(), String> {
+        // The order echo is written, then ^%ZIS (O-01) ends the session at the
+        // order prompt and the echo is dropped.
         let store = order_store("")?;
         assert_eq!(
-            inquire(&store, &inputs(&["", "A12345", "", "", "^"])),
-            unsupported_branch(DEVICE_GATE)
+            run(&store, &inputs(&["", "A12345", "", "", "^"])),
+            ends_at(ORDER_PROMPT_BYTES, DEVICE_GATE)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_store_is_error() -> Result<(), String> {
+        // Site (a): the only order filed under `C` has a zero node holding only
+        // a descendant, which passes $D and raises UNDEF at
+        // S DIY=$P(^(0),U) [DIC3.m:110].
+        let store = load(
+            r#"^PRC(442,0)="PROCUREMENT & ACCOUNTING TRANSACTIONS^442I^1^1"
+^PRC(442,1,0,1)="x"
+^PRC(442,"C","A12345",1)=""
+"#,
+        )?;
+        let outcome = run(&store, &inputs(&["", "A12345", "^"]));
+        assert_eq!(
+            outcome,
+            (
+                Err(InquiryError::CorruptStore("^PRC(442,1,0)".to_string())),
+                None
+            )
+        );
+        assert_eq!(
+            outcome.0.map_err(|error| error.to_string()),
+            Err("CORRUPT STORE ^PRC(442,1,0)".to_string())
         );
         Ok(())
     }
@@ -2712,7 +3057,10 @@ mod tests {
     #[test]
     fn estimated_flag_decides_est_branch() -> Result<(), String> {
         let cases = [
-            ("^PRC(442,1,7)=\"20^^Y\"\n", Err(unsupported("PO-23.b2"))),
+            (
+                "^PRC(442,1,7)=\"20^^Y\"\n",
+                Err(Halt::Unexercised("PO-23.b2")),
+            ),
             ("^PRC(442,1,7)=\"20^^N\"\n", Ok(())),
             ("", Ok(())),
         ];
@@ -2742,6 +3090,8 @@ mod tests {
             inputs(&["", "A12345", "", "", "^"]),
             inputs(&["", "ACME", "^"]),
             inputs(&["", "^"]),
+            inputs(&["", "ABC123", "^"]),
+            inputs(&["", "INVALID!", "^"]),
         ] {
             let _outcome = inquire(&store, &answers);
             assert_eq!(before, store);
@@ -2797,7 +3147,7 @@ mod tests {
     }
 
     #[test]
-    fn word_wrap_unconverted_forms_are_unsupported_branches() {
+    fn word_wrap_unconverted_forms_are_unexercised_branches() {
         let cases = [
             ("A |WINDOW| B", "", "PO-15.b2"),
             ("A |TAB| B", "", "PO-15.b3"),
@@ -2816,7 +3166,7 @@ mod tests {
             };
             assert_eq!(
                 diwp(&mut s, &store, &mut v),
-                Err(unsupported(id)),
+                Err(Halt::Unexercised(id)),
                 "text {text:?}"
             );
         }
@@ -2826,11 +3176,15 @@ mod tests {
     fn word_wrap_wrapper_restores_caller_da() {
         let cases = [
             (None, "WIDGET, BLUE", Ok(())),
-            (None, "A |TAB| B", Err(unsupported("PO-15.b3"))),
-            (None, "A |WINDOW| B", Err(unsupported("PO-15.b2"))),
+            (None, "A |TAB| B", Err(Halt::Unexercised("PO-15.b3"))),
+            (None, "A |WINDOW| B", Err(Halt::Unexercised("PO-15.b2"))),
             (Some("42"), "WIDGET, BLUE", Ok(())),
-            (Some("42"), "A |TAB| B", Err(unsupported("PO-15.b3"))),
-            (Some("42"), "A |WINDOW| B", Err(unsupported("PO-15.b2"))),
+            (Some("42"), "A |TAB| B", Err(Halt::Unexercised("PO-15.b3"))),
+            (
+                Some("42"),
+                "A |WINDOW| B",
+                Err(Halt::Unexercised("PO-15.b2")),
+            ),
         ];
         let store = Store::default();
         let no_input: Vec<String> = Vec::new();
@@ -2893,7 +3247,7 @@ mod tests {
         let mut v = order_locals(&store);
         assert_eq!(
             fob_prchdp1(&mut s, &store, &mut v),
-            Err(unsupported("PO-26.b1"))
+            Err(Halt::Unexercised("PO-26.b1"))
         );
         let sp = |n: usize| " ".repeat(n);
         let expected = [
@@ -2948,7 +3302,7 @@ mod tests {
         };
         assert_eq!(
             item_prchdp2(&mut s, &store, &mut v),
-            Err(unsupported("PO-30.b1"))
+            Err(Halt::Unexercised("PO-30.b1"))
         );
         let sp = |n: usize| " ".repeat(n);
         let expected = format!(
@@ -2998,7 +3352,7 @@ mod tests {
             };
             assert_eq!(
                 item_prchdp2(&mut s, &store, &mut v),
-                Err(unsupported("PO-30.b1"))
+                Err(Halt::Unexercised("PO-30.b1"))
             );
             let line = s
                 .transcript()

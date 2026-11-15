@@ -1348,8 +1348,8 @@ fn mumps_session(mumps: &MumpsMode, inputs: &[String]) -> (u16, String) {
 }
 
 /// `(status, JSON body)` of a compare session: the MUMPS side first, whose
-/// failure is 502; then the Rust side, whose `CorruptStore` is 500 and
-/// `UnsupportedBranch` 422; only then 200.
+/// failure is 502; then the Rust side, whose `CorruptStore` is 500; only
+/// then 200.
 fn compare_session(store: &Store, mumps: &MumpsMode, inputs: &[String]) -> (u16, String) {
     let original = match run_mumps(mumps, inputs) {
         Ok(output) => output,
@@ -2339,15 +2339,10 @@ pub fn decide_live_result(r: &ExecResult) -> Result<String, LiveFailure> {
 }
 
 /// The status and complete JSON body for a Rust-side error:
-/// `UnsupportedBranch(id)` is 422 and `CorruptStore(record)` is 500, each
-/// naming the branch ID or record verbatim.
+/// `CorruptStore(record)` is 500, naming the record verbatim.
 pub fn inquiry_error_to_response(e: &InquiryError) -> (u16, String) {
-    match e {
-        InquiryError::UnsupportedBranch(id) => {
-            (422, error_body(&format!("UNSUPPORTED BRANCH {id}")))
-        }
-        InquiryError::CorruptStore(record) => (500, error_body(&format!("CORRUPT STORE {record}"))),
-    }
+    let InquiryError::CorruptStore(record) = e;
+    (500, error_body(&format!("CORRUPT STORE {record}")))
 }
 
 #[cfg(test)]
@@ -3382,18 +3377,6 @@ mod tests {
         );
         assert_eq!(held_slots(&slots), 0, "a slot was not freed");
         Ok(())
-    }
-
-    #[test]
-    fn inquiry_error_to_response_unsupported_branch_422() {
-        let error = InquiryError::UnsupportedBranch("PO-09.b4".to_string());
-        assert_eq!(
-            inquiry_error_to_response(&error),
-            (
-                422,
-                r#"{"error":"UNSUPPORTED BRANCH PO-09.b4"}"#.to_string()
-            )
-        );
     }
 
     #[test]
