@@ -73,6 +73,11 @@ static SYNTHETIC_SERIAL: AtomicUsize = AtomicUsize::new(0);
 /// following it, and such an entry is never reused or removed: the next name
 /// is tried instead, up to `ATTEMPTS` names.
 ///
+/// Each folder error this function returns starts with `<test>: ` and names
+/// the path concerned, followed by the I/O cause where there is one: the
+/// name it could not create, the base folder when no name was free, or the
+/// folder it could not remove.
+///
 /// Removal of only the path this call created is attempted on every exit of
 /// `body`: `Ok`, `Err` or a panic, which is resumed after that attempt. An
 /// `Err` from `body` takes precedence over a removal failure, which is
@@ -100,12 +105,18 @@ fn with_synthetic_dir<T>(
                 break;
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(format!("{test}: creating the synthetic folder: {e}")),
+            Err(e) => {
+                return Err(format!(
+                    "{test}: creating the synthetic folder {}: {e}",
+                    candidate.display()
+                ));
+            }
         }
     }
     let Some(root) = acquired else {
         return Err(format!(
-            "{test}: no unused synthetic folder name after {ATTEMPTS} attempts"
+            "{test}: no unused synthetic folder name under {} after {ATTEMPTS} attempts",
+            base.display()
         ));
     };
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -113,9 +124,10 @@ fn with_synthetic_dir<T>(
         body(&root)
     }));
     let removed = match fs::remove_dir_all(&root) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => {
-            Err(format!("{test}: removing the synthetic folder: {e}"))
-        }
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(format!(
+            "{test}: removing the synthetic folder {}: {e}",
+            root.display()
+        )),
         _ => Ok(()),
     };
     match outcome {
@@ -1549,23 +1561,43 @@ fn static_paths_exact_match() -> Result<(), String> {
 /// For each case `golden::load_case` reports READY in the checkout's golden
 /// folder, COMPARE with that case's inputs answers 200 with `match` true,
 /// through one bridge started on first need. Every other case prints
-/// `GC-0N NOT COMPARED` and passes. Nothing here reads a capture file
-/// itself or writes anything.
+/// `GC-0N NOT COMPARED` and passes. COMPARE answers from the first recorded
+/// case in `CASE_IDS` order whose inputs equal the request's, so a READY
+/// case whose inputs equal an earlier recorded case's fails before any
+/// request, and `match` is trusted only once COMPARE's MUMPS side is the
+/// case's own raw transcript and return value. Nothing here reads a capture
+/// file itself or writes anything.
 #[test]
 fn end_to_end_real_captures() -> Result<(), String> {
     let golden_dir = default_dir();
     let mut bridge: Option<(SocketAddr, Server)> = None;
+    let mut recorded: Vec<(&str, Vec<String>)> = Vec::new();
     for id in CASE_IDS {
         let case = match load_case(&golden_dir, id) {
-            CaseLoad::Recorded(case) if matches!(case.readiness, Readiness::Ready) => case,
-            CaseLoad::Absent
-            | CaseLoad::NotRecorded(_)
-            | CaseLoad::Recorded(_)
-            | CaseLoad::Unreadable(_) => {
+            CaseLoad::Recorded(case) => case,
+            CaseLoad::Absent | CaseLoad::NotRecorded(_) | CaseLoad::Unreadable(_) => {
                 println!("{id} NOT COMPARED");
                 continue;
             }
         };
+        let earlier = recorded
+            .iter()
+            .find(|(_, inputs)| *inputs == case.inputs)
+            .map(|&(first, _)| first);
+        if earlier.is_none() {
+            recorded.push((id, case.inputs.clone()));
+        }
+        if !matches!(case.readiness, Readiness::Ready) {
+            println!("{id} NOT COMPARED");
+            continue;
+        }
+        if let Some(first) = earlier {
+            return Err(format!(
+                "{id}: its inputs equal {first}'s, so COMPARE answers from {first}'s capture \
+                 (golden::find_capture takes the first recorded case in CASE_IDS order) and \
+                 {id}'s own capture is never compared"
+            ));
+        }
         let addr = match &bridge {
             Some((addr, _)) => *addr,
             None => {
@@ -1586,6 +1618,15 @@ fn end_to_end_real_captures() -> Result<(), String> {
                 });
             }
         };
+        assert_same(
+            &format!("{id}: COMPARE's mumps transcript against the case's own transcript.txt"),
+            &compared.mumps.transcript,
+            &case.transcript,
+        );
+        assert_eq!(
+            compared.mumps.returned, case.returned,
+            "{id}: COMPARE's mumps returned against the case's own returned.txt"
+        );
         assert!(compared.matched, "{id}: COMPARE answered match false");
         println!("{id} MATCH");
     }
