@@ -1317,7 +1317,7 @@ Each is reflected identically in this document, the implementation and the tests
 | O-04 | Which `%RCR` and `%DT` are installed at runtime: `DIRCR.m` and `DIDT.m` (FileMan 22.2) or `ZTRCR.m` and `ZTDT.m` (FileMan 19.0 copies under Kernel) | [DIRCR.m:1-3, 24-30] [ZTRCR.m:1-3, 21-27] [DIDT.m:1-2, 11-12] [ZTDT.m:1-4] | OPEN, not blocking: each pair behaves the same on this path (subtree copy; no output without `A` or `E`) |
 | O-05 | Image digest, and whether the runtime database is commit `dd3fd0f3…` (`snapshot_id`) | `meta.txt` (team) | OPEN; recorded with the captures as `meta.txt` `image_digest` and `snapshot_id`, which `REPORT.md` part 2 shows per case |
 | O-06 | How live mode obtains the original's return value | [19+OPTION.zwr:14691] [PRCHRPT.m:70-75] | **CLOSED.** `EN3^PRCHRPT` is entered by `DO` [19+OPTION.zwr:14691] and quits without a value [PRCHRPT.m:70-75], so `returned` is `None` on both sides and `returned.txt` is zero bytes; live mode needs no channel for a return value |
-| O-07 | The capture start command and `docker_exec_args`: the context set-up (`U`, `DTIME`, `DT` through `$$DT^XLFDT`, `DUZ` through `DUZ^XUP(.5)`; the HOME device is O-01) | [XLFDT.m:159] [XUP.m:54-64] [PRCFSITE.m:7] | **OPEN.** `DUZ^XUP` sets `DUZ` and its parts but not `DT`, `DTIME` or `IO*` [XUP.m:54-64]; defining `DT` keeps `^PRCFSITE` off `NOW^%DTC`, PO-03.b2 [PRCFSITE.m:7]. The README's capture command, run from inside the case folder in the team's shell and unverified, is `docker exec -i vehu su - vehu -c 'source /home/vehu/etc/env && yottadb -run %XCMD "S U=\$C(94),DTIME=300,DT=\$\$DT^XLFDT D DUZ^XUP(.5) D EN3^PRCHRPT"' < input.txt > transcript.txt`. `meta.txt` `docker_exec_args` is split on single spaces and cannot hold its `-c` argument (conflict K3). **Question for the team:** supply a start command whose arguments contain no space, or change the convention. **Live mode is delivered unverified; replay is the delivered MUMPS backend** |
+| O-07 | The capture start command and `docker_exec_args`: the context set-up (`U`, `DTIME`, `DT` through `$$DT^XLFDT`, `DUZ` through `DUZ^XUP(.5)`; the HOME device is O-01) | [XLFDT.m:159] [XUP.m:54-64] [PRCFSITE.m:7] | **OPEN.** `DUZ^XUP` sets `DUZ` and its parts but not `DT`, `DTIME` or `IO*` [XUP.m:54-64]; defining `DT` keeps `^PRCFSITE` off `NOW^%DTC`, PO-03.b2 [PRCFSITE.m:7]. The README's capture command, run from inside the case folder in the team's shell and unverified, is `docker exec -i vehu su - vehu -c 'source /home/vehu/etc/env && yottadb -run %XCMD "S U=\$C(94),DTIME=300,DT=\$\$DT^XLFDT D DUZ^XUP(.5) D EN3^PRCHRPT"' < input.txt > transcript.txt`. `meta.txt` `docker_exec_args` is split on single spaces and cannot hold its `-c` argument (conflict K3). **Question for the team:** supply a start command whose arguments contain no space, or change the convention. **Live mode is delivered unverified; replay is the delivered MUMPS backend**. The 10 s live timeout kills only the `docker` process the bridge started, because stable std has no process-group signal and the crate forbids unsafe code, takes no dependency and runs one kind of command: a process `docker` started is not signalled, can outlive the run outside the 4 live slots, and one holding `docker`'s standard output or error makes the run `TIMEOUT` even when `docker` exited 0; whether the in-container command stops when `docker exec` is killed is unverified with the rest of live mode |
 | O-08 | Pinned toolchain presence on the build host | Planning host: `rustc: command not found` | **CLOSED for this run's host.** Rust 1.99.1 and the C linker `cc` are verified: section "Run evidence", "Toolchain" |
 
 ## Conflict register
@@ -1449,8 +1449,8 @@ Criterion A9. Each search ran on 2026-11-15 from `rust/ifcap-po-inquiry/`, after
 | A9 check | How the design satisfies it | Confirming search or test | Result |
 |---|---|---|---|
 | No public item takes `&mut Store` or returns a mutable `Store`, and `Store` has no mutating method | `Store::from_zwr` returns an owned value; every `Store` method takes `&self`; `load_fixtures` merges each file's map before the `Store` is built | S5 | Both commands print nothing (exit status 1 each) |
-| The live bridge runs one kind of command, `docker exec -i` with the `meta.txt` start arguments | The only production caller of `run_admitted` is `live`, which passes the literal program `"docker"` and the arguments `exec`, `-i`, the container and the `golden::live_start` arguments; `run_admitted` calls `run_command`, which calls `execute`, which builds `Command::new(program)`. No shell runs on the host and no M code comes from a request | S6 | `Command::new(program)` in `execute`, and `Command::new("sleep")` inside `#[cfg(test)] mod tests` (from line 2149 of `src/bridge.rs`). `run_admitted(` hits: the production call in `live`, the definition, and three calls inside `mod tests` |
-| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2149, `src/store.rs` from line 480, `src/golden.rs` from line 1359. Both tests pass (section "Run evidence") |
+| The live bridge runs one kind of command, `docker exec -i` with the `meta.txt` start arguments | The only production caller of `run_admitted` is `live`, which passes the literal program `"docker"` and the arguments `exec`, `-i`, the container and the `golden::live_start` arguments; `run_admitted` calls `run_command`, which calls `execute`, which builds `Command::new(program)`. No shell runs on the host and no M code comes from a request | S6 | `Command::new(program)` in `execute`, and `Command::new("sleep")` inside `#[cfg(test)] mod tests` (from line 2166 of `src/bridge.rs`). `run_admitted(` hits: the production call in `live`, the definition, and three calls inside `mod tests` |
+| The bridge writes no file and exposes only the four static paths and the listed endpoints | No file-write API outside test modules; routing matches exact paths | S7; `tests/bridge.rs` `not_found_404_texts` and `static_paths_exact_match` | Every S7 hit is inside a `#[cfg(test)]` module: `src/bridge.rs` from line 2166, `src/store.rs` from line 480, `src/golden.rs` from line 1359. Both tests pass (section "Run evidence") |
 | The front-end has no create, edit, cancel or delete control | The selector, the input, SEND and EXIT only | S8; by hand (section "Front-end checklist", item 7) | No control element: the hits are `createDocumentFragment` and `createElement`, which build transcript rows, and the comments and handler for the `animationcancel` event |
 | No write path in `src/` or `frontend/` | Only reads of `&Store`; `fetch` sends only the session `POST` and the status `GET`; the MUMPS side runs the original's own read-only inquiry | S5, S7, S8 and S9 | S9 prints nothing (exit status 1); S5, S7 and S8 as above |
 
@@ -1464,26 +1464,26 @@ S6, exit status 0 for each command:
 
 ```text
 $ grep -rn 'Command::new' src/
-src/bridge.rs:1723:    let mut child = Command::new(program)
-src/bridge.rs:2928:        let spawned = Command::new("sleep")
+src/bridge.rs:1731:    let mut child = Command::new(program)
+src/bridge.rs:2947:        let spawned = Command::new("sleep")
 $ grep -n 'run_admitted(' src/bridge.rs
 1548:    run_admitted(
 1562:fn run_admitted(
-3153:                        run_admitted(&slots, Duration::from_secs(60), "sleep", &args, b"")
-3182:        let expired = run_admitted(&slots, wait, absent, &[], b"");
-3192:        let attempted = run_admitted(&slots, wait, absent, &[], b"");
+3172:                        run_admitted(&slots, Duration::from_secs(60), "sleep", &args, b"")
+3201:        let expired = run_admitted(&slots, wait, absent, &[], b"");
+3211:        let attempted = run_admitted(&slots, wait, absent, &[], b"");
 ```
 
 S7, exit status 0:
 
 ```text
 $ grep -rnE 'fs::write|File::create|OpenOptions|create_dir|remove_file|rename\(' src/
-src/bridge.rs:2578:            fs::OpenOptions::new()
-src/bridge.rs:3218:    /// `fs::create_dir`, which fails on any existing entry, so the directory
-src/bridge.rs:3231:                match fs::create_dir(&path) {
-src/bridge.rs:3248:            fs::create_dir_all(&dir)
-src/bridge.rs:3249:                .and_then(|()| fs::write(dir.join(name), text))
-src/bridge.rs:3538:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
+src/bridge.rs:2597:            fs::OpenOptions::new()
+src/bridge.rs:3238:    /// `fs::create_dir`, which fails on any existing entry, so the directory
+src/bridge.rs:3251:                match fs::create_dir(&path) {
+src/bridge.rs:3268:            fs::create_dir_all(&dir)
+src/bridge.rs:3269:                .and_then(|()| fs::write(dir.join(name), text))
+src/bridge.rs:3558:        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
 src/store.rs:506:    /// `ifcap-store-unit-<pid>-<n>` and creates it with `fs::create_dir`,
 src/store.rs:518:            match fs::create_dir(&dir) {
 src/store.rs:532:        fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
@@ -1499,7 +1499,7 @@ src/golden.rs:2486:                Made::Bytes(bytes) => fs::write(&path, bytes)
 src/golden.rs:2488:                Made::Directory => fs::create_dir(&path).map_err(|e| e.to_string())?,
 ```
 
-The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2149`, `src/golden.rs:1359`, `src/inquiry.rs:2496`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:480`.
+The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2166`, `src/golden.rs:1359`, `src/inquiry.rs:2496`, `src/mumps.rs:114`, `src/mumps.rs:635`, `src/mumps.rs:662`, `src/store.rs:480`.
 
 S8, exit status 0:
 

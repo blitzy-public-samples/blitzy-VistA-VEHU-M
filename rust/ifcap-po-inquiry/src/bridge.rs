@@ -1606,12 +1606,13 @@ fn admit(slots: &[Mutex<()>], wait: Duration) -> Option<MutexGuard<'_, ()>> {
 /// How one [`run_command`] child ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExecResult {
-    /// The OS error text when the program could not be started; otherwise,
-    /// when the run itself failed (a stream worker that could not start,
-    /// failed or panicked, output not read to its end, or a child that could
-    /// not be waited on or killed), each failure's stage and cause, joined
-    /// by `; `. A run with this set is never a transcript, whatever the
-    /// other fields hold.
+    /// When nothing could be started, the stage and the OS error, as
+    /// [`execute`] gives them, such as `CANNOT RUN <program>: <error>`;
+    /// otherwise, when the run itself failed (a stream worker that could not
+    /// start, failed or panicked, output not read to its end, or a child
+    /// that could not be waited on or killed), each failure's stage and
+    /// cause, joined by `; `. A run with this set is never a transcript,
+    /// whatever the other fields hold.
     spawn_error: Option<String>,
     /// The exit code; `None` when the child was killed or ended by a signal.
     exit_code: Option<i32>,
@@ -1626,6 +1627,8 @@ struct ExecResult {
 /// Why a live run gives no transcript.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LiveFailure {
+    /// [`ExecResult::spawn_error`], the 502 cause as it stands, such as
+    /// `CANNOT RUN docker: No such file or directory (os error 2)`.
     Spawn(String),
     NonZeroExit {
         code: Option<i32>,
@@ -1642,7 +1645,7 @@ impl fmt::Display for LiveFailure {
     /// The cause text of the 502 body.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LiveFailure::Spawn(os_error) => f.write_str(os_error),
+            LiveFailure::Spawn(cause) => f.write_str(cause),
             LiveFailure::NonZeroExit {
                 code: Some(code),
                 stderr_head,
@@ -1677,14 +1680,16 @@ impl ExecResult {
 /// Standard input is written, and standard output and error drained, each
 /// on its own thread, so a full stream cannot deadlock. The child is killed
 /// when `timeout` passes before it has exited and its output has been read,
-/// or as soon as standard output passes `output_limit` bytes; at most
-/// `output_limit` bytes of each stream are kept. Once the run is over, the
-/// stream threads are cancelled, which stops each within about `POLL` even
-/// while a descendant still holds the child's streams, and every thread
-/// that started is joined before this returns. A failure of the run itself
-/// rather than of the program, such as a thread that could not start or
-/// output that could not be read, is reported in
-/// [`ExecResult::spawn_error`].
+/// or as soon as standard output passes `output_limit` bytes, and only the
+/// child itself is killed, never a process it started ([`kill_and_reap`]);
+/// at most `output_limit` bytes of each stream are kept. Once the run is
+/// over, the stream threads are cancelled, which stops each within about
+/// `POLL` even while a descendant still holds the child's streams, and
+/// every thread that started is joined before this returns. A run that
+/// could not start, such as `CANNOT RUN <program>: <error>` from
+/// [`execute`], and a failure of the run itself rather than of the
+/// program, such as a thread that could not start or output that could
+/// not be read, are reported in [`ExecResult::spawn_error`].
 fn run_command(
     program: &str,
     args: &[String],
@@ -1705,9 +1710,11 @@ fn run_command(
     }
 }
 
-/// [`run_command`] with its stream threads started through `start`. `Err`,
-/// with the OS error, only when the child's streams could not be created or
-/// the program could not be started.
+/// [`run_command`] with its stream threads started through `start`. `Err`
+/// only when nothing could be started: the child's streams could not be
+/// created, `STANDARD STREAMS NOT CREATED: <error>`, or the program could
+/// not be started, `CANNOT RUN <program>: <error>`. `<error>` is the OS
+/// error's text, and the error keeps its kind.
 fn execute(
     program: &str,
     args: &[String],
@@ -1717,7 +1724,8 @@ fn execute(
     start: &mut StartWorker,
 ) -> io::Result<ExecResult> {
     let started = Instant::now();
-    let (streams, (child_stdin, child_stdout, child_stderr)) = stream_pairs()?;
+    let (streams, (child_stdin, child_stdout, child_stderr)) = stream_pairs()
+        .map_err(|e| io::Error::new(e.kind(), format!("STANDARD STREAMS NOT CREATED: {e}")))?;
     // One statement, so the parent's copies of the child's ends are closed
     // as soon as the child holds them; end of output depends on it.
     let mut child = Command::new(program)
@@ -1725,7 +1733,8 @@ fn execute(
         .stdin(Stdio::from(OwnedFd::from(child_stdin)))
         .stdout(Stdio::from(OwnedFd::from(child_stdout)))
         .stderr(Stdio::from(OwnedFd::from(child_stderr)))
-        .spawn()?;
+        .spawn()
+        .map_err(|e| io::Error::new(e.kind(), format!("CANNOT RUN {program}: {e}")))?;
     Ok(supervise(
         &mut child,
         streams,
@@ -1996,6 +2005,14 @@ fn read_bounded(
 
 /// Kills the child and reaps it, recording what fails in `failures`;
 /// `None` when it was not reaped.
+///
+/// Only the child itself is killed. A process it started is not signalled,
+/// because stable std has no call that signals a process group, and this
+/// crate admits only safe code, takes no dependency and starts no second
+/// command. Such a process can keep running after the run ends, outside
+/// [`LIVE_SLOTS`]. While it holds the child's standard output or standard
+/// error, that output has not ended, so the run lasts until its `timeout`
+/// and ends as a timeout even when the child exited 0.
 fn kill_and_reap(child: &mut Child, failures: &mut Vec<String>) -> Option<ExitStatus> {
     let killed = child.kill();
     reap(
@@ -2114,8 +2131,8 @@ fn worker_output(
 /// `\n`, or all of them when it has none, less one trailing `\r`, decoded
 /// lossily), then standard output that is not UTF-8.
 fn decide_live_result(r: &ExecResult) -> Result<String, LiveFailure> {
-    if let Some(os_error) = &r.spawn_error {
-        return Err(LiveFailure::Spawn(os_error.clone()));
+    if let Some(cause) = &r.spawn_error {
+        return Err(LiveFailure::Spawn(cause.clone()));
     }
     if r.timed_out {
         return Err(LiveFailure::Timeout);
@@ -2256,24 +2273,17 @@ mod tests {
 
     #[test]
     fn decide_live_result_spawn() {
+        let cause = "CANNOT RUN docker: No such file or directory (os error 2)";
         let result = ExecResult {
-            spawn_error: Some("No such file or directory (os error 2)".to_string()),
+            spawn_error: Some(cause.to_string()),
             timed_out: true,
             output_limit_exceeded: true,
             exit_code: None,
             ..exited_ok()
         };
         let failure = decide_live_result(&result);
-        assert_eq!(
-            failure,
-            Err(LiveFailure::Spawn(
-                "No such file or directory (os error 2)".to_string()
-            ))
-        );
-        assert_eq!(
-            failure.map_err(|f| f.to_string()),
-            Err("No such file or directory (os error 2)".to_string())
-        );
+        assert_eq!(failure, Err(LiveFailure::Spawn(cause.to_string())));
+        assert_eq!(failure.map_err(|f| f.to_string()), Err(cause.to_string()));
     }
 
     #[test]
@@ -2483,14 +2493,23 @@ mod tests {
             Ok(result) => return Err(format!("spawned a missing program: {result:?}")),
             Err(e) => e,
         };
+        // The cause names the stage and the program, and the error keeps
+        // the OS error's kind.
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("CANNOT RUN {absent}: ")),
+            "{error}"
+        );
         assert_eq!(missing.spawn_error, Some(error.to_string()));
         // A program that exists but cannot be executed fails; only an
         // absent program is NOT RUN.
         let not_executable = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
         let refused = run_available(not_executable, &[], b"", timeout, 4096);
+        let named = format!("could not be started: CANNOT RUN {not_executable}: ");
         assert!(
-            matches!(&refused, Err(cause) if cause.contains("could not be started")),
+            matches!(&refused, Err(cause) if cause.contains(&named)),
             "{refused:?}"
         );
         // The `cat` and `false` probes are independent: an absent program
@@ -3190,8 +3209,9 @@ mod tests {
         assert!(elapsed < Duration::from_secs(3), "waited {elapsed:?}");
         drop(held);
         let attempted = run_admitted(&slots, wait, absent, &[], b"");
+        let named = format!("CANNOT RUN {absent}: ");
         assert!(
-            matches!(&attempted, Err(LiveFailure::Spawn(_))),
+            matches!(&attempted, Err(LiveFailure::Spawn(cause)) if cause.starts_with(&named)),
             "{attempted:?}"
         );
         assert_eq!(held_slots(&slots), 0, "a slot was not freed");
