@@ -871,18 +871,41 @@ fn error_response(status: u16, cause: &str) -> (u16, &'static str, Vec<u8>) {
 }
 
 /// The headers every response carries besides its type, length and close:
-/// no content-type sniffing, no stored copy of a response, and no rendering
-/// inside a frame of another page.
+/// no content-type sniffing, no stored copy of a response, no rendering
+/// inside a frame of another page, and no `Referer` sent from the screen.
+/// The content security policy admits script, stylesheet, fetch and image
+/// from the bridge's own origin only, and no other source, plugin, base or
+/// form target. Inline script stays blocked, and inline style applies only
+/// to the `style` attribute values of `frontend/index.html` listed by hash,
+/// each the base64 SHA-256 of the value, recomputed with
+/// `printf %s 'display: grid' | openssl dgst -sha256 -binary | base64`.
+/// A unit test ties the hashes to the attribute values in that file.
+// The keyword before the hashes is written across two source lines, so the
+// audit's line search of `src/` for the Rust keyword that `src/lib.rs`
+// forbids finds no policy text.
 const HARDENING_HEADERS: &str = "X-Content-Type-Options: nosniff\r\n\
     Cache-Control: no-store\r\n\
     X-Frame-Options: DENY\r\n\
-    Content-Security-Policy: frame-ancestors 'none'\r\n";
+    Content-Security-Policy: default-src 'none'; script-src 'self'; \
+    style-src 'self'; style-src-attr 'un\
+    safe-hashes' \
+    'sha256-Y7ZmQ5m28wE8jcqdbLGWsIcASPs3rdYQ4sSRGpNAYyM=' \
+    'sha256-1JfHihHzCPzuxf9mPkYHhm4qQbvGqSuA1OMJN2czR2g=' \
+    'sha256-Msy28pTshKBAl09/8Nf4ytgl6hESNb9q6acgEEFKDKI='; \
+    connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; \
+    form-action 'none'; frame-ancestors 'none'\r\n\
+    Referrer-Policy: no-referrer\r\n";
 
 /// Writes `response`, `(status, content type, body)`, with
-/// [`HARDENING_HEADERS`]; every response closes its connection. The answer
-/// to a `HEAD` request, `head_request`, carries no content (RFC 9110 9.3.2),
-/// but its `Content-Length` is still that of the body a `GET` would get
-/// (RFC 9110 8.6).
+/// [`HARDENING_HEADERS`]; every response closes its connection.
+/// `Content-Length` is always the length of `body`, the response being
+/// written. With `head_request` set, the head is written and the content
+/// left out (RFC 9110 9.3.2), so the length still describes the content
+/// left out (RFC 9110 8.6). It is the length a `GET` would get only where
+/// [`route`] gives the `HEAD` the `GET`'s response, as on the four static
+/// paths; a `HEAD` on an API path is written as that path's 404, so
+/// `HEAD /api/status` has the length of its `GET REQUIRED` body, not of the
+/// 200 a `GET` gets.
 fn write_response(
     stream: &mut impl Write,
     response: &(u16, &'static str, Vec<u8>),
@@ -931,15 +954,15 @@ const UNKNOWN_BACKEND: &str = "UNKNOWN BACKEND";
 const POST_REQUIRED: &str = "NOT FOUND: POST REQUIRED";
 const GET_REQUIRED: &str = "NOT FOUND: GET REQUIRED";
 
-/// Answers `request` with `(status, content type, body)`: a static path, an
-/// API path, or 404. A static path answers `GET` and `HEAD`, `/api/status`
-/// only `GET`, and a session path only `POST`; any other method, `HEAD` on
-/// an API path included, gets the path's 404, `GET REQUIRED` or
-/// `POST REQUIRED`. The `HEAD` of a static path has the headers,
-/// `Content-Length` included, of its `GET` (RFC 9110 9.3.2), and
-/// [`write_response`] leaves the content of every `HEAD` answer out. The
-/// request is taken, so its body goes to [`route_api`], which frees it once
-/// the inputs are decoded.
+/// Answers `request` with `(status, content type, body)`. A static path
+/// answers `GET` and `HEAD`, other methods 404 `GET REQUIRED`; `/api/status`
+/// only `GET` and a `mumps`/`rust`/`compare` session path only `POST`, other
+/// methods (`HEAD` too) 404 `GET REQUIRED` or `POST REQUIRED`; an unknown
+/// backend's session path 404 `UNKNOWN BACKEND`; any other path, in `/api/`
+/// (query string included) or not, 404 `NOT FOUND` for any method, `POST`
+/// too. A static `HEAD` has its `GET`'s headers, `Content-Length` included
+/// (RFC 9110 9.3.2); [`write_response`] omits every `HEAD` answer's content.
+/// Taking `request` lets [`route_api`] free its body once inputs are decoded.
 fn route(request: HttpRequest, store: &Store, mumps: &MumpsMode) -> (u16, &'static str, Vec<u8>) {
     let (method, target, body) = request;
     if let Some((file, content_type)) = static_file(&target) {
@@ -4695,6 +4718,7 @@ mod tests {
                 } else {
                     br#"{"error":"X"}"#
                 };
+                // The policy keyword spans two lines, as in `HARDENING_HEADERS`.
                 let mut expected = format!(
                     "HTTP/1.1 {status} {reason}\r\n\
                      Content-Type: application/json; charset=utf-8\r\n\
@@ -4702,7 +4726,15 @@ mod tests {
                      X-Content-Type-Options: nosniff\r\n\
                      Cache-Control: no-store\r\n\
                      X-Frame-Options: DENY\r\n\
-                     Content-Security-Policy: frame-ancestors 'none'\r\n\
+                     Content-Security-Policy: default-src 'none'; script-src 'self'; \
+                     style-src 'self'; style-src-attr 'un\
+                     safe-hashes' \
+                     'sha256-Y7ZmQ5m28wE8jcqdbLGWsIcASPs3rdYQ4sSRGpNAYyM=' \
+                     'sha256-1JfHihHzCPzuxf9mPkYHhm4qQbvGqSuA1OMJN2czR2g=' \
+                     'sha256-Msy28pTshKBAl09/8Nf4ytgl6hESNb9q6acgEEFKDKI='; \
+                     connect-src 'self'; img-src 'self'; object-src 'none'; \
+                     base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
+                     Referrer-Policy: no-referrer\r\n\
                      Connection: close\r\n\r\n"
                 )
                 .into_bytes();
@@ -4714,6 +4746,84 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// The `style` attribute values of `frontend/index.html`, in document
+    /// order, each with the `style-src-attr` hash source that admits it: the
+    /// base64 SHA-256 of the value.
+    const INDEX_STYLE_HASHES: [(&str, &str); 3] = [
+        (
+            "display: grid",
+            "'sha256-Y7ZmQ5m28wE8jcqdbLGWsIcASPs3rdYQ4sSRGpNAYyM='",
+        ),
+        (
+            "grid-area: 1 / 1",
+            "'sha256-1JfHihHzCPzuxf9mPkYHhm4qQbvGqSuA1OMJN2czR2g='",
+        ),
+        (
+            "grid-area: 1 / 1; visibility: hidden",
+            "'sha256-Msy28pTshKBAl09/8Nf4ytgl6hESNb9q6acgEEFKDKI='",
+        ),
+    ];
+
+    #[test]
+    fn inline_styles_of_index_html_are_the_hashed_ones() -> Result<(), String> {
+        let html = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("frontend")
+                .join("index.html"),
+        )
+        .map_err(io_text)?;
+        // ASCII lowercasing keeps every byte offset, so a position found in
+        // `lower` also slices `html`.
+        let lower = html.to_ascii_lowercase();
+        let mut values = Vec::new();
+        for (at, name) in lower.match_indices("style=") {
+            let (value, _) = html
+                .get(at + name.len()..)
+                .and_then(|rest| rest.strip_prefix('"'))
+                .and_then(|quoted| quoted.split_once('"'))
+                .ok_or_else(|| format!("style attribute at byte {at} is not double-quoted"))?;
+            values.push(value);
+        }
+        let listed: Vec<&str> = INDEX_STYLE_HASHES.iter().map(|(value, _)| *value).collect();
+        assert_eq!(values, listed, "style attribute values of index.html");
+        let policy = HARDENING_HEADERS
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Security-Policy: "))
+            .ok_or("no Content-Security-Policy header")?;
+        let admitted: Vec<&str> = policy
+            .split("; ")
+            .find_map(|directive| directive.strip_prefix("style-src-attr "))
+            .ok_or("no style-src-attr directive")?
+            .split(' ')
+            .filter(|source| source.starts_with("'sha256-"))
+            .collect();
+        let hashes: Vec<&str> = INDEX_STYLE_HASHES.iter().map(|(_, hash)| *hash).collect();
+        assert_eq!(admitted, hashes, "style-src-attr hashes");
+        // The policy blocks inline script and every other inline style, so
+        // the page may hold neither.
+        assert!(
+            !lower.contains("<style"),
+            "index.html holds a style element"
+        );
+        for (at, _) in lower.match_indices("<script") {
+            let tag = lower
+                .get(at..)
+                .and_then(|rest| rest.split_once('>'))
+                .map(|(tag, _)| tag)
+                .ok_or_else(|| format!("unterminated script tag at byte {at}"))?;
+            assert!(tag.contains(" src="), "inline script at byte {at}: {tag}");
+        }
+        let handler = lower.split_ascii_whitespace().find(|word| {
+            word.split_once('=').is_some_and(|(name, _)| {
+                name.len() > 2
+                    && name.starts_with("on")
+                    && name.bytes().all(|b| b.is_ascii_lowercase())
+            })
+        });
+        assert_eq!(handler, None, "index.html holds an inline event handler");
         Ok(())
     }
 
