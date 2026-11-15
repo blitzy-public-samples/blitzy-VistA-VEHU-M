@@ -1048,7 +1048,9 @@ Rule (conflict C8): a hard feature whose operand is a literal fixed in the pinne
 | Naked references `^(…)` | Throughout, e.g. [PRCHDP1.m:4] [PRCHDP2.m:11, 49-50] [PRCHDP1.m:61-62] | Each resolved to the full global reference it denotes at that point | Resolved |
 | `R X:DTIME`, `W !`, `W ?n`, `$C(7)` | Throughout | Modelled in `src/mumps.rs`; not a hard feature | None |
 
-## Unexercised and BLOCKED branches
+## Unexercised branches
+
+These branches are outside equivalence: a branch no case exercises is not implemented, no capture judges it, and no verdict in `REPORT.md` covers it. A session that reaches a branch that is not implemented, whether exercised by no case or left unresolved by an open item, ends after the last prompt written. The contract function stops with the private `Halt::Unexercised` carrying the branch ID, and `inquire` returns `Ok`, with the transcript cut at that prompt by `Session::into_transcript_at_prompt` and `returned` `None`, so no output is invented after it. There is no error variant for it: `InquiryError` has only `CorruptStore`.
 
 Citations: `PRC*.m` are `Packages/IFCAP/Routines/`, `DI*.m` are `Packages/VA FileMan/Routines/`, `Z*.m` are `Packages/Kernel/Routines/`; `DD.zwr` is `Packages/VA FileMan/Globals/`; the 411 export is `Packages/IFCAP/Globals/411+ADMIN. ACTIVITY SITE PARAMETER.zwr`.
 
@@ -1314,3 +1316,199 @@ Checked by the team (B3, B4) in current Chrome and Firefox; this run reports eac
     - no `box-shadow`, gradient or image styling;
     - a static block cursor, `<span class="cursor">`, after the input, with no blink animation.
 13. **Mode attribute and motion check:** the root element carries `data-mode="mumps|rust|compare"`, following the selected backend; `app.js` checks `matchMedia("(prefers-reduced-motion: reduce)")` before adding animation classes, so none is added under `reduce`.
+
+## Normalisation
+
+The rules of a capture's `normalisation.txt`, as `golden::parse_normalisation` parses them into `golden::Rule` values and `golden::normalise` applies them (`src/golden.rs`). Lines are split on `\n` and not trimmed, so a blank line is a zero-length line.
+
+- Each non-blank line of `normalisation.txt` is an open delimiter, one tab, and a close delimiter. Both delimiters are literal and non-empty. Blank lines are ignored.
+- Rules apply in file order to both sides. Scanning left to right, the text from each open delimiter through the next close delimiter, both included, becomes `<NORM>`. An open delimiter with no later close delimiter leaves the rest unchanged.
+- No other transformation exists. COMPARE uses the same function.
+- Rules may cover only run-time timestamps, internal record numbers and other variable fields documented in that capture's `meta.txt`. `REPORT.md` part 2 lists every rule.
+
+## Places the original looks wrong
+
+Each line was re-read at the baseline commit. Each is reproduced where it lies on an implemented path, and recorded otherwise. None is fixed.
+
+- **The non-specifiable status still displays the order.** `I X<10 W $C(7)," >>> Status makes this record non-specifiable here."` [PRCHRPT.m:73] is followed unconditionally by `S D0=PRCHPO D ^PRCHDP1,K` [PRCHRPT.m:74]. Reproduced in `en30_prchrpt` (PO-06.b2).
+- **A read-only inquiry writes `^DISV`** [DIC2.m:65]. Recorded, not reproduced.
+- **`LAST PARTIAL RECD.` uses a two-digit year:** `S:X>0 X=X_"  "_$E(Y,4,5)_"/"_$E(Y,6,7)_"/"_$E(Y,2,3)` [PRCHDP1.m:17]. The date is written only when node 11 exists (PO-10.b5, n/e), so it is recorded. The label itself is written by the implemented `prchdp1`.
+- **The label `M.O.P.` reads a file named `PAT TYPE`.** `W !,"M.O.P.: ",$P($G(^PRCD(442.5,+$P(PRCHD0,U,2),0)),U,1)` [PRCHDP1.m:16] reads file 442.5, whose header is `^PRCD(442.5,0)="PAT TYPE^442.5^26^13"` [442.5+PAT TYPE.zwr:3]. Reproduced in `prchdp1`, which runs only past PO-12.b1 (not implemented, O-01).
+- **`^DD(411,0,"ID",.1)` is exported twice,** with identical text [DD.zwr:488724, 488748]. Recorded. The identifier is evaluated once, into the R1 constant.
+- **Two index nodes of file 442 point to a record that does not exist.** `^PRC(442,"AH",31,99999949)=""` and `^PRC(442,"AI",31,99999949)=""` [442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:4-5] sit under a header that counts 0 entries [442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:3], and the export has no `^PRC(442,99999949,…)` node. Recorded. The 442 export is not a fixture.
+
+## Existing items outside the layout
+
+Each existing item outside the request's layout is kept only when the layout or the interface names it, a kept item needs it, or it reproduces a source-cited rule on the five cases' path; otherwise it is removed.
+
+| Item | Disposition | Reason |
+|---|---|---|
+| `test-results/` (33 run folders from `20261108T035854Z` to `20261109T025920Z`, 1002 files) | Deleted | Not in the layout and not required. The evidence the run needs moves into "Run evidence" |
+| `tests/fixtures/ifcap/MANIFEST.txt` (11 sha256 lines) | Deleted | Not in the layout (`tests/fixtures/ifcap/*.zwr` only). Fixture-to-source equality is recorded once in "Run evidence" |
+| `Cargo.lock` | Kept | `cargo build --offline --locked` requires an existing, current lock file |
+| `blitzy/documentation/Project Guide - d3cd5e06-5ae1-42c7-8b11-7bb911fc681f.md` (repository root, outside the crate) | Untouched | Outside the crate and the request |
+
+## Run evidence
+
+Each command below ran in this checkout from `rust/ifcap-po-inquiry/`, with `RUSTUP_AUTO_INSTALL=0` set so that a missing toolchain fails instead of downloading. Each entry gives the command, its exit status and its output, standard error included. An output is complete unless its entry says it is trimmed.
+
+### Toolchain
+
+`rustc -Vv`, exit status 0:
+
+```text
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+binary: rustc
+commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67
+commit-date: 2026-10-13
+host: x86_64-unknown-linux-gnu
+release: 1.99.1
+LLVM version: 23.1.1
+```
+
+`cargo -V`, exit status 0:
+
+```text
+cargo 1.99.1 (5f94df478 2026-08-27)
+```
+
+`cc --version`, exit status 0:
+
+```text
+cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+Copyright (C) 2025 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+```
+
+### Capture availability
+
+`ls -la tests/golden/ifcap/ tests/fixtures/ifcap/`, exit status 0:
+
+```text
+tests/fixtures/ifcap/:
+total 1208
+drwxr-sr-x 2 root root   4096 Nov 15 08:14 .
+drwxr-sr-x 3 root root   4096 Nov 15 08:14 ..
+-rw-r--r-- 1 root root   1250 Nov 15 08:14 411.2.zwr
+-rw-r--r-- 1 root root  10664 Nov 15 08:14 411.zwr
+-rw-r--r-- 1 root root   8684 Nov 15 08:14 420.5.zwr
+-rw-r--r-- 1 root root   1091 Nov 15 08:14 420.8.zwr
+-rw-r--r-- 1 root root 783607 Nov 15 08:14 440.zwr
+-rw-r--r-- 1 root root   8686 Nov 15 08:14 442.3.zwr
+-rw-r--r-- 1 root root   1484 Nov 15 08:14 442.4.zwr
+-rw-r--r-- 1 root root   5465 Nov 15 08:14 442.5.zwr
+-rw-r--r-- 1 root root    171 Nov 15 08:14 442.8.zwr
+-rw-r--r-- 1 root root   8998 Nov 15 08:14 49.zwr
+-rw-r--r-- 1 root root 366907 Nov 15 08:14 5.zwr
+
+tests/golden/ifcap/:
+total 48
+drwxr-sr-x 2 root root  4096 Nov 15 08:14 .
+drwxr-sr-x 3 root root  4096 Nov 15 08:14 ..
+-rw-r--r-- 1 root root 38572 Nov 15 08:14 README.md
+```
+
+`ls tests/fixtures/ifcap/cases.zwr`, exit status 2:
+
+```text
+ls: cannot access 'tests/fixtures/ifcap/cases.zwr': No such file or directory
+```
+
+`tests/golden/ifcap/` holds only `README.md` and no `GC-0N` folder, and `tests/fixtures/ifcap/cases.zwr` does not exist, so every case is ABSENT.
+
+### Fixture-to-source equality
+
+This `bash` script compares the sha256 of each of the 11 fixtures with that of its `Packages/` source, prints `EQUAL` or `DIFFERENT` per pair, and exits non-zero when a pair differs or the fixture count is not 11. Exit status 0:
+
+```sh
+status=0
+for pair in \
+  "411.zwr|IFCAP/Globals/411+ADMIN. ACTIVITY SITE PARAMETER.zwr" \
+  "411.2.zwr|IFCAP/Globals/411.2+FACILITY TYPE TEMPORARY.zwr" \
+  "420.5.zwr|IFCAP/Globals/420.5+UNIT OF ISSUE.zwr" \
+  "420.8.zwr|IFCAP/Globals/420.8+SOURCE CODE.zwr" \
+  "440.zwr|IFCAP/Globals/440+VENDOR.zwr" \
+  "442.3.zwr|IFCAP/Globals/442.3+PURCHASE ORDER STATUS.zwr" \
+  "442.4.zwr|IFCAP/Globals/442.4+PURCHASE AUTHORITY.zwr" \
+  "442.5.zwr|IFCAP/Globals/442.5+PAT TYPE.zwr" \
+  "442.8.zwr|IFCAP/Globals/442.8+DELIVERY SCHEDULE ORDER.zwr" \
+  "5.zwr|Kernel/Globals/5+STATE.zwr" \
+  "49.zwr|Kernel/Globals/49+SERVICE-SECTION.zwr"; do
+  fixture=${pair%%|*}; source=${pair#*|}
+  f=$(sha256sum < "tests/fixtures/ifcap/$fixture" | cut -d' ' -f1)
+  s=$(sha256sum < "../../Packages/$source" | cut -d' ' -f1)
+  if [ "$f" = "$s" ]; then echo "EQUAL $f $fixture Packages/$source"
+  else echo "DIFFERENT $fixture $f Packages/$source $s"; status=1; fi
+done
+[ "$(ls tests/fixtures/ifcap/*.zwr | wc -l)" -eq 11 ] || status=1
+[ "$status" -eq 0 ]
+```
+
+Output:
+
+```text
+EQUAL 71dd66f898e2e2ae013202d8c45ba1aaca393576c415032c34a6aacf8479c2dc 411.zwr Packages/IFCAP/Globals/411+ADMIN. ACTIVITY SITE PARAMETER.zwr
+EQUAL f0f80e9ad3215b9da57d194f22f5134f6485186b996ed72eb42f9815a197a558 411.2.zwr Packages/IFCAP/Globals/411.2+FACILITY TYPE TEMPORARY.zwr
+EQUAL 49806f54ffd8796c560f1c60ee167cc4c7963f44a7bb5fc1b9fc52180466c9c9 420.5.zwr Packages/IFCAP/Globals/420.5+UNIT OF ISSUE.zwr
+EQUAL 5744e3a5ec5c5ebfa3eb35e5cd76a3aba3c14a79533cebe0792a8ab8f4f0e2ad 420.8.zwr Packages/IFCAP/Globals/420.8+SOURCE CODE.zwr
+EQUAL 561cc2c490dd8b2a294341508d634c85dcfccc2423065c492e17f22b1a5cefd5 440.zwr Packages/IFCAP/Globals/440+VENDOR.zwr
+EQUAL a17a790e82a4cfa62f170f20243b80926e357d9d440994390dc22b1c2c42bd34 442.3.zwr Packages/IFCAP/Globals/442.3+PURCHASE ORDER STATUS.zwr
+EQUAL 0c21733a35b544fe12e5871905c677ad4470f50c0e376915de88f721dea704e0 442.4.zwr Packages/IFCAP/Globals/442.4+PURCHASE AUTHORITY.zwr
+EQUAL bc93b9a1b77360c0667ad8564ca43a08f862c3127061d3a0995e4b95228f1899 442.5.zwr Packages/IFCAP/Globals/442.5+PAT TYPE.zwr
+EQUAL 8fc831d8f068e8d092244c4e639345f629f96fe543d3ad02a094f8944a8bd187 442.8.zwr Packages/IFCAP/Globals/442.8+DELIVERY SCHEDULE ORDER.zwr
+EQUAL 85fba36abf70a2c5e19783b05cf7be102a0100c04e5c2e5b8e72f212d8cf07c3 5.zwr Packages/Kernel/Globals/5+STATE.zwr
+EQUAL de7af10fbf737fdc948c1c64d50316f22b108515074075e63507c510a70acb0a 49.zwr Packages/Kernel/Globals/49+SERVICE-SECTION.zwr
+```
+
+All 11 fixtures are byte-identical to their sources.
+
+### Build
+
+`cargo build --offline --locked`, exit status 0, with no warning. Output, with its `in <seconds>` timing trimmed:
+
+```text
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+```
+
+### Tests
+
+`cargo test --offline --locked`, exit status 0. Output trimmed to the `Running` or `Doc-tests` line and the `test result:` line of each test binary; the compile lines, the per-test lines and each `finished in <seconds>` timing are omitted:
+
+```text
+     Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
+test result: ok. 131 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+   Doc-tests ifcap_po_inquiry
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+148 tests pass: 131 unit tests in `src/`, 15 in `tests/bridge.rs` and 2 in `tests/equivalence.rs`. Its `equivalence_report` test prints one `GC-0N <verdict>` line per case on standard output, which the test runner captures and does not show for a passing test, so the verdicts appear in the next command's output.
+
+`cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, exit status 0. Output with the compile lines and the `finished in <seconds>` timing trimmed:
+
+```text
+     Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
+
+running 2 tests
+test equivalence_report ... GC-01 NOT COMPARED
+GC-02 NOT COMPARED
+GC-03 NOT COMPARED
+GC-04 NOT COMPARED
+GC-05 NOT COMPARED
+ok
+test spec_has_report_sections ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+All five cases are NOT COMPARED, because none has a capture. Exit 0 is not acceptance, which needs five PASS.
+
+## Acceptance record
+
+Not accepted: no case has a capture.
