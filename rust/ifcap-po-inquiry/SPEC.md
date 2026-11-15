@@ -1801,7 +1801,7 @@ $ grep -E '^\| PO-[0-9]+\.b' SPEC.md | grep -c '| not exercised, not implemented
 
 ### Document limits
 
-`wc -l -w testingMethods.md`, exit status 0: `52  593 testingMethods.md` (at most 60 lines and 600 words). `wc -l runPlaybook.md`, exit status 0: `116 runPlaybook.md` (at most 150 lines).
+`wc -l -w testingMethods.md`, exit status 0: `52  600 testingMethods.md` (at most 60 lines and 600 words). `wc -l runPlaybook.md`, exit status 0: `116 runPlaybook.md` (at most 150 lines).
 
 ### HL7 domain
 

@@ -392,7 +392,6 @@ fn http(
     read_response(&mut stream).map_err(|e| format!("{method} {target}: {e}"))
 }
 
-/// `POST /api/<backend>/session` with `body`.
 fn post_session(addr: SocketAddr, backend: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     http(addr, "POST", &format!("/api/{backend}/session"), Some(body))
 }
@@ -726,7 +725,8 @@ fn hex4(bytes: &[u8], mut pos: usize) -> Result<(u32, usize), String> {
 }
 
 /// `text` as a JSON string: `"` and `\` escaped, `\n`, `\r` and `\t` by
-/// name, every other control character as `\u00XX`, and the rest as itself.
+/// name, the remaining C0 controls (U+0000–U+001F) as `\u00xx`, and every
+/// other character, DEL and the C1 controls included, as itself.
 fn json_str(text: &str) -> String {
     let mut out = String::from("\"");
     for c in text.chars() {
@@ -1474,7 +1474,8 @@ fn status_and_compare_incomplete_on_cr_or_malformed_rule() -> Result<(), String>
     Ok(())
 }
 
-/// `GET /api/status` over a folder with no case folder: three empty lists.
+/// `GET /api/status` over a folder with no case folder: mode `replay`, empty
+/// `recorded` and `ready` arrays and an empty `incomplete` object.
 #[test]
 fn status_empty_folder() -> Result<(), String> {
     let report = with_bridge("status_empty_folder", empty_folder, get_status)?;

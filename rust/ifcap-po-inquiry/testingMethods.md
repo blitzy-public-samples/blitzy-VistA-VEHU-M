@@ -27,7 +27,7 @@ The MUMPS original, `PRCH DISPLAY PO` (`EN3^PRCHRPT`) on `worldvista/vehu:202609
 - **PASS:** the case is READY, normalised transcripts are equal, `returned` is equal, the store is unchanged and `validate_context` accepts the context.
 - **FAIL:** any other recorded case, including one that is unreadable or not READY (conflict K12).
 - READY and INCOMPLETE describe captures. READY means all six `golden::CHECKS` pass: `seven_files_present`, `meta_keys_present`, `input_ends_with_exit`, `normalisation_parses`, `db_before_equals_after`, `no_carriage_return`. INCOMPLETE lists each failed check.
-- `tests/equivalence.rs` fails only on a FAIL or a failed harness check, so without captures `cargo test` exits 0. Acceptance needs five PASS.
+- `tests/equivalence.rs` fails only on a FAIL, a failed harness check, a missing `SPEC.md` section or an unwritable `REPORT.md`; without captures `cargo test` can exit 0. Acceptance needs five PASS.
 
 ## 5. Layers
 - Unit tests in `src/` show the code follows this run's reading of source; not parity.

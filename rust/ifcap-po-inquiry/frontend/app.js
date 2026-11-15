@@ -301,8 +301,10 @@ async function send() {
 // The status line of one GET /api/status body, which the bridge writes as
 // {"mumps_mode": "replay" | "live", "recorded": [...], "ready": [...],
 // "incomplete": {...}} (status_body in src/bridge.rs): the mode, then how
-// many of the five cases are recorded and how many are READY. A body without
-// that shape throws, the same as JSON that does not parse.
+// many of the five cases are recorded and how many are READY. It throws, as
+// JSON that does not parse does, only when the body is not a non-null
+// object, mumps_mode is not a string, or recorded or ready is not an array.
+// Other members, incomplete included, and the mode's value go unchecked.
 function statusLine(body) {
   if (
     body === null ||

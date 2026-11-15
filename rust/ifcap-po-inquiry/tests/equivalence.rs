@@ -14,14 +14,17 @@
 //!
 //! Capture files are read only through `golden`: `load_case`, which also
 //! evaluates readiness, and `readiness` alone for an unreadable case. The
-//! fixtures are loaded only through `store::load_fixtures`. `SPEC.md` is compiled in: the report copies its
-//! static sections, and its literals table only labels a differing line.
-//! Neither golden nor specification text ever derives a rule.
+//! fixtures are loaded only through `store::load_fixtures`. `SPEC.md` is
+//! compiled in: the report copies its static sections, and its literals table
+//! only labels a differing line. Neither golden nor specification text ever
+//! derives a rule.
 //!
 //! `equivalence_report` is the only writer of `REPORT.md`, and the harness
-//! writes nothing else. It fails only when a case is FAIL or a harness check
-//! fails, so a run with no captures exits 0. Exit 0 is not acceptance, which
-//! needs five PASS.
+//! writes nothing else. A `SPEC.md` lacking a required section fails it before
+//! anything is written, and an error writing `REPORT.md` fails it. Once the
+//! report is written, it fails only when a case is FAIL or a harness check
+//! fails, so a run with no captures exits 0 when the fixtures load and the
+//! other harness checks pass. Exit 0 is not acceptance, which needs five PASS.
 
 use std::fs;
 use std::path::Path;
@@ -69,7 +72,6 @@ const STATIC_SECTIONS: [&str; 9] = [
 const LITERALS: &str = "### Literals the five cases can print";
 const NOT_ATTRIBUTED: &str = "not attributed";
 
-/// How a line one side of a transcript comparison lacks is shown.
 const ABSENT_LINE: &str = "`<absent>`";
 
 const TITLE: &str = "# REPORT: PRCH DISPLAY PO (EN3^PRCHRPT) parity";
@@ -342,7 +344,6 @@ fn crate_relative(text: &str) -> String {
     text.replace(&prefix, "")
 }
 
-/// `c` as a visible escape when it is a control character.
 fn escape_control(c: char, out: &mut String) {
     match c {
         '\n' => out.push_str("\\n"),
@@ -724,10 +725,11 @@ fn render(spec: &str, checks: &[Check], results: &[CaseResult]) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Computes the five verdicts, prints `GC-0N <verdict>` for each, writes
-/// `REPORT.md` and fails only when a case is FAIL or a harness check fails.
-/// A `SPEC.md` lacking a required section fails the run before anything is
-/// written.
+/// Computes the five verdicts, prints `GC-0N <verdict>` for each and writes
+/// `REPORT.md`. A `SPEC.md` lacking a required section fails the run before
+/// anything is written, and an error writing `REPORT.md` fails it. Once the
+/// report is written, the run fails only when a case is FAIL or a harness
+/// check fails.
 #[test]
 fn equivalence_report() {
     let missing = missing_headings(SPEC);
