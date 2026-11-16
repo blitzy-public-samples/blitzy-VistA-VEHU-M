@@ -1,0 +1,11 @@
+saved_at=2026-11-16T22:57:22Z
+image=worldvista/vehu:202609
+image_digest=worldvista/vehu@sha256:e0710df4ab487831ad84d0383637488da2baa37168ce8ac8e71e8cd039590622
+snapshot_image=vehu-snap:gc-base
+snapshot_id=sha256:a8089ad06fcca92d40659c2a1503cd6f4ef829f407df547d939275e6892bace4
+roots=^PRC(411 ^PRC(411.2 ^PRCD(420.5 ^PRCD(420.8 ^PRC(440 ^PRCD(442.3 ^PRC(442.4 ^PRCD(442.5 ^PRC(442.8 ^DIC(5 ^DIC(49 ^PRC(442 ^VA(200,.5 ^DIC(4,500
+m_command=zwrite ^PRC(411,*) zwrite ^PRC(411.2,*) zwrite ^PRCD(420.5,*) zwrite ^PRCD(420.8,*) zwrite ^PRC(440,*) zwrite ^PRCD(442.3,*) zwrite ^PRC(442.4,*) zwrite ^PRCD(442.5,*) zwrite ^PRC(442.8,*) zwrite ^DIC(5,*) zwrite ^DIC(49,*) zwrite ^PRC(442,*) zwrite ^VA(200,.5,*) zwrite ^DIC(4,500,*)
+nodes=29935
+bytes=1200971
+sha256=20ebce847e6359d430f01ee794572618cfe28a524509b6266bcb0485d28ee7ae
+verify=VERIFIED: a fresh container from vehu-snap:gc-base exports byte-identical data
