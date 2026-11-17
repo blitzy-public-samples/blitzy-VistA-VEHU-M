@@ -144,12 +144,15 @@ pub const STUB_CONTEXT: [(&str, Option<&str>); 4] = [
 /// limit: the session ends after the last prompt written before that
 /// output, and the transcript is never longer than the limit. The original
 /// has no such limit, since `G EN30` [PRCHRPT.m:75] repeats the display for
-/// as long as orders are entered; the limit bounds one session's output and
-/// work (CWE-400, `SPEC.md` K15), and a session under it writes exactly the
-/// bytes it would without it. Lines left over when `EN3` returns are
-/// ignored. `Err` is only [`InquiryError::CorruptStore`], where M raises
-/// `UNDEF` reading a node with no value, unguarded or after a bare `$D`.
-/// `store` is never written.
+/// as long as orders are entered. The limit bounds one session's output
+/// (CWE-400, `SPEC.md` K15), and its work only through that output: the
+/// repeated found order of `SPEC.md` O-11 stops in its 663rd display, but a
+/// repeated absent value, whose no-match sequence writes 20 bytes, only at
+/// its 52,425th lookup (`SPEC.md` O-15). A session under the limit writes
+/// exactly the bytes it would without it. Lines left over when `EN3` returns
+/// are ignored. `Err` is only [`InquiryError::CorruptStore`], where M raises
+/// `UNDEF` reading a node with no value, unguarded or after a bare `$D`,
+/// before any write is refused for the limit. `store` is never written.
 pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, InquiryError> {
     run(store, inputs).0
 }
@@ -159,7 +162,10 @@ pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, Inquir
 /// can assert which branch ended a session; the ID never leaves the crate.
 /// Only the normal completion within the output limit, `Ok(())`, gets the
 /// closing `\n` of the process exit ([`process_exit`]); the cut sessions,
-/// [`Halt::OutputLimit`] included, end at their last prompt.
+/// [`Halt::OutputLimit`] included, end at their last prompt. Once a write has
+/// been refused for the output limit the session ends at
+/// [`Halt::OutputLimit`], even when an unimplemented branch or a corrupt
+/// node is reached before the next READ: no branch ID, and no `Err`.
 fn run(
     store: &Store,
     inputs: &[String],
@@ -169,6 +175,14 @@ fn run(
     let result = st_prchrpt(&mut s, store, &mut v)
         .and_then(|()| en30_prchrpt(&mut s, store, &mut v))
         .and_then(|()| process_exit(&mut s));
+    // A refused write ended the session at the output limit: a halt the
+    // contracts return after it, before a READ or the process exit could
+    // report the limit, does not decide the outcome.
+    let result = if s.output_limit_crossed() {
+        Err(Halt::OutputLimit)
+    } else {
+        result
+    };
     match result {
         Ok(()) => (
             Ok(InquiryOutput {
@@ -208,7 +222,10 @@ fn run(
 
 /// How a contract function, or the process exit after `EN3` returns, stops
 /// short of returning normally. `run` ends the session at each: all but
-/// `Corrupt` after the last prompt written, under `Ok`.
+/// `Corrupt` after the last prompt written, under `Ok`. After a write refused
+/// for the output limit it ends the session at `OutputLimit` whichever of
+/// them is returned, so an `Unexercised` or `Corrupt` reached before the next
+/// READ gives neither its branch ID nor `CorruptStore`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Halt {
     /// A READ found no input left. The session ends after the last prompt
@@ -217,8 +234,9 @@ enum Halt {
     /// A write would have taken the transcript past
     /// [`SESSION_OUTPUT_LIMIT`](crate::mumps::SESSION_OUTPUT_LIMIT), a bound
     /// the original does not have (`SPEC.md` K15). Reported by the next READ,
-    /// or by the process exit when none follows; the session ends after the
-    /// last prompt written before that write, as for `InputExhausted`.
+    /// or by the process exit when none follows, and given by `run` in place
+    /// of an `Unexercised` or `Corrupt` reached first; the session ends after
+    /// the last prompt written before that write, as for `InputExhausted`.
     OutputLimit,
     /// An unimplemented branch, by its `SPEC.md` branch ID `PO-NN.bM`,
     /// reached before it writes anything. The session ends after the last
@@ -249,10 +267,11 @@ fn read(s: &mut Session) -> Result<String, Halt> {
 }
 
 /// The process exit once `EN3` has returned [PRCHRPT.m:72]: a partial record
-/// (`$X>0`) is completed by a WRITE ! (`SPEC.md` K14). A session whose output
-/// has passed [`SESSION_OUTPUT_LIMIT`](crate::mumps::SESSION_OUTPUT_LIMIT),
-/// by that WRITE ! too, gives `OutputLimit` instead, and so ends after its
-/// last prompt with no `\n`.
+/// (`$X>0`) is completed by a WRITE ! (`SPEC.md` K14). If a write was refused
+/// because it would exceed
+/// [`SESSION_OUTPUT_LIMIT`](crate::mumps::SESSION_OUTPUT_LIMIT), including
+/// this WRITE !, the result is `OutputLimit` instead: the session ends after
+/// its last prompt with no exit `\n`.
 fn process_exit(s: &mut Session) -> Result<(), Halt> {
     if s.x() > 0 {
         s.nl();
@@ -2790,8 +2809,9 @@ mod tests {
         })
     }
 
-    /// The session-end outcome: `transcript`, ended by branch `id`, or by
-    /// running out of input or returning normally when `id` is `None`.
+    /// The successful session-end outcome: `transcript` and the unimplemented
+    /// branch `id`, if any. `None` covers normal completion, exhausted input,
+    /// and the output limit.
     fn ended(
         transcript: &str,
         id: Option<&'static str>,
@@ -3698,6 +3718,20 @@ mod tests {
             answers
         }
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ifcap");
+        // Only `cases.zwr`, which a checkout without captures lacks, holds a
+        // file 442 node: without it the session ends at PO-09.b15, before
+        // the order prompt, so there is no repetition to measure.
+        let export = dir.join("cases.zwr");
+        let present = export
+            .try_exists()
+            .map_err(|error| format!("{}: {error}", export.display()))?;
+        if !present {
+            println!(
+                "NOT RUN: repeated_found_order_ends_at_the_output_limit: \
+                 tests/fixtures/ifcap/cases.zwr is absent, so the fixtures hold no order GC1001"
+            );
+            return Ok(());
+        }
         let store = crate::store::load_fixtures(&dir).map_err(|error| error.to_string())?;
         let transcript_of = |times: usize| -> Result<String, String> {
             let (outcome, id) = run(&store, &repeated(times));
@@ -3739,6 +3773,90 @@ mod tests {
             (start.len(), cycle.len(), displays, limited.len()),
             (80, 1583, 662, 1_048_026)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn refused_write_ends_session_before_a_later_halt() -> Result<(), String> {
+        // Order 9 passes the screen. With node 1 holding only a descendant,
+        // the echo's read of `^(1)` after `W:$D(^(1))` raises UNDEF (Z.01
+        // [DD.zwr:514202]); with no node 1, the display reaches the n/e
+        // PO-10.b3 before any READ. Below the limit each keeps that outcome.
+        // Whole displays of order 1, then no-match sequences, end the order
+        // prompt 16 bytes below the limit, so the echo's two spaces and `.01`
+        // value reach it exactly and its next two spaces are refused: the
+        // session ends at that prompt, `Ok` with no ending branch, whatever
+        // is reached before the next READ.
+        const ORDER_9: &str = r#"^PRC(442,9,0)="500-BAD0010000^2^101 GENERAL"
+^PRC(442,"C","BAD0010000",9)=""
+"#;
+        let echo = "  500-BAD0010000";
+        let orders = format!("{}{ORDER_9}", order_items(1));
+        // One display of order 1, from the order prompt that finds it
+        // through the next order prompt.
+        let found = run(
+            &order_store(&orders)?,
+            &inputs(&["", "A12345", "", "", "^"]),
+        )
+        .0
+        .map_err(|error| error.to_string())?
+        .transcript;
+        let cycle = found
+            .strip_prefix(ORDER_PROMPT_BYTES)
+            .and_then(|display| display.strip_suffix('\n'))
+            .ok_or("order 1's session is not the order prompt, a display and the exit \\n")?;
+        // A display costs far less per byte than a no-match sequence, so the
+        // fill takes as many displays as leave a whole number of sequences.
+        let fill = SESSION_OUTPUT_LIMIT - ORDER_PROMPT_BYTES.len() - echo.len();
+        let displays = (0..=fill / cycle.len())
+            .rev()
+            .find(|displays| (fill - displays * cycle.len()).is_multiple_of(NO_MATCH_BYTES.len()))
+            .ok_or("no whole displays and no-match sequences fill the transcript")?;
+        let no_matches = (fill - displays * cycle.len()) / NO_MATCH_BYTES.len();
+        let prompt = format!(
+            "{ORDER_PROMPT_BYTES}{}{}",
+            cycle.repeat(displays),
+            NO_MATCH_BYTES.repeat(no_matches)
+        );
+        assert_eq!(
+            (cycle.len(), displays, no_matches, prompt.len()),
+            (1563, 660, 845, 1_048_560)
+        );
+        let mut answers = inputs(&[""]);
+        for _ in 0..displays {
+            answers.extend(inputs(&["A12345", "", ""]));
+        }
+        answers.extend(std::iter::repeat_n("ABC123".to_string(), no_matches));
+        answers.push("BAD0010000".to_string());
+        let cases = [
+            (
+                "node 1 holding only a descendant",
+                "^PRC(442,9,1,1)=\"\"\n",
+                (
+                    Err(InquiryError::CorruptStore("^PRC(442,9,1)".to_string())),
+                    None,
+                ),
+            ),
+            ("no node 1", "", ends_at(ORDER_PROMPT_BYTES, "PO-10.b3")),
+        ];
+        for (label, node1, below_limit) in cases {
+            let store = order_store(&format!("{orders}{node1}"))?;
+            assert_eq!(
+                run(&store, &inputs(&["", "BAD0010000"])),
+                below_limit,
+                "{label}, below the limit"
+            );
+            let (outcome, id) = run(&store, &answers);
+            let transcript = outcome
+                .map_err(|error| format!("{label}, at the limit: {error}"))?
+                .transcript;
+            assert_eq!(id, None, "{label}, at the limit");
+            assert!(
+                transcript == prompt,
+                "{label}, at the limit: {} bytes",
+                transcript.len()
+            );
+        }
         Ok(())
     }
 

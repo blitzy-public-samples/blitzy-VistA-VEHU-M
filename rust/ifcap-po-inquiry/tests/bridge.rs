@@ -12,6 +12,8 @@
 //! Each bridge binds `127.0.0.1:0` and runs `serve` in replay mode over one
 //! golden folder, on a detached thread: `serve` loads this crate's fixtures
 //! once and then serves until the test process ends, so no test stops it.
+//! A test's requests start only once its bridge has answered a first
+//! `GET /api/status`, so their socket timeouts never cover that load.
 //! Every golden folder but the checkout's own is synthetic: written by its
 //! test under `std::env::temp_dir()`, named
 //! `ifcap-po-inquiry-synthetic-<test>-…`, marked by `SYNTHETIC.txt`, read
@@ -37,8 +39,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ifcap_po_inquiry::bridge::{MumpsMode, serve};
 use ifcap_po_inquiry::golden::{CASE_IDS, CaseLoad, EXIT_INPUT, Readiness, default_dir, load_case};
 
-/// Read and write timeout of every client connection.
+/// Read and write timeout of every client connection but the two below.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Read and write timeout of the `GET /api/status` with which [`start`]
+/// waits for a new bridge's first answer. That request waits in the
+/// listener's backlog while `serve` loads the fixtures, seconds of work in
+/// a debug build and longer on a loaded host.
+const READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Read and write timeout of the session request of
+/// `rust_session_stops_at_the_output_limit`, which the bridge answers only
+/// after hundreds of displays, seconds of work in a debug build and longer
+/// on a loaded host.
+const LIMIT_SESSION_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a failed request waits for the bridge thread to end, so that
 /// the failure can carry what `serve` returned.
 const SERVER_END_WAIT: Duration = Duration::from_millis(500);
@@ -298,9 +310,15 @@ fn empty_folder(_root: &Path) -> Result<(), String> {
 
 /// Binds `127.0.0.1:0` and starts `serve` on it in replay mode over
 /// `golden_dir`, on its own named thread, which is never joined unless a
-/// request fails (see [`explain`]). The listener is bound before the thread
-/// starts, so a request sent while `serve` still loads the fixtures waits in
-/// the listener's backlog.
+/// request fails (see [`explain`]), and returns once that bridge has
+/// answered a first request.
+///
+/// The listener is bound before the thread starts, so that first request,
+/// `GET /api/status` with the [`READY_TIMEOUT`], waits in the listener's
+/// backlog while `serve` still loads the fixtures. Any complete response
+/// ends the wait, whatever its status; the caller's own requests, each with
+/// the [`IO_TIMEOUT`], then wait only for their own work. A bridge that
+/// gives no response fails with what `serve` returned (see [`explain`]).
 fn start(golden_dir: &Path) -> Result<(SocketAddr, Server), String> {
     let listener =
         TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind 127.0.0.1:0: {e}"))?;
@@ -314,7 +332,13 @@ fn start(golden_dir: &Path) -> Result<(SocketAddr, Server), String> {
         .name(format!("bridge-{}", addr.port()))
         .spawn(move || serve(listener, mode))
         .map_err(|e| format!("spawn the bridge thread: {e}"))?;
-    Ok((addr, server))
+    match http_timed(addr, "GET", "/api/status", None, READY_TIMEOUT) {
+        Ok(_) => Ok((addr, server)),
+        Err(failure) => Err(explain(
+            format!("waiting for the bridge's first answer: {failure}"),
+            server,
+        )),
+    }
 }
 
 /// `failure`, with what `serve` returned when its thread ends within
@@ -354,30 +378,42 @@ fn with_bridge<T>(
 // HTTP/1.1 client
 // ---------------------------------------------------------------------------
 
-/// A fresh client connection to `addr` with the 5-second read and write
+/// A fresh client connection to `addr` with `timeout` as its read and write
 /// timeouts.
-fn connect(addr: SocketAddr) -> Result<TcpStream, String> {
+fn connect(addr: SocketAddr, timeout: Duration) -> Result<TcpStream, String> {
     let stream = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
     stream
-        .set_read_timeout(Some(IO_TIMEOUT))
+        .set_read_timeout(Some(timeout))
         .map_err(|e| format!("set read timeout: {e}"))?;
     stream
-        .set_write_timeout(Some(IO_TIMEOUT))
+        .set_write_timeout(Some(timeout))
         .map_err(|e| format!("set write timeout: {e}"))?;
     Ok(stream)
 }
 
 /// Sends one HTTP/1.1 request with `Content-Length` and `Connection: close`
-/// over a fresh connection, and reads its response as its status and body.
-/// The target is sent literally, so `/../Cargo.toml` reaches the bridge as
-/// typed; `None` sends an empty body.
+/// over a fresh connection with the [`IO_TIMEOUT`], and reads its response
+/// as its status and body. The target is sent literally, so
+/// `/../Cargo.toml` reaches the bridge as typed; `None` sends an empty body.
 fn http(
     addr: SocketAddr,
     method: &str,
     target: &str,
     body: Option<&[u8]>,
 ) -> Result<(u16, Vec<u8>), String> {
-    let mut stream = connect(addr).map_err(|e| format!("{method} {target}: {e}"))?;
+    http_timed(addr, method, target, body, IO_TIMEOUT)
+}
+
+/// [`http`] over a connection with `timeout` as its read and write
+/// timeouts.
+fn http_timed(
+    addr: SocketAddr,
+    method: &str,
+    target: &str,
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<(u16, Vec<u8>), String> {
+    let mut stream = connect(addr, timeout).map_err(|e| format!("{method} {target}: {e}"))?;
     let body = body.unwrap_or_default();
     let mut request = format!(
         "{method} {target} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
@@ -403,7 +439,7 @@ fn post_session(addr: SocketAddr, backend: &str, body: &[u8]) -> Result<(u16, Ve
 /// another `Content-Type`. Errors name the request line.
 fn http_with_head(addr: SocketAddr, head: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let line = head.lines().next().unwrap_or_default();
-    let mut stream = connect(addr).map_err(|e| format!("{line}: {e}"))?;
+    let mut stream = connect(addr, IO_TIMEOUT).map_err(|e| format!("{line}: {e}"))?;
     let mut request = format!(
         "{head}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -1096,15 +1132,33 @@ const MAX_BODY: usize = 1024 * 1024;
 
 /// A body of at least 900,000 bytes that repeats the found order `GC1001` of
 /// the crate's fixtures with its two display pauses, about 60,000 displays
-/// and 95 MB of output without the session output limit, answers 200 within
-/// the client's 5 s timeout. The transcript stops at the limit, at the order
-/// prompt after the last whole display that fits, the 1,048,026 bytes the
-/// unit tests of `src/inquiry.rs` give for the same repetition. Prints the
-/// request's wall time.
+/// and 95 MB of output without the session output limit, answers 200. The
+/// request is sent once [`start`] has had the bridge's first answer, over a
+/// connection whose socket reads and writes each time out after the
+/// [`LIMIT_SESSION_TIMEOUT`]; no deadline bounds the whole request, and its
+/// wall time is printed, not asserted. The transcript stops at the limit,
+/// at the order prompt after the last whole display that fits, the
+/// 1,048,026 bytes the unit tests of `src/inquiry.rs` give for the same
+/// repetition. Without `tests/fixtures/ifcap/cases.zwr` the test prints
+/// `NOT RUN` and passes.
 #[test]
 fn rust_session_stops_at_the_output_limit() -> Result<(), String> {
     const TEST: &str = "rust_session_stops_at_the_output_limit";
     const MIN_BODY: usize = 900_000;
+    // `serve` loads the crate's fixtures, of which only `cases.zwr`, absent
+    // from a checkout without captures, holds a file 442 node: without it
+    // the session ends after the station prompt and repeats nothing.
+    let export = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ifcap/cases.zwr");
+    let present = export
+        .try_exists()
+        .map_err(|e| format!("{TEST}: {}: {e}", export.display()))?;
+    if !present {
+        println!(
+            "NOT RUN: {TEST}: tests/fixtures/ifcap/cases.zwr is absent, \
+             so the fixtures hold no order GC1001"
+        );
+        return Ok(());
+    }
     let mut body = String::from(r#"{"inputs":["","#);
     while body.len() < MIN_BODY {
         body.push_str(r#""GC1001","","","#);
@@ -1116,11 +1170,16 @@ fn rust_session_stops_at_the_output_limit() -> Result<(), String> {
         body.len()
     );
     with_bridge(TEST, empty_folder, |addr| {
-        // `GET /api/status` answers once `serve` has loaded the fixtures, so
-        // the time measured below is the session request's alone.
-        get_status(addr)?;
+        // `start` has had the bridge's first answer, after `serve` loaded
+        // the fixtures, so the time measured here is the session request's.
         let started = Instant::now();
-        let resp = post_session(addr, "rust", body.as_bytes())?;
+        let resp = http_timed(
+            addr,
+            "POST",
+            "/api/rust/session",
+            Some(body.as_bytes()),
+            LIMIT_SESSION_TIMEOUT,
+        )?;
         let elapsed = started.elapsed();
         let session = expect_session(&resp, "rust [repeated GC1001]")?;
         println!(

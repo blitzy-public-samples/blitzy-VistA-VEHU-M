@@ -536,11 +536,11 @@ pub(crate) fn order<S: Ord + Clone + Default>(
 /// writes one more display, without end. The limit has no MUMPS counterpart;
 /// it follows CWE-400, Uncontrolled Resource Consumption
 /// (<https://cwe.mitre.org/data/definitions/400.html>), so that one request
-/// cannot make a session write, hold and spend time on output in proportion
-/// to its input. A write that would take the transcript past the limit
-/// appends nothing, and the session ends as when input runs out: cut after
-/// its last prompt, with no closing `\n` (`SPEC.md` K15). A session under the
-/// limit writes exactly the bytes it would without it.
+/// cannot make a session write and hold output in proportion to its input,
+/// and bounds its work only through that output (`SPEC.md` O-15). A write
+/// that would pass the limit appends nothing, and the session ends as when
+/// input runs out: cut after its last prompt, with no `\n` (`SPEC.md` K15).
+/// A session under the limit writes exactly the bytes it would without it.
 pub(crate) const SESSION_OUTPUT_LIMIT: usize = 1_048_576;
 
 /// The principal device of one session: typed lines in, transcript out,
@@ -1240,6 +1240,60 @@ mod tests {
             let cut = session.into_transcript_at_prompt();
             assert_eq!(cut, "P: ", "write {last:?}");
             assert!(cut.len() <= SESSION_OUTPUT_LIMIT);
+        }
+    }
+
+    #[test]
+    fn output_limit_counts_every_byte_of_tab_and_form_feed() {
+        // Each case writes a prompt and READs it, then fills the transcript to
+        // `below` bytes under the limit, ending at a column above 0 or, after
+        // a `W !`, at column 0. A `tab` to the column 2 past `$X` pads 2
+        // bytes; `form_feed` writes LF and FF while a record is in progress
+        // and FF alone at column 0. What reaches the limit exactly is
+        // appended; what would pass it appends nothing and signals the limit,
+        // while `$X` moves to `x` and `$Y` to 0 as without the limit. As the
+        // caller does, the next READ is issued only below the limit, so the
+        // cut ends after the last prompt and never passes the limit.
+        let tab_two: fn(&mut Session<'_>) = |session| session.tab(session.x() + 2);
+        let form_feed: fn(&mut Session<'_>) = |session| session.form_feed();
+        let limit = SESSION_OUTPUT_LIMIT;
+        let cases = [
+            ("tab", 1, false, tab_two, "", true, limit + 1),
+            ("tab", 2, false, tab_two, "  ", false, limit),
+            ("form feed", 1, false, form_feed, "", true, 0),
+            ("form feed", 2, false, form_feed, "\n\u{c}", false, 0),
+            ("form feed", 1, true, form_feed, "\u{c}", false, 0),
+        ];
+        let inputs = vec!["x".to_string(), "y".to_string()];
+        for (op_name, below, at_column_0, op, appended, crossed, x) in cases {
+            let column = if at_column_0 { "$X=0" } else { "$X>0" };
+            let case = format!("{op_name} at LIMIT-{below}, {column}");
+            let before = limit - below;
+            let mut session = Session::new(&inputs);
+            session.write("P: ");
+            assert_eq!(session.read(), Some("x".to_string()));
+            if at_column_0 {
+                session.write(&"A".repeat(before - 1 - "P: ".len()));
+                session.nl();
+            } else {
+                session.write(&"A".repeat(before - "P: ".len()));
+            }
+            assert_eq!(session.transcript().len(), before, "{case}");
+            assert_eq!(session.x() == 0, at_column_0, "{case}");
+            assert!(!session.output_limit_crossed(), "{case}");
+            op(&mut session);
+            assert_eq!(session.output_limit_crossed(), crossed, "{case}");
+            let written = session.transcript();
+            assert_eq!(written.len(), before + appended.len(), "{case}");
+            assert_eq!(written.get(before..), Some(appended), "{case}");
+            assert_eq!((session.x(), session.y()), (x, 0), "{case}");
+            if !session.output_limit_crossed() {
+                assert_eq!(session.read(), Some("y".to_string()), "{case}");
+            }
+            let cut = session.into_transcript_at_prompt();
+            let kept = if crossed { "P: ".len() } else { limit };
+            assert_eq!(cut.len(), kept, "{case}");
+            assert!(cut.len() <= limit, "{case}");
         }
     }
 }
