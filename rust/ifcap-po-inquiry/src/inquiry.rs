@@ -48,10 +48,10 @@ pub struct InquiryOutput {
     /// of input. A session that ends where `EN3` quits, `Q:'$D(PRCHPO)`
     /// [PRCHRPT.m:72], keeps all of it, followed by one `\n` when its last
     /// record is incomplete. One that ends early, as [`inquire`] sets out
-    /// (input running out at a READ, or an unimplemented branch),
-    /// keeps only what was written through its last prompt: anything written
-    /// after the last READ, such as the station or order echo, is dropped,
-    /// and a session that never READ gives `""`.
+    /// (input running out at a READ, an unimplemented branch, or the output
+    /// limit), keeps only what was written through its last prompt: anything
+    /// written after the last READ, such as the station or order echo, is
+    /// dropped, and a session that never READ gives `""`.
     pub transcript: String,
     /// The entry point's return value. Always `None`: OPTION 1901 enters
     /// `EN3^PRCHRPT` by `DO` [19+OPTION.zwr:14691], and the routine quits
@@ -139,10 +139,17 @@ pub const STUB_CONTEXT: [(&str, Option<&str>); 4] = [
 ///
 /// Input that runs out at a prompt, or a branch that no case exercises and
 /// that is not implemented, ends the session after the last prompt written,
-/// as `Ok`, with nothing invented after it and no `\n` added. Lines left
-/// over when `EN3` returns are ignored. `Err` is only
-/// [`InquiryError::CorruptStore`], where M raises `UNDEF` reading a node
-/// with no value, unguarded or after a bare `$D`. `store` is never written.
+/// as `Ok`, with nothing invented after it and no `\n` added. So does output
+/// that would take the transcript past 1,048,576 bytes, the session output
+/// limit: the session ends after the last prompt written before that
+/// output, and the transcript is never longer than the limit. The original
+/// has no such limit, since `G EN30` [PRCHRPT.m:75] repeats the display for
+/// as long as orders are entered; the limit bounds one session's output and
+/// work (CWE-400, `SPEC.md` K15), and a session under it writes exactly the
+/// bytes it would without it. Lines left over when `EN3` returns are
+/// ignored. `Err` is only [`InquiryError::CorruptStore`], where M raises
+/// `UNDEF` reading a node with no value, unguarded or after a bare `$D`.
+/// `store` is never written.
 pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, InquiryError> {
     run(store, inputs).0
 }
@@ -150,32 +157,34 @@ pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, Inquir
 /// The session of [`inquire`], also returning the `SPEC.md` branch ID of the
 /// unimplemented branch that ended it, if one did. It exists so unit tests
 /// can assert which branch ended a session; the ID never leaves the crate.
-/// Only the normal completion, `Ok(())`, gets the closing `\n` of the
-/// process exit; the cut sessions end at their last prompt.
+/// Only the normal completion within the output limit, `Ok(())`, gets the
+/// closing `\n` of the process exit ([`process_exit`]); the cut sessions,
+/// [`Halt::OutputLimit`] included, end at their last prompt.
 fn run(
     store: &Store,
     inputs: &[String],
 ) -> (Result<InquiryOutput, InquiryError>, Option<&'static str>) {
     let mut s = Session::new(inputs);
     let mut v = Locals::default();
-    let result =
-        st_prchrpt(&mut s, store, &mut v).and_then(|()| en30_prchrpt(&mut s, store, &mut v));
+    let result = st_prchrpt(&mut s, store, &mut v)
+        .and_then(|()| en30_prchrpt(&mut s, store, &mut v))
+        .and_then(|()| process_exit(&mut s));
     match result {
-        Ok(()) => {
-            // EN3 has returned and the process ends: a partial record ($X>0)
-            // is completed by a WRITE !.
-            if s.x() > 0 {
-                s.nl();
-            }
-            (
-                Ok(InquiryOutput {
-                    transcript: s.into_transcript(),
-                    returned: None,
-                }),
-                None,
-            )
-        }
+        Ok(()) => (
+            Ok(InquiryOutput {
+                transcript: s.into_transcript(),
+                returned: None,
+            }),
+            None,
+        ),
         Err(Halt::InputExhausted) => (
+            Ok(InquiryOutput {
+                transcript: s.into_transcript_at_prompt(),
+                returned: None,
+            }),
+            None,
+        ),
+        Err(Halt::OutputLimit) => (
             Ok(InquiryOutput {
                 transcript: s.into_transcript_at_prompt(),
                 returned: None,
@@ -197,12 +206,20 @@ fn run(
 // Private infrastructure
 // ---------------------------------------------------------------------------
 
-/// How a contract function stops short of returning normally.
+/// How a contract function, or the process exit after `EN3` returns, stops
+/// short of returning normally. `run` ends the session at each: all but
+/// `Corrupt` after the last prompt written, under `Ok`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Halt {
     /// A READ found no input left. The session ends after the last prompt
     /// written.
     InputExhausted,
+    /// A write would have taken the transcript past
+    /// [`SESSION_OUTPUT_LIMIT`](crate::mumps::SESSION_OUTPUT_LIMIT), a bound
+    /// the original does not have (`SPEC.md` K15). Reported by the next READ,
+    /// or by the process exit when none follows; the session ends after the
+    /// last prompt written before that write, as for `InputExhausted`.
+    OutputLimit,
     /// An unimplemented branch, by its `SPEC.md` branch ID `PO-NN.bM`,
     /// reached before it writes anything. The session ends after the last
     /// prompt written.
@@ -218,8 +235,32 @@ fn corrupt(key: &[Sub]) -> Halt {
 
 /// M `READ X:DTIME`: the next input line, or `InputExhausted` when none is
 /// left. The Rust READ never times out.
+///
+/// Once a write has been refused for
+/// [`SESSION_OUTPUT_LIMIT`](crate::mumps::SESSION_OUTPUT_LIMIT), it returns
+/// `OutputLimit` without issuing the READ, so the prompt position stays at
+/// the last prompt written before that write and the cut transcript is never
+/// longer than the limit.
 fn read(s: &mut Session) -> Result<String, Halt> {
+    if s.output_limit_crossed() {
+        return Err(Halt::OutputLimit);
+    }
     s.read().ok_or(Halt::InputExhausted)
+}
+
+/// The process exit once `EN3` has returned [PRCHRPT.m:72]: a partial record
+/// (`$X>0`) is completed by a WRITE ! (`SPEC.md` K14). A session whose output
+/// has passed [`SESSION_OUTPUT_LIMIT`](crate::mumps::SESSION_OUTPUT_LIMIT),
+/// by that WRITE ! too, gives `OutputLimit` instead, and so ends after its
+/// last prompt with no `\n`.
+fn process_exit(s: &mut Session) -> Result<(), Halt> {
+    if s.x() > 0 {
+        s.nl();
+    }
+    if s.output_limit_crossed() {
+        return Err(Halt::OutputLimit);
+    }
+    Ok(())
 }
 
 /// The value of `name` in [`STUB_CONTEXT`]; `None` for an unresolved value.
@@ -2639,6 +2680,7 @@ fn k_prchrpt(_s: &mut Session, _st: &Store, v: &mut Locals) -> Result<(), Halt> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mumps::SESSION_OUTPUT_LIMIT;
 
     /// `SPEC.md` R1: the station prompt, written before its READ.
     const STATION_PROMPT_BYTES: &str = "\n\n\nSelect STATION NUMBER ('^' TO EXIT): 500// ";
@@ -3587,6 +3629,115 @@ mod tests {
         assert_eq!(
             run(&store, &inputs(&["", "?"])),
             ends_at(ORDER_PROMPT_BYTES, "PO-09.b4")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn output_limit_ends_session_at_last_prompt() {
+        // The private READ: after a prompt and its READ, a fill to one byte
+        // below the limit and a 2-byte write, the next READ gives
+        // `OutputLimit` although an input is left, and the cut stays after
+        // the prompt that READ answered.
+        let answers = inputs(&["x", "y"]);
+        let mut s = Session::new(&answers);
+        s.write("P: ");
+        assert_eq!(read(&mut s), Ok("x".to_string()));
+        s.write(&"A".repeat(SESSION_OUTPUT_LIMIT - 1 - "P: ".len()));
+        s.write("BC");
+        assert!(matches!(read(&mut s), Err(Halt::OutputLimit)));
+        let cut = s.into_transcript_at_prompt();
+        assert_eq!(cut, "P: ");
+        assert!(cut.len() <= SESSION_OUTPUT_LIMIT);
+        // The process exit after `^` at a final order prompt ending one byte
+        // below the limit writes its `\n`, which reaches the limit exactly.
+        // At the limit that `\n` would pass it, so the session ends after
+        // the prompt with none, as `run` ends one at `OutputLimit`.
+        for (prompt_end, exit) in [
+            (SESSION_OUTPUT_LIMIT - 1, Ok(())),
+            (SESSION_OUTPUT_LIMIT, Err(Halt::OutputLimit)),
+        ] {
+            let mut s = Session::new(&answers);
+            s.write(&"A".repeat(prompt_end - ORDER_PROMPT.len()));
+            s.write(ORDER_PROMPT);
+            assert_eq!(read(&mut s), Ok("x".to_string()));
+            assert_eq!(process_exit(&mut s), exit, "prompt ending at {prompt_end}");
+            let transcript = if exit.is_ok() {
+                s.into_transcript()
+            } else {
+                s.into_transcript_at_prompt()
+            };
+            let ending = if exit.is_ok() {
+                "P.O./REQ.NO.: \n"
+            } else {
+                ORDER_PROMPT
+            };
+            assert_eq!(
+                transcript.len(),
+                SESSION_OUTPUT_LIMIT,
+                "prompt ending at {prompt_end}"
+            );
+            assert!(
+                transcript.ends_with(ending),
+                "prompt ending at {prompt_end}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_found_order_ends_at_the_output_limit() -> Result<(), String> {
+        // The station default, then the found order `GC1001` of the
+        // repository fixtures with its two display pauses, `times` times,
+        // then `^`.
+        fn repeated(times: usize) -> Vec<String> {
+            let mut answers = inputs(&[""]);
+            for _ in 0..times {
+                answers.extend(inputs(&["GC1001", "", ""]));
+            }
+            answers.push("^".to_string());
+            answers
+        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ifcap");
+        let store = crate::store::load_fixtures(&dir).map_err(|error| error.to_string())?;
+        let transcript_of = |times: usize| -> Result<String, String> {
+            let (outcome, id) = run(&store, &repeated(times));
+            assert_eq!(id, None, "{times} repetitions");
+            outcome
+                .map(|output| output.transcript)
+                .map_err(|error| error.to_string())
+        };
+        // One and two repetitions end normally, far below the limit. Their
+        // difference is one display cycle, from the order prompt through the
+        // next order prompt.
+        let (one, two) = (transcript_of(1)?, transcript_of(2)?);
+        let one = one.strip_suffix('\n').ok_or("1 repetition: no exit \\n")?;
+        let two = two.strip_suffix('\n').ok_or("2 repetitions: no exit \\n")?;
+        let cycle = two
+            .strip_prefix(one)
+            .ok_or("1 repetition is no prefix of 2")?;
+        let start = one
+            .strip_suffix(cycle)
+            .ok_or("1 repetition does not end in the cycle")?;
+        // 1,000 repetitions would write about 1.6 MB. The session ends at the
+        // order prompt after the last whole cycle within the limit, the
+        // final `^` never read and no exit `\n` written, and every byte kept
+        // is the byte the session writes without the limit.
+        let limited = transcript_of(1000)?;
+        assert!(
+            limited.len() <= SESSION_OUTPUT_LIMIT,
+            "{} bytes",
+            limited.len()
+        );
+        assert!(limited.ends_with("P.O./REQ.NO.: "));
+        assert!(!limited.ends_with('\n'));
+        let displays = (SESSION_OUTPUT_LIMIT - start.len()) / cycle.len();
+        assert!(
+            limited == format!("{start}{}", cycle.repeat(displays)),
+            "the limited transcript is not the start and {displays} whole cycles"
+        );
+        assert_eq!(
+            (start.len(), cycle.len(), displays, limited.len()),
+            (80, 1583, 662, 1_048_026)
         );
         Ok(())
     }

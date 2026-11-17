@@ -528,6 +528,21 @@ pub(crate) fn order<S: Ord + Clone + Default>(
 // READ and WRITE
 // ---------------------------------------------------------------------------
 
+/// The most bytes one session's transcript holds: 1 MiB, the size of the
+/// live-mode output limit `LIVE_OUTPUT_LIMIT` in `src/bridge.rs`.
+///
+/// The original has no such limit: `G EN30` [PRCHRPT.m:75] asks for the next
+/// order after every display, so each repetition of a found order's inputs
+/// writes one more display, without end. The limit has no MUMPS counterpart;
+/// it follows CWE-400, Uncontrolled Resource Consumption
+/// (<https://cwe.mitre.org/data/definitions/400.html>), so that one request
+/// cannot make a session write, hold and spend time on output in proportion
+/// to its input. A write that would take the transcript past the limit
+/// appends nothing, and the session ends as when input runs out: cut after
+/// its last prompt, with no closing `\n` (`SPEC.md` K15). A session under the
+/// limit writes exactly the bytes it would without it.
+pub(crate) const SESSION_OUTPUT_LIMIT: usize = 1_048_576;
+
 /// The principal device of one session: typed lines in, transcript out,
 /// with M's `$X` (column) and `$Y` (line) tracked as the original's output
 /// moves them.
@@ -559,6 +574,14 @@ pub(crate) fn order<S: Ord + Clone + Default>(
 /// The form feed `W @IOF`, with the HOME device's `IOF` `#` (PRCHDP1.m:12,
 /// PRCHDP2.m:42), is [`Session::form_feed`], and the position reset of the
 /// device open `^%ZIS` is [`Session::reset_position`]; both leave `$Y` at 0.
+///
+/// The transcript never holds more than [`SESSION_OUTPUT_LIMIT`] bytes. The
+/// first write that would take it past the limit, and every write after it,
+/// appends nothing, while `$X` and `$Y` still move as that write moves them,
+/// so the session decides as it would without the limit until it ends.
+/// [`Session::output_limit_crossed`] reports it; the caller then issues no
+/// further READ and ends the session after the last prompt written before
+/// that write.
 #[derive(Debug)]
 pub(crate) struct Session<'a> {
     inputs: &'a [String],
@@ -569,6 +592,9 @@ pub(crate) struct Session<'a> {
     /// The byte length of the transcript when the last READ was issued, 0
     /// before any READ.
     prompt_end: usize,
+    /// Set by the first write that would take the transcript past
+    /// [`SESSION_OUTPUT_LIMIT`]; from then on nothing is appended.
+    limit_crossed: bool,
 }
 
 impl<'a> Session<'a> {
@@ -583,6 +609,7 @@ impl<'a> Session<'a> {
             x: 0,
             y: 0,
             prompt_end: 0,
+            limit_crossed: false,
         }
     }
 
@@ -594,7 +621,9 @@ impl<'a> Session<'a> {
     /// Every READ, including one that finds no input left, records the
     /// transcript length as the prompt position that
     /// [`Session::into_transcript_at_prompt`] cuts at, so the cut lands
-    /// after the prompt the READ answered.
+    /// after the prompt the READ answered. Once
+    /// [`Session::output_limit_crossed`] is true the caller issues no READ,
+    /// so that position stays at the last prompt written before the limit.
     ///
     /// Uses: `R X:DTIME` at PRCHDP2.m:10 (PO-25) and PRCHDP2.m:41 (PO-38),
     /// and FileMan's prompt reads at DIC11.m:17 (PO-05, PO-09).
@@ -605,28 +634,56 @@ impl<'a> Session<'a> {
         Some(line)
     }
 
+    /// Whether `len` more bytes may be appended to the transcript. The first
+    /// refusal, for a write that would take the transcript past
+    /// [`SESSION_OUTPUT_LIMIT`], marks the limit crossed, and every call
+    /// after it refuses, whatever its length.
+    fn admit(&mut self, len: usize) -> bool {
+        if !self.limit_crossed && self.out.len().saturating_add(len) > SESSION_OUTPUT_LIMIT {
+            self.limit_crossed = true;
+        }
+        !self.limit_crossed
+    }
+
+    /// Whether a write has been refused because it would take the transcript
+    /// past [`SESSION_OUTPUT_LIMIT`]. The session must then end after the
+    /// last prompt written, as when input runs out.
+    pub(crate) fn output_limit_crossed(&self) -> bool {
+        self.limit_crossed
+    }
+
     /// M `WRITE "text"`: appends `text` and advances `$X` by its character
-    /// count.
+    /// count. Past [`SESSION_OUTPUT_LIMIT`] it appends nothing and still
+    /// advances `$X`.
     pub(crate) fn write(&mut self, text: &str) {
-        self.out.push_str(text);
+        if self.admit(text.len()) {
+            self.out.push_str(text);
+        }
         self.x = self.x.saturating_add(text.chars().count());
     }
 
     /// M `WRITE !`: appends a newline, sets `$X` to 0 and adds 1 to `$Y`.
+    /// Past [`SESSION_OUTPUT_LIMIT`] it appends nothing and still moves both.
     pub(crate) fn nl(&mut self) {
-        self.out.push('\n');
+        if self.admit(1) {
+            self.out.push('\n');
+        }
         self.x = 0;
         self.y = self.y.saturating_add(1);
     }
 
     /// M `WRITE ?col`: when `$X` is below `col`, appends spaces up to column
-    /// `col` and sets `$X` to `col`; otherwise writes nothing.
+    /// `col` and sets `$X` to `col`; otherwise writes nothing. Past
+    /// [`SESSION_OUTPUT_LIMIT`] it appends nothing and still sets `$X`.
     ///
     /// Uses: every column position of the display, for example `?37` at
     /// PRCHDP1.m:15 (PO-10) and `?67` at PRCHDP2.m:53 (PO-27).
     pub(crate) fn tab(&mut self, col: usize) {
         if self.x < col {
-            self.out.extend(repeat_n(' ', col - self.x));
+            let pad = col - self.x;
+            if self.admit(pad) {
+                self.out.extend(repeat_n(' ', pad));
+            }
             self.x = col;
         }
     }
@@ -672,13 +729,19 @@ impl<'a> Session<'a> {
     /// `<FF>,<LF>`, which does not match them (`SPEC.md` "Places the
     /// original looks wrong").
     ///
+    /// Past [`SESSION_OUTPUT_LIMIT`] it appends nothing and still sets `$X`
+    /// and `$Y` to 0; the LF and FF are admitted or refused together.
+    ///
     /// Uses: `W:$Y>0 @IOF` at PRCHDP1.m:12 (PO-10) and the column header
     /// `HDR` at PRCHDP2.m:42 (PO-26).
     pub(crate) fn form_feed(&mut self) {
-        if self.x > 0 {
-            self.out.push('\n');
+        let record_in_progress = self.x > 0;
+        if self.admit(if record_in_progress { 2 } else { 1 }) {
+            if record_in_progress {
+                self.out.push('\n');
+            }
+            self.out.push('\u{c}');
         }
-        self.out.push('\u{c}');
         self.x = 0;
         self.y = 0;
     }
@@ -1134,12 +1197,49 @@ mod tests {
                 x: 0,
                 y: 0,
                 prompt_end,
+                limit_crossed: false,
             };
             assert_eq!(
                 session.into_transcript_at_prompt(),
                 out,
                 "into_transcript_at_prompt with out {out:?}, prompt_end {prompt_end}"
             );
+        }
+    }
+
+    #[test]
+    fn output_limit_refuses_the_write_that_would_pass_it() {
+        // After a prompt and its READ, the transcript is filled to one byte
+        // below the limit. A 1-byte write reaches the limit exactly and is
+        // appended; a 2-byte write would pass it, so it appends nothing and
+        // signals the limit, and so does every write after it, while `$X`
+        // and `$Y` move as without the limit. The cut stays after the prompt.
+        let inputs = vec!["x".to_string(), "y".to_string()];
+        let filled = SESSION_OUTPUT_LIMIT - 1;
+        for (last, crossed, kept) in [("B", false, SESSION_OUTPUT_LIMIT), ("BC", true, filled)] {
+            let mut session = Session::new(&inputs);
+            session.write("P: ");
+            assert_eq!(session.read(), Some("x".to_string()));
+            session.write(&"A".repeat(filled - "P: ".len()));
+            assert_eq!(session.transcript().len(), filled);
+            assert!(!session.output_limit_crossed());
+            session.write(last);
+            assert_eq!(session.output_limit_crossed(), crossed, "write {last:?}");
+            assert_eq!(session.transcript().len(), kept, "write {last:?}");
+            assert_eq!(session.x(), filled + last.len(), "write {last:?}");
+            if crossed {
+                session.nl();
+                session.tab(5);
+                session.bell();
+                session.form_feed();
+                session.write("D");
+                assert_eq!((session.x(), session.y()), (1, 0));
+                assert_eq!(session.transcript().len(), filled);
+                assert!(session.output_limit_crossed());
+            }
+            let cut = session.into_transcript_at_prompt();
+            assert_eq!(cut, "P: ", "write {last:?}");
+            assert!(cut.len() <= SESSION_OUTPUT_LIMIT);
         }
     }
 }

@@ -121,6 +121,7 @@ VEHU_CONTAINER=<container name> cargo run --offline --locked --bin bridge
   - The `context` is checked before anything runs.
   - Standard input is each input followed by one newline, and standard output is the transcript. The return value is always `null`.
   - At most 4 runs go at once. Each is killed after 10 s, and its output is limited to 1 MiB.
+  - A RUST session, in either mode, has its transcript limited to 1 MiB (1,048,576 bytes), and a session that would pass the limit ends after its last prompt, as when input runs out.
   - The bridge kills only the `docker` process it started. A process `docker` started, such as the child of a wrapper script installed as `docker` or the command `docker exec` runs inside the container, is not signalled. It can run on after the run ends, and it is not counted in the 4 runs.
   - While such a process still holds `docker`'s standard output or standard error, the output has not ended, so the run ends `TIMEOUT` at 10 s even when `docker` exited 0.
 - COMPARE's `MATCH` still needs a READY capture for the inputs. A live answer with no capture shows `MISMATCH`.

@@ -1087,6 +1087,63 @@ fn rust_session_200() -> Result<(), String> {
     )
 }
 
+/// The most bytes one Rust session's transcript holds: `SESSION_OUTPUT_LIMIT`
+/// in `src/mumps.rs`, which is private to the crate, so this copy states it.
+const SESSION_OUTPUT_LIMIT: usize = 1_048_576;
+/// The longest request body the bridge accepts: `MAX_BODY` in
+/// `src/bridge.rs`, private to the crate, so this copy states it.
+const MAX_BODY: usize = 1024 * 1024;
+
+/// A body of at least 900,000 bytes that repeats the found order `GC1001` of
+/// the crate's fixtures with its two display pauses, about 60,000 displays
+/// and 95 MB of output without the session output limit, answers 200 within
+/// the client's 5 s timeout. The transcript stops at the limit, at the order
+/// prompt after the last whole display that fits, the 1,048,026 bytes the
+/// unit tests of `src/inquiry.rs` give for the same repetition. Prints the
+/// request's wall time.
+#[test]
+fn rust_session_stops_at_the_output_limit() -> Result<(), String> {
+    const TEST: &str = "rust_session_stops_at_the_output_limit";
+    const MIN_BODY: usize = 900_000;
+    let mut body = String::from(r#"{"inputs":["","#);
+    while body.len() < MIN_BODY {
+        body.push_str(r#""GC1001","","","#);
+    }
+    body.push_str(r#""^"]}"#);
+    assert!(
+        (MIN_BODY..MAX_BODY).contains(&body.len()),
+        "{} body bytes",
+        body.len()
+    );
+    with_bridge(TEST, empty_folder, |addr| {
+        // `GET /api/status` answers once `serve` has loaded the fixtures, so
+        // the time measured below is the session request's alone.
+        get_status(addr)?;
+        let started = Instant::now();
+        let resp = post_session(addr, "rust", body.as_bytes())?;
+        let elapsed = started.elapsed();
+        let session = expect_session(&resp, "rust [repeated GC1001]")?;
+        println!(
+            "{TEST}: {} body bytes, {} transcript bytes, {:.3} s",
+            body.len(),
+            session.transcript.len(),
+            elapsed.as_secs_f64()
+        );
+        assert!(
+            session.transcript.len() <= SESSION_OUTPUT_LIMIT,
+            "{} transcript bytes",
+            session.transcript.len()
+        );
+        assert!(
+            session.transcript.ends_with("P.O./REQ.NO.: "),
+            "the transcript does not end at the order prompt"
+        );
+        assert_eq!(session.transcript.len(), 1_048_026, "transcript bytes");
+        assert_eq!(session.returned, None, "returned");
+        Ok(())
+    })
+}
+
 /// Replay answers 200 with the recorded capture whose inputs equal the
 /// request's: its `transcript.txt` byte for byte, never rewritten by its
 /// rule, and its zero-byte `returned.txt` as `null`.
