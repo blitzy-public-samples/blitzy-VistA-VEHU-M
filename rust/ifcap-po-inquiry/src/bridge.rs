@@ -1,27 +1,42 @@
 //! The loopback bridge: one HTTP/1.1 server that lets a person run one input
 //! sequence against the original MUMPS system and against the Rust port, from
 //! the one-screen front-end. Rust-only infrastructure with no MUMPS
-//! counterpart.
+//! counterpart; it implements the request's HTTP contract as AAP 0.3.5.1
+//! states it.
 //!
 //! - `POST /api/{mumps|rust|compare}/session` with `{"inputs": [string, ...]}`
-//!   runs the whole sequence statelessly. The MUMPS side is a replay of the
-//!   recorded captures or a live `docker exec`, chosen by [`MumpsMode`]; the
-//!   Rust side is [`inquire`] on the fixture [`Store`].
+//!   runs the whole sequence statelessly. The MUMPS side replays the recorded
+//!   capture whose inputs equal the request's, or runs the original live
+//!   through `docker exec`, as [`MumpsMode`] chooses; the Rust side is
+//!   [`inquire`] on the fixture [`Store`]. COMPARE runs both and reports
+//!   `match`, the PASS rule of one case applied to one request.
+//! - `GET /api/status` reports the MUMPS mode and which of the five cases are
+//!   recorded, READY or INCOMPLETE, read afresh on every request.
 //! - `GET /`, `/index.html`, `/style.css` and `/app.js` serve `frontend/`,
 //!   matched exactly and read at request time.
 //!
 //! There is no authentication, TLS or session state: the trust boundary is
-//! the loopback address the caller binds. A request supplies only `inputs`
-//! and, through its path, the backend; the live container comes only from
-//! [`MumpsMode::Live`]. Nothing here writes to either backend's data.
+//! the loopback address the caller binds. A request must also name a
+//! loopback host, `127.0.0.1`, `localhost` or `[::1]` with any port, in its
+//! `Host` (RFC 9110 7.2) or absolute-form authority (RFC 9112 3.2.2), so a
+//! page whose own name an attacker resolves to the loopback address (DNS
+//! rebinding) reaches nothing of it. A session request must come from the
+//! bridge's own page: its `Origin`, when sent, is `http://` and the host it
+//! names (RFC 6454; Fetch Standard), and its `Content-Type` is
+//! `application/json`, which is not CORS-safelisted, so a page of another
+//! origin cannot send it without a preflight, and the bridge grants none:
+//! an `OPTIONS` request to a session path is answered 404 with no
+//! `Access-Control-*` header, so the browser does not send the request
+//! (Fetch Standard, CORS-safelisted request-header). A request supplies
+//! only `inputs` and, through its path, the backend. The live container
+//! comes only from [`MumpsMode::Live`], and the live start arguments and
+//! context only from the captures, so no request field reaches a command
+//! line. No endpoint changes data, and nothing here writes a file.
 //!
-//! This module also owns the capture-format helpers that the adapters and
-//! both integration test files must apply identically: [`split_input_lines`],
-//! [`parse_normalisation`], [`normalise`], [`parse_meta`] and
-//! [`validate_context`]. Only the MUMPS adapters, compare routing and these
-//! helpers touch capture content.
+//! Capture content (inputs, transcripts, return values, normalisation rules,
+//! readiness, the recorded start arguments and context) is read only through
+//! [`crate::golden`]; this module re-implements none of its parsing or checks.
 
-use std::collections::HashSet;
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -31,11 +46,12 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::inquiry::{InquiryError, InquiryOutput, STUB_CONTEXT, inquire};
+use crate::golden::{self, Case, Readiness};
+use crate::inquiry::{InquiryError, InquiryOutput, inquire};
 use crate::store::{Store, load_fixtures};
 
 /// How often the accept loop polls its shutdown flag, a live request tries
@@ -55,12 +71,23 @@ const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 /// The most connections served at once. Each holds a thread, two descriptors
 /// (the stream and the clone that wakes it at shutdown) and request buffers
-/// of about [`MAX_HEAD`] plus [`MAX_BODY`] at most, so this bounds what
+/// of about [`MAX_HEAD`] plus [`MAX_BODY`] at most. The inputs decoded from a
+/// body hold no more text than the body, and what each input costs beyond
+/// its text is bounded by [`FREE_INPUTS`] per connection and, across the
+/// sessions with more inputs, by [`INPUT_BUDGET`]. So this bounds what
 /// clients can make the bridge hold, far below a 1024-descriptor limit, and
 /// well above the few connections a browser opens to one host. At the bound
 /// no connection is taken: further ones wait in the listener's kernel
 /// backlog.
 const MAX_CONNECTIONS: usize = 64;
+/// The longest one pause of accepting lasts after the process or the system
+/// ran out of descriptors, memory or threads for a connection (accept(2),
+/// "Errors"). The pauses of one shortage start at [`POLL`] and double, so a
+/// lasting shortage costs about one failed attempt a second. Only open
+/// connections ending relieve it, and an idle one ends [`IO_TIMEOUT`] after
+/// it was accepted; a pause of at most a fifth of that takes the connections
+/// waiting in the backlog within a second of the shortage ending.
+const MAX_BACKOFF: Duration = Duration::from_secs(1);
 /// How long, and how much, unread client data is discarded after a response,
 /// so that closing a socket with unread input does not reset the connection
 /// and destroy the response before the client reads it.
@@ -69,6 +96,21 @@ const DRAIN_BYTES: usize = 2 * MAX_BODY;
 /// Deepest JSON nesting the reader accepts. Recursive descent on a 1 MiB
 /// body of `[` would otherwise overflow the connection thread's stack.
 const MAX_JSON_DEPTH: usize = 64;
+/// A session with at most this many inputs never waits for
+/// [`INPUT_BUDGET`], nor is charged against it: more than any typed session
+/// sends.
+const FREE_INPUTS: usize = 1024;
+/// The most decoded inputs that the sessions with more than [`FREE_INPUTS`]
+/// inputs hold at once, across every connection: as many as two maximal
+/// bodies of one-character inputs, `"a",` each, hold, so two such sessions
+/// run at once and a third waits. A decoded input costs several times its
+/// bytes in the body, so it is this, not [`MAX_CONNECTIONS`] alone, that
+/// bounds the inputs clients can make the bridge hold.
+const MAX_HELD_INPUTS: usize = MAX_BODY / 2;
+/// The one bound on decoded inputs, shared by every connection thread: a
+/// session holds its charge from before its inputs are decoded until they
+/// are freed.
+static INPUT_BUDGET: InputBudget = InputBudget::new(MAX_HELD_INPUTS, FREE_INPUTS);
 /// Live-mode limits on the `docker exec` child.
 const LIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const LIVE_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -89,56 +131,85 @@ const JSON_TYPE: &str = "application/json; charset=utf-8";
 // Construction
 // ---------------------------------------------------------------------------
 
-/// Where the MUMPS side of a session comes from.
+/// Where the MUMPS side of a session comes from (AAP 0.3.5.1).
 ///
-/// `Live` carries `golden_dir` as well, because live mode reads the capture
-/// command and context from the captures' `meta.txt`, and the directory can
-/// reach the bridge only as an argument: no test sets an environment
-/// variable.
+/// `Live` carries `golden_dir` as well, because live mode takes its start
+/// arguments and context from the captures, and the directory can reach the
+/// bridge only as an argument: no test sets an environment variable. In both
+/// modes `GET /api/status` describes `golden_dir`, and COMPARE judges `match`
+/// against the capture whose inputs equal the request's.
 #[derive(Clone, Debug)]
 pub enum MumpsMode {
-    /// Answer from the recorded captures `GC-01` to `GC-05` under
-    /// `golden_dir`.
+    /// Replay adapter of AAP 0.3.5.1: answer from the recorded captures
+    /// `GC-01` to `GC-05` under `golden_dir`, read afresh on every request.
     Replay { golden_dir: PathBuf },
-    /// Run the original with `docker exec -i <container> ...`, using the
-    /// capture command recorded in `golden_dir`.
+    /// Live adapter of AAP 0.3.5.1: run the original with
+    /// `docker exec -i <container> ...`, using the start arguments and
+    /// context recorded in the captures under `golden_dir`.
     Live {
         container: String,
         golden_dir: PathBuf,
     },
 }
 
-/// Serves `listener` until serving fails. Loads the fixture store once from
-/// `tests/fixtures/ifcap/` of this crate, before anything is served; a
-/// fixture that cannot be loaded is an `InvalidData` error naming it. Then
-/// hands `listener` to [`serve_until`] with a shutdown flag that is never
-/// set, so this returns only with a serving error of `serve_until`,
-/// unchanged.
+/// Serves `listener` until serving fails (AAP 0.3.5.1). The text of each
+/// error names the stage that failed, and its kind is that of the failure.
+///
+/// - Loads the fixture store once with [`load_fixtures`] from
+///   `tests/fixtures/ifcap/` of this crate, before anything is served. Its
+///   error, a fixture that cannot be read or a malformed line
+///   (`InvalidData`), each naming the file, is returned as
+///   `cannot load fixtures: <error>`.
+/// - Then hands `listener` to `serve_until` with a shutdown flag that is
+///   never set, so this returns only when serving fails after the store
+///   loaded, as `serving failed: <error>`, where `<error>` names the step,
+///   such as `accepting a connection failed: <cause>` for a failure of
+///   `accept` that no retry mends. Running out of descriptors, memory or
+///   threads does not end serving: accepting pauses until connections end.
 pub fn serve(listener: TcpListener, mumps: MumpsMode) -> io::Result<()> {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("ifcap");
-    let store = load_fixtures(&fixtures)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    serve_until(listener, store, mumps, Arc::new(AtomicBool::new(false)))
+    let store = load_store(&fixtures)?;
+    serve_until(listener, store, mumps, Arc::new(AtomicBool::new(false))).map_err(serving_failed)
 }
 
-/// Serves `listener` until `shutdown` is set, then returns `Ok(())`. Public
-/// only as the test hook behind [`serve`].
+/// The fixture store of [`serve`], loaded from `fixtures` by
+/// [`load_fixtures`]. An error keeps its kind and its text, which names the
+/// file, behind `cannot load fixtures: `.
+fn load_store(fixtures: &Path) -> io::Result<Store> {
+    load_fixtures(fixtures)
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot load fixtures: {e}")))
+}
+
+/// A failure of `serve_until` in [`serve`], after the store loaded, with its
+/// kind and its text, which names the step, kept behind `serving failed: `.
+fn serving_failed(e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("serving failed: {e}"))
+}
+
+/// Serves `listener` until `shutdown` is set, then returns `Ok(())`: the
+/// serving loop behind [`serve`]; unit tests in this module drive it with a
+/// shutdown flag.
 ///
 /// The listener is made non-blocking first; a failure to do so is returned
 /// as it is, before anything is served. `shutdown` is polled about every
-/// 10 ms: between attempts to accept while no connection is pending, and
-/// while `MAX_CONNECTIONS` connections are open. At that bound no connection
-/// is accepted, so further ones wait in the listener's kernel backlog, given
-/// no status, until an open one ends. Each connection is handled on its own
-/// thread, so an idle one never blocks another.
+/// 10 ms: between attempts to accept while no connection is pending, while
+/// `MAX_CONNECTIONS` connections are open, and while accepting is paused. At
+/// that bound no connection is accepted, so further ones wait in the
+/// listener's kernel backlog, given no status, until an open one ends. Each
+/// connection is handled on its own thread, so an idle one never blocks
+/// another.
 ///
-/// Serving fails when `accept` fails in a way no retry mends, when a
-/// connection cannot be given its socket clone or its thread, which closes
-/// that connection without a response, or with the failure a finished
-/// connection thread returned because its socket could not be configured.
+/// Serving fails when `accept` fails in a way no retry mends, or with the
+/// failure a finished connection thread returned because its socket could
+/// not be configured. Running out of descriptors or memory, which `accept`
+/// reports (accept(2), "Errors"), does not end it, nor does a connection
+/// that cannot be given its socket clone or its thread, which is closed
+/// without a response: accepting pauses instead, for 10 ms at first and
+/// twice as long after each further shortage, up to [`MAX_BACKOFF`], and
+/// further connections wait in the backlog until open ones end.
 /// Once the flag is set or serving fails, every connection still open is
 /// shut down, which wakes a thread waiting to read or write and cuts off a
 /// response not yet fully written, though bytes already written stay sent,
@@ -146,7 +217,7 @@ pub fn serve(listener: TcpListener, mumps: MumpsMode) -> io::Result<()> {
 /// returned is the serving failure; otherwise the first failure to shut a
 /// connection down, other than `NotConnected`; otherwise the first failure
 /// a connection thread returned. Each keeps its kind and names its stage.
-pub fn serve_until(
+fn serve_until(
     listener: TcpListener,
     store: Store,
     mumps: MumpsMode,
@@ -168,15 +239,8 @@ pub fn serve_until(
     served.and(stopped)
 }
 
-/// The accept loop of [`serve_until`]. It polls `shutdown` about every
-/// [`POLL`], joins the workers that have finished, so that `workers` holds
-/// only open connections, and starts one worker per connection while fewer
-/// than `limit` are open. At `limit` it does not accept, so further
-/// connections wait in the listener's backlog, untouched, until a worker
-/// finishes. `Ok` once the flag is set. `Err` when `accept` fails in a way no
-/// retry mends, when a connection cannot be given its worker, or with the
-/// first failure of the finished workers, once all of them are joined; the
-/// workers still open stay in `workers`.
+/// The accept loop of [`serve_until`]: [`accept_loop`] taking each
+/// connection from `listener`.
 fn accept_until(
     listener: &TcpListener,
     store: &Arc<Store>,
@@ -185,6 +249,47 @@ fn accept_until(
     workers: &mut Vec<(JoinHandle<io::Result<()>>, TcpStream)>,
     limit: usize,
 ) -> io::Result<()> {
+    accept_loop(
+        || listener.accept().map(|(stream, _)| stream),
+        store,
+        mumps,
+        shutdown,
+        workers,
+        limit,
+    )
+}
+
+/// The loop of [`accept_until`], taking each connection from `accept`. It
+/// polls `shutdown` about every [`POLL`], joins the workers that have
+/// finished, so that `workers` holds only open connections, and starts one
+/// worker per connection while fewer than `limit` are open. At `limit` it
+/// does not accept, so further connections wait in the listener's backlog,
+/// untouched, until a worker finishes.
+///
+/// When `accept` reports that the process or the system has run out of
+/// descriptors or memory (accept(2), "Errors"), or a connection cannot be
+/// given its worker, which closes it without a response, the loop pauses
+/// accepting: for [`POLL`] after the first such shortage, and twice as long
+/// after each further one, up to [`MAX_BACKOFF`], until a connection gets its
+/// worker again. A pause sleeps at most [`POLL`] at a time, polling
+/// `shutdown` and joining finished workers in between, so further
+/// connections wait in the backlog, untouched, while open ones end.
+///
+/// `Ok` once the flag is set. `Err` when `accept` fails in a way no retry
+/// mends, or with the first failure of the finished workers, once all of
+/// them are joined; the workers still open stay in `workers`.
+fn accept_loop(
+    mut accept: impl FnMut() -> io::Result<TcpStream>,
+    store: &Arc<Store>,
+    mumps: &Arc<MumpsMode>,
+    shutdown: &AtomicBool,
+    workers: &mut Vec<(JoinHandle<io::Result<()>>, TcpStream)>,
+    limit: usize,
+) -> io::Result<()> {
+    // The last pause of the shortage in progress, `ZERO` when none is, and
+    // when that pause began.
+    let mut backoff = Duration::ZERO;
+    let mut paused = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
         let mut joined = Ok(());
         for (finished, _) in workers.extract_if(.., |(handle, _)| handle.is_finished()) {
@@ -195,17 +300,45 @@ fn accept_until(
             thread::sleep(POLL);
             continue;
         }
-        match listener.accept() {
-            Ok((stream, _)) => workers.push(start_worker(stream, store, mumps)?),
-            Err(e) => {
-                let delay = accept_retry_delay(e)?;
-                if !delay.is_zero() {
-                    thread::sleep(delay);
+        let pause_left = backoff.saturating_sub(paused.elapsed());
+        if !pause_left.is_zero() {
+            thread::sleep(pause_left.min(POLL));
+            continue;
+        }
+        let short = match accept() {
+            Ok(stream) => match start_worker(stream, store, mumps) {
+                Ok(worker) => {
+                    workers.push(worker);
+                    backoff = Duration::ZERO;
+                    false
                 }
-            }
+                // `start_worker` has closed the connection without a
+                // response, and its failure concerns that connection alone.
+                Err(_) => true,
+            },
+            Err(e) => match accept_retry_delay(e)? {
+                AcceptRetry::After(delay) => {
+                    if !delay.is_zero() {
+                        thread::sleep(delay);
+                    }
+                    false
+                }
+                AcceptRetry::BackOff => true,
+            },
+        };
+        if short {
+            backoff = next_backoff(backoff);
+            paused = Instant::now();
         }
     }
     Ok(())
+}
+
+/// The pause of accepting that follows `previous`, the last pause of the
+/// same shortage, or `ZERO` at its start: [`POLL`] first, then twice the one
+/// before, never more than [`MAX_BACKOFF`].
+fn next_backoff(previous: Duration) -> Duration {
+    previous.saturating_mul(2).max(POLL).min(MAX_BACKOFF)
 }
 
 /// Linux `errno` values with no `io::ErrorKind` of their own that `accept`
@@ -214,36 +347,56 @@ fn accept_until(
 /// ENOPROTOOPT, EOPNOTSUPP and EHOSTDOWN.
 const PENDING_CONNECTION_ERRNOS: [i32; 5] = [64, 71, 92, 95, 112];
 
-/// How long the accept loop waits after `accept` failed with `e` before it
-/// tries again: [`POLL`] when no connection is pending, and no time when one
-/// pending connection failed but the listener is sound. Any other failure
-/// ends serving, with an error that keeps `e`'s kind and names the stage.
-fn accept_retry_delay(e: io::Error) -> io::Result<Duration> {
+/// Linux `errno` values that `accept` reports when the process or the system
+/// has run out of what a new connection needs, the listener staying sound
+/// (accept(2), "Errors"): ENOMEM and ENOBUFS, not enough free memory, and
+/// ENFILE and EMFILE, the system-wide and per-process limits on open files.
+const EXHAUSTION_ERRNOS: [i32; 4] = [12, 105, 23, 24];
+
+/// What the accept loop does after a failure of `accept` that a retry mends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptRetry {
+    /// Accept again once this delay has passed.
+    After(Duration),
+    /// Pause accepting by the loop's backoff: only connections ending can
+    /// relieve the shortage.
+    BackOff,
+}
+
+/// How the accept loop waits after `accept` failed with `e` before it tries
+/// again: [`POLL`] when no connection is pending; no time when one pending
+/// connection failed but the listener is sound; and the loop's backoff when
+/// the process or the system has run out of descriptors or memory (accept(2),
+/// "Errors"). Any other failure ends serving, with an error that keeps `e`'s
+/// kind and names the stage.
+fn accept_retry_delay(e: io::Error) -> io::Result<AcceptRetry> {
     match e.kind() {
-        io::ErrorKind::WouldBlock => return Ok(POLL),
+        io::ErrorKind::WouldBlock => return Ok(AcceptRetry::After(POLL)),
         io::ErrorKind::Interrupted
         | io::ErrorKind::ConnectionAborted
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::NetworkDown
         | io::ErrorKind::NetworkUnreachable
-        | io::ErrorKind::HostUnreachable => return Ok(Duration::ZERO),
+        | io::ErrorKind::HostUnreachable => return Ok(AcceptRetry::After(Duration::ZERO)),
         _ => {}
     }
-    if e.raw_os_error()
-        .is_some_and(|code| PENDING_CONNECTION_ERRNOS.contains(&code))
-    {
-        return Ok(Duration::ZERO);
+    match e.raw_os_error() {
+        Some(code) if PENDING_CONNECTION_ERRNOS.contains(&code) => {
+            Ok(AcceptRetry::After(Duration::ZERO))
+        }
+        Some(code) if EXHAUSTION_ERRNOS.contains(&code) => Ok(AcceptRetry::BackOff),
+        _ => Err(io::Error::new(
+            e.kind(),
+            format!("accepting a connection failed: {e}"),
+        )),
     }
-    Err(io::Error::new(
-        e.kind(),
-        format!("accepting a connection failed: {e}"),
-    ))
 }
 
 /// Starts the thread that answers `stream`, and returns it with a clone of
 /// the socket, which [`stop_workers`] uses to wake it. When the clone or the
 /// thread cannot be had, there is no worker: the connection is closed
-/// without a response, and the failure is returned, naming that stage.
+/// without a response, and the failure is returned, naming that stage, for
+/// the accept loop to pause accepting on.
 fn start_worker(
     stream: TcpStream,
     store: &Arc<Store>,
@@ -268,8 +421,7 @@ fn start_worker(
 /// Closes a connection the bridge cannot serve, writing nothing to it: each
 /// response status names an outcome of a request, and none names a failure
 /// of the bridge's own resources, so the client sees a closed connection.
-/// Returns the error that ends serving, which keeps `cause`'s kind and
-/// names `stage`.
+/// Returns the failure, which keeps `cause`'s kind and names `stage`.
 fn abandon(stream: &TcpStream, stage: &str, cause: io::Error) -> io::Error {
     // `NotConnected`, a peer that has already reset the connection, is the
     // only way this fails, and leaves nothing to close.
@@ -330,7 +482,10 @@ fn handle_connection(mut stream: TcpStream, store: &Store, mumps: &MumpsMode) ->
 /// timeout cannot be set, is closed without a response, and that failure is
 /// returned, naming the stage. Every other outcome is `Ok`. The answer to a
 /// `HEAD` request, accepted or rejected, carries no content; its method is
-/// read after any empty-line prelude (see [`skip_prelude`]).
+/// read after any empty-line prelude (see [`skip_prelude`]). The bytes of the
+/// head are freed once that method is known, before the request is routed,
+/// and [`route`] takes the request, body included, so no copy of the request
+/// outlives what the session needs of it.
 fn exchange(stream: &mut TcpStream, store: &Store, mumps: &MumpsMode) -> io::Result<()> {
     let configured = stream
         .set_nonblocking(false)
@@ -339,16 +494,18 @@ fn exchange(stream: &mut TcpStream, store: &Store, mumps: &MumpsMode) -> io::Res
         return Err(abandon(stream, "configuring a connection", e));
     }
     let mut received: Vec<u8> = Vec::new();
-    let response = match read_request(stream, &mut received, IO_TIMEOUT, REQUEST_TIME) {
+    let read = read_request(stream, &mut received, IO_TIMEOUT, REQUEST_TIME);
+    // Method tokens are case-sensitive, so only `HEAD` itself is a HEAD
+    // request, rejected or not.
+    let head_request = skip_prelude(&received).starts_with(b"HEAD ");
+    drop(received);
+    let response = match read {
         Err(e) => return Err(abandon(stream, "configuring a connection", e)),
-        Ok(Ok(Some(request))) => route(&request, store, mumps),
+        Ok(Ok(Some(request))) => route(request, store, mumps),
         // Nothing to answer: the peer sent nothing, or cannot be written to.
         Ok(Ok(None)) => return Ok(()),
         Ok(Err(cause)) => error_response(400, &cause),
     };
-    // Method tokens are case-sensitive, so only `HEAD` itself is a HEAD
-    // request, rejected or not.
-    let head_request = skip_prelude(&received).starts_with(b"HEAD ");
     // A response that cannot be written means the client has gone, or has
     // not read it within `IO_TIMEOUT`: an outcome of that client, which ends
     // only this connection, shut down by `handle_connection`.
@@ -420,10 +577,24 @@ fn drain_reads(
 /// request bytes.
 const BAD_REQUEST: &str = "BAD REQUEST";
 
-/// One request, as far as routing needs it: the method, the target, and the
+/// The causes, after `BAD REQUEST: `, of a session request whose headers do
+/// not show that it comes from the bridge's own page (see [`parse_head`]):
+/// an `Origin` other than the page's, or a `Content-Type` other than
+/// `application/json`.
+const ORIGIN_NOT_ALLOWED: &str = "ORIGIN NOT ALLOWED";
+const JSON_REQUIRED: &str = "CONTENT-TYPE APPLICATION/JSON REQUIRED";
+
+/// One request, as far as routing needs it: the method, the target, the
 /// body read by `Content-Length`, or `None` when the request carried no
-/// `Content-Length`.
-type HttpRequest = (String, String, Option<Vec<u8>>);
+/// `Content-Length`, and the cause a session request with these headers is
+/// refused for, [`ORIGIN_NOT_ALLOWED`] or [`JSON_REQUIRED`], or `None` when
+/// they allow a session.
+type HttpRequest = (String, String, Option<Vec<u8>>, Option<&'static str>);
+
+/// One request's head as [`parse_head`] reads it: the method, the target in
+/// origin-form, the `Content-Length`, whether `Expect: 100-continue` was
+/// sent, and the session refusal cause of [`HttpRequest`].
+type RequestHead<'h> = (&'h str, String, Option<usize>, bool, Option<&'static str>);
 
 /// Reads the request line and headers up to the blank line into `received`,
 /// then the body by `Content-Length`. Empty lines before the request line
@@ -492,7 +663,8 @@ fn read_request(
     let Some((head, rest)) = received.split_at_checked(head_end) else {
         return Ok(Err(bad("INCOMPLETE HEAD")));
     };
-    let (method, target, content_length, expect_continue) = match parse_head(head) {
+    let (method, target, content_length, expect_continue, session_refusal) = match parse_head(head)
+    {
         Ok(parsed) => parsed,
         Err(cause) => return Ok(Err(cause)),
     };
@@ -500,7 +672,14 @@ fn read_request(
         None => None,
         Some(length) if length > MAX_BODY => return Ok(Err(bad("BODY TOO LARGE"))),
         Some(length) => {
-            let mut body = rest.to_vec();
+            // The body is allocated once at its declared length and never
+            // grows past it: it takes what arrived with the head up to that
+            // length, then reads into a window of only the bytes still owed.
+            // Bytes past the declared length (a pipelined request) are not
+            // part of this request: they are not copied, nor read from the
+            // socket, and are not answered.
+            let mut body = Vec::with_capacity(length);
+            body.extend_from_slice(rest.get(..length).unwrap_or(rest));
             // A client that cannot be written to cannot be answered either.
             if expect_continue
                 && body.len() < length
@@ -509,20 +688,26 @@ fn read_request(
                 return Ok(Ok(None));
             }
             while body.len() < length {
-                match read_within(stream, &mut buf, started, request_time)? {
+                let take = length.saturating_sub(body.len()).min(buf.len());
+                let Some(window) = buf.get_mut(..take) else {
+                    return Ok(Err(bad("INCOMPLETE BODY")));
+                };
+                match read_within(stream, window, started, request_time)? {
                     Ok(0) => return Ok(Err(bad("INCOMPLETE BODY"))),
-                    Ok(n) => body.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+                    Ok(n) => body.extend_from_slice(window.get(..n).unwrap_or(&[])),
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(_) => return Ok(Err(bad("INCOMPLETE BODY"))),
                 }
             }
-            // Bytes past the declared length (a pipelined request) are not
-            // part of this request and are not answered.
-            body.truncate(length);
             Some(body)
         }
     };
-    Ok(Ok(Some((method.to_string(), target, body))))
+    Ok(Ok(Some((
+        method.to_string(),
+        target,
+        body,
+        session_refusal,
+    ))))
 }
 
 /// One read of `stream` into `buf` that waits at most what is left of
@@ -580,9 +765,30 @@ fn skip_prelude(bytes: &[u8]) -> &[u8] {
 /// must be free of control bytes other than HTAB (see [`is_field_value`]).
 /// A request carries at most one `Host`, whose value must be a host (see
 /// [`is_host`]), and an HTTP/1.1 request must carry one (RFC 9112 3.2).
+/// The host a request names, by its `Host` (RFC 9110 7.2) or by the
+/// authority of an absolute-form target (RFC 9112 3.2.2), each checked
+/// once its syntax is, must be a loopback host (see [`is_loopback_host`]),
+/// or the cause is `HOST NOT ALLOWED`: so a page served under another name
+/// that resolves to the loopback address reaches nothing of the bridge.
+/// An HTTP/1.0 request without `Host` or an absolute-form target names no
+/// host and stays served.
 /// Errors are 400 causes, each naming the rule the head broke: the request
 /// line's first, then each header line's in order, then a missing `Host`.
-fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String> {
+///
+/// The last item is what a session request needs of these headers, which
+/// [`route_api`] applies to the session routes alone: the cause it is
+/// refused for, or `None`. An `Origin` (RFC 6454 7), when sent, must be
+/// sent once and be the page's own origin (see [`is_own_origin`]), or the
+/// cause is [`ORIGIN_NOT_ALLOWED`]; then exactly one `Content-Type` must
+/// have the media type `application/json` (see [`is_json_media_type`]), or
+/// the cause is [`JSON_REQUIRED`]. A page of another origin can send a
+/// request without a CORS preflight only with a CORS-safelisted
+/// `Content-Type`, `text/plain`, `application/x-www-form-urlencoded` or
+/// `multipart/form-data` (Fetch Standard, CORS-safelisted request-header),
+/// and the bridge grants no preflight: [`route_api`] answers its `OPTIONS`
+/// request 404 [`POST_REQUIRED`] with no `Access-Control-*` header, so the
+/// preflight fails and such a page cannot run a session.
+fn parse_head(head: &[u8]) -> Result<RequestHead<'_>, String> {
     let bad = |cause: &str| format!("{BAD_REQUEST}: {cause}");
     let malformed_line = || bad("MALFORMED REQUEST LINE");
     let text = std::str::from_utf8(skip_prelude(head)).map_err(|_| bad("HEAD NOT UTF-8"))?;
@@ -604,10 +810,16 @@ fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String
     if !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
         return Err(bad("UNSUPPORTED HTTP VERSION"));
     }
-    let target = origin_form(target).ok_or_else(|| bad("INVALID REQUEST TARGET"))?;
+    let (target, authority) = origin_form(target).ok_or_else(|| bad("INVALID REQUEST TARGET"))?;
+    if authority.is_some_and(|authority| !is_loopback_host(authority)) {
+        return Err(bad("HOST NOT ALLOWED"));
+    }
     let mut content_length: Option<usize> = None;
     let mut expect_continue = false;
-    let mut host_seen = false;
+    let mut host: Option<&str> = None;
+    // `Some(value)` for a header sent once, `Some(None)` once it repeats.
+    let mut origin: Option<Option<&str>> = None;
+    let mut content_type: Option<Option<&str>> = None;
     for line in lines {
         let (name, value) = line
             .split_once(':')
@@ -621,13 +833,24 @@ fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String
             return Err(bad("INVALID HEADER VALUE"));
         }
         if name.eq_ignore_ascii_case("host") {
-            if host_seen {
+            if host.is_some() {
                 return Err(bad("REPEATED HOST"));
             }
             if !is_host(value) {
                 return Err(bad("INVALID HOST"));
             }
-            host_seen = true;
+            if !is_loopback_host(value) {
+                return Err(bad("HOST NOT ALLOWED"));
+            }
+            host = Some(value);
+        } else if name.eq_ignore_ascii_case("origin") {
+            origin = Some(if origin.is_some() { None } else { Some(value) });
+        } else if name.eq_ignore_ascii_case("content-type") {
+            content_type = Some(if content_type.is_some() {
+                None
+            } else {
+                Some(value)
+            });
         } else if name.eq_ignore_ascii_case("content-length") {
             let length = parse_content_length(value)
                 .ok_or_else(|| format!("{BAD_REQUEST}: INVALID CONTENT-LENGTH"))?;
@@ -644,30 +867,49 @@ fn parse_head(head: &[u8]) -> Result<(&str, String, Option<usize>, bool), String
             expect_continue = version == "HTTP/1.1";
         }
     }
-    if version == "HTTP/1.1" && !host_seen {
+    if version == "HTTP/1.1" && host.is_none() {
         return Err(bad("MISSING HOST"));
     }
-    Ok((method, target, content_length, expect_continue))
+    // The authority of an absolute-form target stands in for `Host`
+    // (RFC 9112 3.2.2).
+    let own_authority = authority.or(host);
+    let session_refusal = match (origin, content_type.flatten()) {
+        (Some(origin), _) if !origin.is_some_and(|origin| is_own_origin(origin, own_authority)) => {
+            Some(ORIGIN_NOT_ALLOWED)
+        }
+        (_, Some(media_type)) if is_json_media_type(media_type) => None,
+        _ => Some(JSON_REQUIRED),
+    };
+    Ok((
+        method,
+        target,
+        content_length,
+        expect_continue,
+        session_refusal,
+    ))
 }
 
-/// The origin-form of a request target (RFC 9112 3.2): an origin-form
-/// target as sent, or an `http` absolute-form target reduced to its path
-/// and query, an empty path becoming `/` (RFC 9112 3.2.2). The whole target,
-/// in either form, must be visible ASCII in which each `%` begins a
-/// percent-encoded octet (RFC 9112 3.2, RFC 3986 2.1); visible delimiters
-/// that browsers send raw, such as `|` or `[`, stay accepted (see
-/// [`is_target_text`]). The scheme is matched without regard to case. The
-/// authority ends at the first `/`, `?` or `#` (RFC 3986 3.2) and takes no
-/// part in routing, but it must be a host with an optional port, as a
-/// `Host` value is (see [`is_host`], RFC 3986 3.2.2 and 3.2.3), so it is
-/// never empty (RFC 9110 4.2.1) and never carries userinfo (RFC 9110
-/// 4.2.4). `None` for any other target, such as `*` or another scheme.
-fn origin_form(target: &str) -> Option<String> {
+/// The origin-form of a request target (RFC 9112 3.2), with the authority
+/// of an absolute-form target: an origin-form target as sent, with no
+/// authority, or an `http` absolute-form target reduced to its path and
+/// query, an empty path becoming `/`, with its authority, which stands in
+/// for the request's `Host` (RFC 9112 3.2.2). The whole target, in either
+/// form, must be visible ASCII in which each `%` begins a percent-encoded
+/// octet (RFC 9112 3.2, RFC 3986 2.1); visible delimiters that browsers
+/// send raw, such as `|` or `[`, stay accepted (see [`is_target_text`]). The
+/// scheme is matched without regard to case. The authority ends at the
+/// first `/`, `?` or `#` (RFC 3986 3.2) and must be a host with an optional
+/// port, as a `Host` value is (see [`is_host`], RFC 3986 3.2.2 and 3.2.3),
+/// so it is never empty (RFC 9110 4.2.1) and never carries userinfo
+/// (RFC 9110 4.2.4); [`parse_head`] then holds it to the loopback hosts, as
+/// it does `Host`. `None` for any other target, such as `*` or another
+/// scheme.
+fn origin_form(target: &str) -> Option<(String, Option<&str>)> {
     if !is_target_text(target) {
         return None;
     }
     if target.starts_with('/') {
-        return Some(target.to_string());
+        return Some((target.to_string(), None));
     }
     let (scheme, rest) = target.split_once("://")?;
     if !scheme.eq_ignore_ascii_case("http") {
@@ -679,9 +921,9 @@ fn origin_form(target: &str) -> Option<String> {
         return None;
     }
     if path_and_query.starts_with('/') {
-        Some(path_and_query.to_string())
+        Some((path_and_query.to_string(), Some(authority)))
     } else {
-        Some(format!("/{path_and_query}"))
+        Some((format!("/{path_and_query}"), Some(authority)))
     }
 }
 
@@ -732,8 +974,8 @@ fn is_field_value(value: &str) -> bool {
 /// empty (RFC 9110 4.2.1). The host is an IPv6 address or an IPvFuture
 /// between brackets, or a reg-name, which also covers an IPv4 address
 /// (RFC 3986 3.2.2); the port is digits, possibly none (RFC 3986 3.2.3).
-/// Any host of this form is accepted, since the value takes no part in
-/// routing.
+/// This is the syntax alone: [`is_loopback_host`] then decides whether a
+/// value of this form names the bridge's own host.
 fn is_host(value: &str) -> bool {
     let (host_valid, port) = if let Some(literal) = value.strip_prefix('[') {
         let Some((address, after)) = literal.split_once(']') else {
@@ -753,6 +995,58 @@ fn is_host(value: &str) -> bool {
         (!name.is_empty() && is_reg_name(name), port)
     };
     host_valid && port.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether `value`, a `Host` value or an absolute-form authority that
+/// [`is_host`] accepts, names the loopback interface the bridge binds: the
+/// host `127.0.0.1`, `localhost` without regard to case (RFC 9110 4.2.3), or
+/// `[::1]`, with any port or none, since the port a client reaches the
+/// bridge on may be forwarded. A request naming any other host, such as a
+/// name an attacker made resolve to the loopback address (DNS rebinding),
+/// or a subdomain of `localhost`, is not for this bridge (RFC 9110 7.2).
+fn is_loopback_host(value: &str) -> bool {
+    if let Some(literal) = value.strip_prefix('[') {
+        return literal
+            .split_once(']')
+            .is_some_and(|(address, _)| address == "::1");
+    }
+    let name = value.split_once(':').map_or(value, |(name, _)| name);
+    name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost")
+}
+
+/// Whether `origin`, the value of a request's one `Origin`, is the origin
+/// of the bridge's own page as a browser serializes it (RFC 6454 6.2;
+/// Fetch Standard, serializing a request origin): `http://` followed by
+/// `authority`, the host and port the request names, without regard to
+/// case (RFC 9110 4.2.3). A request that names none, an HTTP/1.0 request
+/// without `Host`, accepts `http://` followed by any loopback host (see
+/// [`is_loopback_host`]). So `null`, an `https` origin, another host, and
+/// a loopback host on another port, a page another local server serves,
+/// are each another origin.
+fn is_own_origin(origin: &str, authority: Option<&str>) -> bool {
+    const SCHEME: &str = "http://";
+    let Some((scheme, rest)) = origin.split_at_checked(SCHEME.len()) else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case(SCHEME)
+        && match authority {
+            Some(authority) => rest.eq_ignore_ascii_case(authority),
+            None => is_host(rest) && is_loopback_host(rest),
+        }
+}
+
+/// Whether `value`, a request's one `Content-Type`, has the media type
+/// `application/json` (RFC 8259 11), its type and subtype matched without
+/// regard to case and its parameters, such as `charset=utf-8`, ignored
+/// (RFC 9110 8.3.1): the body itself must still be UTF-8 JSON (see
+/// [`scan_session_body`]).
+fn is_json_media_type(value: &str) -> bool {
+    let media_type = value
+        .split_once(';')
+        .map_or(value, |(media_type, _)| media_type);
+    media_type
+        .trim_matches(|c| c == ' ' || c == '\t')
+        .eq_ignore_ascii_case("application/json")
 }
 
 /// An IPvFuture address: `v` in either case, one or more hex digits, `.`,
@@ -813,18 +1107,41 @@ fn error_response(status: u16, cause: &str) -> (u16, &'static str, Vec<u8>) {
 }
 
 /// The headers every response carries besides its type, length and close:
-/// no content-type sniffing, no stored copy of a response, and no rendering
-/// inside a frame of another page.
+/// no content-type sniffing, no stored copy of a response, no rendering
+/// inside a frame of another page, and no `Referer` sent from the screen.
+/// The content security policy admits script, stylesheet, fetch and image
+/// from the bridge's own origin only, and no other source, plugin, base or
+/// form target. Inline script stays blocked, and inline style applies only
+/// to the `style` attribute values of `frontend/index.html` listed by hash,
+/// each the base64 SHA-256 of the value, recomputed with
+/// `printf %s 'display: grid' | openssl dgst -sha256 -binary | base64`.
+/// A unit test ties the hashes to the attribute values in that file.
+// The keyword before the hashes is written across two source lines, so the
+// audit's line search of `src/` for the Rust keyword that `src/lib.rs`
+// forbids finds no policy text.
 const HARDENING_HEADERS: &str = "X-Content-Type-Options: nosniff\r\n\
     Cache-Control: no-store\r\n\
     X-Frame-Options: DENY\r\n\
-    Content-Security-Policy: frame-ancestors 'none'\r\n";
+    Content-Security-Policy: default-src 'none'; script-src 'self'; \
+    style-src 'self'; style-src-attr 'un\
+    safe-hashes' \
+    'sha256-Y7ZmQ5m28wE8jcqdbLGWsIcASPs3rdYQ4sSRGpNAYyM=' \
+    'sha256-1JfHihHzCPzuxf9mPkYHhm4qQbvGqSuA1OMJN2czR2g=' \
+    'sha256-Msy28pTshKBAl09/8Nf4ytgl6hESNb9q6acgEEFKDKI='; \
+    connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; \
+    form-action 'none'; frame-ancestors 'none'\r\n\
+    Referrer-Policy: no-referrer\r\n";
 
 /// Writes `response`, `(status, content type, body)`, with
-/// [`HARDENING_HEADERS`]; every response closes its connection. The answer
-/// to a `HEAD` request, `head_request`, carries no content (RFC 9110 9.3.2),
-/// but its `Content-Length` is still that of the body a `GET` would get
-/// (RFC 9110 8.6).
+/// [`HARDENING_HEADERS`]; every response closes its connection.
+/// `Content-Length` is always the length of `body`, the response being
+/// written. With `head_request` set, the head is written and the content
+/// left out (RFC 9110 9.3.2), so the length still describes the content
+/// left out (RFC 9110 8.6). It is the length a `GET` would get only where
+/// [`route`] gives the `HEAD` the `GET`'s response, as on the four static
+/// paths; a `HEAD` on an API path is written as that path's 404, so
+/// `HEAD /api/status` has the length of its `GET REQUIRED` body, not of the
+/// 200 a `GET` gets.
 fn write_response(
     stream: &mut impl Write,
     response: &(u16, &'static str, Vec<u8>),
@@ -848,7 +1165,6 @@ fn reason_phrase(status: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
-        422 => "Unprocessable Content",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         _ => "Status",
@@ -874,22 +1190,28 @@ const UNKNOWN_BACKEND: &str = "UNKNOWN BACKEND";
 const POST_REQUIRED: &str = "NOT FOUND: POST REQUIRED";
 const GET_REQUIRED: &str = "NOT FOUND: GET REQUIRED";
 
-/// Answers `request` with `(status, content type, body)`: a static path, an
-/// API path, or 404. A `HEAD` request is answered as a `GET` of the same
-/// target would be, so its headers, `Content-Length` included, are those of
-/// the `GET` (RFC 9110 9.3.2): a static path serves its file, and an API
-/// path, which serves only `POST`, gives the 404 of any other method.
-/// [`write_response`] leaves the content out.
-fn route(request: &HttpRequest, store: &Store, mumps: &MumpsMode) -> (u16, &'static str, Vec<u8>) {
-    let (method, target, body) = request;
-    if let Some((file, content_type)) = static_file(target) {
+/// Answers `request` with `(status, content type, body)`. A static path
+/// answers `GET` and `HEAD`, other methods 404 `GET REQUIRED`; `/api/status`
+/// only `GET` and a `mumps`/`rust`/`compare` session path only `POST`, other
+/// methods (`HEAD` too) 404 `GET REQUIRED` or `POST REQUIRED`; an unknown
+/// backend's session path 404 `UNKNOWN BACKEND`; any other path, in `/api/`
+/// (query string included) or not, 404 `NOT FOUND` for any method, `POST`
+/// too. A static `HEAD` has its `GET`'s headers, `Content-Length` included
+/// (RFC 9110 9.3.2); [`write_response`] omits every `HEAD` answer's content.
+/// Taking `request` lets [`route_api`] free its body once inputs are decoded.
+/// The session refusal cause its headers give (see [`parse_head`])
+/// reaches only [`route_api`]'s session routes; a static path or
+/// `/api/status` answers whatever that cause.
+fn route(request: HttpRequest, store: &Store, mumps: &MumpsMode) -> (u16, &'static str, Vec<u8>) {
+    let (method, target, body, session_refusal) = request;
+    if let Some((file, content_type)) = static_file(&target) {
         if method == "GET" || method == "HEAD" {
             return serve_static(file, content_type);
         }
         return error_response(404, GET_REQUIRED);
     }
     if let Some(rest) = target.strip_prefix("/api/") {
-        let (status, json) = route_api(method, rest, body.as_deref(), store, mumps);
+        let (status, json) = route_api(&method, rest, body, session_refusal, store, mumps);
         return (status, JSON_TYPE, json.into_bytes());
     }
     error_response(404, NOT_FOUND)
@@ -918,17 +1240,35 @@ fn serve_static(file: &str, content_type: &'static str) -> (u16, &'static str, V
     }
 }
 
-/// `rest` is the target after `/api/`. Unknown backends and paths, and any
-/// method but POST, are 404; the body is checked only for a known route.
+/// `rest` is the target after `/api/`. `status` answers only `GET`, with
+/// [`status_body`]; any other method, `HEAD` included, is 404
+/// `GET REQUIRED`. `<backend>/session` answers only `POST`. Unknown backends
+/// and paths, a query string included, and any other method are 404. A
+/// `POST` to a known session route is then refused, before its body is
+/// looked at, as 400 `BAD REQUEST: <cause>` when `session_refusal`, the
+/// cause its headers give (see [`parse_head`]), is set: so a page of
+/// another origin runs no session, live `docker exec` included. The body is
+/// checked only for a known session route, and a body
+/// [`scan_session_body`] rejects is 400 `BAD REQUEST: <cause>`. An accepted
+/// body's inputs are decoded once [`INPUT_BUDGET`] admits their session,
+/// which may wait for heavier sessions to end; the body is freed then,
+/// before the session runs, and the inputs before its charge is released.
 /// The answer is `(status, JSON body)`.
 fn route_api(
     method: &str,
     rest: &str,
-    body: Option<&[u8]>,
+    body: Option<Vec<u8>>,
+    session_refusal: Option<&str>,
     store: &Store,
     mumps: &MumpsMode,
 ) -> (u16, String) {
     let not_found = || (404, error_body(NOT_FOUND));
+    if rest == "status" {
+        return match method {
+            "GET" => (200, status_body(mumps)),
+            _ => (404, error_body(GET_REQUIRED)),
+        };
+    }
     let Some((name, tail)) = rest.split_once('/') else {
         return not_found();
     };
@@ -944,105 +1284,280 @@ fn route_api(
     if method != "POST" {
         return (404, error_body(POST_REQUIRED));
     }
+    if let Some(cause) = session_refusal {
+        return (400, error_body(&format!("{BAD_REQUEST}: {cause}")));
+    }
     let Some(body) = body else {
         return (
             400,
             error_body(&format!("{BAD_REQUEST}: CONTENT-LENGTH REQUIRED")),
         );
     };
-    match parse_session_request(body) {
-        Ok(inputs) => session(store, mumps, &inputs),
-        Err(cause) => (400, error_body(&cause)),
+    let bad = |cause: &str| (400, error_body(&format!("{BAD_REQUEST}: {cause}")));
+    let (text, array) = match scan_session_body(&body) {
+        Ok(found) => found,
+        Err(cause) => return bad(&cause),
+    };
+    // The charge is taken before the inputs exist and declared before them,
+    // so they are freed first on every exit, unwinding included.
+    let charge = INPUT_BUDGET.admit(array.count);
+    let Some(inputs) = decode_inputs(text, array) else {
+        return bad("MALFORMED JSON");
+    };
+    drop(body);
+    let answer = session(store, mumps, &inputs);
+    drop(inputs);
+    drop(charge);
+    answer
+}
+
+/// Where the first `inputs` array of a session body opens, and how many
+/// elements it holds, as [`scan_session_body`] found them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InputsArray {
+    /// The byte offset of the array's `[` in the body.
+    start: usize,
+    /// The number of elements.
+    count: usize,
+}
+
+/// The first element of the `inputs` array that a session cannot take, by
+/// its position counted from 1.
+#[derive(Clone, Copy)]
+enum ElementFault {
+    /// An element that is not a string.
+    NotString(usize),
+    /// A string whose content, unescaped, holds a carriage return or a line
+    /// feed.
+    LineBreak(usize),
+}
+
+/// The value of the first `inputs` member of a session body, as
+/// [`scan_session_body`] found it.
+enum InputsValue {
+    /// A value that is not an array.
+    NotArray,
+    /// An array, with its first element fault, if any.
+    Array(InputsArray, Option<ElementFault>),
+}
+
+/// Checks that `body` is `{"inputs": [string, ...]}` and finds its `inputs`
+/// array, building nothing from the body: the inputs are decoded only once
+/// their session is admitted (see [`decode_inputs`]). An element holding a
+/// carriage return or line feed is rejected, because each input becomes one
+/// line of a captured input file and of live standard input. Other members
+/// of the object are ignored. Returns the body as text, with the array.
+///
+/// The whole body is checked, past a fault of the inputs too, and the cause
+/// is the first of these that holds: the body is not UTF-8 or not exactly
+/// one JSON value (`MALFORMED JSON`); the value is not an object
+/// (`BODY IS NOT A JSON OBJECT`); no member, or more than one, has the key
+/// `inputs`, compared unescaped (`INPUTS MISSING OR REPEATED`); the first
+/// `inputs` value is not an array (`INPUTS IS NOT AN ARRAY`); then the first
+/// element, by position from 1, that is not a string
+/// (`INPUT <n> IS NOT A STRING`) or holds a carriage return or line feed
+/// (`INPUT <n> CONTAINS A CARRIAGE RETURN OR LINE FEED`).
+fn scan_session_body(body: &[u8]) -> Result<(&str, InputsArray), String> {
+    let malformed = || "MALFORMED JSON".to_string();
+    let text = std::str::from_utf8(body).map_err(|_| malformed())?;
+    let mut pos = 0;
+    skip_whitespace(text, &mut pos);
+    let is_object = peek(text, pos) == Some(b'{');
+    let mut inputs_members = 0usize;
+    let mut first_inputs = None;
+    let scanned = if is_object {
+        scan_object(
+            text,
+            &mut pos,
+            0,
+            Some("inputs"),
+            |pos, depth, is_inputs| {
+                if is_inputs {
+                    inputs_members = inputs_members.saturating_add(1);
+                }
+                if !is_inputs || inputs_members > 1 {
+                    return scan_value(text, pos, depth);
+                }
+                let value = if depth <= MAX_JSON_DEPTH && peek(text, *pos) == Some(b'[') {
+                    scan_inputs(text, pos, depth)?
+                } else {
+                    scan_value(text, pos, depth)?;
+                    InputsValue::NotArray
+                };
+                first_inputs = Some(value);
+                Some(())
+            },
+        )
+    } else {
+        scan_value(text, &mut pos, 0)
+    };
+    skip_whitespace(text, &mut pos);
+    if scanned.is_none() || pos != text.len() {
+        return Err(malformed());
+    }
+    if !is_object {
+        return Err("BODY IS NOT A JSON OBJECT".to_string());
+    }
+    let (Some(value), 1) = (first_inputs, inputs_members) else {
+        return Err("INPUTS MISSING OR REPEATED".to_string());
+    };
+    match value {
+        InputsValue::NotArray => Err("INPUTS IS NOT AN ARRAY".to_string()),
+        InputsValue::Array(_, Some(ElementFault::NotString(position))) => {
+            Err(format!("INPUT {position} IS NOT A STRING"))
+        }
+        InputsValue::Array(_, Some(ElementFault::LineBreak(position))) => Err(format!(
+            "INPUT {position} CONTAINS A CARRIAGE RETURN OR LINE FEED"
+        )),
+        InputsValue::Array(array, None) => Ok((text, array)),
     }
 }
 
-/// Validates `{"inputs": [string, ...]}` and returns the inputs unmodified
-/// and in order. An element holding a carriage return or line feed is
-/// rejected, because each input becomes one line of a captured input file
-/// and of live standard input. Other members of the object are ignored.
-fn parse_session_request(body: &[u8]) -> Result<Vec<String>, String> {
-    let text = std::str::from_utf8(body).map_err(|_| "MALFORMED JSON".to_string())?;
-    let Some(json) = parse_json(text) else {
-        return Err("MALFORMED JSON".to_string());
-    };
-    let Some(members) = json_members(json) else {
-        return Err("BODY IS NOT A JSON OBJECT".to_string());
-    };
-    let mut found = members.into_iter().filter(|(key, _)| key == "inputs");
-    let (Some((_, inputs)), None) = (found.next(), found.next()) else {
-        return Err("INPUTS MISSING OR REPEATED".to_string());
-    };
-    let Some(elements) = json_elements(inputs) else {
-        return Err("INPUTS IS NOT AN ARRAY".to_string());
-    };
-    elements
-        .into_iter()
-        .enumerate()
-        .map(|(position, element)| match json_string(element) {
-            Some(text) if text.contains(['\r', '\n']) => Err(format!(
-                "INPUT {} CONTAINS A CARRIAGE RETURN OR LINE FEED",
-                position.saturating_add(1)
-            )),
-            Some(text) => Ok(text),
-            None => Err(format!(
-                "INPUT {} IS NOT A STRING",
-                position.saturating_add(1)
-            )),
-        })
-        .collect()
+/// Checks the first `inputs` array of a session body, at `*pos` and nested
+/// `depth` levels deep, and moves past it, building nothing: where it
+/// opens, how many elements it holds, and the first element a session
+/// cannot take. Every element is checked to its end, a faulty one included.
+fn scan_inputs(text: &str, pos: &mut usize, depth: usize) -> Option<InputsValue> {
+    let start = *pos;
+    let mut count = 0usize;
+    let mut fault = None;
+    scan_array(text, pos, depth, |pos, depth| {
+        count = count.saturating_add(1);
+        if depth <= MAX_JSON_DEPTH && peek(text, *pos) == Some(b'"') {
+            let mut line_break = false;
+            walk_string(text, pos, |piece| {
+                line_break |= piece.contains(['\r', '\n']);
+            })?;
+            if line_break && fault.is_none() {
+                fault = Some(ElementFault::LineBreak(count));
+            }
+        } else {
+            scan_value(text, pos, depth)?;
+            if fault.is_none() {
+                fault = Some(ElementFault::NotString(count));
+            }
+        }
+        Some(())
+    })?;
+    Some(InputsValue::Array(InputsArray { start, count }, fault))
+}
+
+/// The elements of the `inputs` array that [`scan_session_body`] found in
+/// `text`, unescaped and in order, in one pass over the array alone, into a
+/// vector allocated once at exactly their count. `None`, which an accepted
+/// body never gives, means `array` does not describe an accepted array of
+/// `text`.
+fn decode_inputs(text: &str, array: InputsArray) -> Option<Vec<String>> {
+    let mut inputs = Vec::with_capacity(array.count);
+    let mut pos = array.start;
+    // The array is a member's value, one level deep, as it was scanned.
+    scan_array(text, &mut pos, 1, |pos, _| {
+        inputs.push(decode_string(text, pos)?);
+        Some(())
+    })?;
+    (inputs.len() == array.count).then_some(inputs)
+}
+
+/// The string at `*pos`, unescaped, moving past it. The first piece
+/// [`walk_string`] hands over is copied as it stands, so a string without
+/// escapes, one piece, is held at exactly its length.
+fn decode_string(text: &str, pos: &mut usize) -> Option<String> {
+    let mut out = String::new();
+    walk_string(text, pos, |piece| {
+        if out.is_empty() {
+            out = piece.to_owned();
+        } else {
+            out.push_str(piece);
+        }
+    })?;
+    Some(out)
+}
+
+/// A bound on the decoded inputs that sessions hold at once, weighted by
+/// their count. A session with at most `free` inputs is not charged and
+/// never waits. A heavier one is charged its count, at most `capacity`, and
+/// waits until the charges held leave room for it, so one over `capacity`
+/// runs only while no other charge is held, and none ever blocks a light
+/// one.
+struct InputBudget {
+    /// The sum of the charges held.
+    held: Mutex<usize>,
+    /// Signalled whenever a charge is released.
+    released: Condvar,
+    /// The most the charges held may sum to.
+    capacity: usize,
+    /// The most inputs a session may have without being charged.
+    free: usize,
+}
+
+impl InputBudget {
+    /// A budget of `capacity` inputs, none of them held, that charges only
+    /// the sessions with more than `free` inputs.
+    const fn new(capacity: usize, free: usize) -> InputBudget {
+        InputBudget {
+            held: Mutex::new(0),
+            released: Condvar::new(),
+            capacity,
+            free,
+        }
+    }
+
+    /// The charge of a session with `inputs` inputs, taken once the charges
+    /// held leave room for it, and released when it is dropped. A lock
+    /// poisoned by a thread that panicked while holding it is taken all the
+    /// same: the sum it guards is only ever replaced whole.
+    fn admit(&self, inputs: usize) -> InputCharge<'_> {
+        let charge = if inputs <= self.free {
+            0
+        } else {
+            inputs.min(self.capacity)
+        };
+        if charge > 0 {
+            let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            while held.saturating_add(charge) > self.capacity {
+                held = self
+                    .released
+                    .wait(held)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            *held = held.saturating_add(charge);
+        }
+        InputCharge {
+            budget: self,
+            charge,
+        }
+    }
+}
+
+/// One session's charge against an [`InputBudget`]. Dropping it, on
+/// unwinding too, releases the charge and wakes every session waiting for
+/// room.
+struct InputCharge<'b> {
+    /// The budget charged.
+    budget: &'b InputBudget,
+    /// The inputs charged; 0 for a session that was not charged.
+    charge: usize,
+}
+
+impl Drop for InputCharge<'_> {
+    fn drop(&mut self) {
+        if self.charge == 0 {
+            return;
+        }
+        let mut held = self
+            .budget
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *held = held.saturating_sub(self.charge);
+        drop(held);
+        self.budget.released.notify_all();
+    }
 }
 
 // ---------------------------------------------------------------------------
 // JSON reader and writer (private, minimal)
 // ---------------------------------------------------------------------------
-
-/// Parses `text` as exactly one JSON value with optional surrounding
-/// whitespace, anything after it being malformed, and returns the value's
-/// own text without that whitespace.
-///
-/// A value is kept as its text, not as a tree: [`json_members`],
-/// [`json_elements`] and [`json_string`] read from it the kind a caller
-/// expects. Numbers keep their text, since nothing here computes with them.
-/// Throughout this reader, `None` means malformed.
-fn parse_json(text: &str) -> Option<&str> {
-    let mut pos = 0;
-    skip_whitespace(text, &mut pos);
-    let value = value_text(text, &mut pos, 0)?;
-    skip_whitespace(text, &mut pos);
-    if pos == text.len() { Some(value) } else { None }
-}
-
-/// The members of `value`, the text of exactly one JSON object: keys and
-/// value texts in document order, duplicates included, so each caller
-/// decides what a repeated key means.
-fn json_members(value: &str) -> Option<Vec<(String, &str)>> {
-    let mut pos = 0;
-    let members = read_object(value, &mut pos, 0)?;
-    if pos == value.len() {
-        Some(members)
-    } else {
-        None
-    }
-}
-
-/// The element texts of `value`, the text of exactly one JSON array, in
-/// order.
-fn json_elements(value: &str) -> Option<Vec<&str>> {
-    let mut pos = 0;
-    let elements = read_array(value, &mut pos, 0)?;
-    if pos == value.len() {
-        Some(elements)
-    } else {
-        None
-    }
-}
-
-/// The unescaped content of `value`, the text of exactly one JSON string.
-fn json_string(value: &str) -> Option<String> {
-    let mut pos = 0;
-    let text = read_string(value, &mut pos)?;
-    if pos == value.len() { Some(text) } else { None }
-}
 
 fn peek(text: &str, pos: usize) -> Option<u8> {
     text.as_bytes().get(pos).copied()
@@ -1072,25 +1587,22 @@ fn skip_whitespace(text: &str, pos: &mut usize) {
     }
 }
 
-/// The text of the value at `*pos`, moving past it as [`skip_value`] does.
-fn value_text<'t>(text: &'t str, pos: &mut usize, depth: usize) -> Option<&'t str> {
-    let start = *pos;
-    skip_value(text, pos, depth)?;
-    text.get(start..*pos)
-}
-
 /// Checks the value at `*pos`, nested `depth` levels deep, and moves past
-/// it; a value nested deeper than `MAX_JSON_DEPTH` is malformed. This is
-/// recursive descent over the bytes of `text`, and a position is always a
-/// char boundary between tokens, because every token delimiter is ASCII.
-fn skip_value(text: &str, pos: &mut usize, depth: usize) -> Option<()> {
+/// it, building nothing; a value nested deeper than `MAX_JSON_DEPTH` is
+/// malformed. This is recursive descent over the bytes of `text`, and a
+/// position is always a char boundary between tokens, because every token
+/// delimiter is ASCII. Numbers are only checked, since nothing here
+/// computes with them. Throughout this reader, `None` means malformed.
+fn scan_value(text: &str, pos: &mut usize, depth: usize) -> Option<()> {
     if depth > MAX_JSON_DEPTH {
         return None;
     }
     match peek(text, *pos) {
-        Some(b'{') => read_object(text, pos, depth).map(|_| ()),
-        Some(b'[') => read_array(text, pos, depth).map(|_| ()),
-        Some(b'"') => read_string(text, pos).map(|_| ()),
+        Some(b'{') => scan_object(text, pos, depth, None, |pos, depth, _| {
+            scan_value(text, pos, depth)
+        }),
+        Some(b'[') => scan_array(text, pos, depth, |pos, depth| scan_value(text, pos, depth)),
+        Some(b'"') => walk_string(text, pos, |_| {}),
         Some(b't') => eat_literal(text, pos, "true"),
         Some(b'f') => eat_literal(text, pos, "false"),
         Some(b'n') => eat_literal(text, pos, "null"),
@@ -1099,75 +1611,95 @@ fn skip_value(text: &str, pos: &mut usize, depth: usize) -> Option<()> {
     }
 }
 
-/// The object at `*pos`, nested `depth` levels deep, moving past it: its
-/// keys and value texts in document order, duplicates included.
-fn read_object<'t>(text: &'t str, pos: &mut usize, depth: usize) -> Option<Vec<(String, &'t str)>> {
+/// Checks the object at `*pos`, nested `depth` levels deep, and moves past
+/// it. `member` checks each member's value, at its position and nested one
+/// level deeper, and moves past it; it is told whether the member's key,
+/// unescaped, equals `wanted`. Keys are compared, never kept, and what a
+/// repeated key means is the caller's to decide.
+fn scan_object(
+    text: &str,
+    pos: &mut usize,
+    depth: usize,
+    wanted: Option<&str>,
+    mut member: impl FnMut(&mut usize, usize, bool) -> Option<()>,
+) -> Option<()> {
     eat(text, pos, b'{')?;
-    let mut members = Vec::new();
     skip_whitespace(text, pos);
     if peek(text, *pos) == Some(b'}') {
         *pos = pos.saturating_add(1);
-        return Some(members);
+        return Some(());
     }
     loop {
         skip_whitespace(text, pos);
-        let key = read_string(text, pos)?;
+        // The part of `wanted` the key has still to match, while it matches.
+        let mut unmatched = wanted;
+        walk_string(text, pos, |piece| {
+            unmatched = unmatched.and_then(|rest| rest.strip_prefix(piece));
+        })?;
         skip_whitespace(text, pos);
         eat(text, pos, b':')?;
         skip_whitespace(text, pos);
-        let value = value_text(text, pos, depth.saturating_add(1))?;
-        members.push((key, value));
+        member(pos, depth.saturating_add(1), unmatched == Some(""))?;
         skip_whitespace(text, pos);
         match bump(text, pos) {
             Some(b',') => {}
-            Some(b'}') => return Some(members),
+            Some(b'}') => return Some(()),
             _ => return None,
         }
     }
 }
 
-/// The array at `*pos`, nested `depth` levels deep, moving past it: its
-/// element texts in order.
-fn read_array<'t>(text: &'t str, pos: &mut usize, depth: usize) -> Option<Vec<&'t str>> {
+/// Checks the array at `*pos`, nested `depth` levels deep, and moves past
+/// it. `element` checks each element, at its position and nested one level
+/// deeper, and moves past it.
+fn scan_array(
+    text: &str,
+    pos: &mut usize,
+    depth: usize,
+    mut element: impl FnMut(&mut usize, usize) -> Option<()>,
+) -> Option<()> {
     eat(text, pos, b'[')?;
-    let mut elements = Vec::new();
     skip_whitespace(text, pos);
     if peek(text, *pos) == Some(b']') {
         *pos = pos.saturating_add(1);
-        return Some(elements);
+        return Some(());
     }
     loop {
         skip_whitespace(text, pos);
-        elements.push(value_text(text, pos, depth.saturating_add(1))?);
+        element(pos, depth.saturating_add(1))?;
         skip_whitespace(text, pos);
         match bump(text, pos) {
             Some(b',') => {}
-            Some(b']') => return Some(elements),
+            Some(b']') => return Some(()),
             _ => return None,
         }
     }
 }
 
-/// The string at `*pos`, unescaped, moving past it. The escapes are `\"`,
-/// `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\u` followed by four
-/// hexadecimal digits. A high-surrogate `\u` escape must be followed by a
-/// low-surrogate `\u` escape; an unpaired surrogate, an unknown escape or
-/// an unescaped control character is malformed.
-fn read_string(text: &str, pos: &mut usize) -> Option<String> {
+/// Checks the string at `*pos` and moves past it, handing `sink` its
+/// content, unescaped, in order and in pieces, none of them empty: each run
+/// without escapes as it stands in `text`, and the character of each
+/// escape. Skipping a value, comparing a key, checking an input for line
+/// breaks and decoding an input all read a string through this one walk.
+/// The escapes are `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\u`
+/// followed by four hexadecimal digits. A high-surrogate `\u` escape must be
+/// followed by a low-surrogate `\u` escape; an unpaired surrogate, an
+/// unknown escape or an unescaped control character is malformed.
+fn walk_string(text: &str, pos: &mut usize, mut sink: impl FnMut(&str)) -> Option<()> {
     eat(text, pos, b'"')?;
-    let mut out = String::new();
     let mut run_start = *pos;
     loop {
         match peek(text, *pos) {
             None => return None,
-            Some(b'"') => {
-                out.push_str(text.get(run_start..*pos)?);
+            Some(byte @ (b'"' | b'\\')) => {
+                let run = text.get(run_start..*pos)?;
+                if !run.is_empty() {
+                    sink(run);
+                }
                 *pos = pos.saturating_add(1);
-                return Some(out);
-            }
-            Some(b'\\') => {
-                out.push_str(text.get(run_start..*pos)?);
-                *pos = pos.saturating_add(1);
+                if byte == b'"' {
+                    return Some(());
+                }
                 let unescaped = match bump(text, pos) {
                     Some(b'"') => '"',
                     Some(b'\\') => '\\',
@@ -1180,7 +1712,7 @@ fn read_string(text: &str, pos: &mut usize) -> Option<String> {
                     Some(b'u') => read_unicode_escape(text, pos)?,
                     _ => return None,
                 };
-                out.push(unescaped);
+                sink(unescaped.encode_utf8(&mut [0u8; 4]));
                 run_start = *pos;
             }
             Some(byte) if byte < 0x20 => return None,
@@ -1288,27 +1820,68 @@ fn write_json_optional(out: &mut String, value: Option<&str>) {
     }
 }
 
+/// Appends `items` as a JSON array of strings, in order.
+fn write_json_strings(out: &mut String, items: &[&str]) {
+    out.push('[');
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        write_json_string(out, item);
+    }
+    out.push(']');
+}
+
 // ---------------------------------------------------------------------------
 // Session backends
 // ---------------------------------------------------------------------------
 
-/// The capture directories, scanned in this order.
-const CASE_DIRS: [&str; 5] = ["GC-01", "GC-02", "GC-03", "GC-04", "GC-05"];
-/// The capture files the bridge reads. Replay and compare read the first
-/// four; live mode reads only `META_FILE`.
-const INPUT_FILE: &str = "input.txt";
-const TRANSCRIPT_FILE: &str = "transcript.txt";
-const RETURNED_FILE: &str = "returned.txt";
-const NORMALISATION_FILE: &str = "normalisation.txt";
-const META_FILE: &str = "meta.txt";
+/// The MUMPS-side cause when no capture's inputs equal the request's.
+const NOT_RECORDED: &str = "NOT RECORDED";
 
-/// One MUMPS-side session result: the transcript; what the original's entry
-/// point returned, as far as the MUMPS side knows; and the normalisation
-/// rules of the capture whose inputs equal the session's (none in live
-/// mode). The return value is `None` when live mode cannot obtain it (open
-/// item O-06), and otherwise `Some` of the recorded value, zero bytes being
-/// `Some(None)`.
-type MumpsSide = (String, Option<Option<String>>, Vec<(String, String)>);
+/// One MUMPS-side session result: the raw transcript and return value
+/// answered with, and the capture whose inputs equal the session's, which
+/// alone decides COMPARE's `match`. Each variant holds its output once.
+enum MumpsRun {
+    /// Replay: the capture whose inputs equal the session's. The transcript
+    /// and return value are that capture's own, borrowed from it.
+    Replay(Case),
+    /// Live: the run's standard output as the transcript, and the capture
+    /// whose inputs equal the session's, which may be absent. The return
+    /// value is `None`, because `EN3^PRCHRPT` is entered by `DO` and returns
+    /// nothing (open item O-06, closed).
+    Live {
+        transcript: String,
+        capture: Option<Case>,
+    },
+}
+
+impl MumpsRun {
+    /// The raw transcript answered with, never normalised.
+    fn transcript(&self) -> &str {
+        match self {
+            MumpsRun::Replay(case) => &case.transcript,
+            MumpsRun::Live { transcript, .. } => transcript,
+        }
+    }
+
+    /// The return value answered with: the capture's own in replay, and
+    /// `None` in live mode (open item O-06, closed).
+    fn returned(&self) -> Option<&str> {
+        match self {
+            MumpsRun::Replay(case) => case.returned.as_deref(),
+            MumpsRun::Live { .. } => None,
+        }
+    }
+
+    /// The capture that decides COMPARE's `match`; always present in replay.
+    fn capture(&self) -> Option<&Case> {
+        match self {
+            MumpsRun::Replay(case) => Some(case),
+            MumpsRun::Live { capture, .. } => capture.as_ref(),
+        }
+    }
+}
 
 /// `{"transcript": ..., "returned": ...}`.
 fn write_session(out: &mut String, transcript: &str, returned: Option<&str>) {
@@ -1325,7 +1898,38 @@ fn session_body(transcript: &str, returned: Option<&str>) -> String {
     out
 }
 
-/// `(status, JSON body)` of a Rust-side session.
+/// The JSON body of `GET /api/status`:
+/// `{"mumps_mode":"replay"|"live","recorded":[...],"ready":[...],
+/// "incomplete":{"GC-0N":[check names]}}`, from [`golden::status`] of the
+/// mode's golden folder, read afresh on every request. The lists describe
+/// that folder in both modes.
+fn status_body(mumps: &MumpsMode) -> String {
+    let (mode, golden_dir) = match mumps {
+        MumpsMode::Replay { golden_dir } => ("replay", golden_dir),
+        MumpsMode::Live { golden_dir, .. } => ("live", golden_dir),
+    };
+    let status = golden::status(golden_dir);
+    let mut out = String::from("{\"mumps_mode\":");
+    write_json_string(&mut out, mode);
+    out.push_str(",\"recorded\":");
+    write_json_strings(&mut out, &status.recorded);
+    out.push_str(",\"ready\":");
+    write_json_strings(&mut out, &status.ready);
+    out.push_str(",\"incomplete\":{");
+    for (index, (id, failed)) in status.incomplete.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        write_json_string(&mut out, id);
+        out.push(':');
+        write_json_strings(&mut out, failed);
+    }
+    out.push_str("}}");
+    out
+}
+
+/// `(status, JSON body)` of a Rust-side session: 200 with the transcript and
+/// a `null` return value, or the 500 of [`inquiry_error_to_response`].
 fn rust_session(store: &Store, inputs: &[String]) -> (u16, String) {
     match inquire(store, inputs) {
         Ok(output) => (
@@ -1336,177 +1940,133 @@ fn rust_session(store: &Store, inputs: &[String]) -> (u16, String) {
     }
 }
 
-/// `(status, JSON body)` of a MUMPS-side session; its failure is 502.
+/// `(status, JSON body)` of a MUMPS-side session: 200 with the raw
+/// transcript and return value, or 502 with the cause, such as
+/// `NOT RECORDED`.
 fn mumps_session(mumps: &MumpsMode, inputs: &[String]) -> (u16, String) {
     match run_mumps(mumps, inputs) {
-        Ok((transcript, returned, _)) => (
-            200,
-            session_body(&transcript, returned.flatten().as_deref()),
-        ),
+        Ok(run) => (200, session_body(run.transcript(), run.returned())),
         Err(cause) => (502, error_body(&cause)),
     }
 }
 
 /// `(status, JSON body)` of a compare session: the MUMPS side first, whose
-/// failure is 502; then the Rust side, whose `CorruptStore` is 500 and
-/// `UnsupportedBranch` 422; only then 200.
+/// failure is 502 `MUMPS: <cause>`; then the Rust side, whose
+/// `CorruptStore` is 502 `RUST: CORRUPT STORE <node>` here, as the request
+/// specifies for COMPARE; only then 200 with both raw outputs, never
+/// normalised, and the boolean `match` of [`decide_match`].
 fn compare_session(store: &Store, mumps: &MumpsMode, inputs: &[String]) -> (u16, String) {
     let original = match run_mumps(mumps, inputs) {
-        Ok(output) => output,
-        Err(cause) => return (502, error_body(&cause)),
+        Ok(run) => run,
+        Err(cause) => return (502, error_body(&format!("MUMPS: {cause}"))),
     };
     let port = match inquire(store, inputs) {
         Ok(output) => output,
-        Err(error) => return inquiry_error_to_response(&error),
+        Err(error) => return (502, error_body(&format!("RUST: {error}"))),
     };
-    let (transcript, returned, _) = &original;
-    let mut out = String::from("{\"mumps\":");
-    write_session(
-        &mut out,
-        transcript,
-        returned.as_ref().and_then(Option::as_deref),
+    let matched = decide_match(
+        original.capture(),
+        original.transcript(),
+        original.returned(),
+        &port,
     );
+    let mut out = String::from("{\"mumps\":");
+    write_session(&mut out, original.transcript(), original.returned());
     out.push_str(",\"rust\":");
     write_session(&mut out, &port.transcript, port.returned.as_deref());
     out.push_str(",\"match\":");
-    out.push_str(match decide_match(&original, &port) {
-        Some(true) => "true",
-        Some(false) => "false",
-        None => "null",
-    });
+    out.push_str(if matched { "true" } else { "false" });
     out.push('}');
     (200, out)
 }
 
-/// `match` of a compare response. `None` when the MUMPS return value is
-/// unavailable. Otherwise `true` only when both the transcripts and the
-/// return values are equal after normalising both sides with the capture's
-/// rules: transcript-only agreement is never a match.
-fn decide_match(original: &MumpsSide, port: &InquiryOutput) -> Option<bool> {
-    let (transcript, returned, rules) = original;
-    let expected = returned.as_ref()?;
-    let rules = rules.as_slice();
-    let transcripts_equal = normalise(transcript, rules) == normalise(&port.transcript, rules);
-    let returns_equal = expected.as_deref().map(|value| normalise(value, rules))
-        == port
-            .returned
-            .as_deref()
-            .map(|value| normalise(value, rules));
-    Some(transcripts_equal && returns_equal)
+/// `match` of a compare response: the PASS rule of AAP 0.7.2 applied to one
+/// request, the same in replay and live mode (AAP 0.3.5.1; conflict K11).
+/// True only when a capture's inputs equal the request's, that capture is
+/// READY, [`golden::validate_context`] accepts its recorded context, both
+/// transcripts are equal after the capture's rules, and both return values
+/// are equal. Otherwise false, inputs with no capture included, which only
+/// live mode answers with 200. The rules apply only inside this comparison;
+/// the response carries the raw outputs.
+fn decide_match(
+    capture: Option<&Case>,
+    mumps_transcript: &str,
+    mumps_returned: Option<&str>,
+    port: &InquiryOutput,
+) -> bool {
+    let Some(case) = capture else {
+        return false;
+    };
+    if case.readiness != Readiness::Ready {
+        return false;
+    }
+    let context_accepted = case
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.context().ok())
+        .is_some_and(|context| golden::validate_context(&context).is_ok());
+    context_accepted
+        && golden::normalise(mumps_transcript, &case.rules)
+            == golden::normalise(&port.transcript, &case.rules)
+        && mumps_returned == port.returned.as_deref()
 }
 
-fn run_mumps(mumps: &MumpsMode, inputs: &[String]) -> Result<MumpsSide, String> {
+/// The MUMPS side of a session. Replay answers with the capture that
+/// [`golden::find_capture`] finds for `inputs`, raw: no capture is
+/// `NOT RECORDED`, and a capture file that cannot be read is
+/// `NOT RECORDED (unreadable: <path>: <cause>)`. Live mode answers with
+/// [`live`], and looks the capture up only for `match`, a lookup that fails
+/// leaving none.
+fn run_mumps(mumps: &MumpsMode, inputs: &[String]) -> Result<MumpsRun, String> {
     match mumps {
-        MumpsMode::Replay { golden_dir } => replay(golden_dir, inputs),
+        MumpsMode::Replay { golden_dir } => match golden::find_capture(golden_dir, inputs) {
+            Ok(Some(case)) => Ok(MumpsRun::Replay(case)),
+            Ok(None) => Err(NOT_RECORDED.to_string()),
+            Err(cause) => Err(format!("{NOT_RECORDED} (unreadable: {cause})")),
+        },
         MumpsMode::Live {
             container,
             golden_dir,
-        } => live(container, golden_dir, inputs),
-    }
-}
-
-/// Why a capture file gave no text: it is absent; it is present but not
-/// readable, a directory in its place counting here; or it is not UTF-8.
-const CAPTURE_MISSING: &str = "MISSING";
-const CAPTURE_UNREADABLE: &str = "UNREADABLE";
-const CAPTURE_NON_UTF8: &str = "NON-UTF8";
-
-/// The text of one capture file, or which of `CAPTURE_MISSING`,
-/// `CAPTURE_UNREADABLE` and `CAPTURE_NON_UTF8` it is.
-fn read_capture_file(path: &Path) -> Result<String, &'static str> {
-    match fs::read(path) {
-        Ok(bytes) => String::from_utf8(bytes).map_err(|_| CAPTURE_NON_UTF8),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(CAPTURE_MISSING),
-        Err(_) => Err(CAPTURE_UNREADABLE),
-    }
-}
-
-/// A capture file that must be present, readable and UTF-8.
-fn required_capture_file(path: &Path) -> Result<String, String> {
-    read_capture_file(path).map_err(|problem| format!("CAPTURE FILE {}: {problem}", path.display()))
-}
-
-/// The first capture under `golden_dir` whose input lines equal `inputs`,
-/// used whole or not at all. A directory whose input file is missing is
-/// skipped silently; one whose input file is present but unreadable (a
-/// directory in its place included) or not UTF-8 does not match either, and
-/// its path is listed in the `NOT RECORDED` error when nothing matches.
-fn replay(golden_dir: &Path, inputs: &[String]) -> Result<MumpsSide, String> {
-    let mut unreadable: Vec<String> = Vec::new();
-    for case in CASE_DIRS {
-        let dir = golden_dir.join(case);
-        let input_path = dir.join(INPUT_FILE);
-        match read_capture_file(&input_path) {
-            Ok(text) if split_input_lines(&text) == inputs => {
-                return read_capture(&dir);
-            }
-            Ok(_) | Err(CAPTURE_MISSING) => {}
-            // CAPTURE_UNREADABLE or CAPTURE_NON_UTF8.
-            Err(_) => {
-                unreadable.push(input_path.display().to_string());
-            }
+        } => {
+            let transcript = live(container, golden_dir, inputs)?;
+            Ok(MumpsRun::Live {
+                transcript,
+                capture: golden::find_capture(golden_dir, inputs).ok().flatten(),
+            })
         }
     }
-    if unreadable.is_empty() {
-        Err("NOT RECORDED".to_string())
-    } else {
-        Err(format!(
-            "NOT RECORDED (unreadable: {})",
-            unreadable.join(", ")
-        ))
-    }
 }
 
-/// The transcript, return value and normalisation rules of the matching
-/// capture in `dir`. An empty return-value or normalisation file is valid;
-/// a non-empty return value loses one trailing newline.
-fn read_capture(dir: &Path) -> Result<MumpsSide, String> {
-    let transcript = required_capture_file(&dir.join(TRANSCRIPT_FILE))?;
-    let returned = required_capture_file(&dir.join(RETURNED_FILE))?;
-    let normalisation_path = dir.join(NORMALISATION_FILE);
-    let normalisation = required_capture_file(&normalisation_path)?;
-    let rules = parse_normalisation(&normalisation).map_err(|line| {
-        format!(
-            "MALFORMED NORMALISATION {} line {line}",
-            normalisation_path.display()
-        )
-    })?;
-    let returned = if returned.is_empty() {
-        None
-    } else {
-        Some(returned.strip_suffix('\n').unwrap_or(&returned).to_string())
-    };
-    Ok((transcript, Some(returned), rules))
-}
-
-/// Runs the original live: the capture command and context come from the
-/// first capture directory holding a meta file, the context must equal
-/// `STUB_CONTEXT` before anything runs, and the container comes only from
-/// the bridge's own configuration. Standard input is each input followed by
-/// one `\n`, the form of a captured input file. Once the context has
-/// passed, the run takes one of the [`LIVE_SLOTS`] that every connection
-/// shares; a request that gets none within [`LIVE_ADMISSION_WAIT`] starts
-/// nothing and fails as `TIMEOUT`. Output is used only when the run
-/// succeeded, and the return value is unavailable.
-fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<MumpsSide, String> {
-    let meta = live_meta(golden_dir)?;
-    validate_context(&meta.context)?;
+/// Runs the original live: the start arguments and context come from
+/// [`golden::live_start`], the context must pass [`golden::validate_context`]
+/// before anything runs, and the container comes only from the bridge's own
+/// configuration. The one command is `docker exec -i <container>` followed
+/// by the recorded start arguments, run directly, never through a shell.
+/// Standard input is each input followed by one `\n`, the form of a captured
+/// input file. Once the context has passed, the run takes one of the
+/// [`LIVE_SLOTS`] that every connection shares; a request that gets none
+/// within [`LIVE_ADMISSION_WAIT`] starts nothing and fails as `TIMEOUT`.
+/// Standard output is the transcript only when the run succeeded; any other
+/// outcome is the [`LiveFailure`] text, such as
+/// `EXIT <code>: <first line of docker's standard error>`.
+fn live(container: &str, golden_dir: &Path, inputs: &[String]) -> Result<String, String> {
+    let (start_args, context) = golden::live_start(golden_dir)?;
+    golden::validate_context(&context)?;
     let mut args = vec!["exec".to_string(), "-i".to_string(), container.to_string()];
-    args.extend(meta.docker_exec_args);
+    args.extend(start_args);
     let mut stdin = String::new();
     for input in inputs {
         stdin.push_str(input);
         stdin.push('\n');
     }
-    let transcript = run_admitted(
+    run_admitted(
         &LIVE_ADMISSION,
         LIVE_ADMISSION_WAIT,
         "docker",
         &args,
         stdin.as_bytes(),
     )
-    .map_err(|failure| failure.to_string())?;
-    Ok((transcript, None, Vec::new()))
+    .map_err(|failure| failure.to_string())
 }
 
 /// [`run_command`] of `program` with the live limits, decided by
@@ -1553,290 +2113,41 @@ fn admit(slots: &[Mutex<()>], wait: Duration) -> Option<MutexGuard<'_, ()>> {
     }
 }
 
-/// The parsed meta file of the first capture directory that has one. A case
-/// with no meta file is skipped, and so is a case entry that is not a
-/// directory, which can hold none. A meta file that cannot be read for any
-/// other reason, is not UTF-8 or does not parse gives `MALFORMED META`
-/// naming it, never a skip. With none present, the error names where the
-/// first would be.
-fn live_meta(golden_dir: &Path) -> Result<Meta, String> {
-    for case in CASE_DIRS {
-        let dir = golden_dir.join(case);
-        let path = dir.join(META_FILE);
-        let malformed = || format!("MALFORMED META {}", path.display());
-        match read_capture_file(&path) {
-            Err(CAPTURE_MISSING) => {}
-            // Opening a file below a case entry that is not a directory
-            // fails without the file being missing. Only an entry known
-            // not to be a directory is skipped; a failed check fails closed.
-            Err(CAPTURE_UNREADABLE) if fs::metadata(&dir).is_ok_and(|entry| !entry.is_dir()) => {}
-            Ok(text) => return parse_meta(&text).map_err(|_| malformed()),
-            // CAPTURE_UNREADABLE or CAPTURE_NON_UTF8.
-            Err(_) => return Err(malformed()),
-        }
-    }
-    let first = golden_dir
-        .join(CASE_DIRS.first().copied().unwrap_or_default())
-        .join(META_FILE);
-    Err(format!("MALFORMED META {}", first.display()))
-}
-
-// ---------------------------------------------------------------------------
-// Shared capture-format helpers
-// ---------------------------------------------------------------------------
-
-/// The inputs of a captured input file: one per `\n`-terminated line. One
-/// trailing `\n` ends the last line and adds no empty input; inner empty
-/// lines are empty inputs. `""` gives no inputs and `"\n"` one empty input.
-/// A `\r` is part of its line, never stripped.
-pub fn split_input_lines(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let body = text.strip_suffix('\n').unwrap_or(text);
-    body.split('\n').map(str::to_string).collect()
-}
-
-/// Parses a normalisation file into `(open, close)` rules, in file order.
-///
-/// Lines are split on `\n` and nothing is trimmed. A zero-length line is
-/// blank and ignored. Every other line holds exactly one tab, separating two
-/// literal, non-empty delimiters, open then close; a line with no tab, more
-/// than one tab, or an empty delimiter gives `Err` with its 1-based line
-/// number. A `\r` before the line end belongs to the close delimiter.
-pub fn parse_normalisation(text: &str) -> Result<Vec<(String, String)>, usize> {
-    let mut rules = Vec::new();
-    for (index, line) in text.split('\n').enumerate() {
-        if line.is_empty() {
-            continue;
-        }
-        let mut delimiters = line.split('\t');
-        match (delimiters.next(), delimiters.next(), delimiters.next()) {
-            (Some(open), Some(close), None) if !open.is_empty() && !close.is_empty() => {
-                rules.push((open.to_string(), close.to_string()));
-            }
-            _ => return Err(index.saturating_add(1)),
-        }
-    }
-    Ok(rules)
-}
-
-/// Applies normalisation `rules` to `text`, in order, each to the result of
-/// the one before.
-///
-/// For each rule the text is scanned left to right: from each occurrence of
-/// `open` through the next `close` after it, both delimiters included, the
-/// span becomes `<NORM>`, and scanning resumes after the replaced span. An
-/// `open` with no later `close` leaves the rest of the text unchanged. A
-/// rule with an empty delimiter, which [`parse_normalisation`] never
-/// produces, changes nothing. No other transformation exists.
-pub fn normalise(text: &str, rules: &[(String, String)]) -> String {
-    let mut current = text.to_string();
-    for (open, close) in rules {
-        current = apply_rule(&current, open, close);
-    }
-    current
-}
-
-fn apply_rule(text: &str, open: &str, close: &str) -> String {
-    if open.is_empty() || close.is_empty() {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find(open) {
-        let Some((before, from_open)) = rest.split_at_checked(start) else {
-            break;
-        };
-        let after_open = from_open.get(open.len()..).unwrap_or("");
-        let Some(end) = after_open.find(close) else {
-            break;
-        };
-        out.push_str(before);
-        out.push_str("<NORM>");
-        rest = after_open
-            .get(end.saturating_add(close.len())..)
-            .unwrap_or("");
-    }
-    out.push_str(rest);
-    out
-}
-
-/// The parsed meta file of one capture.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Meta {
-    pub image_digest: String,
-    pub source_revision: String,
-    pub snapshot_id: String,
-    pub record_ids: String,
-    pub entry_point: String,
-    /// The capture's context, in document order.
-    pub context: Vec<(String, String)>,
-    /// The arguments after `docker exec -i <container>`.
-    pub docker_exec_args: Vec<String>,
-}
-
-/// Parses a meta file: `key=value` lines, split at the first `=`, with the
-/// seven keys `image_digest`, `source_revision`, `snapshot_id`,
-/// `record_ids`, `entry_point`, `context` and `docker_exec_args`, each
-/// exactly once. Whitespace-only lines are blank and ignored, and one
-/// trailing `\r` per line is dropped, as the ZWR loader does; values are
-/// otherwise kept exactly. `context` must be a JSON object whose values are
-/// all strings, with no repeated key; `docker_exec_args` a JSON array of
-/// strings. A missing, repeated or unknown key, or a line without `=`, is
-/// an error naming it.
-pub fn parse_meta(text: &str) -> Result<Meta, String> {
-    const KEYS: [&str; 7] = [
-        "image_digest",
-        "source_revision",
-        "snapshot_id",
-        "record_ids",
-        "entry_point",
-        "context",
-        "docker_exec_args",
-    ];
-    let mut values: Vec<(&str, &str)> = Vec::new();
-    for (index, raw) in text.split('\n').enumerate() {
-        let number = index.saturating_add(1);
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| format!("line {number}: no '='"))?;
-        if !KEYS.contains(&key) {
-            return Err(format!("line {number}: unknown key {key}"));
-        }
-        if values.iter().any(|(seen, _)| *seen == key) {
-            return Err(format!("line {number}: repeated key {key}"));
-        }
-        values.push((key, value));
-    }
-    for key in KEYS {
-        meta_value(&values, key)?;
-    }
-    Ok(Meta {
-        image_digest: meta_value(&values, "image_digest")?.to_string(),
-        source_revision: meta_value(&values, "source_revision")?.to_string(),
-        snapshot_id: meta_value(&values, "snapshot_id")?.to_string(),
-        record_ids: meta_value(&values, "record_ids")?.to_string(),
-        entry_point: meta_value(&values, "entry_point")?.to_string(),
-        context: parse_context(meta_value(&values, "context")?)?,
-        docker_exec_args: parse_exec_args(meta_value(&values, "docker_exec_args")?)?,
-    })
-}
-
-fn meta_value<'t>(values: &[(&str, &'t str)], key: &str) -> Result<&'t str, String> {
-    values
-        .iter()
-        .find(|(seen, _)| *seen == key)
-        .map(|(_, value)| *value)
-        .ok_or_else(|| format!("missing key {key}"))
-}
-
-fn parse_context(value: &str) -> Result<Vec<(String, String)>, String> {
-    let not_object = || "context: not a JSON object of strings".to_string();
-    let Some(members) = parse_json(value).and_then(json_members) else {
-        return Err(not_object());
-    };
-    let mut seen: HashSet<&str> = HashSet::with_capacity(members.len());
-    let mut context: Vec<(String, String)> = Vec::with_capacity(members.len());
-    for (key, member) in &members {
-        let Some(text) = json_string(member) else {
-            return Err(not_object());
-        };
-        if !seen.insert(key.as_str()) {
-            return Err(format!("context: repeated key {key}"));
-        }
-        context.push((key.clone(), text));
-    }
-    Ok(context)
-}
-
-fn parse_exec_args(value: &str) -> Result<Vec<String>, String> {
-    let not_array = || "docker_exec_args: not a JSON array of strings".to_string();
-    let Some(elements) = parse_json(value).and_then(json_elements) else {
-        return Err(not_array());
-    };
-    elements
-        .into_iter()
-        .map(|element| json_string(element).ok_or_else(not_array))
-        .collect()
-}
-
-/// Compares a capture's context with `STUB_CONTEXT`, key by key: first each
-/// `STUB_CONTEXT` key in its order (`DUZ`, `IOF`, `IOSL`, `STATION`), then
-/// each capture key `STUB_CONTEXT` lacks, in capture order. The first
-/// mismatch is `Err("CONTEXT MISMATCH <key>: expected <value>, actual
-/// <value>")`, where `UNRESOLVED` stands for an unresolved constant, which
-/// matches nothing, `MISSING` for a key the capture lacks, and `ABSENT` for
-/// the expected value of an extra capture key. A key the capture repeats
-/// must match at every occurrence. No capture value overrides a constant.
-pub fn validate_context(ctx: &[(String, String)]) -> Result<(), String> {
-    validate_against(&STUB_CONTEXT, ctx)
-}
-
-/// [`validate_context`] against any constant table, so the unit tests can
-/// reach the extra-key rule, which an unresolved constant in
-/// `STUB_CONTEXT` always pre-empts.
-fn validate_against(
-    constants: &[(&str, Option<&str>)],
-    ctx: &[(String, String)],
-) -> Result<(), String> {
-    for &(key, expected) in constants {
-        let mut occurrences = ctx.iter().filter(|(name, _)| name == key).peekable();
-        if occurrences.peek().is_none() {
-            return Err(mismatch(key, expected.unwrap_or("UNRESOLVED"), "MISSING"));
-        }
-        for (_, actual) in occurrences {
-            if expected != Some(actual.as_str()) {
-                return Err(mismatch(key, expected.unwrap_or("UNRESOLVED"), actual));
-            }
-        }
-    }
-    for (key, actual) in ctx {
-        if !constants.iter().any(|(name, _)| name == key) {
-            return Err(mismatch(key, "ABSENT", actual));
-        }
-    }
-    Ok(())
-}
-
-fn mismatch(key: &str, expected: &str, actual: &str) -> String {
-    format!("CONTEXT MISMATCH {key}: expected {expected}, actual {actual}")
-}
-
 // ---------------------------------------------------------------------------
 // Live execution
 // ---------------------------------------------------------------------------
 
 /// How one [`run_command`] child ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecResult {
-    /// The OS error text when the program could not be started; otherwise,
-    /// when the run itself failed (a stream worker that could not start,
-    /// failed or panicked, output not read to its end, or a child that could
-    /// not be waited on or killed), each failure's stage and cause, joined
-    /// by `; `. A run with this set is never a transcript, whatever the
-    /// other fields hold.
-    pub spawn_error: Option<String>,
+struct ExecResult {
+    /// When nothing could be started, the stage and the OS error, as
+    /// [`execute`] gives them, such as `CANNOT RUN <program>: <error>`;
+    /// otherwise, when the run itself failed (a stream worker that could not
+    /// start, failed or panicked, output not read to its end, or a child
+    /// that could not be waited on or killed), each failure's stage and
+    /// cause, joined by `; `. A run with this set is never a transcript,
+    /// whatever the other fields hold.
+    spawn_error: Option<String>,
     /// The exit code; `None` when the child was killed or ended by a signal.
-    pub exit_code: Option<i32>,
-    pub timed_out: bool,
-    pub output_limit_exceeded: bool,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    output_limit_exceeded: bool,
     /// At most `output_limit` bytes of standard output.
-    pub stdout: Vec<u8>,
+    stdout: Vec<u8>,
     /// At most `output_limit` bytes of standard error.
-    pub stderr: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 /// Why a live run gives no transcript.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LiveFailure {
+enum LiveFailure {
+    /// [`ExecResult::spawn_error`], the 502 cause as it stands, such as
+    /// `CANNOT RUN docker: No such file or directory (os error 2)`.
     Spawn(String),
     NonZeroExit {
         code: Option<i32>,
+        /// The first line of standard error, as [`decide_live_result`]
+        /// takes it.
         stderr_head: String,
     },
     Timeout,
@@ -1848,7 +2159,7 @@ impl fmt::Display for LiveFailure {
     /// The cause text of the 502 body.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LiveFailure::Spawn(os_error) => f.write_str(os_error),
+            LiveFailure::Spawn(cause) => f.write_str(cause),
             LiveFailure::NonZeroExit {
                 code: Some(code),
                 stderr_head,
@@ -1883,15 +2194,17 @@ impl ExecResult {
 /// Standard input is written, and standard output and error drained, each
 /// on its own thread, so a full stream cannot deadlock. The child is killed
 /// when `timeout` passes before it has exited and its output has been read,
-/// or as soon as standard output passes `output_limit` bytes; at most
-/// `output_limit` bytes of each stream are kept. Once the run is over, the
-/// stream threads are cancelled, which stops each within about `POLL` even
-/// while a descendant still holds the child's streams, and every thread
-/// that started is joined before this returns. A failure of the run itself
-/// rather than of the program, such as a thread that could not start or
-/// output that could not be read, is reported in
-/// [`ExecResult::spawn_error`].
-pub fn run_command(
+/// or as soon as standard output passes `output_limit` bytes, and only the
+/// child itself is killed, never a process it started ([`kill_and_reap`]);
+/// at most `output_limit` bytes of each stream are kept. Once the run is
+/// over, the stream threads are cancelled, which stops each within about
+/// `POLL` even while a descendant still holds the child's streams, and
+/// every thread that started is joined before this returns. A run that
+/// could not start, such as `CANNOT RUN <program>: <error>` from
+/// [`execute`], and a failure of the run itself rather than of the
+/// program, such as a thread that could not start or output that could
+/// not be read, are reported in [`ExecResult::spawn_error`].
+fn run_command(
     program: &str,
     args: &[String],
     stdin: &[u8],
@@ -1911,9 +2224,11 @@ pub fn run_command(
     }
 }
 
-/// [`run_command`] with its stream threads started through `start`. `Err`,
-/// with the OS error, only when the child's streams could not be created or
-/// the program could not be started.
+/// [`run_command`] with its stream threads started through `start`. `Err`
+/// only when nothing could be started: the child's streams could not be
+/// created, `STANDARD STREAMS NOT CREATED: <error>`, or the program could
+/// not be started, `CANNOT RUN <program>: <error>`. `<error>` is the OS
+/// error's text, and the error keeps its kind.
 fn execute(
     program: &str,
     args: &[String],
@@ -1923,7 +2238,8 @@ fn execute(
     start: &mut StartWorker,
 ) -> io::Result<ExecResult> {
     let started = Instant::now();
-    let (streams, (child_stdin, child_stdout, child_stderr)) = stream_pairs()?;
+    let (streams, (child_stdin, child_stdout, child_stderr)) = stream_pairs()
+        .map_err(|e| io::Error::new(e.kind(), format!("STANDARD STREAMS NOT CREATED: {e}")))?;
     // One statement, so the parent's copies of the child's ends are closed
     // as soon as the child holds them; end of output depends on it.
     let mut child = Command::new(program)
@@ -1931,7 +2247,8 @@ fn execute(
         .stdin(Stdio::from(OwnedFd::from(child_stdin)))
         .stdout(Stdio::from(OwnedFd::from(child_stdout)))
         .stderr(Stdio::from(OwnedFd::from(child_stderr)))
-        .spawn()?;
+        .spawn()
+        .map_err(|e| io::Error::new(e.kind(), format!("CANNOT RUN {program}: {e}")))?;
     Ok(supervise(
         &mut child,
         streams,
@@ -2202,6 +2519,14 @@ fn read_bounded(
 
 /// Kills the child and reaps it, recording what fails in `failures`;
 /// `None` when it was not reaped.
+///
+/// Only the child itself is killed. A process it started is not signalled,
+/// because stable std has no call that signals a process group, and this
+/// crate admits only safe code, takes no dependency and starts no second
+/// command. Such a process can keep running after the run ends, outside
+/// [`LIVE_SLOTS`]. While it holds the child's standard output or standard
+/// error, that output has not ended, so the run lasts until its `timeout`
+/// and ends as a timeout even when the child exited 0.
 fn kill_and_reap(child: &mut Child, failures: &mut Vec<String>) -> Option<ExitStatus> {
     let killed = child.kill();
     reap(
@@ -2316,11 +2641,12 @@ fn worker_output(
 
 /// The transcript of a live run, or why there is none. The first match
 /// wins: a spawn error, a timeout, too much output, an exit code other than
-/// 0 (with the first 200 bytes of standard error, decoded lossily), then
-/// standard output that is not UTF-8.
-pub fn decide_live_result(r: &ExecResult) -> Result<String, LiveFailure> {
-    if let Some(os_error) = &r.spawn_error {
-        return Err(LiveFailure::Spawn(os_error.clone()));
+/// 0 (with the first line of standard error: the bytes before its first
+/// `\n`, or all of them when it has none, less one trailing `\r`, decoded
+/// lossily), then standard output that is not UTF-8.
+fn decide_live_result(r: &ExecResult) -> Result<String, LiveFailure> {
+    if let Some(cause) = &r.spawn_error {
+        return Err(LiveFailure::Spawn(cause.clone()));
     }
     if r.timed_out {
         return Err(LiveFailure::Timeout);
@@ -2329,25 +2655,26 @@ pub fn decide_live_result(r: &ExecResult) -> Result<String, LiveFailure> {
         return Err(LiveFailure::OutputTooLarge);
     }
     if r.exit_code != Some(0) {
-        let head = r.stderr.get(..200).unwrap_or(r.stderr.as_slice());
+        let line = r
+            .stderr
+            .split(|&byte| byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         return Err(LiveFailure::NonZeroExit {
             code: r.exit_code,
-            stderr_head: String::from_utf8_lossy(head).into_owned(),
+            stderr_head: String::from_utf8_lossy(line).into_owned(),
         });
     }
     String::from_utf8(r.stdout.clone()).map_err(|_| LiveFailure::NonUtf8)
 }
 
-/// The status and complete JSON body for a Rust-side error:
-/// `UnsupportedBranch(id)` is 422 and `CorruptStore(record)` is 500, each
-/// naming the branch ID or record verbatim.
-pub fn inquiry_error_to_response(e: &InquiryError) -> (u16, String) {
-    match e {
-        InquiryError::UnsupportedBranch(id) => {
-            (422, error_body(&format!("UNSUPPORTED BRANCH {id}")))
-        }
-        InquiryError::CorruptStore(record) => (500, error_body(&format!("CORRUPT STORE {record}"))),
-    }
+/// The status and complete JSON body for a Rust-side error outside COMPARE:
+/// `CorruptStore(record)` is 500 with its `CORRUPT STORE <record>` text,
+/// naming the record verbatim. The request defines no status for a Rust-side
+/// failure, so 500 is kept (conflict K8).
+fn inquiry_error_to_response(e: &InquiryError) -> (u16, String) {
+    (500, error_body(&e.to_string()))
 }
 
 #[cfg(test)]
@@ -2356,16 +2683,10 @@ mod tests {
     use std::any::Any;
     use std::os::unix::process::ExitStatusExt;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_string()).collect()
-    }
-
-    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
-        items
-            .iter()
-            .map(|(a, b)| ((*a).to_string(), (*b).to_string()))
-            .collect()
     }
 
     /// A child that exited 0 and wrote `T`.
@@ -2380,38 +2701,77 @@ mod tests {
         }
     }
 
+    /// The inputs of a session body, scanned and then decoded as
+    /// `route_api` does, without the admission between the two.
+    fn session_inputs(body: &[u8]) -> Result<Vec<String>, String> {
+        let (text, array) = scan_session_body(body)?;
+        decode_inputs(text, array).ok_or_else(|| "decoding failed after the scan".to_string())
+    }
+
+    /// The request whose request line and header lines, each ending `\r\n`,
+    /// are `head_lines`, followed by `Content-Length` and `body`, as
+    /// [`read_request`] hands it to [`route`]: its head read by
+    /// [`parse_head`], its body taken whole.
+    fn request_of(head_lines: &str, body: &[u8]) -> Result<HttpRequest, String> {
+        let head = format!("{head_lines}Content-Length: {}\r\n\r\n", body.len());
+        let (method, target, _, _, session_refusal) = parse_head(head.as_bytes())?;
+        Ok((
+            method.to_string(),
+            target,
+            Some(body.to_vec()),
+            session_refusal,
+        ))
+    }
+
+    /// `method` on `target` with `body`, sent as the bridge's own page sends
+    /// it: `Host: localhost`, `Content-Type: application/json` and no
+    /// `Origin`.
+    fn page_request(method: &str, target: &str, body: &[u8]) -> Result<HttpRequest, String> {
+        request_of(
+            &format!(
+                "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+            ),
+            body,
+        )
+    }
+
     #[test]
     fn json_reads_escapes_and_surrogate_pairs() -> Result<(), String> {
-        let text = r#" {"s":"q\" b\\ s\/ \b\f\n\r\t \u0041\u00e9\u20ac \ud83d\ude00 \u0007",
-            "n":-1.5e3, "z":0, "a":[true,false,null], "o":{}} "#;
-        let rejected = || "rejected well-formed JSON".to_string();
-        let value = parse_json(text).ok_or_else(rejected)?;
-        assert_eq!(value, text.trim());
-        let members = json_members(value).ok_or_else(rejected)?;
-        let keys: Vec<&str> = members.iter().map(|(key, _)| key.as_str()).collect();
-        assert_eq!(keys, ["s", "n", "z", "a", "o"]);
-        let member = |key: &str| {
-            members
-                .iter()
-                .find(|(name, _)| name == key)
-                .map(|(_, member)| *member)
-        };
+        let escaped = r#""q\" b\\ s\/ \b\f\n\r\t \u0041\u00e9\u20ac \ud83d\ude00 \u0007""#;
+        let unescaped = "q\" b\\ s/ \u{8}\u{c}\n\r\t A\u{e9}\u{20ac} \u{1f600} \u{7}";
+        let mut pos = 0;
+        let text = format!("{escaped} ");
+        assert_eq!(decode_string(&text, &mut pos).as_deref(), Some(unescaped));
         assert_eq!(
-            member("s").and_then(json_string),
-            Some("q\" b\\ s/ \u{8}\u{c}\n\r\t A\u{e9}\u{20ac} \u{1f600} \u{7}".to_string())
+            pos,
+            escaped.len(),
+            "the reader stops past the closing quote"
         );
-        assert_eq!(member("n"), Some("-1.5e3"));
-        assert_eq!(member("z"), Some("0"));
+        // A string without escapes is held at exactly its length.
+        let mut pos = 0;
+        let plain = decode_string(r#""plain text é""#, &mut pos).ok_or("plain string rejected")?;
         assert_eq!(
-            member("a").and_then(json_elements),
-            Some(vec!["true", "false", "null"])
+            (plain.as_str(), plain.capacity()),
+            ("plain text é", plain.len())
         );
-        assert_eq!(member("o").and_then(json_members), Some(Vec::new()));
+        // Every kind of value, in members a session ignores, and the same
+        // escapes in an input, which may hold no CR or LF.
+        let body = format!(
+            r#" {{"s":{escaped},
+            "n":-1.5e3, "z":0, "a":[true,false,null], "o":{{}},
+            "inputs":["q\" b\\ s\/ \b\f\t \u0041\u00e9\u20ac \ud83d\ude00 \u0007",""]}} "#
+        );
+        assert_eq!(
+            session_inputs(body.as_bytes()),
+            Ok(strings(&[
+                "q\" b\\ s/ \u{8}\u{c}\t A\u{e9}\u{20ac} \u{1f600} \u{7}",
+                ""
+            ]))
+        );
         // Each reader takes exactly one value of its own kind.
-        assert_eq!(member("n").and_then(json_string), None);
-        assert_eq!(member("a").and_then(json_members), None);
-        assert_eq!(member("o").and_then(json_elements), None);
-        assert_eq!(json_string(r#""a" "#), None);
+        assert_eq!(decode_string("-1.5e3", &mut 0), None);
+        assert_eq!(scan_array("{}", &mut 0, 0, |_, _| None), None);
+        assert_eq!(scan_object("[]", &mut 0, 0, None, |_, _, _| None), None);
         let malformed = [
             r#""\ud83d""#,
             r#""\ude00""#,
@@ -2434,12 +2794,31 @@ mod tests {
             "[1] x",
             "{} {}",
         ];
+        let malformed_json = Err("MALFORMED JSON".to_string());
         for text in malformed {
-            assert!(parse_json(text).is_none(), "accepted {text:?}");
+            // As the whole body, and as the value of a member a session
+            // ignores.
+            assert_eq!(session_inputs(text.as_bytes()), malformed_json, "{text:?}");
+            let ignored = format!(r#"{{"x":{text},"inputs":[]}}"#);
+            assert_eq!(
+                session_inputs(ignored.as_bytes()),
+                malformed_json,
+                "{ignored:?}"
+            );
         }
+        // The top-level value is at depth 0, so one more array than the
+        // limit still nests within it.
         let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
-        assert!(parse_json(&nested(MAX_JSON_DEPTH)).is_some());
-        assert!(parse_json(&nested(MAX_JSON_DEPTH.saturating_add(2))).is_none());
+        let not_object = Err("BODY IS NOT A JSON OBJECT".to_string());
+        for depth in [MAX_JSON_DEPTH, MAX_JSON_DEPTH.saturating_add(1)] {
+            assert_eq!(
+                session_inputs(nested(depth).as_bytes()),
+                not_object,
+                "{depth}"
+            );
+        }
+        let too_deep = nested(MAX_JSON_DEPTH.saturating_add(2));
+        assert_eq!(session_inputs(too_deep.as_bytes()), malformed_json);
         Ok(())
     }
 
@@ -2449,10 +2828,16 @@ mod tests {
         let mut out = String::new();
         write_json_string(&mut out, original);
         assert_eq!(out, r#""q\" b\\ \n\r\t\b\f\u0007\u001f\u0000 é€😀 /""#);
-        let read_back = parse_json(&out)
-            .and_then(json_string)
+        let mut pos = 0;
+        let read_back = decode_string(&out, &mut pos)
             .ok_or_else(|| "writer output does not parse".to_string())?;
-        assert_eq!(read_back, original);
+        assert_eq!((read_back.as_str(), pos), (original, out.len()));
+        // Written without its CR and LF, it is read back as an input.
+        let input = original.replace(['\r', '\n'], "");
+        let mut element = String::new();
+        write_json_string(&mut element, &input);
+        let body = format!(r#"{{"inputs":[{element}]}}"#);
+        assert_eq!(session_inputs(body.as_bytes()), Ok(vec![input]));
         assert_eq!(error_body("NOT RECORDED"), r#"{"error":"NOT RECORDED"}"#);
         assert_eq!(
             session_body("a\u{7}\n", None),
@@ -2467,24 +2852,17 @@ mod tests {
 
     #[test]
     fn decide_live_result_spawn() {
+        let cause = "CANNOT RUN docker: No such file or directory (os error 2)";
         let result = ExecResult {
-            spawn_error: Some("No such file or directory (os error 2)".to_string()),
+            spawn_error: Some(cause.to_string()),
             timed_out: true,
             output_limit_exceeded: true,
             exit_code: None,
             ..exited_ok()
         };
         let failure = decide_live_result(&result);
-        assert_eq!(
-            failure,
-            Err(LiveFailure::Spawn(
-                "No such file or directory (os error 2)".to_string()
-            ))
-        );
-        assert_eq!(
-            failure.map_err(|f| f.to_string()),
-            Err("No such file or directory (os error 2)".to_string())
-        );
+        assert_eq!(failure, Err(LiveFailure::Spawn(cause.to_string())));
+        assert_eq!(failure.map_err(|f| f.to_string()), Err(cause.to_string()));
     }
 
     #[test]
@@ -2514,24 +2892,41 @@ mod tests {
 
     #[test]
     fn decide_live_result_non_zero_exit() {
-        // 251 bytes of standard error: 199 ASCII bytes, then `é` (0xC3 0xA9)
-        // as bytes 200 and 201. The 200-byte cut keeps only 0xC3, which
-        // decodes lossily to U+FFFD; a 200-character cut would keep the
-        // whole `é`.
+        // A first line of 250 bytes, kept whole, then a second line.
+        let mut long = vec![b'L'; 250];
+        long.extend(b"\nrest");
+        // A first line of 251 bytes: 199 ASCII bytes, `é` (0xC3 0xA9) as
+        // bytes 200 and 201, then 50 more, kept whole with the `é` intact.
         let mut crossing = vec![b'a'; 199];
         crossing.extend("é".bytes());
         crossing.extend(std::iter::repeat_n(b'z', 50));
         assert_eq!(crossing.get(199..201), Some([0xC3, 0xA9].as_slice()));
-        // 250 bytes of standard error, the first not UTF-8.
+        crossing.extend(b"\nnext line\n");
+        // A first line whose first byte is not UTF-8.
         let mut invalid_first = vec![0xFF];
-        invalid_first.extend(std::iter::repeat_n(b'e', 249));
+        invalid_first.extend(b"bad byte\nsecond line\n");
         let stderrs = [
-            (crossing, format!("{}\u{fffd}", "a".repeat(199))),
-            (invalid_first, format!("\u{fffd}{}", "e".repeat(199))),
+            (
+                b"first failure\nextra diagnostic\n".to_vec(),
+                "first failure".to_string(),
+            ),
+            (
+                b"first failure\r\nmore\r\n".to_vec(),
+                "first failure".to_string(),
+            ),
+            // Only the one `\r` of the line end goes.
+            (
+                b"first failure\r\r\nmore\n".to_vec(),
+                "first failure\r".to_string(),
+            ),
+            (long, "L".repeat(250)),
+            (crossing, format!("{}é{}", "a".repeat(199), "z".repeat(50))),
+            (invalid_first, "\u{fffd}bad byte".to_string()),
             (
                 b"no such container".to_vec(),
                 "no such container".to_string(),
             ),
+            (Vec::new(), String::new()),
         ];
         // Standard output is not UTF-8 either: the exit code is decided
         // first, so every row is `NonZeroExit`, never `NonUtf8`.
@@ -2677,26 +3072,43 @@ mod tests {
             Ok(result) => return Err(format!("spawned a missing program: {result:?}")),
             Err(e) => e,
         };
+        // The cause names the stage and the program, and the error keeps
+        // the OS error's kind.
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("CANNOT RUN {absent}: ")),
+            "{error}"
+        );
         assert_eq!(missing.spawn_error, Some(error.to_string()));
         // A program that exists but cannot be executed fails; only an
         // absent program is NOT RUN.
         let not_executable = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
         let refused = run_available(not_executable, &[], b"", timeout, 4096);
+        let named = format!("could not be started: CANNOT RUN {not_executable}: ");
         assert!(
-            matches!(&refused, Err(cause) if cause.contains("could not be started")),
+            matches!(&refused, Err(cause) if cause.contains(&named)),
             "{refused:?}"
         );
-        let echoed = run_available("cat", &[], b"\nA1\n^\n", Duration::from_secs(10), 4096)?;
-        let Some(echoed) = echoed else {
-            return Ok(());
-        };
-        assert_eq!(decide_live_result(&echoed), Ok("\nA1\n^\n".to_string()));
-        let failed = run_available("false", &[], b"", Duration::from_secs(10), 4096)?;
-        let Some(failed) = failed else {
-            return Ok(());
-        };
-        assert_eq!(failed.exit_code, Some(1));
+        // The `cat` and `false` probes are independent: an absent program
+        // is NOT RUN on its own and leaves the other probe to run.
+        if let Some(echoed) =
+            run_available("cat", &[], b"\nA1\n^\n", Duration::from_secs(10), 4096)?
+        {
+            assert_eq!(decide_live_result(&echoed), Ok("\nA1\n^\n".to_string()));
+        }
+        if let Some(failed) = run_available("false", &[], b"", Duration::from_secs(10), 4096)? {
+            assert_eq!(failed.exit_code, Some(1));
+            let decision = decide_live_result(&failed);
+            assert!(
+                matches!(
+                    decision,
+                    Err(LiveFailure::NonZeroExit { code: Some(1), .. })
+                ),
+                "{decision:?}"
+            );
+        }
         Ok(())
     }
 
@@ -3239,6 +3651,74 @@ mod tests {
     }
 
     #[test]
+    fn input_budget_holds_back_only_heavy_sessions() -> Result<(), String> {
+        let budget = &InputBudget::new(10, 2);
+        let held = || *budget.held.lock().unwrap_or_else(PoisonError::into_inner);
+        // A light session is admitted uncharged with the budget full, and
+        // heavy sessions that fit together are admitted together.
+        let full = budget.admit(10);
+        let light = budget.admit(2);
+        assert_eq!((full.charge, light.charge, held()), (10, 0, 10));
+        drop((light, full));
+        let halves = (budget.admit(5), budget.admit(5));
+        assert_eq!(held(), 10);
+        drop(halves);
+        assert_eq!(held(), 0);
+        // (the inputs of the session holding a charge, the inputs of a
+        // session that must wait for it, the charge that one then holds):
+        // a heavy session that does not fit, and one over the capacity,
+        // which waits for the budget to empty.
+        let waits = [(10, 3, 3), (3, 25, 10)];
+        for (holding, inputs, charged) in waits {
+            let holder = budget.admit(holding);
+            thread::scope(|scope| -> Result<(), String> {
+                let (admitted, admissions) = mpsc::channel();
+                let (release, released) = mpsc::channel::<()>();
+                let waiter = thread::Builder::new()
+                    .spawn_scoped(scope, move || {
+                        let charge = budget.admit(inputs);
+                        let _ = admitted.send(charge.charge);
+                        let _ = released.recv_timeout(Duration::from_secs(30));
+                        drop(charge);
+                    })
+                    .map_err(|e| format!("starting the waiter: {e}"))?;
+                assert_eq!(
+                    admissions.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout),
+                    "{inputs} inputs admitted while {holding} were held"
+                );
+                drop(holder);
+                assert_eq!(
+                    admissions.recv_timeout(Duration::from_secs(10)),
+                    Ok(charged)
+                );
+                assert_eq!(held(), charged);
+                let _ = release.send(());
+                waiter.join().map_err(|_| "the waiter panicked".to_string())
+            })?;
+            assert_eq!(held(), 0, "a charge of {charged} was not released");
+        }
+        // A lock poisoned by a thread that panicked holding it still admits
+        // and releases.
+        thread::scope(|scope| -> Result<(), String> {
+            let poisoner = thread::Builder::new()
+                .spawn_scoped(scope, || -> Result<(), String> {
+                    let _held = budget.held.lock();
+                    std::panic::resume_unwind(Box::new("poisoning the budget"))
+                })
+                .map_err(|e| format!("starting the poisoner: {e}"))?;
+            assert!(poisoner.join().is_err(), "the poisoner did not unwind");
+            Ok(())
+        })?;
+        assert!(budget.held.is_poisoned());
+        let charge = budget.admit(5);
+        assert_eq!(held(), 5);
+        drop(charge);
+        assert_eq!(held(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn live_admission_bounds_concurrent_runs() -> Result<(), String> {
         let slots = [const { Mutex::new(()) }; 2];
         let inside = AtomicUsize::new(0);
@@ -3376,24 +3856,13 @@ mod tests {
         assert!(elapsed < Duration::from_secs(3), "waited {elapsed:?}");
         drop(held);
         let attempted = run_admitted(&slots, wait, absent, &[], b"");
+        let named = format!("CANNOT RUN {absent}: ");
         assert!(
-            matches!(&attempted, Err(LiveFailure::Spawn(_))),
+            matches!(&attempted, Err(LiveFailure::Spawn(cause)) if cause.starts_with(&named)),
             "{attempted:?}"
         );
         assert_eq!(held_slots(&slots), 0, "a slot was not freed");
         Ok(())
-    }
-
-    #[test]
-    fn inquiry_error_to_response_unsupported_branch_422() {
-        let error = InquiryError::UnsupportedBranch("PO-09.b4".to_string());
-        assert_eq!(
-            inquiry_error_to_response(&error),
-            (
-                422,
-                r#"{"error":"UNSUPPORTED BRANCH PO-09.b4"}"#.to_string()
-            )
-        );
     }
 
     #[test]
@@ -3408,62 +3877,131 @@ mod tests {
         );
     }
 
-    #[test]
-    fn split_input_lines_trailing_newline() {
-        let cases: [(&str, &[&str]); 8] = [
-            ("", &[]),
-            ("\n", &[""]),
-            ("a", &["a"]),
-            ("a\n", &["a"]),
-            ("a\n\n", &["a", ""]),
-            ("\nA1\n\n\n^\n", &["", "A1", "", "", "^"]),
-            ("\nINVALID!\n^", &["", "INVALID!", "^"]),
-            ("a\r\n", &["a\r"]),
-        ];
-        for (text, expected) in cases {
-            assert_eq!(split_input_lines(text), strings(expected), "for {text:?}");
+    /// A new directory under the system temporary directory. A test that
+    /// reaches its end removes it with everything in it by
+    /// [`Scratch::close`], which reports a failed removal; `Drop` removes it
+    /// best effort when a test fails early or unwinds. Each attempt
+    /// takes the next name `ifcap-bridge-unit-<pid>-<n>` and creates it with
+    /// `fs::create_dir`, which fails on any existing entry, so the directory
+    /// belongs to this test alone.
+    struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new() -> Result<Scratch, String> {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            for _ in 0..100 {
+                let n = NEXT.fetch_add(1, Ordering::SeqCst);
+                let name = format!("ifcap-bridge-unit-{}-{n}", std::process::id());
+                let path = std::env::temp_dir().join(name);
+                match fs::create_dir(&path) {
+                    Ok(()) => return Ok(Scratch { path }),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(format!("creating {}: {e}", path.display())),
+                }
+            }
+            Err("no free scratch directory name".to_string())
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// Writes `text` to the capture file `name` of case `id`, creating
+        /// the case folder when it is missing.
+        fn write(&self, id: &str, name: &str, text: &str) -> Result<(), String> {
+            let dir = self.path.join(id);
+            fs::create_dir_all(&dir)
+                .and_then(|()| fs::write(dir.join(name), text))
+                .map_err(|e| format!("writing {id}/{name}: {e}"))
+        }
+
+        /// Removes the directory with everything in it, on a test's normal
+        /// path. A failure, a directory already gone included, is an error
+        /// naming the directory, so a passing test cannot leave it behind
+        /// unnoticed.
+        fn close(mut self) -> Result<(), String> {
+            let path = std::mem::take(&mut self.path);
+            fs::remove_dir_all(&path).map_err(|e| format!("removing {}: {e}", path.display()))
         }
     }
 
-    #[test]
-    fn normalisation_rules_and_malformed_lines() {
-        type Parsed = Result<Vec<(String, String)>, usize>;
-        let parsed: [(&str, Parsed); 9] = [
-            ("", Ok(Vec::new())),
-            ("\n\n", Ok(Vec::new())),
-            ("@\t#\n", Ok(pairs(&[("@", "#")]))),
-            ("\nT=\t;\n\n@\t#\r", Ok(pairs(&[("T=", ";"), ("@", "#\r")]))),
-            ("no tab", Err(1)),
-            ("@\t#\na\tb\tc", Err(2)),
-            ("\n\tb", Err(2)),
-            ("a\t", Err(1)),
-            (" ", Err(1)),
-        ];
-        for (text, expected) in parsed {
-            assert_eq!(parse_normalisation(text), expected, "for {text:?}");
-        }
-        type Rules<'a> = &'a [(&'a str, &'a str)];
-        let applied: [(&str, Rules, &str); 8] = [
-            ("a@1#b@2#c", &[("@", "#")], "a<NORM>b<NORM>c"),
-            ("a@1#b@2", &[("@", "#")], "a<NORM>b@2"),
-            ("a@1", &[("@", "#")], "a@1"),
-            ("a|1|b|2|c", &[("|", "|")], "a<NORM>b<NORM>c"),
-            ("abab", &[("ab", "b")], "<NORM>"),
-            ("x@1#y", &[("@", "#"), ("x<", "y")], "<NORM>"),
-            ("x@1#y", &[("x<", "y"), ("@", "#")], "x<NORM>y"),
-            ("a@1#b", &[("", "#"), ("@", "")], "a@1#b"),
-        ];
-        for (text, rules, expected) in applied {
-            assert_eq!(normalise(text, &pairs(rules)), expected, "for {text:?}");
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // Best-effort removal for a test that ends before `close`, by an
+            // early error return or an unwind: that test has already failed,
+            // and a removal failure cannot be reported from here. A closed
+            // `Scratch` holds an empty path and is skipped.
+            if !self.path.as_os_str().is_empty() {
+                let _ = fs::remove_dir_all(&self.path);
+            }
         }
     }
 
-    fn recorded(transcript: &str, returned: Option<&str>, rules: &[(&str, &str)]) -> MumpsSide {
-        (
-            transcript.to_string(),
-            Some(returned.map(str::to_string)),
-            pairs(rules),
-        )
+    /// The capture file of `golden::CAPTURE_FILES` whose name before its
+    /// extension is `stem`, so that this module never spells a capture file
+    /// name itself.
+    fn capture_file(stem: &str) -> Result<&'static str, String> {
+        golden::CAPTURE_FILES
+            .iter()
+            .copied()
+            .find(|name| name.split('.').next() == Some(stem))
+            .ok_or_else(|| format!("no capture file {stem}"))
+    }
+
+    /// A capture's recorded metadata text holding each of the eight
+    /// `golden::META_KEYS` once, `context` set to `context` and every other
+    /// key to `x`.
+    fn meta_text(context: &str) -> String {
+        golden::META_KEYS
+            .iter()
+            .map(|key| {
+                let value = if *key == "context" { context } else { "x" };
+                format!("{key}={value}\n")
+            })
+            .collect()
+    }
+
+    /// The `STUB_CONTEXT` keys with sample device values, which
+    /// `golden::validate_context` accepts.
+    const CONTEXT: &str = r##"{"DUZ":".5","IOF":"#","IOSL":"60","STATION":"500"}"##;
+
+    /// Site (a) of `SPEC.md` "Contracts": the only order filed under `C` has
+    /// a zero node holding only a descendant, so the lookup's read of
+    /// `^PRC(442,1,0)` [DIC3.m:110] gives `CorruptStore` for the inputs
+    /// `""`, `A12345`, `^`.
+    const CORRUPT_ORDER: &str = r#"^PRC(442,0)="PROCUREMENT & ACCOUNTING TRANSACTIONS^442I^1^1"
+^PRC(442,1,0,1)="x"
+^PRC(442,"C","A12345",1)=""
+"#;
+
+    fn fixture_store() -> Result<Store, String> {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("ifcap");
+        load_fixtures(&fixtures).map_err(io_text)
+    }
+
+    /// A capture held in memory, with `readiness`, `meta` and the
+    /// normalisation `rules` given.
+    fn case(readiness: Readiness, meta: Option<golden::Meta>, rules: &[(&str, &str)]) -> Case {
+        Case {
+            id: "GC-01".to_string(),
+            inputs: strings(&["^"]),
+            transcript: String::new(),
+            returned: None,
+            rules: rules
+                .iter()
+                .map(|(open, close)| golden::Rule {
+                    open: (*open).to_string(),
+                    close: (*close).to_string(),
+                })
+                .collect(),
+            meta,
+            readiness,
+        }
     }
 
     fn port(transcript: &str, returned: Option<&str>) -> InquiryOutput {
@@ -3474,239 +4012,467 @@ mod tests {
     }
 
     #[test]
-    fn compare_match_null_when_mumps_returned_unavailable() {
-        let live: MumpsSide = ("T".to_string(), None, Vec::new());
-        assert_eq!(decide_match(&live, &port("T", None)), None);
-        assert_eq!(decide_match(&live, &port("other", Some("x"))), None);
-    }
-
-    #[test]
-    fn compare_match_needs_transcript_and_returned() {
+    fn decide_match_is_the_pass_rule() -> Result<(), String> {
+        let valid = Some(golden::parse_meta(&meta_text(CONTEXT))?);
+        let duz_one = Some(golden::parse_meta(&meta_text(
+            r##"{"DUZ":"1","IOF":"#","IOSL":"60","STATION":"500"}"##,
+        ))?);
+        let unparsable = Some(golden::parse_meta(&meta_text("not json"))?);
+        let ready = Readiness::Ready;
+        let incomplete = Readiness::Incomplete(vec!["db_before_equals_after"]);
+        let marked = [("@", "#")];
+        // (label, capture, MUMPS transcript, MUMPS return value, Rust output,
+        // expected match)
         let cases = [
-            (recorded("T", None, &[]), port("T", None), Some(true)),
             (
-                recorded("T", Some("1"), &[]),
-                port("T", Some("1")),
-                Some(true),
-            ),
-            (recorded("T", Some("1"), &[]), port("T", None), Some(false)),
-            (recorded("T", None, &[]), port("T", Some("")), Some(false)),
-            (recorded("T", None, &[]), port("U", None), Some(false)),
-            (
-                recorded("at @07# end", Some("@1#"), &[("@", "#")]),
-                port("at @99# end", Some("@2#")),
-                Some(true),
+                "no capture (live, unmatched)",
+                None,
+                "T",
+                None,
+                port("T", None),
+                false,
             ),
             (
-                recorded("at @07# end", None, &[("@", "#")]),
+                "READY, context DUZ 1",
+                Some(case(ready.clone(), duz_one, &[])),
+                "T",
+                None,
+                port("T", None),
+                false,
+            ),
+            (
+                "INCOMPLETE, equal texts",
+                Some(case(incomplete, valid.clone(), &[])),
+                "T",
+                None,
+                port("T", None),
+                false,
+            ),
+            (
+                "READY, no recorded metadata",
+                Some(case(ready.clone(), None, &[])),
+                "T",
+                None,
+                port("T", None),
+                false,
+            ),
+            (
+                "READY, context not an object",
+                Some(case(ready.clone(), unparsable, &[])),
+                "T",
+                None,
+                port("T", None),
+                false,
+            ),
+            (
+                "READY, valid context, equal texts",
+                Some(case(ready.clone(), valid.clone(), &[])),
+                "T",
+                None,
+                port("T", None),
+                true,
+            ),
+            (
+                "READY, differing texts",
+                Some(case(ready.clone(), valid.clone(), &[])),
+                "T",
+                None,
+                port("U", None),
+                false,
+            ),
+            (
+                "READY, differing return values",
+                Some(case(ready.clone(), valid.clone(), &[])),
+                "T",
+                Some("1"),
+                port("T", None),
+                false,
+            ),
+            (
+                "READY, rule makes the texts equal",
+                Some(case(ready.clone(), valid.clone(), &marked)),
+                "at @07# end",
+                None,
+                port("at @99# end", None),
+                true,
+            ),
+            (
+                "READY, rule finds no span on one side",
+                Some(case(ready, valid, &marked)),
+                "at @07# end",
+                None,
                 port("at 99 end", None),
-                Some(false),
+                false,
             ),
         ];
-        for (original, rust, expected) in cases {
-            assert_eq!(decide_match(&original, &rust), expected, "for {original:?}");
-        }
-    }
-
-    /// A well-formed meta file whose context holds resolved device values.
-    const META_TEXT: &str = r##"image_digest=sha256:0123
-source_revision=dd3fd0f3124c8178657d9fff4173c324da30f7ae
-snapshot_id=git:dd3fd0f3124c8178657d9fff4173c324da30f7ae
-
-record_ids=1 500-A12345
-entry_point=EN3^PRCHRPT
-context={"DUZ":".5","IOF":"#","IOSL":"24","STATION":"500"}
-docker_exec_args=["--user","vehu","synthetic","X=1"]
-"##;
-
-    #[test]
-    fn parse_meta_reads_seven_keys_and_rejects_bad_lines() -> Result<(), String> {
-        let meta = parse_meta(META_TEXT)?;
-        assert_eq!(
-            meta,
-            Meta {
-                image_digest: "sha256:0123".to_string(),
-                source_revision: "dd3fd0f3124c8178657d9fff4173c324da30f7ae".to_string(),
-                snapshot_id: "git:dd3fd0f3124c8178657d9fff4173c324da30f7ae".to_string(),
-                record_ids: "1 500-A12345".to_string(),
-                entry_point: "EN3^PRCHRPT".to_string(),
-                context: pairs(&[
-                    ("DUZ", ".5"),
-                    ("IOF", "#"),
-                    ("IOSL", "24"),
-                    ("STATION", "500")
-                ]),
-                docker_exec_args: strings(&["--user", "vehu", "synthetic", "X=1"]),
-            }
-        );
-        assert_eq!(parse_meta(&META_TEXT.replace('\n', "\r\n")), Ok(meta));
-        let replaced = |from: &str, to: &str| parse_meta(&META_TEXT.replacen(from, to, 1));
-        let rejected = [
-            (
-                replaced("record_ids=1 500-A12345\n", ""),
-                "missing key record_ids",
-            ),
-            (
-                replaced("entry_point=", "image_digest="),
-                "line 6: repeated key image_digest",
-            ),
-            (
-                replaced("entry_point=", "entry=point="),
-                "line 6: unknown key entry",
-            ),
-            (replaced("entry_point=", "entry_point "), "line 6: no '='"),
-            (
-                replaced(r#"{"DUZ""#, r#"{"IOSL":"24","DUZ""#),
-                "context: repeated key IOSL",
-            ),
-            (
-                replaced(r#""500"}"#, r#"500}"#),
-                "context: not a JSON object of strings",
-            ),
-            (
-                replaced(r#"={"DUZ"#, r#"=["DUZ"#),
-                "context: not a JSON object of strings",
-            ),
-            (
-                replaced(r#"["--user""#, "not-json"),
-                "docker_exec_args: not a JSON array of strings",
-            ),
-            (
-                replaced(r#""X=1""#, "1"),
-                "docker_exec_args: not a JSON array of strings",
-            ),
-        ];
-        for (result, message) in rejected {
-            assert_eq!(result, Err(message.to_string()));
+        for (label, capture, transcript, returned, rust, expected) in cases {
+            assert_eq!(
+                decide_match(capture.as_ref(), transcript, returned, &rust),
+                expected,
+                "{label}"
+            );
         }
         Ok(())
     }
 
-    /// `parse_context` over 10,000 keys keeps them in document order and
-    /// rejects a key repeated at the end, and a non-string value is reported
-    /// before a repetition. Only results are asserted: that repetitions are
-    /// found with a set lookup, not by rescanning earlier keys, is verified by
-    /// reading `parse_context`, because a timing assertion would be flaky.
     #[test]
-    fn context_keeps_document_order_and_rejects_repeats_at_scale() {
-        let expected: Vec<(String, String)> = (0..10_000)
-            .map(|n| (format!("K{n}"), format!("v{n}")))
-            .collect();
-        let members: Vec<String> = expected
-            .iter()
-            .map(|(key, value)| format!("\"{key}\":\"{value}\""))
-            .collect();
-        let object = format!("{{{}}}", members.join(","));
-        assert_eq!(parse_context(&object), Ok(expected));
-        let repeated = format!("{{{},\"K0\":\"again\"}}", members.join(","));
+    fn status_json_shape() -> Result<(), String> {
+        let scratch = Scratch::new()?;
+        let replay = MumpsMode::Replay {
+            golden_dir: scratch.path().to_path_buf(),
+        };
+        let live = MumpsMode::Live {
+            container: "vehu".to_string(),
+            golden_dir: scratch.path().to_path_buf(),
+        };
         assert_eq!(
-            parse_context(&repeated),
-            Err("context: repeated key K0".to_string())
+            status_body(&replay),
+            r#"{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}"#
         );
-        // A value that is not a string is found before the key's repetition.
         assert_eq!(
-            parse_context(r#"{"A":"1","A":2}"#),
-            Err("context: not a JSON object of strings".to_string())
+            status_body(&live),
+            r#"{"mumps_mode":"live","recorded":[],"ready":[],"incomplete":{}}"#
         );
-    }
-
-    #[test]
-    fn validate_context_messages() {
-        let resolved = pairs(&[
-            ("DUZ", ".5"),
-            ("IOF", "#"),
-            ("IOSL", "24"),
-            ("STATION", "500"),
-        ]);
-        let cases = [
-            (
-                resolved.clone(),
-                "CONTEXT MISMATCH IOF: expected UNRESOLVED, actual #",
-            ),
-            (
-                Vec::new(),
-                "CONTEXT MISMATCH DUZ: expected .5, actual MISSING",
-            ),
-            (
-                pairs(&[("DUZ", "1")]),
-                "CONTEXT MISMATCH DUZ: expected .5, actual 1",
-            ),
-            (
-                pairs(&[("DUZ", ".5"), ("DUZ", "1")]),
-                "CONTEXT MISMATCH DUZ: expected .5, actual 1",
-            ),
-            (
-                pairs(&[("DUZ", ".5"), ("STATION", "500")]),
-                "CONTEXT MISMATCH IOF: expected UNRESOLVED, actual MISSING",
-            ),
-            (
-                pairs(&[
-                    ("DUZ", ".5"),
-                    ("IOF", "UNRESOLVED"),
-                    ("IOSL", "UNRESOLVED"),
-                    ("STATION", "500"),
-                ]),
-                "CONTEXT MISMATCH IOF: expected UNRESOLVED, actual UNRESOLVED",
-            ),
-        ];
-        for (context, message) in cases {
-            assert_eq!(validate_context(&context), Err(message.to_string()));
+        // GC-01 holds only the first two capture files, an input sequence
+        // ending with the exit input and a transcript: recorded, INCOMPLETE.
+        for name in golden::CAPTURE_FILES.iter().take(2) {
+            scratch.write("GC-01", name, "^\n")?;
         }
-        // An unresolved constant matches nothing, its sentinel spelling included.
-        let partial = [("DUZ", Some(".5")), ("IOSL", None)];
-        let sentinel = pairs(&[("DUZ", ".5"), ("IOSL", "UNRESOLVED")]);
-        assert_eq!(
-            validate_against(&partial, &sentinel),
-            Err("CONTEXT MISMATCH IOSL: expected UNRESOLVED, actual UNRESOLVED".to_string())
-        );
-        // With every constant resolved, the extra-key rule is reachable.
-        let constants = [("DUZ", Some(".5")), ("STATION", Some("500"))];
-        let exact = pairs(&[("STATION", "500"), ("DUZ", ".5")]);
-        assert_eq!(validate_against(&constants, &exact), Ok(()));
-        let extra = pairs(&[("DUZ", ".5"), ("STATION", "500"), ("IOM", "80")]);
-        assert_eq!(
-            validate_against(&constants, &extra),
-            Err("CONTEXT MISMATCH IOM: expected ABSENT, actual 80".to_string())
-        );
+        let incomplete = r#"{"GC-01":["seven_files_present","meta_keys_present","normalisation_parses","db_before_equals_after"]}"#;
+        for (mode, label) in [(&replay, "replay"), (&live, "live")] {
+            assert_eq!(
+                status_body(mode),
+                format!(
+                    r#"{{"mumps_mode":"{label}","recorded":["GC-01"],"ready":[],"incomplete":{incomplete}}}"#
+                )
+            );
+        }
+        scratch.close()
     }
 
     #[test]
-    fn session_request_validation() {
-        let accepted =
-            parse_session_request(br#"{"other":1,"inputs":[""," A1 ","^","\u0007\t\u00e9"]}"#);
-        assert_eq!(accepted, Ok(strings(&["", " A1 ", "^", "\u{7}\t\u{e9}"])));
-        let rejected: [(&[u8], &str); 11] = [
+    fn sessions_answer_from_the_capture_whose_inputs_match() -> Result<(), String> {
+        let scratch = Scratch::new()?;
+        let fixtures = fixture_store()?;
+        let mumps = MumpsMode::Replay {
+            golden_dir: scratch.path().to_path_buf(),
+        };
+        let inputs = strings(&["^"]);
+        let other = strings(&["", "^"]);
+        let not_recorded = (502, error_body(NOT_RECORDED));
+        assert_eq!(mumps_session(&mumps, &inputs), not_recorded);
+        assert_eq!(
+            compare_session(&fixtures, &mumps, &inputs),
+            (502, error_body("MUMPS: NOT RECORDED"))
+        );
+        // GC-01 is recorded but INCOMPLETE: five capture files are missing.
+        let (input, transcript) = (capture_file("input")?, capture_file("transcript")?);
+        scratch.write("GC-01", input, "^\n")?;
+        scratch.write("GC-01", transcript, "RECORDED\n")?;
+        assert_eq!(
+            mumps_session(&mumps, &inputs),
+            (200, session_body("RECORDED\n", None))
+        );
+        assert_eq!(mumps_session(&mumps, &other), not_recorded);
+        // COMPARE answers both raw outputs, and `match` is false because the
+        // capture is not READY.
+        let rust = inquire(&fixtures, &inputs).map_err(|e| e.to_string())?;
+        let mut compared = String::from("{\"mumps\":");
+        write_session(&mut compared, "RECORDED\n", None);
+        compared.push_str(",\"rust\":");
+        write_session(&mut compared, &rust.transcript, rust.returned.as_deref());
+        compared.push_str(",\"match\":false}");
+        assert_eq!(compare_session(&fixtures, &mumps, &inputs), (200, compared));
+        assert_eq!(
+            rust_session(&fixtures, &inputs),
+            (200, session_body(&rust.transcript, None))
+        );
+        // A Rust-side `CorruptStore` is 500 alone and 502 inside COMPARE.
+        let corrupt = Store::from_zwr(CORRUPT_ORDER).map_err(|e| e.to_string())?;
+        let corrupt_inputs = strings(&["", "A12345", "^"]);
+        scratch.write("GC-02", input, "\nA12345\n^\n")?;
+        scratch.write("GC-02", transcript, "RECORDED\n")?;
+        assert_eq!(
+            rust_session(&corrupt, &corrupt_inputs),
+            (500, error_body("CORRUPT STORE ^PRC(442,1,0)"))
+        );
+        assert_eq!(
+            compare_session(&corrupt, &mumps, &corrupt_inputs),
+            (502, error_body("RUST: CORRUPT STORE ^PRC(442,1,0)"))
+        );
+        // GC-03 is recorded, but a directory in place of its input file
+        // cannot be read: inputs no earlier case matches name it.
+        fs::create_dir_all(scratch.path().join("GC-03").join(input)).map_err(io_text)?;
+        scratch.write("GC-03", transcript, "RECORDED\n")?;
+        let cause = golden::find_capture(scratch.path(), &other)
+            .err()
+            .ok_or_else(|| "the unreadable capture was not reported".to_string())?;
+        assert!(cause.contains("GC-03"), "{cause}");
+        let unreadable = format!("NOT RECORDED (unreadable: {cause})");
+        assert_eq!(
+            mumps_session(&mumps, &other),
+            (502, error_body(&unreadable))
+        );
+        assert_eq!(
+            compare_session(&fixtures, &mumps, &other),
+            (502, error_body(&format!("MUMPS: {unreadable}")))
+        );
+        // A capture found before the unreadable case still answers.
+        assert_eq!(
+            mumps_session(&mumps, &inputs),
+            (200, session_body("RECORDED\n", None))
+        );
+        scratch.close()
+    }
+
+    #[test]
+    fn live_checks_the_context_before_any_command() -> Result<(), String> {
+        let scratch = Scratch::new()?;
+        // No container has this name, so a command that ran would fail with
+        // an `EXIT` or spawn cause, never with either cause asserted here.
+        let container = "ifcap-bridge-unit-no-such-container";
+        let mumps = MumpsMode::Live {
+            container: container.to_string(),
+            golden_dir: scratch.path().to_path_buf(),
+        };
+        let store = Store::from_zwr("").map_err(|e| e.to_string())?;
+        let inputs = strings(&["^"]);
+        // No recorded start arguments anywhere: golden's own cause.
+        let none = golden::live_start(scratch.path())
+            .err()
+            .ok_or_else(|| "an empty golden folder gave start arguments".to_string())?;
+        assert_eq!(live(container, scratch.path(), &inputs), Err(none.clone()));
+        assert_eq!(mumps_session(&mumps, &inputs), (502, error_body(&none)));
+        // Recorded start arguments whose context names another user.
+        let duz_one = r##"{"DUZ":"1","IOF":"#","IOSL":"60","STATION":"500"}"##;
+        scratch.write("GC-01", capture_file("meta")?, &meta_text(duz_one))?;
+        let mismatch = "CONTEXT MISMATCH DUZ: expected .5, actual 1";
+        assert_eq!(
+            live(container, scratch.path(), &inputs),
+            Err(mismatch.to_string())
+        );
+        assert_eq!(
+            compare_session(&store, &mumps, &inputs),
+            (502, error_body(&format!("MUMPS: {mismatch}")))
+        );
+        scratch.close()
+    }
+
+    #[test]
+    fn serve_until_answers_until_shutdown_is_set() -> Result<(), String> {
+        let scratch = Scratch::new()?;
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(io_text)?;
+        let addr = listener.local_addr().map_err(io_text)?;
+        let store = Store::from_zwr("").map_err(|e| e.to_string())?;
+        let mumps = MumpsMode::Replay {
+            golden_dir: scratch.path().to_path_buf(),
+        };
+        let status = status_body(&mumps);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let serving = thread::Builder::new()
+            .spawn(move || serve_until(listener, store, mumps, flag))
+            .map_err(io_text)?;
+        let exchanged = (|| -> Result<Vec<u8>, String> {
+            let mut client = TcpStream::connect(addr).map_err(io_text)?;
+            client
+                .set_read_timeout(Some(IO_TIMEOUT))
+                .and_then(|()| client.set_write_timeout(Some(IO_TIMEOUT)))
+                .map_err(io_text)?;
+            client
+                .write_all(b"GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .map_err(io_text)?;
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).map_err(io_text)?;
+            Ok(response)
+        })();
+        // Set on every path, so the serving thread always ends and is joined.
+        shutdown.store(true, Ordering::SeqCst);
+        let served = serving
+            .join()
+            .map_err(|_| "the serving loop panicked".to_string())?;
+        served.map_err(io_text)?;
+        let response = String::from_utf8(exchanged?).map_err(|e| e.to_string())?;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(
+            response.ends_with(&format!("\r\n\r\n{status}")),
+            "{response}"
+        );
+        scratch.close()
+    }
+
+    #[test]
+    fn session_request_validation() -> Result<(), String> {
+        // The inputs array is a member's value, at depth 1, so its elements
+        // are at depth 2, and a value that deep holds one array fewer than
+        // a member's value can.
+        let brackets = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        let deepest_element = format!(
+            r#"{{"inputs":[{}]}}"#,
+            brackets(MAX_JSON_DEPTH.saturating_sub(1))
+        );
+        let too_deep_element = format!(r#"{{"inputs":[{}]}}"#, brackets(MAX_JSON_DEPTH));
+        let deepest_member = format!(r#"{{"x":{},"inputs":["^"]}}"#, brackets(MAX_JSON_DEPTH));
+        let too_deep_member = format!(
+            r#"{{"x":{},"inputs":["^"]}}"#,
+            brackets(MAX_JSON_DEPTH.saturating_add(1))
+        );
+        let many = format!(r#"{{"inputs":[{}"^"]}}"#, r#""a","#.repeat(5000));
+        let mut many_inputs = vec!["a".to_string(); 5000];
+        many_inputs.push("^".to_string());
+        let accepted: &[(&[u8], Vec<String>)] = &[
+            (
+                br#"{"other":1,"inputs":[""," A1 ","^","\u0007\t\u00e9"]}"#,
+                strings(&["", " A1 ", "^", "\u{7}\t\u{e9}"]),
+            ),
+            // The key is compared unescaped.
+            (br#"{"\u0069nputs":["^"]}"#, strings(&["^"])),
+            // An `inputs` key inside another member is not a member.
+            (br#"{"x":{"inputs":1},"inputs":["^"]}"#, strings(&["^"])),
+            (deepest_member.as_bytes(), strings(&["^"])),
+            (
+                b" \t\r\n{ \"inputs\" : [ \"a\" , \"b\" ] } \r\n",
+                strings(&["a", "b"]),
+            ),
+            (br#"{"inputs":[]}"#, Vec::new()),
+            (many.as_bytes(), many_inputs),
+        ];
+        for (body, expected) in accepted {
+            let inputs = session_inputs(body)?;
+            assert_eq!(&inputs, expected, "{}", String::from_utf8_lossy(body));
+            // The inputs are held in one allocation of exactly their count.
+            assert_eq!(inputs.capacity(), inputs.len());
+        }
+        let line_break = "INPUT 1 CONTAINS A CARRIAGE RETURN OR LINE FEED";
+        // Causes in precedence order: a syntax error anywhere, an element
+        // fault's array included, is malformed; then the kind of body; then
+        // `inputs`; then the first faulty element by position.
+        let rejected: &[(&[u8], &str)] = &[
             (br#"{"inputs": ["#, "MALFORMED JSON"),
             (b"", "MALFORMED JSON"),
             (b"{\"inputs\":[\"\xff\"]}", "MALFORMED JSON"),
+            (b"{\"x\":\"\xff\",\"inputs\":[]}", "MALFORMED JSON"),
+            (br#"{"inputs":[1],}"#, "MALFORMED JSON"),
+            (br#"{"inputs":["a\nb"],}"#, "MALFORMED JSON"),
+            (br#"{"inputs":["a"]} x"#, "MALFORMED JSON"),
+            (too_deep_element.as_bytes(), "MALFORMED JSON"),
+            (too_deep_member.as_bytes(), "MALFORMED JSON"),
             (br#"["a"]"#, "BODY IS NOT A JSON OBJECT"),
+            (br#""str""#, "BODY IS NOT A JSON OBJECT"),
+            (b"1", "BODY IS NOT A JSON OBJECT"),
             (br#"{}"#, "INPUTS MISSING OR REPEATED"),
             (
                 br#"{"inputs":[],"inputs":[]}"#,
                 "INPUTS MISSING OR REPEATED",
             ),
+            (
+                br#"{"inputs":"x","inputs":[]}"#,
+                "INPUTS MISSING OR REPEATED",
+            ),
+            (
+                br#"{"inputs":[1],"\u0069nputs":[]}"#,
+                "INPUTS MISSING OR REPEATED",
+            ),
             (br#"{"inputs":"x"}"#, "INPUTS IS NOT AN ARRAY"),
+            (br#"{"inputs":{}}"#, "INPUTS IS NOT AN ARRAY"),
             (br#"{"inputs":[1]}"#, "INPUT 1 IS NOT A STRING"),
             (br#"{"inputs":["",null]}"#, "INPUT 2 IS NOT A STRING"),
+            (deepest_element.as_bytes(), "INPUT 1 IS NOT A STRING"),
+            (br#"{"inputs":[1,"a\nb"]}"#, "INPUT 1 IS NOT A STRING"),
+            (br#"{"inputs":["a",{},"b\rc"]}"#, "INPUT 2 IS NOT A STRING"),
+            (br#"{"inputs":["a\rb"]}"#, line_break),
+            (br#"{"inputs":["a\nb"]}"#, line_break),
+            (br#"{"inputs":["a\nb",1]}"#, line_break),
+            (br#"{"inputs":["a\u000ab"]}"#, line_break),
             (
-                br#"{"inputs":["a\rb"]}"#,
-                "INPUT 1 CONTAINS A CARRIAGE RETURN OR LINE FEED",
-            ),
-            (
-                br#"{"inputs":["a\nb"]}"#,
-                "INPUT 1 CONTAINS A CARRIAGE RETURN OR LINE FEED",
+                br#"{"inputs":["a","\u000Db"]}"#,
+                "INPUT 2 CONTAINS A CARRIAGE RETURN OR LINE FEED",
             ),
         ];
-        for (body, cause) in rejected {
-            assert_eq!(parse_session_request(body), Err(cause.to_string()));
+        let store = Store::from_zwr("").map_err(|e| e.to_string())?;
+        // Every rejected body is answered before a backend runs, so no
+        // capture is read.
+        let mumps = MumpsMode::Replay {
+            golden_dir: PathBuf::new(),
+        };
+        // The wire text of one rejection, spelled out.
+        let malformed = page_request("POST", "/api/rust/session", br#"{"inputs": ["#)?;
+        let (status, content_type, answer) = route(malformed, &store, &mumps);
+        let answer = String::from_utf8(answer).map_err(|e| e.to_string())?;
+        assert_eq!(
+            (status, content_type, answer.as_str()),
+            (400, JSON_TYPE, r#"{"error":"BAD REQUEST: MALFORMED JSON"}"#)
+        );
+        for &(body, cause) in rejected {
+            assert_eq!(
+                scan_session_body(body).map(|(_, array)| array),
+                Err(cause.to_string()),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+            // Each session route answers the cause inside the 400 envelope.
+            let expected = error_body(&format!("{BAD_REQUEST}: {cause}"));
+            for backend in ["mumps", "rust", "compare"] {
+                let request = page_request("POST", &format!("/api/{backend}/session"), body)?;
+                let (status, content_type, answer) = route(request, &store, &mumps);
+                let answer = String::from_utf8(answer).map_err(|e| e.to_string())?;
+                assert_eq!(
+                    (status, content_type, answer.as_str()),
+                    (400, JSON_TYPE, expected.as_str()),
+                    "POST /api/{backend}/session with {}",
+                    String::from_utf8_lossy(body)
+                );
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn largest_session_body_answers_as_its_first_inputs() -> Result<(), String> {
+        let store = fixture_store()?;
+        // Rust sessions read no capture.
+        let mumps = MumpsMode::Replay {
+            golden_dir: PathBuf::new(),
+        };
+        let session = |body: &[u8]| {
+            page_request("POST", "/api/rust/session", body)
+                .map(|request| route(request, &store, &mumps))
+        };
+        // As many one-character inputs as fit within `MAX_BODY`, then the
+        // exit: a session the budget charges, answered as the session of
+        // its first input and the exit is.
+        let mut body = br#"{"inputs":["#.to_vec();
+        let filler = br#""a","#;
+        let rest = br#""^"]}"#;
+        let count = MAX_BODY.saturating_sub(body.len().saturating_add(rest.len())) / filler.len();
+        for _ in 0..count {
+            body.extend_from_slice(filler);
+        }
+        body.extend_from_slice(rest);
+        assert!(body.len() <= MAX_BODY && count > FREE_INPUTS);
+        let largest = session(&body)?;
+        let short = session(br#"{"inputs":["a","^"]}"#)?;
+        assert_eq!(largest, short);
+        assert_eq!(largest.0, 200);
+        // No other test sends a session heavy enough to be charged, so the
+        // shared budget is empty again once the session has answered.
+        let held = *INPUT_BUDGET
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(held, 0);
+        Ok(())
     }
 
     #[test]
     fn request_head_parsing() {
+        // No head here carries `Content-Type`, so each gives a session
+        // request the cause `JSON_REQUIRED`, which only a session route
+        // applies (see `session_post_needs_own_origin_and_json`).
+        let refusal = Some(JSON_REQUIRED);
         assert_eq!(
             parse_head(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
-            Ok(("GET", "/".to_string(), None, false))
+            Ok(("GET", "/".to_string(), None, false, refusal))
         );
         // An HTTP/1.0 request needs no `Host`, and its `Expect: 100-continue`
         // is ignored (RFC 9110 10.1.1).
@@ -3714,33 +4480,48 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             parse_head(
                 b"POST /api/rust/session HTTP/1.0\r\ncontent-length: 12\r\nContent-Length:12\r\nExpect: 100-continue\r\n\r\n"
             ),
-            Ok(("POST", "/api/rust/session".to_string(), Some(12), false))
+            Ok((
+                "POST",
+                "/api/rust/session".to_string(),
+                Some(12),
+                false,
+                refusal
+            ))
         );
         // An HTTP/1.1 request's `Expect: 100-continue` is reported.
         assert_eq!(
             parse_head(
-                b"POST /api/rust/session HTTP/1.1\r\nHost: h\r\nContent-Length: 12\r\nExpect: 100-continue\r\n\r\n"
+                b"POST /api/rust/session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 12\r\nExpect: 100-continue\r\n\r\n"
             ),
-            Ok(("POST", "/api/rust/session".to_string(), Some(12), true))
+            Ok((
+                "POST",
+                "/api/rust/session".to_string(),
+                Some(12),
+                true,
+                refusal
+            ))
         );
-        // Each head accepted as `GET /`: an empty-line prelude, `Host` values
-        // of every form, any host name included, and a value with an HTAB
-        // and a byte from 0x80.
-        let accepted: [&[u8]; 9] = [
-            b"\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n",
-            b"\r\n\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: h:8080\r\n\r\n",
+        // Each head accepted as `GET /`: an empty-line prelude, each loopback
+        // host in `Host`, with a port, an empty port or none and `localhost`
+        // in any case, an HTTP/1.0 request without `Host`, and a value with
+        // an HTAB and a byte from 0x80.
+        let accepted: [&[u8]; 11] = [
+            b"\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: LOCALHOST\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost:18092\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost:\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n",
             b"GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: [v1.a:b]\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: %41-b~!$&'()*+,;=\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: h:\r\n\r\n",
-            b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\tb \xc3\xa9\r\n\r\n",
+            b"GET / HTTP/1.0\r\nHost: 127.0.0.1:18092\r\n\r\n",
+            b"GET / HTTP/1.0\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: a\tb \xc3\xa9\r\n\r\n",
         ];
         for head in accepted {
             assert_eq!(
                 parse_head(head),
-                Ok(("GET", "/".to_string(), None, false)),
+                Ok(("GET", "/".to_string(), None, false, refusal)),
                 "for {}",
                 String::from_utf8_lossy(head)
             );
@@ -3750,42 +4531,46 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         // are left as they are.
         let origin: [&str; 4] = ["/%00", "/%2e%2e/Cargo.toml", "/a|b", "/^[]{}?q=|\"<>`"];
         for target in origin {
-            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            let head = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n");
             assert_eq!(
                 parse_head(head.as_bytes()),
-                Ok(("GET", target.to_string(), None, false)),
+                Ok(("GET", target.to_string(), None, false, refusal)),
                 "for {target}"
             );
         }
-        // Each absolute-form target, and the origin-form it is routed by.
+        // Each absolute-form target, whose authority is a loopback host, and
+        // the origin-form it is routed by.
         let absolute: [(&str, &str); 9] = [
             ("http://127.0.0.1:18221/", "/"),
-            ("http://h", "/"),
-            ("http://h?x", "/?x"),
-            ("HTTP://h/app.js", "/app.js"),
-            ("hTtP://h:1/api/rust/session?q=1", "/api/rust/session?q=1"),
-            ("http://h/a@b", "/a@b"),
-            ("http://h#f", "/#f"),
+            ("http://localhost", "/"),
+            ("http://localhost?x", "/?x"),
+            ("HTTP://LOCALHOST/app.js", "/app.js"),
+            (
+                "hTtP://localhost:1/api/rust/session?q=1",
+                "/api/rust/session?q=1",
+            ),
+            ("http://127.0.0.1/a@b", "/a@b"),
+            ("http://[::1]#f", "/#f"),
             ("http://[::1]:8080/app.js", "/app.js"),
-            ("http://h:/", "/"),
+            ("http://localhost:/", "/"),
         ];
         for (target, origin) in absolute {
-            let head = format!("GET {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            let head = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n");
             assert_eq!(
                 parse_head(head.as_bytes()),
-                Ok(("GET", origin.to_string(), None, false)),
+                Ok(("GET", origin.to_string(), None, false, refusal)),
                 "for {target}"
             );
         }
         // Each rejected head, and the rule its 400 cause names.
-        let rejected: [(&[u8], &str); 62] = [
+        let rejected: [(&[u8], &str); 84] = [
             (b"GET /\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET / HTTP/1.1 x\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET  / HTTP/1.1\r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"GET / \r\n\r\n", "MALFORMED REQUEST LINE"),
             (b"\r\n\r\n", "INCOMPLETE HEAD"),
             (
-                b"\r\n \r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"\r\n \r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "MALFORMED REQUEST LINE",
             ),
             (b"G/T / HTTP/1.1\r\n\r\n", "MALFORMED REQUEST LINE"),
@@ -3808,85 +4593,109 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             // that is not a host with an optional port. The heads are
             // otherwise valid.
             (
-                b"GET /a\x00b HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\x00b HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\tb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\tb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\rb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\rb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\nb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\nb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\x01b HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\x01b HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\x1fb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\x1fb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a\x7fb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a\x7fb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /\xc3\xa9 HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /\xc3\xa9 HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /%zz HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /%zz HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /%4 HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /%4 HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /a% HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /a% HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET /?q=\x00 HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET /?q=\x00 HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://[]/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://[]/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://[zz]/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://[zz]/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://localhost:abc/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://localhost:abc/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://h:1:2/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://localhost:1:2/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://h\x01/ HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://localhost\x01/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://h/a\x00b HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://localhost/a\x00b HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
             ),
             (
-                b"GET http://h/a\x7fb HTTP/1.1\r\nHost: h\r\n\r\n",
+                b"GET http://localhost/a\x7fb HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 "INVALID REQUEST TARGET",
+            ),
+            // An absolute-form authority that is a host with an optional
+            // port, but not a loopback host, checked once its syntax is and
+            // before any header, a loopback `Host` included.
+            (
+                b"GET http://evil.example/app.js HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET http://evil.localhost:8080/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET HTTP://127.0.0.2/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET http://[::2]:8080/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (b"GET http://h/ HTTP/1.0\r\n\r\n", "HOST NOT ALLOWED"),
+            (
+                b"GET http://evil.example/ HTTP/1.1\r\nHost: a b\r\n\r\n",
+                "HOST NOT ALLOWED",
             ),
             (b"GET / HTTP/1.1\r\nNoColon\r\n\r\n", "MALFORMED HEADER"),
             (b"GET / HTTP/1.1\r\nBad Name: x\r\n\r\n", "MALFORMED HEADER"),
             (
-                b"GET / HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\n folded\r\n\r\n",
                 "MALFORMED HEADER",
             ),
             (b"GET /\xff HTTP/1.1\r\n\r\n", "HEAD NOT UTF-8"),
@@ -3905,14 +4714,72 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 "TRANSFER-ENCODING NOT SUPPORTED",
             ),
             (b"GET / HTTP/1.1\r\n\r\n", "MISSING HOST"),
-            (b"GET http://h/ HTTP/1.1\r\n\r\n", "MISSING HOST"),
+            (b"GET http://localhost/ HTTP/1.1\r\n\r\n", "MISSING HOST"),
             (
-                b"GET / HTTP/1.1\r\nHost: h\r\nhost: h\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nhost: localhost\r\n\r\n",
                 "REPEATED HOST",
             ),
             (
-                b"GET / HTTP/1.0\r\nHost: h\r\nHost: h\r\n\r\n",
+                b"GET / HTTP/1.0\r\nHost: localhost\r\nHost: 127.0.0.1\r\n\r\n",
                 "REPEATED HOST",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nHost: evil.example\r\n\r\n",
+                "REPEATED HOST",
+            ),
+            // A `Host` that is a host with an optional port, but not a
+            // loopback host, rejected at its own line once its syntax is
+            // checked: another name, a subdomain of `localhost`, another
+            // loopback address, an IPvFuture, or any reg-name.
+            (
+                b"GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: evil.example:8080\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: evil.localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: localhost.\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", "HOST NOT ALLOWED"),
+            (
+                b"GET / HTTP/1.1\r\nHost: h:8080\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: 127.0.0.2\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (b"GET / HTTP/1.1\r\nHost: [::2]\r\n\r\n", "HOST NOT ALLOWED"),
+            (
+                b"GET / HTTP/1.1\r\nHost: [v1.a:b]\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: %41-b~!$&'()*+,;=\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.0\r\nHost: evil.example\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET http://localhost/ HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: evil.example\r\nHost: localhost\r\n\r\n",
+                "HOST NOT ALLOWED",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: evil.example\r\nX-Test: \x00\r\n\r\n",
+                "HOST NOT ALLOWED",
             ),
             (b"GET / HTTP/1.1\r\nHost: a b\r\n\r\n", "INVALID HOST"),
             (b"GET / HTTP/1.1\r\nHost: a/b\r\n\r\n", "INVALID HOST"),
@@ -3923,19 +4790,23 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             (b"GET / HTTP/1.1\r\nHost: [::1\r\n\r\n", "INVALID HOST"),
             (b"GET / HTTP/1.1\r\nHost: %4g\r\n\r\n", "INVALID HOST"),
             (
-                b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\x00b\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: a\x00b\r\n\r\n",
                 "INVALID HEADER VALUE",
             ),
             (
-                b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\rb\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: a\rb\r\n\r\n",
                 "INVALID HEADER VALUE",
             ),
             (
-                b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: a\x7fb\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Test: a\x7fb\r\n\r\n",
                 "INVALID HEADER VALUE",
             ),
             (
                 b"GET / HTTP/1.1\r\nX-Test: \x00\r\nHost: a b\r\n\r\n",
+                "INVALID HEADER VALUE",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nX-Test: \x00\r\nHost: evil.example\r\n\r\n",
                 "INVALID HEADER VALUE",
             ),
         ];
@@ -3992,7 +4863,8 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         let trickle = |bytes: &[u8]| -> Vec<(Duration, Vec<u8>)> {
             bytes.iter().map(|byte| (tick, vec![*byte])).collect()
         };
-        let head = b"POST /api/rust/session HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\n\r\n";
+        let head =
+            b"POST /api/rust/session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n";
         let mut trickled_body = now(head);
         trickled_body.extend(trickle(&[b'x'; 100]));
         let oversized = |end: &[u8], filler: usize| {
@@ -4002,18 +4874,32 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             vec![(Duration::ZERO, bytes)]
         };
         let bad = |cause: &str| Err(format!("{BAD_REQUEST}: {cause}"));
+        // These heads carry no `Content-Type`, so a session route would
+        // refuse them; reading them is all this test checks.
         let answered = Ok(Some((
             "POST".to_string(),
             "/api/rust/session".to_string(),
             Some(b"{}".to_vec()),
+            Some(JSON_REQUIRED),
         )));
         let request_then_body = vec![
             (
                 Duration::ZERO,
-                b"POST /api/rust/session HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n".to_vec(),
+                b"POST /api/rust/session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n"
+                    .to_vec(),
             ),
             (Duration::from_millis(100), b"{}".to_vec()),
         ];
+        // A body followed by a pipelined request, with the head and later.
+        let pipelined = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut body_and_more = request_then_body.clone();
+        if let Some((_, body)) = body_and_more.last_mut() {
+            body.extend_from_slice(pipelined);
+        }
+        let mut with_the_head =
+            b"POST /api/rust/session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
+                .to_vec();
+        with_the_head.extend_from_slice(pipelined);
         // (case, what the client sends, whether it then ends its output,
         // the outcome, the least time the outcome takes)
         let cases = [
@@ -4034,14 +4920,14 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             ),
             (
                 "partial head, then silence",
-                now(b"POST /api/rust/session HTTP/1.1\r\nHost: x\r\n"),
+                now(b"POST /api/rust/session HTTP/1.1\r\nHost: localhost\r\n"),
                 false,
                 bad("READ TIMEOUT"),
                 request_time,
             ),
             (
                 "closed mid-head",
-                now(b"GET / HTTP/1.1\r\nHost: x\r\n"),
+                now(b"GET / HTTP/1.1\r\nHost: localhost\r\n"),
                 true,
                 bad("INCOMPLETE HEAD"),
                 Duration::ZERO,
@@ -4083,14 +4969,33 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             ),
             (
                 "empty-line prelude, then a request",
-                now(b"\r\n\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n"),
+                now(b"\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n"),
                 false,
-                Ok(Some(("GET".to_string(), "/".to_string(), None))),
+                Ok(Some((
+                    "GET".to_string(),
+                    "/".to_string(),
+                    None,
+                    Some(JSON_REQUIRED),
+                ))),
                 Duration::ZERO,
             ),
             (
                 "body within the deadline",
                 request_then_body,
+                false,
+                answered.clone(),
+                Duration::ZERO,
+            ),
+            (
+                "body, then a pipelined request",
+                body_and_more,
+                false,
+                answered.clone(),
+                Duration::ZERO,
+            ),
+            (
+                "body and a pipelined request with the head",
+                now(&with_the_head),
                 false,
                 answered,
                 Duration::ZERO,
@@ -4118,6 +5023,10 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             let outcome = outcome.map_err(|e| format!("{case}: read timeout not set: {e}"))?;
             println!("read_request, {case}: {outcome:?} after {took:?}");
             assert_eq!(outcome, expected, "{case}");
+            if let Ok(Some((_, _, Some(body), _))) = &outcome {
+                // Allocated once, at the declared length.
+                assert_eq!(body.capacity(), body.len(), "{case}");
+            }
             assert!(sent.starts_with(&received), "{case}: received out of order");
             assert!(
                 took >= least && took < bound,
@@ -4135,7 +5044,7 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             golden_dir: PathBuf::new(),
         };
         // `NAME` marks request data that no 404 body may repeat.
-        let cases: [(&str, &str, &str); 12] = [
+        let cases: [(&str, &str, &str); 17] = [
             ("GET", "/missing?patient=NAME", NOT_FOUND),
             ("POST", "/NAME", NOT_FOUND),
             ("POST", "/api/NAME/session", UNKNOWN_BACKEND),
@@ -4148,14 +5057,15 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             ("POST", "/api/NAME", NOT_FOUND),
             ("POST", "/style.css", GET_REQUIRED),
             ("NAME", "/", GET_REQUIRED),
+            ("POST", "/api/status", GET_REQUIRED),
+            ("PUT", "/api/status", GET_REQUIRED),
+            ("HEAD", "/api/status", GET_REQUIRED),
+            ("NAME", "/api/status", GET_REQUIRED),
+            ("GET", "/api/status?x=NAME", NOT_FOUND),
         ];
         for (method, target, cause) in cases {
-            let request = (
-                method.to_string(),
-                target.to_string(),
-                Some(br#"{"inputs":["NAME"]}"#.to_vec()),
-            );
-            let (status, content_type, body) = route(&request, &store, &mumps);
+            let request = page_request(method, target, br#"{"inputs":["NAME"]}"#)?;
+            let (status, content_type, body) = route(request, &store, &mumps);
             let body = String::from_utf8(body).map_err(|e| e.to_string())?;
             assert_eq!(
                 (status, content_type, body.as_str()),
@@ -4167,13 +5077,272 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         Ok(())
     }
 
+    /// A `POST` to each session route runs its session only when its
+    /// headers show it comes from the bridge's own page: an `Origin`, when
+    /// sent, once and equal to `http://` and the host the request names,
+    /// then exactly one `Content-Type` of media type `application/json`.
+    /// Otherwise it is refused before its `Content-Length` or body is looked
+    /// at, so before any session runs, with the fixed cause of the first
+    /// rule broken. The 404s of routing come first, and `/api/status` and
+    /// the static paths answer whatever these headers are.
+    #[test]
+    fn session_post_needs_own_origin_and_json() -> Result<(), String> {
+        let store = fixture_store()?;
+        // An empty golden folder: a MUMPS session that runs answers 502
+        // `NOT RECORDED`, so its 400 shows it was refused before it ran.
+        let scratch = Scratch::new()?;
+        let mumps = MumpsMode::Replay {
+            golden_dir: scratch.path().to_path_buf(),
+        };
+        let body = br#"{"inputs":["^"]}"#;
+        let inputs = strings(&["^"]);
+        let answer = |request: HttpRequest| {
+            let (status, content_type, answer) = route(request, &store, &mumps);
+            String::from_utf8(answer)
+                .map(|answer| (status, content_type, answer))
+                .map_err(|e| e.to_string())
+        };
+        let refused = |cause: &str| {
+            let cause = format!("{BAD_REQUEST}: {cause}");
+            (400, JSON_TYPE, error_body(&cause))
+        };
+        // What a backend answers once its session runs.
+        let ran = |backend: &str| {
+            let (status, json) = match backend {
+                "mumps" => mumps_session(&mumps, &inputs),
+                "rust" => rust_session(&store, &inputs),
+                _ => compare_session(&store, &mumps, &inputs),
+            };
+            (status, JSON_TYPE, json)
+        };
+        assert_eq!(ran("mumps").0, 502, "a MUMPS session that runs");
+        assert_eq!(ran("rust").0, 200, "a RUST session that runs");
+        // What the headers are, the header lines after
+        // `Host: 127.0.0.1:8080`, and the cause, or `None` for a session
+        // that runs.
+        let cases: [(&str, &str, Option<&str>); 24] = [
+            (
+                "foreign origin",
+                "Origin: http://evil.example\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "null origin",
+                "Origin: null\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "https origin",
+                "Origin: https://127.0.0.1:8080\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "loopback origin on another port",
+                "Origin: http://127.0.0.1:28086\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "another loopback name",
+                "Origin: http://localhost:8080\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "origin with a path",
+                "Origin: http://127.0.0.1:8080/\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "empty origin",
+                "Origin:\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "repeated origin",
+                "Origin: http://127.0.0.1:8080\r\nOrigin: http://127.0.0.1:8080\r\n\
+                 Content-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "foreign origin and text/plain",
+                "Origin: http://evil.example\r\nContent-Type: text/plain\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            ("missing content-type", "", Some(JSON_REQUIRED)),
+            (
+                "text/plain",
+                "Content-Type: text/plain\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "text/plain with a charset",
+                "Content-Type: text/plain;charset=UTF-8\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "form-urlencoded",
+                "Content-Type: application/x-www-form-urlencoded\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "multipart",
+                "Content-Type: multipart/form-data; boundary=b\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "json-patch",
+                "Content-Type: application/json-patch+json\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "json as a parameter",
+                "Content-Type: text/plain; application/json\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "empty content-type",
+                "Content-Type:\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "repeated content-type",
+                "Content-Type: application/json\r\nContent-Type: application/json\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "own origin and text/plain",
+                "Origin: http://127.0.0.1:8080\r\nContent-Type: text/plain\r\n",
+                Some(JSON_REQUIRED),
+            ),
+            (
+                "application/json",
+                "Content-Type: application/json\r\n",
+                None,
+            ),
+            (
+                "json in another case with a charset",
+                "Content-Type: Application/JSON; charset=utf-8\r\n",
+                None,
+            ),
+            (
+                "json, then a space before the parameter",
+                "Content-Type: application/json ; charset=utf-8\r\n",
+                None,
+            ),
+            (
+                "own origin",
+                "Origin: http://127.0.0.1:8080\r\nContent-Type: application/json\r\n",
+                None,
+            ),
+            (
+                "own origin in another case",
+                "Origin: HTTP://127.0.0.1:8080\r\nContent-Type: application/json\r\n",
+                None,
+            ),
+        ];
+        for backend in ["mumps", "rust", "compare"] {
+            for (what, headers, cause) in cases {
+                let head = format!(
+                    "POST /api/{backend}/session HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n{headers}"
+                );
+                let expected = cause.map_or_else(|| ran(backend), refused);
+                assert_eq!(
+                    answer(request_of(&head, body)?)?,
+                    expected,
+                    "{backend}: {what}"
+                );
+            }
+        }
+        // Heads naming their host otherwise: an absolute-form authority
+        // stands in for `Host` (RFC 9112 3.2.2), and an HTTP/1.0 request
+        // without either takes any loopback origin.
+        let named: [(&str, Option<&str>); 4] = [
+            (
+                "POST http://localhost:8080/api/rust/session HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\
+                 Origin: http://localhost:8080\r\nContent-Type: application/json\r\n",
+                None,
+            ),
+            (
+                "POST http://localhost:8080/api/rust/session HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\
+                 Origin: http://127.0.0.1:8080\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+            (
+                "POST /api/rust/session HTTP/1.0\r\n\
+                 Origin: http://localhost:9999\r\nContent-Type: application/json\r\n",
+                None,
+            ),
+            (
+                "POST /api/rust/session HTTP/1.0\r\n\
+                 Origin: http://evil.example\r\nContent-Type: application/json\r\n",
+                Some(ORIGIN_NOT_ALLOWED),
+            ),
+        ];
+        for (head, cause) in named {
+            let expected = cause.map_or_else(|| ran("rust"), refused);
+            assert_eq!(answer(request_of(head, body)?)?, expected, "{head:?}");
+        }
+        // Refused before the `Content-Length` and body checks: whatever the
+        // body, or with none.
+        let without_body = |headers: &str| -> Result<HttpRequest, String> {
+            let head =
+                format!("POST /api/rust/session HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n{headers}\r\n");
+            let (method, target, _, _, session_refusal) = parse_head(head.as_bytes())?;
+            Ok((method.to_string(), target, None, session_refusal))
+        };
+        assert_eq!(
+            answer(without_body("Content-Type: text/plain\r\n")?)?,
+            refused(JSON_REQUIRED)
+        );
+        assert_eq!(
+            answer(without_body("Content-Type: application/json\r\n")?)?,
+            refused("CONTENT-LENGTH REQUIRED")
+        );
+        let malformed = request_of(
+            "POST /api/mumps/session HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\
+             Origin: http://evil.example\r\nContent-Type: application/json\r\n",
+            br#"{"inputs": ["#,
+        )?;
+        assert_eq!(answer(malformed)?, refused(ORIGIN_NOT_ALLOWED));
+        // The 404s of routing, `/api/status` and the static paths answer
+        // as they would with the page's own headers.
+        let foreign = "Origin: http://evil.example\r\nContent-Type: text/plain\r\n";
+        let rows: [(&str, &str, u16, String); 4] = [
+            (
+                "POST",
+                "/api/java/session",
+                404,
+                error_body(UNKNOWN_BACKEND),
+            ),
+            ("GET", "/api/rust/session", 404, error_body(POST_REQUIRED)),
+            ("POST", "/api/rust/other", 404, error_body(NOT_FOUND)),
+            ("GET", "/api/status", 200, status_body(&mumps)),
+        ];
+        for (method, target, status, json) in rows {
+            let head = format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n{foreign}");
+            assert_eq!(
+                answer(request_of(&head, body)?)?,
+                (status, JSON_TYPE, json),
+                "{method} {target}"
+            );
+        }
+        let app_js = request_of(
+            &format!("GET /app.js HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n{foreign}"),
+            b"",
+        )?;
+        let (status, content_type, _) = route(app_js, &store, &mumps);
+        assert_eq!(
+            (status, content_type),
+            (200, "text/javascript; charset=utf-8")
+        );
+        scratch.close()
+    }
+
     #[test]
     fn every_status_written_with_hardening_headers() -> Result<(), String> {
         let statuses = [
             (200, "OK"),
             (400, "Bad Request"),
             (404, "Not Found"),
-            (422, "Unprocessable Content"),
             (500, "Internal Server Error"),
             (502, "Bad Gateway"),
         ];
@@ -4187,6 +5356,7 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 } else {
                     br#"{"error":"X"}"#
                 };
+                // The policy keyword spans two lines, as in `HARDENING_HEADERS`.
                 let mut expected = format!(
                     "HTTP/1.1 {status} {reason}\r\n\
                      Content-Type: application/json; charset=utf-8\r\n\
@@ -4194,7 +5364,15 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                      X-Content-Type-Options: nosniff\r\n\
                      Cache-Control: no-store\r\n\
                      X-Frame-Options: DENY\r\n\
-                     Content-Security-Policy: frame-ancestors 'none'\r\n\
+                     Content-Security-Policy: default-src 'none'; script-src 'self'; \
+                     style-src 'self'; style-src-attr 'un\
+                     safe-hashes' \
+                     'sha256-Y7ZmQ5m28wE8jcqdbLGWsIcASPs3rdYQ4sSRGpNAYyM=' \
+                     'sha256-1JfHihHzCPzuxf9mPkYHhm4qQbvGqSuA1OMJN2czR2g=' \
+                     'sha256-Msy28pTshKBAl09/8Nf4ytgl6hESNb9q6acgEEFKDKI='; \
+                     connect-src 'self'; img-src 'self'; object-src 'none'; \
+                     base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
+                     Referrer-Policy: no-referrer\r\n\
                      Connection: close\r\n\r\n"
                 )
                 .into_bytes();
@@ -4209,13 +5387,94 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         Ok(())
     }
 
+    /// The `style` attribute values of `frontend/index.html`, in document
+    /// order, each with the `style-src-attr` hash source that admits it: the
+    /// base64 SHA-256 of the value.
+    const INDEX_STYLE_HASHES: [(&str, &str); 3] = [
+        (
+            "display: grid",
+            "'sha256-Y7ZmQ5m28wE8jcqdbLGWsIcASPs3rdYQ4sSRGpNAYyM='",
+        ),
+        (
+            "grid-area: 1 / 1",
+            "'sha256-1JfHihHzCPzuxf9mPkYHhm4qQbvGqSuA1OMJN2czR2g='",
+        ),
+        (
+            "grid-area: 1 / 1; visibility: hidden",
+            "'sha256-Msy28pTshKBAl09/8Nf4ytgl6hESNb9q6acgEEFKDKI='",
+        ),
+    ];
+
+    #[test]
+    fn inline_styles_of_index_html_are_the_hashed_ones() -> Result<(), String> {
+        let html = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("frontend")
+                .join("index.html"),
+        )
+        .map_err(io_text)?;
+        // ASCII lowercasing keeps every byte offset, so a position found in
+        // `lower` also slices `html`.
+        let lower = html.to_ascii_lowercase();
+        let mut values = Vec::new();
+        for (at, name) in lower.match_indices("style=") {
+            let (value, _) = html
+                .get(at + name.len()..)
+                .and_then(|rest| rest.strip_prefix('"'))
+                .and_then(|quoted| quoted.split_once('"'))
+                .ok_or_else(|| format!("style attribute at byte {at} is not double-quoted"))?;
+            values.push(value);
+        }
+        let listed: Vec<&str> = INDEX_STYLE_HASHES.iter().map(|(value, _)| *value).collect();
+        assert_eq!(values, listed, "style attribute values of index.html");
+        let policy = HARDENING_HEADERS
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Security-Policy: "))
+            .ok_or("no Content-Security-Policy header")?;
+        let admitted: Vec<&str> = policy
+            .split("; ")
+            .find_map(|directive| directive.strip_prefix("style-src-attr "))
+            .ok_or("no style-src-attr directive")?
+            .split(' ')
+            .filter(|source| source.starts_with("'sha256-"))
+            .collect();
+        let hashes: Vec<&str> = INDEX_STYLE_HASHES.iter().map(|(_, hash)| *hash).collect();
+        assert_eq!(admitted, hashes, "style-src-attr hashes");
+        // The policy blocks inline script and every other inline style, so
+        // the page may hold neither.
+        assert!(
+            !lower.contains("<style"),
+            "index.html holds a style element"
+        );
+        for (at, _) in lower.match_indices("<script") {
+            let tag = lower
+                .get(at..)
+                .and_then(|rest| rest.split_once('>'))
+                .map(|(tag, _)| tag)
+                .ok_or_else(|| format!("unterminated script tag at byte {at}"))?;
+            assert!(tag.contains(" src="), "inline script at byte {at}: {tag}");
+        }
+        let handler = lower.split_ascii_whitespace().find(|word| {
+            word.split_once('=').is_some_and(|(name, _)| {
+                name.len() > 2
+                    && name.starts_with("on")
+                    && name.bytes().all(|b| b.is_ascii_lowercase())
+            })
+        });
+        assert_eq!(handler, None, "index.html holds an inline event handler");
+        Ok(())
+    }
+
     #[test]
     fn head_requests_answered_as_get_without_content() -> Result<(), String> {
         let store = Store::from_zwr("").map_err(|e| e.to_string())?;
-        // No case reaches a backend, so no capture is read.
+        // No case reaches a session backend; only `/api/status` reads the
+        // golden folder, an empty scratch folder here.
+        let scratch = Scratch::new()?;
         let mumps = MumpsMode::Replay {
-            golden_dir: PathBuf::new(),
+            golden_dir: scratch.path().to_path_buf(),
         };
+        let status = status_body(&mumps).into_bytes();
         let app_js = fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("frontend")
@@ -4227,14 +5486,14 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         let post_required = error_body(POST_REQUIRED).into_bytes();
         let malformed = error_body(&format!("{BAD_REQUEST}: MALFORMED REQUEST LINE")).into_bytes();
         let missing_host = error_body(&format!("{BAD_REQUEST}: MISSING HOST")).into_bytes();
-        let request = |line: &str| format!("{line} HTTP/1.1\r\nHost: h\r\n\r\n");
-        // (request, status line, content type, the body a GET gets, whether
+        let request = |line: &str| format!("{line} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        // (request, status line, content type, the answer's body, whether
         // the answer leaves that body out)
         let cases = [
             (request("GET /app.js"), "200 OK", js_type, &app_js, false),
             (request("HEAD /app.js"), "200 OK", js_type, &app_js, true),
             (
-                request("HEAD http://h/app.js"),
+                request("HEAD http://localhost/app.js"),
                 "200 OK",
                 js_type,
                 &app_js,
@@ -4245,6 +5504,22 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 "404 Not Found",
                 JSON_TYPE,
                 &post_required,
+                true,
+            ),
+            (
+                request("GET /api/status"),
+                "200 OK",
+                JSON_TYPE,
+                &status,
+                false,
+            ),
+            // `/api/status` answers only `GET`: its `HEAD` is the 404
+            // `GET REQUIRED`, written without content.
+            (
+                request("HEAD /api/status"),
+                "404 Not Found",
+                JSON_TYPE,
+                &get_required,
                 true,
             ),
             // Method tokens are case-sensitive: `head` is not `HEAD`.
@@ -4320,30 +5595,106 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
                 "for {request_line}"
             );
         }
+        scratch.close()
+    }
+
+    /// A fixture failure of `serve` keeps the kind and the text of
+    /// `load_fixtures`, which name the file, behind `cannot load fixtures: `:
+    /// a malformed line, and a fixtures folder that does not exist.
+    #[test]
+    fn fixture_failure_labelled_cannot_load_fixtures() -> Result<(), String> {
+        let scratch = Scratch::new()?;
+        scratch.write("fixtures", "bad.zwr", "ZWR\n^X(1)=\"a\"\n^X(01)=\"b\"\n")?;
+        let malformed = scratch.path().join("fixtures");
+        let absent = scratch.path().join("absent");
+        let cases = [
+            (
+                &malformed,
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cannot load fixtures: {}: MALFORMED ZWR LINE 3: ",
+                    malformed.join("bad.zwr").display()
+                ),
+            ),
+            (
+                &absent,
+                io::ErrorKind::NotFound,
+                format!("cannot load fixtures: {}: cannot read: ", absent.display()),
+            ),
+        ];
+        for (fixtures, kind, start) in cases {
+            match load_store(fixtures) {
+                Err(e) => {
+                    assert_eq!(e.kind(), kind, "{e:?}");
+                    let text = e.to_string();
+                    assert!(text.starts_with(&start), "{text:?} should start {start:?}");
+                }
+                Ok(store) => {
+                    return Err(format!("{} loaded as {store:?}", fixtures.display()));
+                }
+            }
+        }
+        scratch.close()
+    }
+
+    /// A failure of `serve_until` after the store loaded keeps its kind and
+    /// its text, which names the step, behind `serving failed: `.
+    #[test]
+    fn serving_failure_labelled_serving_failed() -> Result<(), String> {
+        // EBADF, a listener descriptor that is no longer valid, as the accept
+        // loop returns it.
+        let Err(accept) = accept_retry_delay(io::Error::from_raw_os_error(9)) else {
+            return Err("EBADF was retried".to_string());
+        };
+        // A listener that cannot be made non-blocking, returned as it is.
+        let nonblocking = io::Error::from(io::ErrorKind::PermissionDenied);
+        for failure in [accept, nonblocking] {
+            let (kind, text) = (failure.kind(), failure.to_string());
+            let labelled = serving_failed(failure);
+            assert_eq!(labelled.kind(), kind, "kind kept");
+            assert_eq!(labelled.to_string(), format!("serving failed: {text}"));
+        }
         Ok(())
     }
 
     #[test]
     fn accept_errors_retried_or_returned() -> Result<(), String> {
         let retried = [
-            (io::Error::from(io::ErrorKind::WouldBlock), POLL),
-            (io::Error::from(io::ErrorKind::Interrupted), Duration::ZERO),
+            (
+                io::Error::from(io::ErrorKind::WouldBlock),
+                AcceptRetry::After(POLL),
+            ),
+            (
+                io::Error::from(io::ErrorKind::Interrupted),
+                AcceptRetry::After(Duration::ZERO),
+            ),
             (
                 io::Error::from(io::ErrorKind::ConnectionAborted),
-                Duration::ZERO,
+                AcceptRetry::After(Duration::ZERO),
             ),
             // EPROTO: one pending connection failed a protocol check.
-            (io::Error::from_raw_os_error(71), Duration::ZERO),
+            (
+                io::Error::from_raw_os_error(71),
+                AcceptRetry::After(Duration::ZERO),
+            ),
+            // ENOMEM, ENOBUFS, ENFILE and EMFILE: memory, or the system's or
+            // the process's open files, ran out.
+            (io::Error::from_raw_os_error(12), AcceptRetry::BackOff),
+            (io::Error::from_raw_os_error(105), AcceptRetry::BackOff),
+            (io::Error::from_raw_os_error(23), AcceptRetry::BackOff),
+            (io::Error::from_raw_os_error(24), AcceptRetry::BackOff),
         ];
         for (error, expected) in retried {
-            let kind = error.kind();
-            let delay =
-                accept_retry_delay(error).map_err(|e| format!("{kind:?} not retried: {e}"))?;
-            assert_eq!(delay, expected, "retry delay after {kind:?}");
+            let described = error.to_string();
+            let retry =
+                accept_retry_delay(error).map_err(|e| format!("{described} not retried: {e}"))?;
+            assert_eq!(retry, expected, "retry after {described}");
         }
-        // EMFILE, a full descriptor table, and a refused permission.
+        // EBADF, a listener descriptor no longer valid, EINVAL, a socket
+        // that is not listening, and a refused permission.
         let unexpected = [
-            io::Error::from_raw_os_error(24),
+            io::Error::from_raw_os_error(9),
+            io::Error::from_raw_os_error(22),
             io::Error::from(io::ErrorKind::PermissionDenied),
         ];
         for error in unexpected {
@@ -4359,6 +5710,34 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn exhaustion_pauses_double_from_poll_up_to_their_cap() {
+        let ms = Duration::from_millis;
+        // The pause after `previous`, at the edges of the range.
+        let cases = [
+            (Duration::ZERO, POLL),
+            (ms(600), MAX_BACKOFF),
+            (MAX_BACKOFF, MAX_BACKOFF),
+            (Duration::MAX, MAX_BACKOFF),
+        ];
+        for (previous, expected) in cases {
+            assert_eq!(
+                next_backoff(previous),
+                expected,
+                "the pause after {previous:?}"
+            );
+        }
+        // One shortage from its start: doubling from `POLL`, then the cap.
+        let mut pause = Duration::ZERO;
+        let mut pauses = Vec::new();
+        for _ in 0..12 {
+            pause = next_backoff(pause);
+            pauses.push(pause);
+        }
+        let expected = [10, 20, 40, 80, 160, 320, 640, 1000, 1000, 1000, 1000, 1000].map(ms);
+        assert_eq!(pauses, expected, "the pauses of one shortage");
     }
 
     #[test]
@@ -4705,7 +6084,7 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
             let fail = |what: &str, e: io::Error| format!("{what}: {e}");
             let mut waiting = TcpStream::connect(addr).map_err(|e| fail("connect", e))?;
             waiting
-                .write_all(b"GET /no-such-path HTTP/1.1\r\nHost: x\r\n\r\n")
+                .write_all(b"GET /no-such-path HTTP/1.1\r\nHost: localhost\r\n\r\n")
                 .and_then(|()| waiting.set_read_timeout(Some(Duration::from_millis(500))))
                 .map_err(|e| fail("send the request", e))?;
             let mut buf = [0u8; 4096];
@@ -4789,6 +6168,291 @@ docker_exec_args=["--user","vehu","synthetic","X=1"]
         assert!(
             still_open <= LIMIT,
             "{still_open} workers open past the bound"
+        );
+        Ok(())
+    }
+
+    /// The store and the MUMPS mode of the accept-loop tests: an empty
+    /// store, and replay from no captures.
+    fn empty_backends() -> Result<(Arc<Store>, Arc<MumpsMode>), String> {
+        let store = Store::from_zwr("").map_err(|e| e.to_string())?;
+        let mumps = MumpsMode::Replay {
+            golden_dir: PathBuf::new(),
+        };
+        Ok((Arc::new(store), Arc::new(mumps)))
+    }
+
+    /// The status line of the response on `stream`, read up to its CRLF or
+    /// the end of input.
+    fn status_line(stream: &mut TcpStream) -> Result<String, String> {
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !received.windows(2).any(|pair| pair == b"\r\n") {
+            let n = read_some(stream, &mut buf).map_err(|e| format!("read the response: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+        }
+        let text = String::from_utf8_lossy(&received);
+        Ok(text.lines().next().unwrap_or_default().to_string())
+    }
+
+    #[test]
+    fn accept_loop_serves_once_a_shortage_passes() -> Result<(), String> {
+        let fail = |what: &str, e: io::Error| format!("{what}: {e}");
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| fail("bind", e))?;
+        let addr = listener.local_addr().map_err(|e| fail("local_addr", e))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| fail("set nonblocking", e))?;
+        // Pending before the loop starts, in this order, so the first two
+        // accepts that reach the listener take them.
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut client = TcpStream::connect(addr).map_err(|e| fail("connect", e))?;
+            client
+                .write_all(b"GET /no-such-path HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .and_then(|()| client.set_read_timeout(Some(IO_TIMEOUT)))
+                .map_err(|e| fail("send the request", e))?;
+            clients.push(client);
+        }
+        let (store, mumps) = empty_backends()?;
+        let shutdown = AtomicBool::new(false);
+        let mut workers = Vec::new();
+        // The pauses of the shortages before the first client is taken; the
+        // next one would be the cap.
+        let pauses = [1u32, 2, 4, 8, 16, 32, 64].map(|n| POLL.saturating_mul(n));
+        // ENOMEM, ENOBUFS, ENFILE and EMFILE in turn, then the listener with
+        // the first client, then EMFILE again, then the listener.
+        let mut script = EXHAUSTION_ERRNOS
+            .into_iter()
+            .cycle()
+            .take(pauses.len())
+            .map(Some)
+            .chain([None, Some(24)]);
+        let mut calls: Vec<Instant> = Vec::new();
+        let started = Instant::now();
+        let (answered, served) = thread::scope(|scope| -> Result<_, String> {
+            let serving = thread::Builder::new()
+                .spawn_scoped(scope, || {
+                    let accept = || -> io::Result<TcpStream> {
+                        calls.push(Instant::now());
+                        match script.next().flatten() {
+                            Some(code) => Err(io::Error::from_raw_os_error(code)),
+                            None => listener.accept().map(|(stream, _)| stream),
+                        }
+                    };
+                    accept_loop(
+                        accept,
+                        &store,
+                        &mumps,
+                        &shutdown,
+                        &mut workers,
+                        MAX_CONNECTIONS,
+                    )
+                })
+                .map_err(io_text)?;
+            let answered: Result<Vec<(String, Duration)>, String> = clients
+                .iter_mut()
+                .map(|client| status_line(client).map(|line| (line, started.elapsed())))
+                .collect();
+            // Set on every path, so the loop always ends and is joined.
+            shutdown.store(true, Ordering::SeqCst);
+            let served = serving
+                .join()
+                .map_err(|_| "the accept loop panicked".to_string())?;
+            Ok((answered, served))
+        })?;
+        let stopped = stop_workers(workers);
+        served.map_err(|e| format!("the accept loop ended: {e}"))?;
+        stopped.map_err(io_text)?;
+        let answered = answered?;
+        println!("answered after {answered:?}");
+        assert_eq!(answered.len(), 2, "both clients answered");
+        for (line, _) in &answered {
+            assert!(line.starts_with("HTTP/1.1 404 "), "status line {line:?}");
+        }
+        // The gap from each accept to the next: the first `pauses.len()`
+        // follow the shortages before the first client, and the one after
+        // the first client's accept follows the shortage after it.
+        let gaps: Vec<Duration> = calls
+            .iter()
+            .zip(calls.iter().skip(1))
+            .map(|(before, after)| after.duration_since(*before))
+            .collect();
+        assert!(
+            gaps.len() > pauses.len() + 1,
+            "{} accepts, too few to reach the second client",
+            calls.len()
+        );
+        for (gap, pause) in gaps.iter().zip(pauses) {
+            assert!(*gap >= pause, "accepted {gap:?} into a {pause:?} pause");
+        }
+        let paused: Duration = pauses.iter().sum();
+        let first = answered.first().map(|(_, took)| *took);
+        // The margin allows for a loaded host.
+        assert!(
+            first.is_some_and(|took| took >= paused && took < IO_TIMEOUT),
+            "first answered after {first:?}, with {paused:?} of pauses"
+        );
+        // Once the first client got its worker, a shortage starts its pauses
+        // again at `POLL`; without that reset this pause would be the cap.
+        let after_reset = gaps.get(pauses.len() + 1).copied();
+        assert!(
+            after_reset.is_some_and(|gap| gap >= POLL && gap < MAX_BACKOFF / 2),
+            "accepted {after_reset:?} after the shortage that followed a worker"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accept_loop_pause_ends_within_a_poll_of_shutdown_or_a_worker_failure() -> Result<(), String>
+    {
+        // The pause after the eighth shortage in a row is the cap.
+        const SHORTAGES: usize = 8;
+        let (store, mumps) = empty_backends()?;
+        for worker_fails in [false, true] {
+            let trigger = if worker_fails {
+                "a worker failure"
+            } else {
+                "shutdown"
+            };
+            let shutdown = AtomicBool::new(false);
+            let release = Arc::new(AtomicBool::new(false));
+            let mut workers = Vec::new();
+            // The worker's client stays open, so only `release` ends it.
+            let mut peer = None;
+            if worker_fails {
+                let (client, control) = loopback_pair()?;
+                peer = Some(client);
+                let release = Arc::clone(&release);
+                let worker = thread::Builder::new()
+                    .spawn(move || -> io::Result<()> {
+                        let started = Instant::now();
+                        while !release.load(Ordering::SeqCst) && started.elapsed() < IO_TIMEOUT * 2
+                        {
+                            thread::sleep(POLL);
+                        }
+                        Err(io::Error::new(io::ErrorKind::PermissionDenied, "worker"))
+                    })
+                    .map_err(io_text)?;
+                workers.push((worker, control));
+            }
+            let calls = AtomicUsize::new(0);
+            let (seen, took, served) = thread::scope(|scope| -> Result<_, String> {
+                let serving = thread::Builder::new()
+                    .spawn_scoped(scope, || {
+                        let accept = || -> io::Result<TcpStream> {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Err(io::Error::from_raw_os_error(24))
+                        };
+                        accept_loop(
+                            accept,
+                            &store,
+                            &mumps,
+                            &shutdown,
+                            &mut workers,
+                            MAX_CONNECTIONS,
+                        )
+                    })
+                    .map_err(io_text)?;
+                let started = Instant::now();
+                while calls.load(Ordering::SeqCst) < SHORTAGES && started.elapsed() < IO_TIMEOUT {
+                    thread::sleep(POLL / 2);
+                }
+                let seen = calls.load(Ordering::SeqCst);
+                let triggered = Instant::now();
+                if worker_fails {
+                    release.store(true, Ordering::SeqCst);
+                } else {
+                    shutdown.store(true, Ordering::SeqCst);
+                }
+                while !serving.is_finished() && triggered.elapsed() < IO_TIMEOUT {
+                    thread::sleep(POLL / 2);
+                }
+                let took = triggered.elapsed();
+                // Set on every path, so the loop always ends and is joined.
+                shutdown.store(true, Ordering::SeqCst);
+                let served = serving
+                    .join()
+                    .map_err(|_| "the accept loop panicked".to_string())?;
+                Ok((seen, took, served))
+            })?;
+            let stopped = stop_workers(workers);
+            drop(peer);
+            stopped.map_err(io_text)?;
+            println!("{trigger} after {seen} shortages ended the loop in {took:?}");
+            assert!(
+                seen >= SHORTAGES,
+                "{trigger}: only {seen} shortages before it"
+            );
+            let expected = if worker_fails {
+                Err((io::ErrorKind::PermissionDenied, "worker".to_string()))
+            } else {
+                Ok(())
+            };
+            assert_eq!(
+                served.map_err(|e| (e.kind(), e.to_string())),
+                expected,
+                "{trigger} ends the loop"
+            );
+            // A pause slept out whole would end near `MAX_BACKOFF`; the
+            // margin allows for a loaded host.
+            assert!(
+                took < MAX_BACKOFF / 2,
+                "{trigger}: the loop ended {took:?} after it, in a {MAX_BACKOFF:?} pause"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn accept_loop_fatal_failure_after_a_pause_ends_serving() -> Result<(), String> {
+        let (store, mumps) = empty_backends()?;
+        let shutdown = AtomicBool::new(false);
+        let mut workers = Vec::new();
+        let mut calls: Vec<Instant> = Vec::new();
+        let ebadf = io::Error::from_raw_os_error(9);
+        let (kind, text) = (
+            ebadf.kind(),
+            format!("accepting a connection failed: {ebadf}"),
+        );
+        // EMFILE, then EBADF; a loop that retried EBADF ends at the next
+        // accept.
+        let accept = || -> io::Result<TcpStream> {
+            calls.push(Instant::now());
+            match calls.len() {
+                1 => Err(io::Error::from_raw_os_error(24)),
+                2 => Err(io::Error::from_raw_os_error(9)),
+                _ => {
+                    shutdown.store(true, Ordering::SeqCst);
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                }
+            }
+        };
+        let served = accept_loop(
+            accept,
+            &store,
+            &mumps,
+            &shutdown,
+            &mut workers,
+            MAX_CONNECTIONS,
+        );
+        assert_eq!(
+            served.map_err(|e| (e.kind(), e.to_string())),
+            Err((kind, text)),
+            "EBADF ends the loop"
+        );
+        assert_eq!(calls.len(), 2, "no accept after EBADF");
+        let gap = calls
+            .iter()
+            .zip(calls.iter().skip(1))
+            .map(|(before, after)| after.duration_since(*before))
+            .next();
+        assert!(
+            gap.is_some_and(|gap| gap >= POLL),
+            "EBADF {gap:?} after EMFILE, within its {POLL:?} pause"
         );
         Ok(())
     }

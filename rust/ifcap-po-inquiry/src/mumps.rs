@@ -528,14 +528,60 @@ pub(crate) fn order<S: Ord + Clone + Default>(
 // READ and WRITE
 // ---------------------------------------------------------------------------
 
+/// The most bytes one session's transcript holds: 1 MiB, the size of the
+/// live-mode output limit `LIVE_OUTPUT_LIMIT` in `src/bridge.rs`.
+///
+/// The original has no such limit: `G EN30` [PRCHRPT.m:75] asks for the next
+/// order after every display, so each repetition of a found order's inputs
+/// writes one more display, without end. The limit has no MUMPS counterpart;
+/// it follows CWE-400, Uncontrolled Resource Consumption
+/// (<https://cwe.mitre.org/data/definitions/400.html>), so that one request
+/// cannot make a session write and hold output in proportion to its input,
+/// and bounds its work only through that output (`SPEC.md` O-15). A write
+/// that would pass the limit appends nothing, and the session ends as when
+/// input runs out: cut after its last prompt, with no `\n` (`SPEC.md` K15).
+/// A session under the limit writes exactly the bytes it would without it.
+pub(crate) const SESSION_OUTPUT_LIMIT: usize = 1_048_576;
+
 /// The principal device of one session: typed lines in, transcript out,
 /// with M's `$X` (column) and `$Y` (line) tracked as the original's output
 /// moves them.
 ///
 /// The original is captured without a terminal, so typed input is never
-/// echoed: a READ leaves the transcript, `$X` and `$Y` unchanged. Form feed
-/// (`W @IOF`) is not modelled, because the HOME device's `IOF` is unresolved
-/// (open item O-01); `inquiry.rs` returns the BLOCKED branch ID there.
+/// echoed: a READ leaves the transcript, `$X` and `$Y` unchanged. Every
+/// character written, a control character included, advances `$X` by one:
+/// "Generally, YottaDB increments `$X` for every character written to and
+/// read from the current device" (YottaDB Programmer's Guide, Intrinsic
+/// Special Variables, `$X`,
+/// <https://docs.yottadb.com/ProgrammersGuide/isv.html#x>), and by default
+/// "YottaDB does not screen output for escape sequences" (Input/Output
+/// Processing, `FILTER`,
+/// <https://docs.yottadb.com/ProgrammersGuide/ioproc.html#filter>).
+///
+/// [`Session::read`] does not count the characters read, which that
+/// sentence also covers: the input is piped (`docker exec -i`, no `-t`) and
+/// never echoed, so nothing read reaches the transcript, and `$X` and `$Y`
+/// stay as the prompt left them. The captures show that a READ does not end
+/// the record in progress: after the halt prompt `ENTER '^' TO HALT: ` is
+/// read at PRCHDP2.m:10, `W @IOF` at PRCHDP2.m:42 writes the LF that ends
+/// it before its FF (`0A 0C`), and after the final `P.O./REQ.NO.: ` is read
+/// every capture ends with the process-exit `\n` (`SPEC.md` K14). Their
+/// `$X>0` tests, in [`Session::form_feed`] and in the normal-completion arm
+/// of `run` in `inquiry.rs`, are the only exercised uses of `$X` between a
+/// READ and the next `W !`, and the prompt has already left `$X` above 0, so
+/// whether a read character also counts in `$X` is not observed.
+///
+/// The form feed `W @IOF`, with the HOME device's `IOF` `#` (PRCHDP1.m:12,
+/// PRCHDP2.m:42), is [`Session::form_feed`], and the position reset of the
+/// device open `^%ZIS` is [`Session::reset_position`]; both leave `$Y` at 0.
+///
+/// The transcript never holds more than [`SESSION_OUTPUT_LIMIT`] bytes. The
+/// first write that would take it past the limit, and every write after it,
+/// appends nothing, while `$X` and `$Y` still move as that write moves them,
+/// so the session decides as it would without the limit until it ends.
+/// [`Session::output_limit_crossed`] reports it; the caller then issues no
+/// further READ and ends the session after the last prompt written before
+/// that write.
 #[derive(Debug)]
 pub(crate) struct Session<'a> {
     inputs: &'a [String],
@@ -543,6 +589,12 @@ pub(crate) struct Session<'a> {
     out: String,
     x: usize,
     y: usize,
+    /// The byte length of the transcript when the last READ was issued, 0
+    /// before any READ.
+    prompt_end: usize,
+    /// Set by the first write that would take the transcript past
+    /// [`SESSION_OUTPUT_LIMIT`]; from then on nothing is appended.
+    limit_crossed: bool,
 }
 
 impl<'a> Session<'a> {
@@ -556,6 +608,8 @@ impl<'a> Session<'a> {
             out: String::new(),
             x: 0,
             y: 0,
+            prompt_end: 0,
+            limit_crossed: false,
         }
     }
 
@@ -564,36 +618,72 @@ impl<'a> Session<'a> {
     /// there). A READ never times out, so the timeout branches stay
     /// unexercised.
     ///
+    /// Every READ, including one that finds no input left, records the
+    /// transcript length as the prompt position that
+    /// [`Session::into_transcript_at_prompt`] cuts at, so the cut lands
+    /// after the prompt the READ answered. Once
+    /// [`Session::output_limit_crossed`] is true the caller issues no READ,
+    /// so that position stays at the last prompt written before the limit.
+    ///
     /// Uses: `R X:DTIME` at PRCHDP2.m:10 (PO-25) and PRCHDP2.m:41 (PO-38),
     /// and FileMan's prompt reads at DIC11.m:17 (PO-05, PO-09).
     pub(crate) fn read(&mut self) -> Option<String> {
+        self.prompt_end = self.out.len();
         let line = self.inputs.get(self.next)?.clone();
         self.next = self.next.saturating_add(1);
         Some(line)
     }
 
+    /// Whether `len` more bytes may be appended to the transcript. The first
+    /// refusal, for a write that would take the transcript past
+    /// [`SESSION_OUTPUT_LIMIT`], marks the limit crossed, and every call
+    /// after it refuses, whatever its length.
+    fn admit(&mut self, len: usize) -> bool {
+        if !self.limit_crossed && self.out.len().saturating_add(len) > SESSION_OUTPUT_LIMIT {
+            self.limit_crossed = true;
+        }
+        !self.limit_crossed
+    }
+
+    /// Whether a write has been refused because it would take the transcript
+    /// past [`SESSION_OUTPUT_LIMIT`]. The session must then end after the
+    /// last prompt written, as when input runs out.
+    pub(crate) fn output_limit_crossed(&self) -> bool {
+        self.limit_crossed
+    }
+
     /// M `WRITE "text"`: appends `text` and advances `$X` by its character
-    /// count.
+    /// count. Past [`SESSION_OUTPUT_LIMIT`] it appends nothing and still
+    /// advances `$X`.
     pub(crate) fn write(&mut self, text: &str) {
-        self.out.push_str(text);
+        if self.admit(text.len()) {
+            self.out.push_str(text);
+        }
         self.x = self.x.saturating_add(text.chars().count());
     }
 
     /// M `WRITE !`: appends a newline, sets `$X` to 0 and adds 1 to `$Y`.
+    /// Past [`SESSION_OUTPUT_LIMIT`] it appends nothing and still moves both.
     pub(crate) fn nl(&mut self) {
-        self.out.push('\n');
+        if self.admit(1) {
+            self.out.push('\n');
+        }
         self.x = 0;
         self.y = self.y.saturating_add(1);
     }
 
     /// M `WRITE ?col`: when `$X` is below `col`, appends spaces up to column
-    /// `col` and sets `$X` to `col`; otherwise writes nothing.
+    /// `col` and sets `$X` to `col`; otherwise writes nothing. Past
+    /// [`SESSION_OUTPUT_LIMIT`] it appends nothing and still sets `$X`.
     ///
     /// Uses: every column position of the display, for example `?37` at
     /// PRCHDP1.m:15 (PO-10) and `?67` at PRCHDP2.m:53 (PO-27).
     pub(crate) fn tab(&mut self, col: usize) {
         if self.x < col {
-            self.out.extend(repeat_n(' ', col - self.x));
+            let pad = col - self.x;
+            if self.admit(pad) {
+                self.out.extend(repeat_n(' ', pad));
+            }
             self.x = col;
         }
     }
@@ -608,6 +698,54 @@ impl<'a> Session<'a> {
         self.write("\u{7}");
     }
 
+    /// M `SET $X=0,$Y=0`: moves the virtual cursor to column 0, line 0 and
+    /// writes nothing. YottaDB permits an M routine to SET `$X` and `$Y`, and
+    /// "SET `$X` does not automatically issue device commands or escape
+    /// sequences to reposition the physical cursor" (YottaDB Programmer's
+    /// Guide, Intrinsic Special Variables, `$X` and `$Y`,
+    /// <https://docs.yottadb.com/ProgrammersGuide/isv.html#x>).
+    ///
+    /// Uses: the HOME device open of `^%ZIS` (PO-12), which sets both before
+    /// and after its open execute, `U IO S $X=0,$Y=0` [ZIS4GTM.m:35] and the
+    /// TRM reset `S:'(IO=IO(0)&'$D(IO("S"))&'$D(ZTQUEUED)) $X=0,$Y=0`
+    /// [ZIS1.m:25].
+    pub(crate) fn reset_position(&mut self) {
+        self.x = 0;
+        self.y = 0;
+    }
+
+    /// M `WRITE #`, the form feed `W @IOF` of a device whose `IOF` is `#`:
+    /// "`#` Sets `$X` and `$Y` to zero (0), and terminates the logical record
+    /// in progress" (YottaDB Programmer's Guide, Input/Output Processing,
+    /// Maintenance of `$X` and `$Y`,
+    /// <https://docs.yottadb.com/ProgrammersGuide/ioproc.html#maintenance-of-x-and-y>).
+    /// A record is in progress when `$X` is above 0, and is terminated by one
+    /// LF, the record terminator of the principal device; then FF is written,
+    /// with no LF after it, and `$X` and `$Y` become 0.
+    ///
+    /// The captures judge the bytes: after the READ of `ENTER '^' TO HALT: `
+    /// [PRCHDP2.m:10] the WRITE `@IOF,!!` [PRCHDP2.m:42] gives `0A 0C 0A 0A`.
+    /// The sequential-device table of the same chapter gives `WRITE #` as
+    /// `<FF>,<LF>`, which does not match them (`SPEC.md` "Places the
+    /// original looks wrong").
+    ///
+    /// Past [`SESSION_OUTPUT_LIMIT`] it appends nothing and still sets `$X`
+    /// and `$Y` to 0; the LF and FF are admitted or refused together.
+    ///
+    /// Uses: `W:$Y>0 @IOF` at PRCHDP1.m:12 (PO-10) and the column header
+    /// `HDR` at PRCHDP2.m:42 (PO-26).
+    pub(crate) fn form_feed(&mut self) {
+        let record_in_progress = self.x > 0;
+        if self.admit(if record_in_progress { 2 } else { 1 }) {
+            if record_in_progress {
+                self.out.push('\n');
+            }
+            self.out.push('\u{c}');
+        }
+        self.x = 0;
+        self.y = 0;
+    }
+
     /// M `$X`: the current column.
     pub(crate) fn x(&self) -> usize {
         self.x
@@ -619,7 +757,8 @@ impl<'a> Session<'a> {
     }
 
     /// Everything written so far. Test-only: a session's transcript leaves
-    /// production code once, through [`Session::into_transcript`].
+    /// production code once, through [`Session::into_transcript`] or
+    /// [`Session::into_transcript_at_prompt`].
     #[cfg(test)]
     pub(crate) fn transcript(&self) -> &str {
         &self.out
@@ -628,6 +767,22 @@ impl<'a> Session<'a> {
     /// Ends the session and returns everything written.
     pub(crate) fn into_transcript(self) -> String {
         self.out
+    }
+
+    /// Ends the session after the last prompt written: everything written
+    /// after the last READ is dropped. A session that never READ gives `""`.
+    /// Used when input runs out or an unimplemented branch is reached (AAP
+    /// session-end rule).
+    pub(crate) fn into_transcript_at_prompt(self) -> String {
+        // `prompt_end` is always an earlier `out.len()` and `out` only grows,
+        // so the `get` check succeeds and the owned buffer is truncated in
+        // place with no copy; the whole transcript is the non-panicking
+        // fallback should that ever stop holding.
+        let mut out = self.out;
+        if out.get(..self.prompt_end).is_some() {
+            out.truncate(self.prompt_end);
+        }
+        out
     }
 }
 
@@ -902,6 +1057,9 @@ mod tests {
             ("19.995", 6, Some(3), "19.995"),
             ("2.5", 3, Some(0), "  3"),
             (".4", 3, Some(0), "  0"),
+            ("-1.005", 0, Some(2), "-1.01"),
+            ("-2.5", 3, Some(0), " -3"),
+            ("-.25", 5, Some(1), " -0.3"),
             ("", 7, Some(2), "   0.00"),
             ("007", 4, None, " 007"),
             ("12345678", 3, None, "12345678"),
@@ -937,6 +1095,48 @@ mod tests {
     }
 
     #[test]
+    fn control_characters_count_in_x_and_reset_position_writes_nothing() {
+        let inputs: Vec<String> = Vec::new();
+        let mut session = Session::new(&inputs);
+        session.nl();
+        session.write("AB");
+        session.write("\u{1b}[?5i");
+        assert_eq!((session.x(), session.y()), (7, 1));
+        session.reset_position();
+        assert_eq!((session.x(), session.y()), (0, 0));
+        assert_eq!(session.transcript(), "\nAB\u{1b}[?5i");
+        session.tab(3);
+        assert_eq!(session.into_transcript(), "\nAB\u{1b}[?5i   ");
+    }
+
+    #[test]
+    fn form_feed_terminates_record_in_progress_then_writes_ff() {
+        let inputs = vec![String::new()];
+        // A record in progress: the prompt, then its READ, which moves
+        // nothing; `W #` writes LF and FF, and `$X` and `$Y` become 0.
+        let mut session = Session::new(&inputs);
+        session.nl();
+        session.tab(8);
+        session.write("ENTER '^' TO HALT: ");
+        assert_eq!(session.read(), Some(String::new()));
+        session.form_feed();
+        assert_eq!((session.x(), session.y()), (0, 0));
+        session.nl();
+        session.nl();
+        assert_eq!(
+            session.into_transcript(),
+            "\n        ENTER '^' TO HALT: \n\u{c}\n\n"
+        );
+        // At column 0 no record is in progress: FF alone.
+        let mut session = Session::new(&inputs);
+        session.write("LINE");
+        session.nl();
+        session.form_feed();
+        assert_eq!((session.x(), session.y()), (0, 0));
+        assert_eq!(session.into_transcript(), "LINE\n\u{c}");
+    }
+
+    #[test]
     fn read_returns_none_when_exhausted() {
         let inputs = vec![String::new(), "^".to_string()];
         let mut session = Session::new(&inputs);
@@ -946,5 +1146,154 @@ mod tests {
         assert_eq!(session.read(), None);
         assert_eq!(session.transcript(), "");
         assert_eq!((session.x(), session.y()), (0, 0));
+    }
+
+    #[test]
+    fn prompt_cut_drops_output_after_last_read() {
+        let inputs = vec!["x".to_string()];
+        let mut session = Session::new(&inputs);
+        session.write("A: ");
+        assert_eq!(session.read(), Some("x".to_string()));
+        session.write("ECHO");
+        assert_eq!(session.into_transcript_at_prompt(), "A: ");
+
+        let mut session = Session::new(&inputs);
+        session.write("A: ");
+        assert_eq!(session.read(), Some("x".to_string()));
+        session.nl();
+        session.write("B: ");
+        assert_eq!(session.read(), None);
+        session.write("TAIL");
+        assert_eq!(session.into_transcript_at_prompt(), "A: \nB: ");
+    }
+
+    #[test]
+    fn prompt_cut_without_read_is_empty() {
+        let inputs: Vec<String> = Vec::new();
+        let mut session = Session::new(&inputs);
+        session.write("TEXT");
+        assert_eq!(session.into_transcript_at_prompt(), "");
+    }
+
+    #[test]
+    fn prompt_cut_after_exhausted_read() {
+        let inputs: Vec<String> = Vec::new();
+        let mut session = Session::new(&inputs);
+        session.write("P: ");
+        assert_eq!(session.read(), None);
+        session.write("X");
+        assert_eq!(session.into_transcript_at_prompt(), "P: ");
+    }
+
+    #[test]
+    fn prompt_cut_off_boundary_keeps_whole_transcript() {
+        let inputs: Vec<String> = Vec::new();
+        let cases = [("P: ", 4), ("\u{e9}", 1)];
+        for (out, prompt_end) in cases {
+            let session = Session {
+                inputs: &inputs,
+                next: 0,
+                out: out.to_string(),
+                x: 0,
+                y: 0,
+                prompt_end,
+                limit_crossed: false,
+            };
+            assert_eq!(
+                session.into_transcript_at_prompt(),
+                out,
+                "into_transcript_at_prompt with out {out:?}, prompt_end {prompt_end}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_limit_refuses_the_write_that_would_pass_it() {
+        // After a prompt and its READ, the transcript is filled to one byte
+        // below the limit. A 1-byte write reaches the limit exactly and is
+        // appended; a 2-byte write would pass it, so it appends nothing and
+        // signals the limit, and so does every write after it, while `$X`
+        // and `$Y` move as without the limit. The cut stays after the prompt.
+        let inputs = vec!["x".to_string(), "y".to_string()];
+        let filled = SESSION_OUTPUT_LIMIT - 1;
+        for (last, crossed, kept) in [("B", false, SESSION_OUTPUT_LIMIT), ("BC", true, filled)] {
+            let mut session = Session::new(&inputs);
+            session.write("P: ");
+            assert_eq!(session.read(), Some("x".to_string()));
+            session.write(&"A".repeat(filled - "P: ".len()));
+            assert_eq!(session.transcript().len(), filled);
+            assert!(!session.output_limit_crossed());
+            session.write(last);
+            assert_eq!(session.output_limit_crossed(), crossed, "write {last:?}");
+            assert_eq!(session.transcript().len(), kept, "write {last:?}");
+            assert_eq!(session.x(), filled + last.len(), "write {last:?}");
+            if crossed {
+                session.nl();
+                session.tab(5);
+                session.bell();
+                session.form_feed();
+                session.write("D");
+                assert_eq!((session.x(), session.y()), (1, 0));
+                assert_eq!(session.transcript().len(), filled);
+                assert!(session.output_limit_crossed());
+            }
+            let cut = session.into_transcript_at_prompt();
+            assert_eq!(cut, "P: ", "write {last:?}");
+            assert!(cut.len() <= SESSION_OUTPUT_LIMIT);
+        }
+    }
+
+    #[test]
+    fn output_limit_counts_every_byte_of_tab_and_form_feed() {
+        // Each case writes a prompt and READs it, then fills the transcript to
+        // `below` bytes under the limit, ending at a column above 0 or, after
+        // a `W !`, at column 0. A `tab` to the column 2 past `$X` pads 2
+        // bytes; `form_feed` writes LF and FF while a record is in progress
+        // and FF alone at column 0. What reaches the limit exactly is
+        // appended; what would pass it appends nothing and signals the limit,
+        // while `$X` moves to `x` and `$Y` to 0 as without the limit. As the
+        // caller does, the next READ is issued only below the limit, so the
+        // cut ends after the last prompt and never passes the limit.
+        let tab_two: fn(&mut Session<'_>) = |session| session.tab(session.x() + 2);
+        let form_feed: fn(&mut Session<'_>) = |session| session.form_feed();
+        let limit = SESSION_OUTPUT_LIMIT;
+        let cases = [
+            ("tab", 1, false, tab_two, "", true, limit + 1),
+            ("tab", 2, false, tab_two, "  ", false, limit),
+            ("form feed", 1, false, form_feed, "", true, 0),
+            ("form feed", 2, false, form_feed, "\n\u{c}", false, 0),
+            ("form feed", 1, true, form_feed, "\u{c}", false, 0),
+        ];
+        let inputs = vec!["x".to_string(), "y".to_string()];
+        for (op_name, below, at_column_0, op, appended, crossed, x) in cases {
+            let column = if at_column_0 { "$X=0" } else { "$X>0" };
+            let case = format!("{op_name} at LIMIT-{below}, {column}");
+            let before = limit - below;
+            let mut session = Session::new(&inputs);
+            session.write("P: ");
+            assert_eq!(session.read(), Some("x".to_string()));
+            if at_column_0 {
+                session.write(&"A".repeat(before - 1 - "P: ".len()));
+                session.nl();
+            } else {
+                session.write(&"A".repeat(before - "P: ".len()));
+            }
+            assert_eq!(session.transcript().len(), before, "{case}");
+            assert_eq!(session.x() == 0, at_column_0, "{case}");
+            assert!(!session.output_limit_crossed(), "{case}");
+            op(&mut session);
+            assert_eq!(session.output_limit_crossed(), crossed, "{case}");
+            let written = session.transcript();
+            assert_eq!(written.len(), before + appended.len(), "{case}");
+            assert_eq!(written.get(before..), Some(appended), "{case}");
+            assert_eq!((session.x(), session.y()), (x, 0), "{case}");
+            if !session.output_limit_crossed() {
+                assert_eq!(session.read(), Some("y".to_string()), "{case}");
+            }
+            let cut = session.into_transcript_at_prompt();
+            let kept = if crossed { "P: ".len() } else { limit };
+            assert_eq!(cut.len(), kept, "{case}");
+            assert!(cut.len() <= limit, "{case}");
+        }
     }
 }

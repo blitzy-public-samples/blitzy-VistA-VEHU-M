@@ -1,0 +1,8 @@
+image_digest=worldvista/vehu@sha256:e0710df4ab487831ad84d0383637488da2baa37168ce8ac8e71e8cd039590622
+source_revision=dd3fd0f3124c8178657d9fff4173c324da30f7ae
+snapshot_id=sha256:a8089ad06fcca92d40659c2a1503cd6f4ef829f407df547d939275e6892bace4
+record_ids=442:none
+entry_point=EN3^PRCHRPT
+context={"DUZ":".5","IOF":"#","IOSL":"60","STATION":"500"}
+setup=HOME device 0, IOM=132, IOSL=60; orders loaded by load_orders.sh into a throwaway container, frozen as vehu-snap:gc-base; read-only inquiry. 
+docker_exec_args=su - vehu -c "source /home/vehu/etc/env && yottadb -run %XCMD "S U=\$C(94),DTIME=300,DT=\$\$DT^XLFDT D DUZ^XUP(.5) D EN3^PRCHRPT""

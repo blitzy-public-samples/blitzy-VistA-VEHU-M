@@ -20,6 +20,7 @@ const previousLineCount = new Map();
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 const root = document.documentElement;
+const bridgeStatus = document.getElementById("bridge-status");
 const backendSelect = document.getElementById("backend");
 const transcriptEl = document.getElementById("transcript");
 const mumpsPane = document.getElementById("transcript-mumps");
@@ -31,7 +32,7 @@ const sendButton = document.getElementById("send");
 const exitButton = document.getElementById("exit");
 const errorStatus = document.getElementById("error-status");
 
-const NOT_COMPARED = "NOT COMPARED";
+const BRIDGE_UNREACHABLE = "BRIDGE UNREACHABLE";
 
 // The reaction classes (busy, new, reject) are added only in RUST mode and
 // only without reduced motion; style.css gates them the same way again.
@@ -168,40 +169,56 @@ reduceMotion.addEventListener("change", () => {
 });
 
 // A request that never reached a 2xx answer: the error is shown, the
-// transcripts stay as last rendered, and COMPARE has no result to show.
+// transcripts stay as last rendered, and the COMPARE verdict line is emptied,
+// since there is no verdict to show.
 function showFailure(backend, message) {
   errorStatus.textContent = message;
   if (backend === "compare") {
-    matchStatus.textContent = NOT_COMPARED;
+    matchStatus.textContent = "";
   }
   reject();
 }
 
-// A 2xx answer: every pane it names is prepared before any is committed, so
-// either every pane and the verdict change together or, for a body that
-// cannot be shown, only the error line does.
+// The verdict of one COMPARE 200 body, which the bridge writes as
+// {"mumps": {...}, "rust": {...}, "match": bool} (compare_session in
+// src/bridge.rs). A match that is not a boolean throws, the same as a
+// transcript that is not a string, so it is never shown as a MISMATCH.
+function verdictOf(body) {
+  if (typeof body.match !== "boolean") {
+    throw new TypeError("match is not a boolean");
+  }
+  return body.match ? "MATCH" : "MISMATCH";
+}
+
+// A 2xx answer: every pane it names is prepared, and a COMPARE verdict read,
+// before any pane is committed, so either every pane and the verdict change
+// together or, for a body that cannot be shown, only the error line is set
+// and the COMPARE verdict line is emptied.
 function showSuccess(backend, text) {
   errorStatus.textContent = "";
   try {
     const body = JSON.parse(text);
     if (backend === "compare") {
+      // Only the bridge decides the comparison verdict: the line shows its
+      // boolean match field, and transcripts are never compared here.
+      const verdict = verdictOf(body);
       const mumpsText = transcriptOf(body.mumps);
       const rustText = transcriptOf(body.rust);
-      // Only the bridge decides the comparison verdict: the status line shows
-      // its match field, and transcripts are never compared here.
-      const verdict = body["match"];
       const mumpsRows = prepareRows(mumpsPane, mumpsText, "compare:mumps", false);
       const rustRows = prepareRows(rustPane, rustText, "compare:rust", false);
       commitRows(mumpsRows);
       commitRows(rustRows);
-      matchStatus.textContent =
-        verdict === true ? "MATCH" : verdict === false ? "MISMATCH" : NOT_COMPARED;
+      matchStatus.textContent = verdict;
     } else {
       commitRows(prepareRows(transcriptEl, transcriptOf(body), backend, reactionsOn()));
     }
   } catch (err) {
-    // A 200 is never a rejection, so no shake here.
+    // A 200 is never a rejection, so no shake here, and no verdict stands
+    // beside the error line.
     errorStatus.textContent = "MALFORMED RESPONSE: " + text;
+    if (backend === "compare") {
+      matchStatus.textContent = "";
+    }
   }
 }
 
@@ -225,6 +242,12 @@ async function send() {
   const backend = backendSelect.value;
   const seq = ++requestSeq;
   pending = true;
+  // The verdict line only ever describes the sequence last answered, so it
+  // is empty while a compare is in flight: a 200 sets it again, and an error
+  // leaves it empty.
+  if (backend === "compare") {
+    matchStatus.textContent = "";
+  }
   if (reactionsOn()) {
     sendButton.classList.add("busy");
   }
@@ -275,24 +298,102 @@ async function send() {
   }
 }
 
+// The status line of one GET /api/status body, which the bridge writes as
+// {"mumps_mode": "replay" | "live", "recorded": [...], "ready": [...],
+// "incomplete": {...}} (status_body in src/bridge.rs): the mode, then how
+// many of the five cases are recorded and how many are READY. It throws, as
+// JSON that does not parse does, only when the body is not a non-null
+// object, mumps_mode is not a string, or recorded or ready is not an array.
+// Other members, incomplete included, and the mode's value go unchecked.
+function statusLine(body) {
+  if (
+    body === null ||
+    typeof body !== "object" ||
+    typeof body.mumps_mode !== "string" ||
+    !Array.isArray(body.recorded) ||
+    !Array.isArray(body.ready)
+  ) {
+    throw new TypeError("not a status body");
+  }
+  return (
+    "MUMPS BACKEND: " +
+    body.mumps_mode.toUpperCase() +
+    " RECORDED " +
+    body.recorded.length +
+    " OF 5 READY " +
+    body.ready.length +
+    " OF 5"
+  );
+}
+
+// Fills the status line from GET /api/status (route_api in src/bridge.rs),
+// asked once on load. A failed fetch or body read, a non-2xx answer, or a
+// body statusLine cannot read shows BRIDGE UNREACHABLE. It is not a
+// rejection: no shake, and no other line or request state is touched. It
+// never rejects, so it is fired without waiting or catching. index.html
+// stacks a hidden copy of the zero-captures text in the same grid cell to
+// reserve the line's wrapped height; keep that copy in step with statusLine.
+async function showBridgeStatus() {
+  try {
+    const res = await fetch("/api/status");
+    if (!res.ok) {
+      bridgeStatus.textContent = BRIDGE_UNREACHABLE;
+      return;
+    }
+    bridgeStatus.textContent = statusLine(JSON.parse(await res.text()));
+  } catch {
+    bridgeStatus.textContent = BRIDGE_UNREACHABLE;
+  }
+}
+
 // The typed line goes in unchanged, the empty string included: RETURN
 // answers the station prompt and both display pauses
 // [Packages/IFCAP/Routines/PRCFSITE.m:18] [Packages/IFCAP/Routines/PRCHDP2.m:10, 41].
+// INPUT is then emptied and given focus, so the next answer can be typed at
+// once: a mouse click on SEND moves focus to the button, and keystrokes
+// there would be lost.
 entryForm.addEventListener("submit", (event) => {
   event.preventDefault();
   inputs.push(lineInput.value);
   lineInput.value = "";
+  lineInput.focus();
   send();
 });
 
-exitButton.addEventListener("click", () => {
+// A mouse double-click on SEND is one answer, not two. The second and later
+// clicks of one multi-click (event.detail above 1) are stopped before they
+// submit the form, which would add the emptied INPUT as an extra RETURN, and
+// focus goes back to INPUT, which that click's press moved to the button. A
+// key press, on INPUT or on SEND, clicks with detail 0, and clicks far enough
+// apart each count from 1 again, so each of those still sends one answer.
+sendButton.addEventListener("click", (event) => {
+  if (event.detail > 1) {
+    event.preventDefault();
+    lineInput.focus();
+  }
+});
+
+// EXIT adds only the exit input. Any text typed in INPUT is discarded, not
+// sent, so it cannot follow the exit input on a later RETURN, and INPUT gets
+// focus back from the button. As on SEND, the second and later clicks of one
+// mouse multi-click add nothing and only give INPUT focus back: replay
+// matches the whole input sequence, so an extra "^" would leave a recorded
+// case NOT RECORDED.
+exitButton.addEventListener("click", (event) => {
+  if (event.detail > 1) {
+    lineInput.focus();
+    return;
+  }
   inputs.push(EXIT_INPUT);
+  lineInput.value = "";
+  lineInput.focus();
   send();
 });
 
 // A new backend never shows another backend's transcript or verdict: any
-// request in flight is superseded, every pane is emptied, and the current
-// sequence, an empty one included, is always sent again to the new backend.
+// request in flight is superseded, every pane and the verdict line are
+// emptied, and the current sequence, an empty one included, is always sent
+// again to the new backend. The status line is left as it is.
 backendSelect.addEventListener("change", () => {
   root.dataset.mode = backendSelect.value;
   requestSeq += 1;
@@ -302,11 +403,14 @@ backendSelect.addEventListener("change", () => {
   transcriptEl.replaceChildren();
   mumpsPane.replaceChildren();
   rustPane.replaceChildren();
-  matchStatus.textContent = NOT_COMPARED;
+  matchStatus.textContent = "";
   send();
 });
 
-// Nothing is sent on load: an empty sequence matches no capture, so MUMPS
-// replay would answer 502 while RUST showed the station prompt, and the idle
-// MUMPS and RUST screens must differ only in the selector.
+// On load the only request is GET /api/status, for the status line. No
+// session request is sent, since a reload starts a new session. A later
+// selector change does resend the sequence, so at rest with no captures RUST
+// shows the station prompt where MUMPS shows nothing: the idle-screen check
+// masks the transcript box, selector and status line (SPEC.md conflict K13).
 root.dataset.mode = backendSelect.value;
+showBridgeStatus();

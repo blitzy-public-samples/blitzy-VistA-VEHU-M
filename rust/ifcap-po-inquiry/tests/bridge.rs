@@ -1,49 +1,29 @@
-//! Integration tests of the loopback bridge, driven through its public test
-//! hook `serve_until` over real TCP connections on `127.0.0.1:0`.
+//! Integration tests of the loopback bridge's HTTP contract, driven through
+//! its public entry point `serve` over real TCP connections.
 //!
-//! The `synthetic_*` tests check routing only (static paths, status codes,
-//! error texts, JSON framing and the capture-file rules), except
-//! `synthetic_gc_02_readiness_missing_only_when_absent`, which checks the
-//! readiness rule of the GC-02 check below. Their store is
-//! invented. Each capture directory lives under `std::env::temp_dir()`,
-//! carries `synthetic` in its name and a `SYNTHETIC.txt` marker, and is
-//! removed when its test ends. Its base case is `GC-01/`, and the discovery
-//! checks add later `GC-0N/` entries to pin the order the bridge scans them
-//! in. Each capture's transcript and return value come from `inquire` on
-//! the synthetic store, given the captured session or, where `inquire`
-//! refuses it, the longest prefix of it that `inquire` answers with `Ok`. A
-//! capture the bridge must pass over carries one marked synthetic change,
-//! and the compare and escaping checks add only the differences they assert
-//! on. Synthetic fixtures are never parity evidence. Every expected
-//! Rust-side answer comes from calling `inquire` directly on the same store,
-//! never from a literal.
+//! They prove that the bridge contract holds: status codes and error texts,
+//! the session, compare and status JSON, the boolean `match` rule, exact
+//! static routing, and the exit input the served front-end sends. They are
+//! not parity evidence. Only `end_to_end_real_captures` compares the two
+//! sides on real captures, each READY case reached through
+//! `golden::load_case` on `golden::default_dir()`; every other case prints
+//! `GC-0N NOT COMPARED` and passes.
 //!
-//! `gc_02_end_to_end_compare` is the one check against a real capture,
-//! `tests/golden/ifcap/GC-02/` with the real fixtures, and is reported apart
-//! from the synthetic tests. Without GC-02's prerequisites it prints NOT
-//! COMPARED and passes. Only an absent prerequisite counts as missing. One
-//! that cannot be inspected, behind a denied permission or a link loop for
-//! example, is never missing: when nothing is absent it makes the check
-//! FAIL, as `synthetic_gc_02_readiness_missing_only_when_absent` checks.
+//! Each bridge binds `127.0.0.1:0` and runs `serve` in replay mode over one
+//! golden folder, on a detached thread: `serve` loads this crate's fixtures
+//! once and then serves until the test process ends, so no test stops it.
+//! A test's requests start only once its bridge has answered a first
+//! `GET /api/status`, so their socket timeouts never cover that load.
+//! Every golden folder but the checkout's own is synthetic: written by its
+//! test under `std::env::temp_dir()`, named
+//! `ifcap-po-inquiry-synthetic-<test>-…`, marked by `SYNTHETIC.txt`, read
+//! only by the bridge, and removed when the test ends, on a failure too. A
+//! synthetic capture is never parity evidence.
 //!
-//! HTTP 500 is reached end to end before the BLOCKED branch `PO-12.b1`, the
-//! device gate a found order reaches first: the order lookup (PO-09) reads
-//! nodes after a bare `$D` test, and a node holding only descendants is
-//! `CorruptStore`, for example a candidate order's zero node. `SPEC.md`
-//! "CorruptStore sites" lists the sites.
-//! `synthetic_500_corrupt_store_end_to_end` covers the answer end to end,
-//! and the unit test `inquiry_error_to_response_corrupt_store_500` in
-//! `src/bridge.rs` covers the mapping.
-//!
-//! One answer cannot be reached end to end, so a unit test in
-//! `src/bridge.rs` covers it instead: `match: null` arises only in live
-//! mode, which cannot obtain the original's return value (open item O-06),
-//! and no live session runs here
-//! (`compare_match_null_when_mumps_returned_unavailable`).
-//!
-//! No test sets an environment variable: configuration reaches the bridge
-//! only as `serve_until` arguments. Every test binds its own port and uses
-//! its own directory, so the tests also run in parallel.
+//! No test sets or reads an environment variable: configuration reaches the
+//! bridge only as `serve` arguments. Every bridge has its own folder and its
+//! own port, a test that starts several included, so the tests also run in
+//! parallel.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -51,66 +31,69 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::DirBuilderExt;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ifcap_po_inquiry::bridge::{
-    MumpsMode, normalise, parse_normalisation, serve_until, split_input_lines,
-};
-use ifcap_po_inquiry::store::load_fixtures;
-use ifcap_po_inquiry::{InquiryError, Store, StoreError, inquire};
+use ifcap_po_inquiry::bridge::{MumpsMode, serve};
+use ifcap_po_inquiry::golden::{CASE_IDS, CaseLoad, EXIT_INPUT, Readiness, default_dir, load_case};
 
-/// Read and write timeout of every client connection.
+/// Read and write timeout of every client connection but the two below.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long [`with_server`] waits, once it has set the shutdown flag, for
-/// the server thread to finish.
-const STOP_BOUND: Duration = Duration::from_secs(5);
-/// The bound `synthetic_shutdown_joins_within_bound` holds the server to.
-const SHUTDOWN_BOUND: Duration = Duration::from_secs(2);
-/// A session the 404 tests, several 502 tests and the shutdown test send:
-/// RETURN at the station prompt and `^` at the order prompt. The replay side
-/// never runs it, so any sequence that round-trips through
-/// `split_input_lines` would do.
-const SESSION_INPUTS: [&str; 2] = ["", "^"];
+/// Read and write timeout of the `GET /api/status` with which [`start`]
+/// waits for a new bridge's first answer. That request waits in the
+/// listener's backlog while `serve` loads the fixtures, seconds of work in
+/// a debug build and longer on a loaded host.
+const READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Read and write timeout of the session request of
+/// `rust_session_stops_at_the_output_limit`, which the bridge answers only
+/// after hundreds of displays, seconds of work in a debug build and longer
+/// on a loaded host.
+const LIMIT_SESSION_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a failed request waits for the bridge thread to end, so that
+/// the failure can carry what `serve` returned.
+const SERVER_END_WAIT: Duration = Duration::from_millis(500);
+
+/// The detached thread running one bridge's `serve`.
+type Server = JoinHandle<io::Result<()>>;
 
 // ---------------------------------------------------------------------------
-// Synthetic directories and store
+// Synthetic golden folders
 // ---------------------------------------------------------------------------
 
-/// Text of `SYNTHETIC.txt` in every synthetic directory.
+/// Text of `SYNTHETIC.txt` in every synthetic golden folder.
 const SYNTHETIC_MARKER: &str = "\
-SYNTHETIC ROUTING FIXTURE
-Created by tests/bridge.rs of the ifcap-po-inquiry crate for one routing
-test, and removed when that test ends. It is not a capture of the original
+SYNTHETIC GOLDEN FOLDER
+Created by tests/bridge.rs of the ifcap-po-inquiry crate for one bridge
+test, and removed when that test ends. It holds no capture of the original
 system and is never parity evidence.
 ";
 
-/// Distinguishes directories created in the same nanosecond.
+/// Distinguishes folders created in the same nanosecond.
 static SYNTHETIC_SERIAL: AtomicUsize = AtomicUsize::new(0);
 
-/// Runs `body` with one test's own capture directory under
+/// Runs `body` with one test's own golden folder under
 /// `std::env::temp_dir()`, named
 /// `ifcap-po-inquiry-synthetic-<test>-<pid>-<nanos>-<serial>` and marked by
-/// `SYNTHETIC.txt`. The directory is the `golden_dir` of the test's bridge.
-/// Its base synthetic case is `GC-01/`, the first case the bridge scans; the
-/// discovery checks add later `GC-0N/` entries beside it.
+/// `SYNTHETIC.txt`.
 ///
-/// The directory is acquired exclusively before `body` runs. Each attempt
-/// takes a fresh `<nanos>` and `<serial>` and creates that one name,
-/// non-recursively and with mode `0o700` so that only the owner can enter
-/// it. The creation fails on any existing entry, a symbolic link included,
-/// without following it, and such an entry is never reused, followed or
-/// removed: the next name is tried instead, up to `ATTEMPTS` names.
+/// The folder is acquired exclusively before `body` runs. Each attempt takes
+/// a fresh `<nanos>` and `<serial>` and creates that one name,
+/// non-recursively and with mode `0o700`, so only the owner can enter it.
+/// Creation fails on any existing entry, a symbolic link included, without
+/// following it, and such an entry is never reused or removed: the next name
+/// is tried instead, up to `ATTEMPTS` names.
 ///
-/// Removal of only the path this call created is attempted on every exit
-/// of `body`: `Ok`, `Err` or a panic. A panic is resumed after that
-/// attempt, whatever its outcome. An `Err` from writing `SYNTHETIC.txt` or
-/// from `body` takes precedence over a removal failure, which is returned
-/// only when `body` succeeded. A directory `body` has already removed is
-/// not an error.
+/// Each folder error this function returns starts with `<test>: ` and names
+/// the path concerned, followed by the I/O cause where there is one: the
+/// name it could not create, the base folder when no name was free, or the
+/// folder it could not remove.
+///
+/// Removal of only the path this call created is attempted on every exit of
+/// `body`: `Ok`, `Err` or a panic, which is resumed after that attempt. An
+/// `Err` from `body` takes precedence over a removal failure, which is
+/// returned only when `body` succeeded.
 fn with_synthetic_dir<T>(
     test: &str,
     body: impl FnOnce(&Path) -> Result<T, String>,
@@ -134,12 +117,18 @@ fn with_synthetic_dir<T>(
                 break;
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(format!("{test}: creating the synthetic directory: {e}")),
+            Err(e) => {
+                return Err(format!(
+                    "{test}: creating the synthetic folder {}: {e}",
+                    candidate.display()
+                ));
+            }
         }
     }
     let Some(root) = acquired else {
         return Err(format!(
-            "{test}: no unused synthetic directory name after {ATTEMPTS} attempts"
+            "{test}: no unused synthetic folder name under {} after {ATTEMPTS} attempts",
+            base.display()
         ));
     };
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -147,9 +136,10 @@ fn with_synthetic_dir<T>(
         body(&root)
     }));
     let removed = match fs::remove_dir_all(&root) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => {
-            Err(format!("{test}: removing the synthetic directory: {e}"))
-        }
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(format!(
+            "{test}: removing the synthetic folder {}: {e}",
+            root.display()
+        )),
         _ => Ok(()),
     };
     match outcome {
@@ -158,375 +148,308 @@ fn with_synthetic_dir<T>(
     }
 }
 
-fn case_path(root: &Path, case: &str, name: &str) -> PathBuf {
-    root.join(case).join(name)
-}
-
-/// [`case_path`] in `GC-01/`, the base synthetic case and the first case
-/// the bridge scans.
-fn case_file(root: &Path, name: &str) -> PathBuf {
-    case_path(root, "GC-01", name)
-}
-
 /// Writes `bytes` to `rel` under `root`, creating its parents. Errors name
 /// `rel`, never the temporary path. Creating the parents with
-/// `create_dir_all` is safe because they lie inside the owner-only root
-/// that [`with_synthetic_dir`] acquired exclusively, where no other user can
-/// place an entry first.
-fn write_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+/// `create_dir_all` is safe because they lie inside the owner-only root that
+/// [`with_synthetic_dir`] acquired exclusively.
+fn write_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
     let path = root.join(rel);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("creating the parent of synthetic {rel}: {e}"))?;
     }
-    fs::write(&path, bytes).map_err(|e| format!("writing synthetic {rel}: {e}"))?;
-    Ok(path)
+    fs::write(&path, bytes).map_err(|e| format!("writing synthetic {rel}: {e}"))
 }
 
-fn replay(root: &Path) -> MumpsMode {
-    MumpsMode::Replay {
-        golden_dir: root.to_path_buf(),
-    }
-}
+/// The Rust side's whole transcript for the exit input alone, and for no
+/// input: the station prompt, `SPEC.md` "Stubs". `^` at the station prompt
+/// is the unimplemented branch PO-05.b2, and an empty sequence runs out of
+/// input there, so either session ends after that prompt, whether or not
+/// `cases.zwr` exists.
+const STATION_PROMPT_TRANSCRIPT: &str = "\n\n\nSelect STATION NUMBER ('^' TO EXIT): 500// ";
 
-/// Live mode over the synthetic directory `root`, in a container that does
-/// not exist.
-fn live(root: &Path) -> MumpsMode {
-    MumpsMode::Live {
-        container: "synthetic-no-such-container".to_string(),
-        golden_dir: root.to_path_buf(),
-    }
-}
+/// The station prompt with a station number the Rust side never writes: the
+/// transcript of a READY capture that differs from the Rust side.
+const DIFFERING_TRANSCRIPT: &str = "\n\n\nSelect STATION NUMBER ('^' TO EXIT): 501// ";
 
-/// An invented store for the routing tests, taken from no snapshot: the
-/// site file with two stations, 500 the primary one; the institution entry
-/// 500; and the purchase-order file header with no order.
-///
-/// The `^PRC(442,0)` header is the only node of file 442 here, and is kept
-/// although the store is meant to hold no purchase-order data: the order
-/// lookup tests it before prompting, and without it every session reaching
-/// the order prompt stops at `UnsupportedBranch("PO-09.b15")`, so neither
-/// `^` nor `?` would be read there. No order record or index entry is
-/// added, as the repository snapshot holds no order. The site-context stubs
-/// read none of this, which is why every expectation comes from `inquire`.
-const SYNTHETIC_ZWR: &str = r#"SYNTHETIC routing store of tests/bridge.rs: invented, not a capture, never parity evidence
-ZWR
-^DIC(4,500,0)="SYNTHETIC INSTITUTION 500"
-^PRC(411,0)="SYNTHETIC SITE PARAMETER^411I^501^2"
-^PRC(411,500,0)="500^Y"
-^PRC(411,501,0)="501^N"
-^PRC(411,"AC","Y",500)=""
-^PRC(411,"B",500,500)=""
-^PRC(411,"B",501,501)=""
-^PRC(442,0)="PROCUREMENT & ACCOUNTING TRANSACTIONS^442I^^0"
-"#;
+/// A READY capture transcript that the Rust side never writes and that the
+/// case's own rule would rewrite: [`DIFFERING_TRANSCRIPT`], a BEL, and one
+/// span from the rule's open delimiter through its close delimiter. A replay
+/// answer holding it byte for byte is the capture's raw transcript, neither
+/// the Rust side's nor rewritten by a rule.
+const RAW_TRANSCRIPT: &str = "\n\n\nSelect STATION NUMBER ('^' TO EXIT): 501// \u{7}<<SYNTHETIC-OPEN 12:00 SYNTHETIC-CLOSE>>";
 
-fn synthetic_store() -> Result<Store, String> {
-    Store::from_zwr(SYNTHETIC_ZWR)
-        .map_err(|e| format!("SYNTHETIC_ZWR does not load: {}", store_error_cause(&e)))
-}
+/// A capture context that `golden::validate_context` accepts: the two
+/// resolved stub constants, and values for `IOF` and `IOSL`, which stay
+/// unresolved while open item O-01 stands and so accept any value.
+const SYNTHETIC_CONTEXT: &str = r##"{"DUZ":".5","IOF":"#","IOSL":"60","STATION":"500"}"##;
 
-fn strings(items: &[&str]) -> Vec<String> {
-    items.iter().map(|item| (*item).to_string()).collect()
-}
+/// [`SYNTHETIC_CONTEXT`] with `DUZ` `1`, which `golden::validate_context`
+/// rejects.
+const DUZ_1_CONTEXT: &str = r##"{"DUZ":"1","IOF":"#","IOSL":"60","STATION":"500"}"##;
 
-/// The captured form of `inputs`: each input followed by one `\n`.
-fn capture_form(inputs: &[String]) -> String {
-    let mut text = String::new();
-    for input in inputs {
-        text.push_str(input);
-        text.push('\n');
-    }
-    text
-}
+/// One normalisation rule whose delimiters no Rust transcript holds.
+const SYNTHETIC_RULES: &str = "<<SYNTHETIC-OPEN\tSYNTHETIC-CLOSE>>\n";
 
-/// The first input of `read_back` that differs from `inputs`, 1-based, or
-/// the count past the shorter list; `None` when the lists are equal.
-fn first_differing_input(read_back: &[String], inputs: &[String]) -> Option<usize> {
-    if read_back == inputs {
-        return None;
-    }
-    let same = read_back
-        .iter()
-        .zip(inputs)
-        .take_while(|(a, b)| a == b)
-        .count();
-    Some(same.saturating_add(1))
-}
+/// [`SYNTHETIC_RULES`] with a space where the tab belongs: a rule line
+/// without a tab, which `golden::parse_normalisation` rejects. A case holding
+/// it fails `normalisation_parses` and no other check.
+const MALFORMED_RULES: &str = "<<SYNTHETIC-OPEN SYNTHETIC-CLOSE>>\n";
 
-/// A synthetic session that `inquire` answers with `Ok`, as its inputs, its
-/// transcript and its return value: the first candidate sequence that
-/// `inquire` answers with `Ok` on `store` and whose captured form reads back
-/// through `split_input_lines` unchanged. The candidates shrink because
-/// station acceptance or the order prompt may be BLOCKED by `SPEC.md`;
-/// `Err` is the NOT RUN reason, naming each candidate by its number.
-fn ok_case(store: &Store) -> Result<(Vec<String>, String, Option<String>), String> {
-    let candidates: [&[&str]; 3] = [&["", "^"], &[""], &[]];
-    let mut refusals: Vec<String> = Vec::new();
-    for (number, candidate) in (1usize..).zip(candidates) {
-        let inputs = strings(candidate);
-        let read_back = split_input_lines(&capture_form(&inputs));
-        if let Some(input) = first_differing_input(&read_back, &inputs) {
-            refusals.push(format!(
-                "candidate {number}: input {input} does not round-trip split_input_lines"
-            ));
-            continue;
-        }
-        match inquire(store, &inputs) {
-            Ok(output) => return Ok((inputs, output.transcript, output.returned)),
-            Err(InquiryError::UnsupportedBranch(id)) => {
-                refusals.push(format!("candidate {number}: UnsupportedBranch({id})"));
-            }
-            Err(InquiryError::CorruptStore(_)) => {
-                refusals.push(format!("candidate {number}: CorruptStore"));
-            }
-        }
-    }
-    Err(format!(
-        "NOT RUN: inquire refuses every candidate input ({})",
-        refusals.join(", ")
-    ))
-}
+/// One valid rule, open `EXIT): ` and close `// `, whose span both
+/// [`STATION_PROMPT_TRANSCRIPT`] and [`DIFFERING_TRANSCRIPT`] hold: by
+/// `SPEC.md` "Normalisation" each becomes
+/// `\n\n\nSelect STATION NUMBER ('^' TO <NORM>`, so their one difference, the
+/// station number, lies inside the span.
+const ACTIVE_RULES: &str = "EXIT): \t// \n";
 
-/// [`ok_case`], or `None` after printing the NOT RUN reason for `test`.
-fn ok_case_or_not_run(test: &str, store: &Store) -> Option<(Vec<String>, String, Option<String>)> {
-    match ok_case(store) {
-        Ok(case) => Some(case),
-        Err(reason) => {
-            println!("{test}: {reason}");
-            None
-        }
-    }
-}
+/// [`DIFFERING_TRANSCRIPT`] with `CODE` for `NUMBER`, a second difference
+/// from the Rust side's transcript that lies outside every span of
+/// [`ACTIVE_RULES`]: it becomes `\n\n\nSelect STATION CODE ('^' TO <NORM>`,
+/// still unequal to the Rust side's after the rule.
+const OUTSIDE_SPAN_TRANSCRIPT: &str = "\n\n\nSelect STATION CODE ('^' TO EXIT): 501// ";
 
-/// The transcript and return value of a synthetic capture of `inputs`, from
-/// `inquire` on `store`: its answer to the whole session or, when it refuses
-/// that, to the longest prefix of `inputs` it answers with `Ok`, a session
-/// ended by input exhaustion before the input it refuses. `Err` names each
-/// refusal when no prefix, not even the empty one, is answered `Ok`.
-fn inquire_carrier(store: &Store, inputs: &[String]) -> Result<(String, Option<String>), String> {
-    let mut refusals: Vec<String> = Vec::new();
-    for length in (0..=inputs.len()).rev() {
-        let prefix = inputs.get(..length).unwrap_or_default();
-        match inquire(store, prefix) {
-            Ok(output) => return Ok((output.transcript, output.returned)),
-            Err(InquiryError::UnsupportedBranch(id)) => {
-                refusals.push(format!("first {length} inputs: UnsupportedBranch({id})"));
-            }
-            Err(InquiryError::CorruptStore(record)) => {
-                refusals.push(format!("first {length} inputs: CorruptStore({record})"));
-            }
-        }
-    }
-    Err(format!(
-        "inquire refuses every prefix of the synthetic session ({})",
-        refusals.join(", ")
-    ))
-}
+/// The text of both synthetic exports, `db-before.zwr` and `db-after.zwr`.
+const SYNTHETIC_EXPORT: &str = "SYNTHETIC export written by tests/bridge.rs\nZWR\n\
+     ^PRC(442,0)=\"PROCUREMENT & ACCOUNTING TRANSACTIONS^442I^^0\"\n";
 
-/// Writes `<case>/input.txt` in captured form, after confirming it reads
-/// back as `inputs` through `split_input_lines`, so that replay can match.
-fn write_inputs_in(root: &Path, case: &str, inputs: &[String]) -> Result<(), String> {
-    let text = capture_form(inputs);
-    if let Some(input) = first_differing_input(&split_input_lines(&text), inputs) {
-        return Err(format!(
-            "synthetic {case}/input.txt: input {input} does not read back through split_input_lines"
-        ));
-    }
-    write_file(root, &format!("{case}/input.txt"), text.as_bytes())?;
-    Ok(())
-}
-
-/// [`write_inputs_in`] for `GC-01/`, the base synthetic case.
-fn write_inputs(root: &Path, inputs: &[String]) -> Result<(), String> {
-    write_inputs_in(root, "GC-01", inputs)
-}
-
-/// Writes a whole synthetic capture into the case directory `case`.
-/// `returned.txt` is zero bytes for `None`, and otherwise the value with
-/// one trailing newline, which the bridge removes.
-fn write_case_in(
-    root: &Path,
-    case: &str,
-    inputs: &[String],
-    transcript: &str,
-    returned: Option<&str>,
-    normalisation: &str,
-) -> Result<(), String> {
-    write_inputs_in(root, case, inputs)?;
-    write_file(
-        root,
-        &format!("{case}/transcript.txt"),
-        transcript.as_bytes(),
-    )?;
-    let returned = returned
-        .map(|value| format!("{value}\n"))
-        .unwrap_or_default();
-    write_file(root, &format!("{case}/returned.txt"), returned.as_bytes())?;
-    write_file(
-        root,
-        &format!("{case}/normalisation.txt"),
-        normalisation.as_bytes(),
-    )?;
-    Ok(())
-}
-
-/// [`write_case_in`] for `GC-01/`, the base synthetic case.
-fn write_case(
-    root: &Path,
-    inputs: &[String],
-    transcript: &str,
-    returned: Option<&str>,
-    normalisation: &str,
-) -> Result<(), String> {
-    write_case_in(root, "GC-01", inputs, transcript, returned, normalisation)
-}
-
-/// A well-formed capture context whose `IOF` and `IOSL` carry values,
-/// which `STUB_CONTEXT` holds unresolved while open item O-01 stands.
-const SYNTHETIC_CONTEXT: &str = r##"{"DUZ":".5","IOF":"#","IOSL":"24","STATION":"500"}"##;
-
-/// The seven keys of a synthetic `meta.txt`, with `context` and
-/// `docker_exec_args` as given.
-fn meta_text(context: &str, docker_exec_args: &str) -> String {
+/// A synthetic `meta.txt` with all eight keys, one `key=value` line each.
+fn synthetic_meta(context: &str) -> String {
     format!(
-        "image_digest=SYNTHETIC\nsource_revision=SYNTHETIC\nsnapshot_id=SYNTHETIC\n\
-         record_ids=SYNTHETIC\nentry_point=EN3^PRCHRPT\ncontext={context}\n\
-         docker_exec_args={docker_exec_args}\n"
+        "image_digest=synthetic\nsource_revision=synthetic\nsnapshot_id=synthetic\n\
+         record_ids=442:none\nentry_point=EN3^PRCHRPT\ncontext={context}\n\
+         setup=SYNTHETIC folder written by tests/bridge.rs; not a capture\n\
+         docker_exec_args=synthetic-arg-1 synthetic-arg-2\n"
     )
 }
 
-fn write_meta_in(root: &Path, case: &str, text: &[u8]) -> Result<(), String> {
-    write_file(root, &format!("{case}/meta.txt"), text)?;
-    Ok(())
+/// [`synthetic_meta`] of [`SYNTHETIC_CONTEXT`] with a carriage return ending
+/// the `setup` value. `golden::parse_meta` keeps the `\r` in that value, so
+/// all eight keys stay present and the context stays accepted: a case holding
+/// it fails `no_carriage_return` and no other check.
+fn cr_in_setup_meta() -> String {
+    synthetic_meta(SYNTHETIC_CONTEXT).replacen("; not a capture\n", "; not a capture\r\n", 1)
 }
 
-/// Writes a regular file named `case` under `root`, in place of a case
-/// directory: an entry that holds no capture file.
-fn write_case_entry_file(root: &Path, case: &str) -> Result<(), String> {
-    write_file(
-        root,
-        case,
-        b"SYNTHETIC: a regular file in place of a case directory\n",
-    )?;
-    Ok(())
+/// The input sequence of every synthetic capture: the exit input alone.
+fn exit_only() -> Vec<String> {
+    vec![EXIT_INPUT.to_string()]
 }
 
-/// Builds the case entries of one row of a discovery table under the row's
-/// own synthetic root.
-type Layout<'a> = &'a dyn Fn(&Path) -> Result<(), String>;
-
-// ---------------------------------------------------------------------------
-// Server and client
-// ---------------------------------------------------------------------------
-
-/// Sets `shutdown` and waits up to `bound` for the server thread, then
-/// joins it. `Ok` only when `serve_until` returned `Ok(())` within the
-/// bound; a thread still running then is left behind and reported.
-fn stop_server(
-    shutdown: &AtomicBool,
-    handle: JoinHandle<io::Result<()>>,
-    bound: Duration,
+/// Writes the synthetic case `root/<case_id>/` by the capture convention:
+/// `input.txt` holding the one line [`EXIT_INPUT`], `transcript` as
+/// `transcript.txt` with no newline added, a zero-byte `returned.txt`, `meta`
+/// as `meta.txt` and `rules` as `normalisation.txt`, each byte for byte, and
+/// [`SYNTHETIC_EXPORT`] as `db-before.zwr` and, when `with_db_after`, as
+/// `db-after.zwr`. The fixed files hold no carriage return and pass every
+/// check they enter, so the case's readiness depends only on `transcript`,
+/// `meta`, `rules` and `with_db_after`.
+fn write_case_files(
+    root: &Path,
+    case_id: &str,
+    transcript: &str,
+    meta: &str,
+    rules: &str,
+    with_db_after: bool,
 ) -> Result<(), String> {
-    shutdown.store(true, Ordering::SeqCst);
-    let started = Instant::now();
-    while !handle.is_finished() {
-        if started.elapsed() >= bound {
-            return Err(format!(
-                "server stop: serve_until still running {} ms after the shutdown flag was set",
-                bound.as_millis()
-            ));
-        }
-        thread::sleep(Duration::from_millis(5));
+    let file = |name: &str, bytes: &[u8]| write_file(root, &format!("{case_id}/{name}"), bytes);
+    file("input.txt", format!("{EXIT_INPUT}\n").as_bytes())?;
+    file("transcript.txt", transcript.as_bytes())?;
+    file("returned.txt", b"")?;
+    file("meta.txt", meta.as_bytes())?;
+    file("normalisation.txt", rules.as_bytes())?;
+    file("db-before.zwr", SYNTHETIC_EXPORT.as_bytes())?;
+    if with_db_after {
+        file("db-after.zwr", SYNTHETIC_EXPORT.as_bytes())?;
     }
-    match handle.join() {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(format!("server stop: serve_until returned an error: {e}")),
-        Err(_) => Err("server stop: the server thread panicked".to_string()),
-    }
+    Ok(())
 }
 
-/// [`with_server_within`] with the stop bound [`STOP_BOUND`].
-fn with_server<T>(
-    store: Store,
-    mode: MumpsMode,
-    client: impl FnOnce(SocketAddr) -> Result<T, String>,
-) -> Result<T, String> {
-    with_server_within(STOP_BOUND, store, mode, client)
+/// [`write_case_files`] with [`synthetic_meta`] of `context` and
+/// [`SYNTHETIC_RULES`]. With a `transcript` free of carriage returns no file
+/// holds one, so with `with_db_after` and an accepted context the case is
+/// READY; without `db-after.zwr` it is INCOMPLETE on `seven_files_present`
+/// and `db_before_equals_after`.
+fn write_synthetic_case(
+    root: &Path,
+    case_id: &str,
+    transcript: &str,
+    context: &str,
+    with_db_after: bool,
+) -> Result<(), String> {
+    write_case_files(
+        root,
+        case_id,
+        transcript,
+        &synthetic_meta(context),
+        SYNTHETIC_RULES,
+        with_db_after,
+    )
 }
 
-/// Runs `client` against a bridge serving `store` in `mode` on its own
-/// `127.0.0.1:0` port, in its own thread. Stopping the bridge is attempted
-/// on every exit of `client`: `Ok`, `Err` or a panic. It sets the shutdown
-/// flag and waits up to `bound` for the server thread; a thread still
-/// running then is left detached and reported as a stop failure (see
-/// [`stop_server`]). A panic is resumed after that attempt, whatever its
-/// outcome. An `Err` from `client` takes precedence over a stop failure,
-/// which is returned only when `client` succeeded.
-fn with_server_within<T>(
-    bound: Duration,
-    store: Store,
-    mode: MumpsMode,
-    client: impl FnOnce(SocketAddr) -> Result<T, String>,
-) -> Result<T, String> {
+/// The synthetic READY `GC-01`: [`STATION_PROMPT_TRANSCRIPT`] under
+/// [`SYNTHETIC_CONTEXT`], with both exports.
+fn ready_gc01(root: &Path) -> Result<(), String> {
+    write_synthetic_case(
+        root,
+        "GC-01",
+        STATION_PROMPT_TRANSCRIPT,
+        SYNTHETIC_CONTEXT,
+        true,
+    )
+}
+
+/// Leaves the golden folder empty but for its marker: no case folder.
+fn empty_folder(_root: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bridge
+// ---------------------------------------------------------------------------
+
+/// Binds `127.0.0.1:0` and starts `serve` on it in replay mode over
+/// `golden_dir`, on its own named thread, which is never joined unless a
+/// request fails (see [`explain`]), and returns once that bridge has
+/// answered a first request.
+///
+/// The listener is bound before the thread starts, so that first request,
+/// `GET /api/status` with the [`READY_TIMEOUT`], waits in the listener's
+/// backlog while `serve` still loads the fixtures. Any complete response
+/// ends the wait, whatever its status; the caller's own requests, each with
+/// the [`IO_TIMEOUT`], then wait only for their own work. A bridge that
+/// gives no response fails with what `serve` returned (see [`explain`]).
+fn start(golden_dir: &Path) -> Result<(SocketAddr, Server), String> {
     let listener =
         TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind 127.0.0.1:0: {e}"))?;
     let addr = listener
         .local_addr()
         .map_err(|e| format!("local_addr: {e}"))?;
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&shutdown);
-    let handle = thread::Builder::new()
-        .name("synthetic-bridge".to_string())
-        .spawn(move || serve_until(listener, store, mode, flag))
-        .map_err(|e| format!("spawn the server thread: {e}"))?;
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| client(addr)));
-    let stopped = stop_server(&shutdown, handle, bound);
-    match outcome {
-        Ok(result) => result.and_then(|value| stopped.map(|()| value)),
-        Err(payload) => panic::resume_unwind(payload),
+    let mode = MumpsMode::Replay {
+        golden_dir: golden_dir.to_path_buf(),
+    };
+    let server = thread::Builder::new()
+        .name(format!("bridge-{}", addr.port()))
+        .spawn(move || serve(listener, mode))
+        .map_err(|e| format!("spawn the bridge thread: {e}"))?;
+    match http_timed(addr, "GET", "/api/status", None, READY_TIMEOUT) {
+        Ok(_) => Ok((addr, server)),
+        Err(failure) => Err(explain(
+            format!("waiting for the bridge's first answer: {failure}"),
+            server,
+        )),
     }
 }
 
-/// A fresh client connection to `addr` with the 5-second read and write
+/// `failure`, with what `serve` returned when its thread ends within
+/// [`SERVER_END_WAIT`]: a bridge that stopped, because its fixtures did not
+/// load for example, explains the failed request.
+fn explain(failure: String, server: Server) -> String {
+    let started = Instant::now();
+    while !server.is_finished() {
+        if started.elapsed() >= SERVER_END_WAIT {
+            return format!("{failure} (serve is still running)");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    match server.join() {
+        Ok(Ok(())) => format!("{failure} (serve returned Ok)"),
+        Ok(Err(e)) => format!("{failure} (serve failed: {e})"),
+        Err(_) => format!("{failure} (the bridge thread panicked)"),
+    }
+}
+
+/// Runs `client` against a bridge of its own over a synthetic golden folder
+/// of its own, which `setup` fills first (see [`with_synthetic_dir`]). A
+/// failure names `test` and, through [`explain`], what `serve` returned.
+fn with_bridge<T>(
+    test: &str,
+    setup: impl FnOnce(&Path) -> Result<(), String>,
+    client: impl FnOnce(SocketAddr) -> Result<T, String>,
+) -> Result<T, String> {
+    with_synthetic_dir(test, |root| {
+        setup(root).map_err(|e| format!("{test}: {e}"))?;
+        let (addr, server) = start(root).map_err(|e| format!("{test}: {e}"))?;
+        client(addr).map_err(|failure| explain(format!("{test}: {failure}"), server))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/1.1 client
+// ---------------------------------------------------------------------------
+
+/// A fresh client connection to `addr` with `timeout` as its read and write
 /// timeouts.
-fn connect(addr: SocketAddr) -> Result<TcpStream, String> {
+fn connect(addr: SocketAddr, timeout: Duration) -> Result<TcpStream, String> {
     let stream = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
     stream
-        .set_read_timeout(Some(IO_TIMEOUT))
+        .set_read_timeout(Some(timeout))
         .map_err(|e| format!("set read timeout: {e}"))?;
     stream
-        .set_write_timeout(Some(IO_TIMEOUT))
+        .set_write_timeout(Some(timeout))
         .map_err(|e| format!("set write timeout: {e}"))?;
     Ok(stream)
 }
 
-/// Sends one request over a fresh connection and reads its response, as
-/// its status and body. The target is sent literally, so `/../Cargo.toml`
-/// reaches the server as typed; `None` sends an empty body.
+/// Sends one HTTP/1.1 request with `Content-Length` and `Connection: close`
+/// over a fresh connection with the [`IO_TIMEOUT`], and reads its response
+/// as its status and body. The target is sent literally, so
+/// `/../Cargo.toml` reaches the bridge as typed; `None` sends an empty body.
 fn http(
     addr: SocketAddr,
     method: &str,
     target: &str,
     body: Option<&[u8]>,
 ) -> Result<(u16, Vec<u8>), String> {
-    let fail = |what: &str, e: io::Error| format!("{method} {target}: {what}: {e}");
-    let mut stream = connect(addr).map_err(|e| format!("{method} {target}: {e}"))?;
+    http_timed(addr, method, target, body, IO_TIMEOUT)
+}
+
+/// [`http`] over a connection with `timeout` as its read and write
+/// timeouts.
+fn http_timed(
+    addr: SocketAddr,
+    method: &str,
+    target: &str,
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<(u16, Vec<u8>), String> {
+    let mut stream = connect(addr, timeout).map_err(|e| format!("{method} {target}: {e}"))?;
     let body = body.unwrap_or_default();
-    let mut request = format!("{method} {target} HTTP/1.1\r\nHost: {addr}\r\n");
-    let _ = write!(
-        request,
-        "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut request = format!(
+        "{method} {target} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    );
-    let mut bytes = request.into_bytes();
-    bytes.extend_from_slice(body);
-    stream.write_all(&bytes).map_err(|e| fail("send", e))?;
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    stream
+        .write_all(&request)
+        .map_err(|e| format!("{method} {target}: send: {e}"))?;
     read_response(&mut stream).map_err(|e| format!("{method} {target}: {e}"))
 }
 
 fn post_session(addr: SocketAddr, backend: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     http(addr, "POST", &format!("/api/{backend}/session"), Some(body))
+}
+
+/// Sends `head`, the request line and header lines each ending `\r\n`, as
+/// given, then `Content-Length`, `Connection: close` and `body`, over a
+/// fresh connection, and reads its response as its status and body: the
+/// requests [`http`] cannot send, with another `Host`, an `Origin` or
+/// another `Content-Type`. Errors name the request line.
+fn http_with_head(addr: SocketAddr, head: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    let line = head.lines().next().unwrap_or_default();
+    let mut stream = connect(addr, IO_TIMEOUT).map_err(|e| format!("{line}: {e}"))?;
+    let mut request = format!(
+        "{head}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    stream
+        .write_all(&request)
+        .map_err(|e| format!("{line}: send: {e}"))?;
+    read_response(&mut stream).map_err(|e| format!("{line}: {e}"))
 }
 
 /// One `read`, retried on `Interrupted`.
@@ -541,8 +464,9 @@ fn read_some(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize, String> {
 }
 
 /// Reads the status line and headers, then exactly `Content-Length` body
-/// bytes, or everything up to end of stream when that header is absent.
-/// Errors name the part of the response at fault, never its content.
+/// bytes, or everything up to the end of the stream when that header is
+/// absent. Errors name the part of the response at fault, never its
+/// content.
 fn read_response(stream: &mut TcpStream) -> Result<(u16, Vec<u8>), String> {
     let mut received: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
@@ -614,7 +538,7 @@ fn read_response(stream: &mut TcpStream) -> Result<(u16, Vec<u8>), String> {
 
 // ---------------------------------------------------------------------------
 // Test-local JSON: an oracle independent of the bridge's private reader and
-// writer
+// writer (RFC 8259)
 // ---------------------------------------------------------------------------
 
 // A JSON text is checked once by `json_body` and then kept as that text.
@@ -634,7 +558,7 @@ fn json_body(body: &[u8]) -> Result<&str, String> {
 /// Checks that `text` is exactly one JSON value with only whitespace around
 /// it. Strings may hold four-hex-digit Unicode escapes, surrogate pairs
 /// combined; an unpaired surrogate or an unescaped control character is an
-/// error, so a response that leaves BEL or a tab raw fails here.
+/// error, so a response that leaves a BEL raw fails here.
 fn parse_json(text: &str) -> Result<(), String> {
     let bytes = text.as_bytes();
     let end = skip_whitespace(bytes, json_value(bytes, skip_whitespace(bytes, 0))?);
@@ -676,7 +600,7 @@ fn eat(bytes: &[u8], pos: usize, byte: u8) -> Result<usize, String> {
 fn json_value(bytes: &[u8], pos: usize) -> Result<usize, String> {
     match bytes.get(pos) {
         Some(b'{') => json_object(bytes, pos, &mut |_, _, _| {}),
-        Some(b'[') => json_array(bytes, pos),
+        Some(b'[') => json_array(bytes, pos, &mut |_, _| {}),
         Some(b'"') => json_string(bytes, pos).map(|(_, next)| next),
         Some(b't') => json_literal(bytes, pos, "true"),
         Some(b'f') => json_literal(bytes, pos, "false"),
@@ -728,13 +652,22 @@ fn json_number(bytes: &[u8], mut pos: usize) -> Result<usize, String> {
     Ok(pos)
 }
 
-fn json_array(bytes: &[u8], pos: usize) -> Result<usize, String> {
+/// Scans the array that starts at `pos`, calling `visit` with the start and
+/// end of each element, in order.
+fn json_array(
+    bytes: &[u8],
+    pos: usize,
+    visit: &mut dyn FnMut(usize, usize),
+) -> Result<usize, String> {
     let mut pos = skip_whitespace(bytes, eat(bytes, pos, b'[')?);
     if bytes.get(pos) == Some(&b']') {
         return Ok(pos + 1);
     }
     loop {
-        pos = skip_whitespace(bytes, json_value(bytes, skip_whitespace(bytes, pos))?);
+        let start = skip_whitespace(bytes, pos);
+        let end = json_value(bytes, start)?;
+        visit(start, end);
+        pos = skip_whitespace(bytes, end);
         match next_byte(bytes, pos)? {
             (b',', next) => pos = next,
             (b']', next) => return Ok(next),
@@ -848,19 +781,9 @@ fn hex4(bytes: &[u8], mut pos: usize) -> Result<(u32, usize), String> {
 }
 
 /// `text` as a JSON string: `"` and `\` escaped, `\n`, `\r` and `\t` by
-/// name, every other control character as `\u00XX`, and the rest as itself.
+/// name, the remaining C0 controls (U+0000–U+001F) as `\u00xx`, and every
+/// other character, DEL and the C1 controls included, as itself.
 fn json_str(text: &str) -> String {
-    encode_json_string(text, false)
-}
-
-/// [`json_str`] with every non-ASCII character also escaped, as a
-/// four-hex-digit Unicode escape or, beyond the Basic Multilingual Plane, as
-/// a surrogate pair of them.
-fn json_str_ascii(text: &str) -> String {
-    encode_json_string(text, true)
-}
-
-fn encode_json_string(text: &str, ascii_only: bool) -> String {
     let mut out = String::from("\"");
     for c in text.chars() {
         match c {
@@ -870,13 +793,8 @@ fn encode_json_string(text: &str, ascii_only: bool) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if u32::from(c) < 0x20 => {
+                // Writing to a String cannot fail.
                 let _ = write!(out, "\\u{:04x}", u32::from(c));
-            }
-            c if ascii_only && !c.is_ascii() => {
-                let mut units = [0u16; 2];
-                for unit in c.encode_utf16(&mut units) {
-                    let _ = write!(out, "\\u{unit:04x}");
-                }
             }
             c => out.push(c),
         }
@@ -885,19 +803,11 @@ fn encode_json_string(text: &str, ascii_only: bool) -> String {
     out
 }
 
-/// `{"inputs":[...]}` with each input encoded by `encode`.
-fn inputs_body(inputs: &[String], encode: fn(&str) -> String) -> Vec<u8> {
-    let elements: Vec<String> = inputs.iter().map(|input| encode(input)).collect();
-    format!("{{\"inputs\":[{}]}}", elements.join(",")).into_bytes()
-}
-
+/// The session request `{"inputs":[...]}` for `inputs`, each element encoded
+/// by [`json_str`].
 fn body_for(inputs: &[String]) -> Vec<u8> {
-    inputs_body(inputs, json_str)
-}
-
-/// [`body_for`] in pure ASCII, every non-ASCII character escaped.
-fn body_for_ascii(inputs: &[String]) -> Vec<u8> {
-    inputs_body(inputs, json_str_ascii)
+    let elements: Vec<String> = inputs.iter().map(|input| json_str(input)).collect();
+    format!("{{\"inputs\":[{}]}}", elements.join(",")).into_bytes()
 }
 
 /// The value of member `name` of the JSON object `json`, as the text it
@@ -921,17 +831,47 @@ fn member<'j>(json: &'j str, name: &str) -> Result<&'j str, String> {
         .ok_or_else(|| format!("member {name:?}: bytes {value_start}..{value_end} out of range"))
 }
 
+/// The JSON value text `value`, which must be exactly one string, decoded.
+fn string_of(value: &str) -> Result<String, String> {
+    if !value.starts_with('"') {
+        return Err("not a string".to_string());
+    }
+    let (text, end) = json_string(value.as_bytes(), 0)?;
+    if end != value.len() {
+        return Err(json_error("text after the string", end));
+    }
+    Ok(text)
+}
+
+/// The JSON value text `value`, which must be exactly one array of strings,
+/// decoded in order.
+fn strings_of(value: &str) -> Result<Vec<String>, String> {
+    let bytes = value.as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return Err("not an array".to_string());
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    json_array(bytes, 0, &mut |start, end| spans.push((start, end)))?;
+    spans
+        .into_iter()
+        .map(|(start, end)| {
+            value
+                .get(start..end)
+                .ok_or_else(|| json_error("element out of range", start))
+                .and_then(string_of)
+                .map_err(|e| format!("element at byte {start}: {e}"))
+        })
+        .collect()
+}
+
 /// The member `name` of `json` that is a string or `null`, decoded.
 fn optional_str_member(json: &str, name: &str) -> Result<Option<String>, String> {
     let value = member(json, name)?;
     if value == "null" {
         return Ok(None);
     }
-    if !value.starts_with('"') {
-        return Err(format!("member {name:?} is neither a string nor null"));
-    }
-    json_string(value.as_bytes(), 0)
-        .map(|(text, _)| Some(text))
+    string_of(value)
+        .map(Some)
         .map_err(|e| format!("member {name:?}: {e}"))
 }
 
@@ -939,36 +879,135 @@ fn str_member(json: &str, name: &str) -> Result<String, String> {
     optional_str_member(json, name)?.ok_or_else(|| format!("member {name:?} is null, not a string"))
 }
 
-/// The `transcript` and `returned` of one session object.
-fn session_of(json: &str) -> Result<(String, Option<String>), String> {
-    Ok((
-        str_member(json, "transcript")?,
-        optional_str_member(json, "returned")?,
-    ))
+/// The member `name` of `json` that is `true` or `false`.
+fn bool_member(json: &str, name: &str) -> Result<bool, String> {
+    match member(json, name)? {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("member {name:?} is not a boolean")),
+    }
 }
 
-/// Asserts that `resp` has `status` and a JSON body `{"error": string}`, and
-/// returns the error text. Failures name `context`, never the body.
-fn expect_error(resp: &(u16, Vec<u8>), status: u16, context: &str) -> Result<String, String> {
+/// The member `name` of `json` that is an array of strings, decoded.
+fn string_array(json: &str, name: &str) -> Result<Vec<String>, String> {
+    strings_of(member(json, name)?).map_err(|e| format!("member {name:?}: {e}"))
+}
+
+/// The member `name` of `json` that is an object whose every value is an
+/// array of strings, as its keys and decoded arrays in document order.
+fn object_of_string_arrays(json: &str, name: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    let value = member(json, name)?;
+    let bytes = value.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return Err(format!("member {name:?} is not an object"));
+    }
+    let mut spans: Vec<(String, usize, usize)> = Vec::new();
+    json_object(bytes, 0, &mut |key, start, end| {
+        spans.push((key.to_string(), start, end));
+    })?;
+    spans
+        .into_iter()
+        .map(|(key, start, end)| {
+            let items = value
+                .get(start..end)
+                .ok_or_else(|| json_error("value out of range", start))
+                .and_then(strings_of)
+                .map_err(|e| format!("member {name:?}.{key:?}: {e}"))?;
+            Ok((key, items))
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Response checks
+// ---------------------------------------------------------------------------
+
+/// One session object of a response: `{"transcript": string, "returned":
+/// string or null}`.
+struct Session {
+    transcript: String,
+    returned: Option<String>,
+}
+
+fn session_of(json: &str) -> Result<Session, String> {
+    Ok(Session {
+        transcript: str_member(json, "transcript")?,
+        returned: optional_str_member(json, "returned")?,
+    })
+}
+
+/// A 200 compare answer: `{"mumps": session, "rust": session, "match":
+/// boolean}`.
+struct Compared {
+    mumps: Session,
+    rust: Session,
+    matched: bool,
+}
+
+/// A 200 `GET /api/status` answer, every member compared by value.
+struct StatusReport {
+    mumps_mode: String,
+    recorded: Vec<String>,
+    ready: Vec<String>,
+    incomplete: Vec<(String, Vec<String>)>,
+}
+
+/// The JSON body of `resp`, once its status is `status`. Any other status
+/// fails, naming `context` and the answer's `error` text, which the bridge
+/// builds from fixed causes and never from request data.
+fn expect_json<'r>(
+    resp: &'r (u16, Vec<u8>),
+    status: u16,
+    context: &str,
+) -> Result<&'r str, String> {
     let (actual, body) = resp;
-    assert_eq!(*actual, status, "{context}: status");
     let json = json_body(body).map_err(|e| format!("{context}: {e}"))?;
+    if *actual != status {
+        let cause = str_member(json, "error").unwrap_or_else(|e| format!("({e})"));
+        return Err(format!(
+            "{context}: status {actual} where {status} is expected: {cause}"
+        ));
+    }
+    Ok(json)
+}
+
+/// The `error` text of `resp`, a `{"error": string}` answer with `status`.
+fn expect_error(resp: &(u16, Vec<u8>), status: u16, context: &str) -> Result<String, String> {
+    let json = expect_json(resp, status, context)?;
     str_member(json, "error").map_err(|e| format!("{context}: {e}"))
 }
 
-/// Starts a bridge in `mode` over a synthetic directory, POSTs `inputs` to
-/// the mumps backend, stops the bridge, and returns the error text of the
-/// 502 answer.
-fn mumps_502(mode: MumpsMode, inputs: &[String]) -> Result<String, String> {
-    mumps_502_named("mumps backend over the synthetic directory", mode, inputs)
+/// The session of `resp`, a 200 session answer.
+fn expect_session(resp: &(u16, Vec<u8>), context: &str) -> Result<Session, String> {
+    session_of(expect_json(resp, 200, context)?).map_err(|e| format!("{context}: {e}"))
 }
 
-/// [`mumps_502`] whose failures name `context`, such as one row of a table.
-fn mumps_502_named(context: &str, mode: MumpsMode, inputs: &[String]) -> Result<String, String> {
-    let resp = with_server(synthetic_store()?, mode, |addr| {
-        post_session(addr, "mumps", &body_for(inputs))
-    })?;
-    expect_error(&resp, 502, context)
+/// The members of `resp`, a 200 compare answer.
+fn expect_compare(resp: &(u16, Vec<u8>), context: &str) -> Result<Compared, String> {
+    let json = expect_json(resp, 200, context)?;
+    let side = |name: &str| {
+        member(json, name)
+            .and_then(session_of)
+            .map_err(|e| format!("{context}: {name}: {e}"))
+    };
+    Ok(Compared {
+        mumps: side("mumps")?,
+        rust: side("rust")?,
+        matched: bool_member(json, "match").map_err(|e| format!("{context}: {e}"))?,
+    })
+}
+
+/// `GET /api/status` of the bridge at `addr`.
+fn get_status(addr: SocketAddr) -> Result<StatusReport, String> {
+    let resp = http(addr, "GET", "/api/status", None)?;
+    let json = expect_json(&resp, 200, "GET /api/status")?;
+    let named = |e: String| format!("GET /api/status: {e}");
+    Ok(StatusReport {
+        mumps_mode: str_member(json, "mumps_mode").map_err(named)?,
+        recorded: string_array(json, "recorded").map_err(named)?,
+        ready: string_array(json, "ready").map_err(named)?,
+        incomplete: object_of_string_arrays(json, "incomplete").map_err(named)?,
+    })
 }
 
 /// Where `actual` first differs from `expected`: the 1-based line and the
@@ -1005,1714 +1044,799 @@ fn assert_same(check: &str, actual: impl AsRef<[u8]>, expected: impl AsRef<[u8]>
     );
 }
 
-/// [`assert_same`] for a value that may be `null`.
-fn assert_same_optional(check: &str, actual: Option<&str>, expected: Option<&str>) {
-    let kind = |value: Option<&str>| if value.is_some() { "a string" } else { "null" };
-    assert!(
-        actual.is_some() == expected.is_some(),
-        "{check}: {} where {} is expected",
-        kind(actual),
-        kind(expected)
-    );
-    if let (Some(actual), Some(expected)) = (actual, expected) {
-        assert_same(check, actual, expected);
-    }
+/// Whether `haystack` holds `needle` as a contiguous run of bytes.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
-fn crate_dir() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+/// Over a synthetic folder holding only the `GC-01` that
+/// [`write_case_files`] writes from these arguments: the whole
+/// `GET /api/status` answer, then the compare answer to the exit input
+/// alone, which equals that case's inputs.
+fn status_and_compare_over_gc01(
+    test: &str,
+    transcript: &str,
+    meta: &str,
+    rules: &str,
+    with_db_after: bool,
+) -> Result<(StatusReport, Compared), String> {
+    with_bridge(
+        test,
+        |root| write_case_files(root, "GC-01", transcript, meta, rules, with_db_after),
+        |addr| {
+            let report = get_status(addr)?;
+            let resp = post_session(addr, "compare", &body_for(&exit_only()))?;
+            Ok((report, expect_compare(&resp, "compare [^]")?))
+        },
+    )
 }
 
-/// `path` relative to the crate, or its file name when it lies outside.
-fn crate_relative(path: &Path) -> String {
-    match path.strip_prefix(crate_dir()) {
-        Ok(relative) => relative.display().to_string(),
-        Err(_) => path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "a path outside the crate".to_string()),
-    }
-}
-
-/// The cause of a `StoreError`, from its fields: the crate-relative file and
-/// line of a malformed line, or the file that cannot be read. Never its
-/// message, which may quote fixture content.
-fn store_error_cause(e: &StoreError) -> String {
-    match e {
-        StoreError::Parse {
-            file: Some(file),
-            line,
-            ..
-        } => format!("{} line {line}: malformed", crate_relative(file)),
-        StoreError::Parse {
-            file: None, line, ..
-        } => format!("line {line}: malformed"),
-        StoreError::Io { file, .. } => format!("{}: unreadable", crate_relative(file)),
-    }
+/// Over a synthetic folder holding only the `GC-01` that
+/// [`write_synthetic_case`] writes from these arguments: the ids
+/// `GET /api/status` reports READY, then the compare answer to the exit
+/// input alone, which equals that case's inputs.
+fn compare_over_synthetic_gc01(
+    test: &str,
+    transcript: &str,
+    context: &str,
+    with_db_after: bool,
+) -> Result<(Vec<String>, Compared), String> {
+    let (report, compared) = status_and_compare_over_gc01(
+        test,
+        transcript,
+        &synthetic_meta(context),
+        SYNTHETIC_RULES,
+        with_db_after,
+    )?;
+    Ok((report.ready, compared))
 }
 
 // ---------------------------------------------------------------------------
-// 200
+// Session backends
 // ---------------------------------------------------------------------------
 
+/// The Rust side answers 200 from the fixtures alone, ignoring the captures:
+/// over a READY `GC-01` whose transcript differs from it, the exit input and
+/// the empty sequence each end after the station prompt, returning nothing.
 #[test]
-fn synthetic_static_paths_exact_match() -> Result<(), String> {
-    let frontend = crate_dir().join("frontend");
-    let static_paths = [
+fn rust_session_200() -> Result<(), String> {
+    with_bridge(
+        "rust_session_200",
+        |root| write_synthetic_case(root, "GC-01", DIFFERING_TRANSCRIPT, SYNTHETIC_CONTEXT, true),
+        |addr| {
+            for inputs in [exit_only(), Vec::new()] {
+                let context = format!("rust {inputs:?}");
+                let resp = post_session(addr, "rust", &body_for(&inputs))?;
+                let session = expect_session(&resp, &context)?;
+                assert_same(
+                    &format!("{context}: transcript"),
+                    &session.transcript,
+                    STATION_PROMPT_TRANSCRIPT,
+                );
+                assert_eq!(session.returned, None, "{context}: returned");
+            }
+            Ok(())
+        },
+    )
+}
+
+/// The most bytes one Rust session's transcript holds: `SESSION_OUTPUT_LIMIT`
+/// in `src/mumps.rs`, which is private to the crate, so this copy states it.
+const SESSION_OUTPUT_LIMIT: usize = 1_048_576;
+/// The longest request body the bridge accepts: `MAX_BODY` in
+/// `src/bridge.rs`, private to the crate, so this copy states it.
+const MAX_BODY: usize = 1024 * 1024;
+
+/// A body of at least 900,000 bytes that repeats the found order `GC1001` of
+/// the crate's fixtures with its two display pauses, about 60,000 displays
+/// and 95 MB of output without the session output limit, answers 200. The
+/// request is sent once [`start`] has had the bridge's first answer, over a
+/// connection whose socket reads and writes each time out after the
+/// [`LIMIT_SESSION_TIMEOUT`]; no deadline bounds the whole request, and its
+/// wall time is printed, not asserted. The transcript stops at the limit,
+/// at the order prompt after the last whole display that fits, the
+/// 1,048,026 bytes the unit tests of `src/inquiry.rs` give for the same
+/// repetition. Without `tests/fixtures/ifcap/cases.zwr` the test prints
+/// `NOT RUN` and passes.
+#[test]
+fn rust_session_stops_at_the_output_limit() -> Result<(), String> {
+    const TEST: &str = "rust_session_stops_at_the_output_limit";
+    const MIN_BODY: usize = 900_000;
+    // `serve` loads the crate's fixtures, of which only `cases.zwr`, absent
+    // from a checkout without captures, holds a file 442 node: without it
+    // the session ends after the station prompt and repeats nothing.
+    let export = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ifcap/cases.zwr");
+    let present = export
+        .try_exists()
+        .map_err(|e| format!("{TEST}: {}: {e}", export.display()))?;
+    if !present {
+        println!(
+            "NOT RUN: {TEST}: tests/fixtures/ifcap/cases.zwr is absent, \
+             so the fixtures hold no order GC1001"
+        );
+        return Ok(());
+    }
+    let mut body = String::from(r#"{"inputs":["","#);
+    while body.len() < MIN_BODY {
+        body.push_str(r#""GC1001","","","#);
+    }
+    body.push_str(r#""^"]}"#);
+    assert!(
+        (MIN_BODY..MAX_BODY).contains(&body.len()),
+        "{} body bytes",
+        body.len()
+    );
+    with_bridge(TEST, empty_folder, |addr| {
+        // `start` has had the bridge's first answer, after `serve` loaded
+        // the fixtures, so the time measured here is the session request's.
+        let started = Instant::now();
+        let resp = http_timed(
+            addr,
+            "POST",
+            "/api/rust/session",
+            Some(body.as_bytes()),
+            LIMIT_SESSION_TIMEOUT,
+        )?;
+        let elapsed = started.elapsed();
+        let session = expect_session(&resp, "rust [repeated GC1001]")?;
+        println!(
+            "{TEST}: {} body bytes, {} transcript bytes, {:.3} s",
+            body.len(),
+            session.transcript.len(),
+            elapsed.as_secs_f64()
+        );
+        assert!(
+            session.transcript.len() <= SESSION_OUTPUT_LIMIT,
+            "{} transcript bytes",
+            session.transcript.len()
+        );
+        assert!(
+            session.transcript.ends_with("P.O./REQ.NO.: "),
+            "the transcript does not end at the order prompt"
+        );
+        assert_eq!(session.transcript.len(), 1_048_026, "transcript bytes");
+        assert_eq!(session.returned, None, "returned");
+        Ok(())
+    })
+}
+
+/// Replay answers 200 with the recorded capture whose inputs equal the
+/// request's: its `transcript.txt` byte for byte, never rewritten by its
+/// rule, and its zero-byte `returned.txt` as `null`.
+#[test]
+fn mumps_replay_200_when_recorded() -> Result<(), String> {
+    with_bridge(
+        "mumps_replay_200_when_recorded",
+        |root| write_synthetic_case(root, "GC-01", RAW_TRANSCRIPT, SYNTHETIC_CONTEXT, true),
+        |addr| {
+            let resp = post_session(addr, "mumps", &body_for(&exit_only()))?;
+            let session = expect_session(&resp, "mumps [^]")?;
+            assert_same(
+                "mumps [^]: transcript against the written transcript.txt",
+                &session.transcript,
+                RAW_TRANSCRIPT,
+            );
+            assert_eq!(session.returned, None, "mumps [^]: returned");
+            Ok(())
+        },
+    )
+}
+
+/// Replay answers 502 `NOT RECORDED` when no capture's inputs equal the
+/// request's.
+#[test]
+fn mumps_replay_502_not_recorded() -> Result<(), String> {
+    with_bridge("mumps_replay_502_not_recorded", ready_gc01, |addr| {
+        let inputs = vec![String::new(), EXIT_INPUT.to_string()];
+        let resp = post_session(addr, "mumps", &body_for(&inputs))?;
+        let error = expect_error(&resp, 502, "mumps [\"\", \"^\"]")?;
+        assert_eq!(error, "NOT RECORDED", "mumps [\"\", \"^\"]: error");
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// COMPARE and the match rule
+// ---------------------------------------------------------------------------
+
+/// `match` is true for a READY case whose context is accepted and whose
+/// transcript and return value equal the Rust side's; both raw outputs are
+/// answered.
+#[test]
+fn compare_match_true_for_ready_equal_case() -> Result<(), String> {
+    let (ready, compared) = compare_over_synthetic_gc01(
+        "compare_match_true_for_ready_equal_case",
+        STATION_PROMPT_TRANSCRIPT,
+        SYNTHETIC_CONTEXT,
+        true,
+    )?;
+    assert_eq!(ready, ["GC-01"], "status: ready");
+    assert_same(
+        "mumps transcript",
+        &compared.mumps.transcript,
+        STATION_PROMPT_TRANSCRIPT,
+    );
+    assert_eq!(compared.mumps.returned, None, "mumps returned");
+    assert_same(
+        "rust transcript",
+        &compared.rust.transcript,
+        STATION_PROMPT_TRANSCRIPT,
+    );
+    assert_eq!(compared.rust.returned, None, "rust returned");
+    assert!(compared.matched, "match is false for a READY equal case");
+    Ok(())
+}
+
+/// `match` is false for a READY case whose transcript differs from the Rust
+/// side's, and the MUMPS side is still answered raw.
+#[test]
+fn compare_match_false_for_differing_ready_case() -> Result<(), String> {
+    let (ready, compared) = compare_over_synthetic_gc01(
+        "compare_match_false_for_differing_ready_case",
+        DIFFERING_TRANSCRIPT,
+        SYNTHETIC_CONTEXT,
+        true,
+    )?;
+    assert_eq!(ready, ["GC-01"], "status: ready");
+    assert_same(
+        "mumps transcript",
+        &compared.mumps.transcript,
+        DIFFERING_TRANSCRIPT,
+    );
+    assert_same(
+        "rust transcript",
+        &compared.rust.transcript,
+        STATION_PROMPT_TRANSCRIPT,
+    );
+    assert!(!compared.matched, "match is true for a differing case");
+    Ok(())
+}
+
+/// `match` compares the transcripts after the case's rules: for a READY case
+/// whose raw transcript differs from the Rust side's only inside a span of
+/// [`ACTIVE_RULES`], `match` is true, and both sides are still answered raw,
+/// never rewritten by the rule.
+#[test]
+fn compare_match_true_when_rule_covers_the_difference() -> Result<(), String> {
+    let (report, compared) = status_and_compare_over_gc01(
+        "compare_match_true_when_rule_covers_the_difference",
+        DIFFERING_TRANSCRIPT,
+        &synthetic_meta(SYNTHETIC_CONTEXT),
+        ACTIVE_RULES,
+        true,
+    )?;
+    assert_eq!(report.ready, ["GC-01"], "status: ready");
+    assert_same(
+        "mumps transcript against the written transcript.txt",
+        &compared.mumps.transcript,
+        DIFFERING_TRANSCRIPT,
+    );
+    assert_eq!(compared.mumps.returned, None, "mumps returned");
+    assert_same(
+        "rust transcript",
+        &compared.rust.transcript,
+        STATION_PROMPT_TRANSCRIPT,
+    );
+    assert_eq!(compared.rust.returned, None, "rust returned");
+    assert!(
+        compared.matched,
+        "match is false for a READY case differing only inside a rule span"
+    );
+    Ok(())
+}
+
+/// The negative control of
+/// [`compare_match_true_when_rule_covers_the_difference`]: under the same
+/// rule, a READY case whose raw transcript also differs from the Rust side's
+/// outside the rule's span gives `match` false, and both sides are answered
+/// raw.
+#[test]
+fn compare_match_false_when_difference_is_outside_the_rule() -> Result<(), String> {
+    let (report, compared) = status_and_compare_over_gc01(
+        "compare_match_false_when_difference_is_outside_the_rule",
+        OUTSIDE_SPAN_TRANSCRIPT,
+        &synthetic_meta(SYNTHETIC_CONTEXT),
+        ACTIVE_RULES,
+        true,
+    )?;
+    assert_eq!(report.ready, ["GC-01"], "status: ready");
+    assert_same(
+        "mumps transcript against the written transcript.txt",
+        &compared.mumps.transcript,
+        OUTSIDE_SPAN_TRANSCRIPT,
+    );
+    assert_eq!(compared.mumps.returned, None, "mumps returned");
+    assert_same(
+        "rust transcript",
+        &compared.rust.transcript,
+        STATION_PROMPT_TRANSCRIPT,
+    );
+    assert_eq!(compared.rust.returned, None, "rust returned");
+    assert!(
+        !compared.matched,
+        "match is true for a difference outside the rule's span"
+    );
+    Ok(())
+}
+
+/// `match` is false for an INCOMPLETE case, here one without
+/// `db-after.zwr`, even though both transcripts are equal.
+#[test]
+fn compare_match_false_for_incomplete_case() -> Result<(), String> {
+    let (ready, compared) = compare_over_synthetic_gc01(
+        "compare_match_false_for_incomplete_case",
+        STATION_PROMPT_TRANSCRIPT,
+        SYNTHETIC_CONTEXT,
+        false,
+    )?;
+    assert!(ready.is_empty(), "status: ready {ready:?}");
+    assert_same(
+        "mumps transcript",
+        &compared.mumps.transcript,
+        STATION_PROMPT_TRANSCRIPT,
+    );
+    assert_same(
+        "rust transcript",
+        &compared.rust.transcript,
+        STATION_PROMPT_TRANSCRIPT,
+    );
+    assert!(!compared.matched, "match is true for an INCOMPLETE case");
+    Ok(())
+}
+
+/// `match` is false for a READY case whose `meta.txt` context has `DUZ` `1`,
+/// which `golden::validate_context` rejects, even though both transcripts
+/// are equal.
+#[test]
+fn compare_match_false_for_context_duz_1() -> Result<(), String> {
+    let (ready, compared) = compare_over_synthetic_gc01(
+        "compare_match_false_for_context_duz_1",
+        STATION_PROMPT_TRANSCRIPT,
+        DUZ_1_CONTEXT,
+        true,
+    )?;
+    assert_eq!(ready, ["GC-01"], "status: ready");
+    assert_same(
+        "mumps transcript",
+        &compared.mumps.transcript,
+        STATION_PROMPT_TRANSCRIPT,
+    );
+    assert_same(
+        "rust transcript",
+        &compared.rust.transcript,
+        STATION_PROMPT_TRANSCRIPT,
+    );
+    assert!(!compared.matched, "match is true for a DUZ 1 context");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Rejections
+// ---------------------------------------------------------------------------
+
+/// Every backend answers 400 for malformed JSON, a missing or non-array
+/// `inputs`, a non-string element, and an element holding a carriage return
+/// or a line feed, with the error text `BAD REQUEST: <cause>`.
+#[test]
+fn bad_request_400_on_every_backend() -> Result<(), String> {
+    // What the body is, the body, and the cause after `BAD REQUEST: `.
+    const BODIES: [(&str, &str, &str); 7] = [
+        ("malformed JSON", r#"{"inputs": ["#, "MALFORMED JSON"),
+        ("missing inputs", "{}", "INPUTS MISSING OR REPEATED"),
+        (
+            "non-array inputs",
+            r#"{"inputs":"x"}"#,
+            "INPUTS IS NOT AN ARRAY",
+        ),
+        (
+            "number element",
+            r#"{"inputs":[1]}"#,
+            "INPUT 1 IS NOT A STRING",
+        ),
+        (
+            "null element",
+            r#"{"inputs":[null]}"#,
+            "INPUT 1 IS NOT A STRING",
+        ),
+        (
+            "carriage return element",
+            r#"{"inputs":["a\rb"]}"#,
+            "INPUT 1 CONTAINS A CARRIAGE RETURN OR LINE FEED",
+        ),
+        (
+            "line feed element",
+            r#"{"inputs":["a\nb"]}"#,
+            "INPUT 1 CONTAINS A CARRIAGE RETURN OR LINE FEED",
+        ),
+    ];
+    with_bridge("bad_request_400_on_every_backend", ready_gc01, |addr| {
+        for backend in ["rust", "mumps", "compare"] {
+            for (what, body, cause) in BODIES {
+                let context = format!("{backend}: {what}");
+                let resp = post_session(addr, backend, body.as_bytes())?;
+                let error = expect_error(&resp, 400, &context)?;
+                assert!(
+                    error.starts_with("BAD REQUEST: "),
+                    "{context}: error {error:?} lacks the BAD REQUEST prefix"
+                );
+                assert_eq!(error, format!("BAD REQUEST: {cause}"), "{context}: error");
+            }
+        }
+        Ok(())
+    })
+}
+
+/// 404 with the bridge's exact texts for an unknown backend, unknown paths
+/// (paths outside the four static files included) and wrong methods.
+#[test]
+fn not_found_404_texts() -> Result<(), String> {
+    const UNKNOWN_BACKEND: &str = "UNKNOWN BACKEND";
+    const NOT_FOUND: &str = "NOT FOUND";
+    const POST_REQUIRED: &str = "NOT FOUND: POST REQUIRED";
+    const GET_REQUIRED: &str = "NOT FOUND: GET REQUIRED";
+    // Method, target, whether the request carries a valid session body, and
+    // the expected error text.
+    const ROWS: [(&str, &str, bool, &str); 11] = [
+        ("POST", "/api/java/session", true, UNKNOWN_BACKEND),
+        ("GET", "/nope", false, NOT_FOUND),
+        ("POST", "/api/rust/other", true, NOT_FOUND),
+        ("GET", "/../Cargo.toml", false, NOT_FOUND),
+        ("GET", "/frontend/app.js", false, NOT_FOUND),
+        ("GET", "/api/rust/session", false, POST_REQUIRED),
+        ("GET", "/api/mumps/session", false, POST_REQUIRED),
+        ("GET", "/api/compare/session", false, POST_REQUIRED),
+        ("POST", "/api/status", true, GET_REQUIRED),
+        ("POST", "/index.html", true, GET_REQUIRED),
+        ("POST", "/app.js", true, GET_REQUIRED),
+    ];
+    let session_body = body_for(&exit_only());
+    with_bridge("not_found_404_texts", ready_gc01, |addr| {
+        for (method, target, with_body, expected) in ROWS {
+            let context = format!("{method} {target}");
+            let body = with_body.then_some(session_body.as_slice());
+            let resp = http(addr, method, target, body)?;
+            let error = expect_error(&resp, 404, &context)?;
+            assert_eq!(error, expected, "{context}: error");
+        }
+        Ok(())
+    })
+}
+
+/// The bridge answers only requests for itself, from its own page. A `Host`
+/// or an absolute-form authority naming another host, as a page under a
+/// name rebound to the loopback address sends, is 400
+/// `BAD REQUEST: HOST NOT ALLOWED` on every path. A session `POST` whose
+/// `Content-Type` is not `application/json`, or whose `Origin` is not the
+/// page's own, is 400 on every backend before its session runs: MUMPS
+/// would answer 200 from the READY `GC-01`. The page's own `Origin` with
+/// `application/json` runs the session.
+#[test]
+fn foreign_host_and_cross_origin_post_400() -> Result<(), String> {
+    const HOST_NOT_ALLOWED: &str = "BAD REQUEST: HOST NOT ALLOWED";
+    const JSON_REQUIRED: &str = "BAD REQUEST: CONTENT-TYPE APPLICATION/JSON REQUIRED";
+    const ORIGIN_NOT_ALLOWED: &str = "BAD REQUEST: ORIGIN NOT ALLOWED";
+    const JSON: &str = "Content-Type: application/json\r\n";
+    let body = body_for(&exit_only());
+    with_bridge(
+        "foreign_host_and_cross_origin_post_400",
+        ready_gc01,
+        |addr| {
+            let port = addr.port();
+            let foreign_hosts = [
+                "GET /api/status HTTP/1.1\r\nHost: evil.example\r\n".to_string(),
+                "GET / HTTP/1.1\r\nHost: evil.example\r\n".to_string(),
+                format!("GET http://evil.example/app.js HTTP/1.1\r\nHost: {addr}\r\n"),
+                format!(
+                    "POST /api/mumps/session HTTP/1.1\r\nHost: evil.localhost:{port}\r\n{JSON}"
+                ),
+            ];
+            for head in &foreign_hosts {
+                let context = head.lines().next().unwrap_or_default();
+                let error = expect_error(&http_with_head(addr, head, &body)?, 400, context)?;
+                assert_eq!(error, HOST_NOT_ALLOWED, "{context}: error");
+            }
+            // What the headers are, the header lines after `Host`, and the
+            // cause.
+            let foreign_origin = format!("Origin: http://evil.example\r\n{JSON}");
+            let refused = [
+                ("text/plain", "Content-Type: text/plain\r\n", JSON_REQUIRED),
+                (
+                    "foreign origin",
+                    foreign_origin.as_str(),
+                    ORIGIN_NOT_ALLOWED,
+                ),
+            ];
+            for backend in ["rust", "mumps", "compare"] {
+                for (what, headers, cause) in refused {
+                    let context = format!("{backend}: {what}");
+                    let line = format!("POST /api/{backend}/session HTTP/1.1");
+                    let head = format!("{line}\r\nHost: {addr}\r\n{headers}");
+                    let resp = http_with_head(addr, &head, &body)?;
+                    let error = expect_error(&resp, 400, &context)?;
+                    assert_eq!(error, cause, "{context}: error");
+                }
+            }
+            for backend in ["rust", "mumps"] {
+                let context = format!("{backend}: own origin");
+                let line = format!("POST /api/{backend}/session HTTP/1.1");
+                let head = format!("{line}\r\nHost: {addr}\r\nOrigin: http://{addr}\r\n{JSON}");
+                let session = expect_session(&http_with_head(addr, &head, &body)?, &context)?;
+                assert_same(
+                    &format!("{context}: transcript"),
+                    &session.transcript,
+                    STATION_PROMPT_TRANSCRIPT,
+                );
+                assert_eq!(session.returned, None, "{context}: returned");
+            }
+            Ok(())
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Status
+// ---------------------------------------------------------------------------
+
+/// `GET /api/status` over a folder holding the synthetic READY `GC-01`.
+#[test]
+fn status_ready_case() -> Result<(), String> {
+    let report = with_bridge("status_ready_case", ready_gc01, get_status)?;
+    assert_eq!(report.mumps_mode, "replay", "mumps_mode");
+    assert_eq!(report.recorded, ["GC-01"], "recorded");
+    assert_eq!(report.ready, ["GC-01"], "ready");
+    assert!(
+        report.incomplete.is_empty(),
+        "incomplete: {:?}",
+        report.incomplete
+    );
+    Ok(())
+}
+
+/// `GET /api/status` over a folder whose `GC-01` lacks `db-after.zwr`: it is
+/// recorded, not READY, and INCOMPLETE on exactly the two checks the missing
+/// file fails, in check order.
+#[test]
+fn status_incomplete_case() -> Result<(), String> {
+    let report = with_bridge(
+        "status_incomplete_case",
+        |root| {
+            write_synthetic_case(
+                root,
+                "GC-01",
+                STATION_PROMPT_TRANSCRIPT,
+                SYNTHETIC_CONTEXT,
+                false,
+            )
+        },
+        get_status,
+    )?;
+    assert_eq!(report.mumps_mode, "replay", "mumps_mode");
+    assert_eq!(report.recorded, ["GC-01"], "recorded");
+    assert!(report.ready.is_empty(), "ready: {:?}", report.ready);
+    let expected = vec![(
+        "GC-01".to_string(),
+        vec![
+            "seven_files_present".to_string(),
+            "db_before_equals_after".to_string(),
+        ],
+    )];
+    assert_eq!(report.incomplete, expected, "incomplete");
+    Ok(())
+}
+
+/// A recorded `GC-01` with both exports and a transcript equal to the Rust
+/// side's fails exactly one readiness check: a carriage return ending its
+/// `meta.txt` `setup` value fails `no_carriage_return`, and a rule line
+/// without a tab fails `normalisation_parses`. Each row has its own folder
+/// and bridge. `GET /api/status` reports the case recorded, not READY and
+/// INCOMPLETE on that one check; COMPARE answers 200 with both raw outputs
+/// and `match` false, because only a READY case can match.
+#[test]
+fn status_and_compare_incomplete_on_cr_or_malformed_rule() -> Result<(), String> {
+    let cr_meta = cr_in_setup_meta();
+    let valid_meta = synthetic_meta(SYNTHETIC_CONTEXT);
+    // Test name, meta.txt, normalisation.txt, and the one check they fail.
+    let rows = [
+        (
+            "status_and_compare_incomplete_on_cr",
+            cr_meta.as_str(),
+            SYNTHETIC_RULES,
+            "no_carriage_return",
+        ),
+        (
+            "status_and_compare_incomplete_on_malformed_rule",
+            valid_meta.as_str(),
+            MALFORMED_RULES,
+            "normalisation_parses",
+        ),
+    ];
+    for (test, meta, rules, check) in rows {
+        let (report, compared) =
+            status_and_compare_over_gc01(test, STATION_PROMPT_TRANSCRIPT, meta, rules, true)?;
+        assert_eq!(report.mumps_mode, "replay", "{test}: mumps_mode");
+        assert_eq!(report.recorded, ["GC-01"], "{test}: recorded");
+        assert!(report.ready.is_empty(), "{test}: ready: {:?}", report.ready);
+        let expected = vec![("GC-01".to_string(), vec![check.to_string()])];
+        assert_eq!(report.incomplete, expected, "{test}: incomplete");
+        assert_same(
+            &format!("{test}: mumps transcript"),
+            &compared.mumps.transcript,
+            STATION_PROMPT_TRANSCRIPT,
+        );
+        assert_eq!(compared.mumps.returned, None, "{test}: mumps returned");
+        assert_same(
+            &format!("{test}: rust transcript"),
+            &compared.rust.transcript,
+            STATION_PROMPT_TRANSCRIPT,
+        );
+        assert_eq!(compared.rust.returned, None, "{test}: rust returned");
+        assert!(
+            !compared.matched,
+            "{test}: match is true for a case INCOMPLETE on {check}"
+        );
+    }
+    Ok(())
+}
+
+/// `GET /api/status` over a folder with no case folder: mode `replay`, empty
+/// `recorded` and `ready` arrays and an empty `incomplete` object.
+#[test]
+fn status_empty_folder() -> Result<(), String> {
+    let report = with_bridge("status_empty_folder", empty_folder, get_status)?;
+    assert_eq!(report.mumps_mode, "replay", "mumps_mode");
+    assert!(
+        report.recorded.is_empty(),
+        "recorded: {:?}",
+        report.recorded
+    );
+    assert!(report.ready.is_empty(), "ready: {:?}", report.ready);
+    assert!(
+        report.incomplete.is_empty(),
+        "incomplete: {:?}",
+        report.incomplete
+    );
+    Ok(())
+}
+
+/// A bridge started over a folder with no capture serves: the Rust side
+/// answers 200, while the MUMPS side answers 502 `NOT RECORDED` and COMPARE
+/// 502 `MUMPS: NOT RECORDED`.
+#[test]
+fn startup_with_empty_folder() -> Result<(), String> {
+    with_bridge("startup_with_empty_folder", empty_folder, |addr| {
+        let body = body_for(&exit_only());
+        let rust = expect_session(&post_session(addr, "rust", &body)?, "rust [^]")?;
+        assert_same(
+            "rust [^]: transcript",
+            &rust.transcript,
+            STATION_PROMPT_TRANSCRIPT,
+        );
+        assert_eq!(rust.returned, None, "rust [^]: returned");
+        let mumps = expect_error(&post_session(addr, "mumps", &body)?, 502, "mumps [^]")?;
+        assert_eq!(mumps, "NOT RECORDED", "mumps [^]: error");
+        let compare = expect_error(&post_session(addr, "compare", &body)?, 502, "compare [^]")?;
+        assert_eq!(compare, "MUMPS: NOT RECORDED", "compare [^]: error");
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Static paths
+// ---------------------------------------------------------------------------
+
+/// `GET` on each of the four static paths answers 200 with the file under
+/// `frontend/` byte for byte, and the served `app.js` holds the front-end's
+/// copy of the exit input, equal to `golden::EXIT_INPUT`.
+#[test]
+fn static_paths_exact_match() -> Result<(), String> {
+    const ROWS: [(&str, &str); 4] = [
         ("/", "index.html"),
         ("/index.html", "index.html"),
         ("/style.css", "style.css"),
         ("/app.js", "app.js"),
     ];
-    with_synthetic_dir("static", |root| {
-        with_server(synthetic_store()?, replay(root), |addr| {
-            for (target, file) in static_paths {
-                let expected = fs::read(frontend.join(file))
-                    .map_err(|e| format!("reading frontend/{file}: {e}"))?;
-                let (status, body) = http(addr, "GET", target, None)?;
-                assert_eq!(status, 200, "GET {target}: status");
-                assert_same(
-                    &format!("GET {target} against frontend/{file}"),
-                    &body,
-                    &expected,
-                );
-            }
-            for target in ["/../Cargo.toml", "/frontend/app.js"] {
-                let resp = http(addr, "GET", target, None)?;
-                expect_error(&resp, 404, &format!("GET {target}"))?;
-            }
-            Ok(())
-        })
-    })
-}
-
-#[test]
-fn synthetic_rust_session_200() -> Result<(), String> {
-    let store = synthetic_store()?;
-    let Some((inputs, transcript, returned)) =
-        ok_case_or_not_run("synthetic_rust_session_200", &store)
-    else {
-        return Ok(());
-    };
-    let (status, body) = with_synthetic_dir("rust-200", |root| {
-        with_server(store, replay(root), |addr| {
-            post_session(addr, "rust", &body_for(&inputs))
-        })
-    })?;
-    assert_eq!(status, 200, "rust backend: status");
-    let (rust_transcript, rust_returned) = session_of(json_body(&body)?)?;
-    assert_same(
-        "rust transcript against inquire",
-        &rust_transcript,
-        &transcript,
-    );
-    assert_same_optional(
-        "rust returned against inquire",
-        rust_returned.as_deref(),
-        returned.as_deref(),
-    );
-    Ok(())
-}
-
-#[test]
-fn synthetic_mumps_replay_200() -> Result<(), String> {
-    let store = synthetic_store()?;
-    let Some((inputs, transcript, _)) = ok_case_or_not_run("synthetic_mumps_replay_200", &store)
-    else {
-        return Ok(());
-    };
-    let other = strings(&["SYNTHETIC OTHER INPUT"]);
-    let (other_transcript, other_returned) = inquire_carrier(&store, &other)?;
-    // The one synthetic change of a capture replay must pass over, so that
-    // replaying it fails the transcript check.
-    let passed_over = |carrier: &str, case: &str| {
-        format!("{carrier}SYNTHETIC {case} DECOY: replay must pass over this capture\n")
-    };
-    // The capture replay must choose: `inputs` with inquire's transcript and
-    // a zero-byte returned.txt, which replay must answer as null.
-    let chosen =
-        |root: &Path, case: &str| write_case_in(root, case, &inputs, &transcript, None, "");
-    // A capture of `inputs` that replay must pass over: the chosen capture
-    // with the synthetic change.
-    let decoy = |root: &Path, case: &str| {
-        write_case_in(
-            root,
-            case,
-            &inputs,
-            &passed_over(&transcript, case),
-            None,
-            "",
-        )
-    };
-    // A complete capture of another session, which does not match, with the
-    // synthetic change: inquire's own carrier of it may equal `transcript`.
-    let other_session = |root: &Path, case: &str| {
-        write_case_in(
-            root,
-            case,
-            &other,
-            &passed_over(&other_transcript, case),
-            other_returned.as_deref(),
-            "",
-        )
-    };
-    let layouts: [(&str, Layout<'_>); 6] = [
-        ("mumps-200", &|root| chosen(root, "GC-01")),
-        // A non-matching GC-01 does not end the scan.
-        ("mumps-200-after-other-session", &|root| {
-            other_session(root, "GC-01")?;
-            chosen(root, "GC-02")
-        }),
-        // Nor does a non-UTF-8 input.txt in GC-01, or GC-02 being absent.
-        ("mumps-200-after-non-utf8-input", &|root| {
-            decoy(root, "GC-01")?;
-            write_file(root, "GC-01/input.txt", &[0xFF, 0xFE, b'\n'])?;
-            chosen(root, "GC-03")
-        }),
-        // Nor a directory in place of GC-01's input.txt, which is unreadable.
-        ("mumps-200-after-unreadable-input", &|root| {
-            decoy(root, "GC-01")?;
-            let input = case_path(root, "GC-01", "input.txt");
-            fs::remove_file(&input)
-                .map_err(|e| format!("removing synthetic GC-01/input.txt: {e}"))?;
-            fs::create_dir(&input)
-                .map_err(|e| format!("creating the directory GC-01/input.txt: {e}"))?;
-            chosen(root, "GC-03")
-        }),
-        // Of two matching captures, the first is replayed.
-        ("mumps-200-first-duplicate", &|root| {
-            chosen(root, "GC-01")?;
-            decoy(root, "GC-02")
-        }),
-        // After a non-matching GC-01, the first match wins over a later one.
-        ("mumps-200-first-later-match", &|root| {
-            other_session(root, "GC-01")?;
-            chosen(root, "GC-02")?;
-            decoy(root, "GC-05")
-        }),
-    ];
-    for (label, layout) in layouts {
-        let (status, body) = with_synthetic_dir(label, |root| {
-            layout(root)?;
-            with_server(store.clone(), replay(root), |addr| {
-                post_session(addr, "mumps", &body_for(&inputs))
-            })
-        })?;
-        let in_row = |e: String| format!("{label}: {e}");
-        assert_eq!(status, 200, "{label}: mumps backend: status");
-        let json = json_body(&body).map_err(in_row)?;
-        let (replayed, _) = session_of(json).map_err(in_row)?;
-        assert_same(
-            &format!("{label}: replayed transcript against the chosen transcript.txt"),
-            &replayed,
-            &transcript,
-        );
-        assert!(
-            member(json, "returned").map_err(in_row)? == "null",
-            "{label}: a zero-byte returned.txt must replay as null"
-        );
-    }
-    Ok(())
-}
-
-/// Asserts that `resp` is a 200 compare answer whose `mumps` and `rust`
-/// sides carry `mumps` and `rust`, each a transcript and a return value,
-/// and whose `match` is `expected`. A response is never normalised, so each
-/// side is held to its raw text. Failures name `check`, never the body.
-fn assert_compare(
-    check: &str,
-    resp: &(u16, Vec<u8>),
-    mumps: (&str, Option<&str>),
-    rust: (&str, Option<&str>),
-    expected: &str,
-) -> Result<(), String> {
-    let (status, body) = resp;
-    assert_eq!(*status, 200, "{check}: compare status");
-    let json = json_body(body).map_err(|e| format!("{check}: {e}"))?;
-    for (side, (transcript, returned)) in [("mumps", mumps), ("rust", rust)] {
-        let (side_transcript, side_returned) = member(json, side)
-            .and_then(session_of)
-            .map_err(|e| format!("{check}: {e}"))?;
-        assert_same(
-            &format!("{check}: raw {side} side transcript"),
-            &side_transcript,
-            transcript,
-        );
-        assert_same_optional(
-            &format!("{check}: {side} side returned"),
-            side_returned.as_deref(),
-            returned,
-        );
-    }
-    let actual = member(json, "match").map_err(|e| format!("{check}: {e}"))?;
-    assert!(actual == expected, "{check}: match must be {expected}");
-    Ok(())
-}
-
-/// One compare sub-case in its own synthetic directory and bridge: `GC-01/`
-/// captures `captured` with `inquire`'s return value, under the
-/// normalisation file `rules`. The Rust side must be `inquire`'s answer and
-/// the MUMPS side the capture, both raw, and `match` must be `expected`, a
-/// literal each sub-case designs from the normalisation format, never one
-/// computed by `normalise`.
-fn compare_sub_case(
-    name: &str,
-    store: &Store,
-    case: &(Vec<String>, String, Option<String>),
-    captured: &str,
-    rules: &str,
-    expected: &str,
-) -> Result<(), String> {
-    let (inputs, transcript, returned) = case;
-    if let Err(line) = parse_normalisation(rules) {
-        return Err(format!(
-            "{name}: precondition: synthetic normalisation.txt line {line} is malformed"
-        ));
-    }
-    let resp = with_synthetic_dir(name, |root| {
-        write_case(root, inputs, captured, returned.as_deref(), rules)?;
-        with_server(store.clone(), replay(root), |addr| {
-            post_session(addr, "compare", &body_for(inputs))
-        })
-    })?;
-    assert_compare(
-        name,
-        &resp,
-        (captured, returned.as_deref()),
-        (transcript.as_str(), returned.as_deref()),
-        expected,
-    )
-}
-
-/// One return-value sub-case of `synthetic_compare_match_false` in its own
-/// synthetic directory and bridge: `GC-01/` captures `inquire`'s own
-/// transcript with the return value `value`, which `write_case` must store
-/// as `file`, the value and one terminating newline. The mumps backend must
-/// replay exactly `value`, only that terminator removed, and compare must
-/// answer `match: false`: the transcripts agree, the return values do not,
-/// and transcript-only agreement is never a match.
-fn returned_sub_case(
-    name: &str,
-    store: &Store,
-    case: &(Vec<String>, String, Option<String>),
-    value: &str,
-    file: &str,
-) -> Result<(), String> {
-    let (inputs, transcript, returned) = case;
-    if returned.as_deref() == Some(value) {
-        return Err(format!(
-            "{name}: precondition: inquire returns the captured value itself"
-        ));
-    }
-    let (written, mumps, compare) = with_synthetic_dir(name, |root| {
-        write_case(root, inputs, transcript, Some(value), "")?;
-        let written = fs::read(root.join("GC-01").join("returned.txt"))
-            .map_err(|e| format!("{name}: reading back synthetic GC-01/returned.txt: {e}"))?;
-        let body = body_for(inputs);
-        let (mumps, compare) = with_server(store.clone(), replay(root), |addr| {
-            Ok((
-                post_session(addr, "mumps", &body)?,
-                post_session(addr, "compare", &body)?,
-            ))
-        })?;
-        Ok((written, mumps, compare))
-    })?;
-    assert_same(
-        &format!("{name}: synthetic GC-01/returned.txt"),
-        &written,
-        file,
-    );
-    let (status, body) = &mumps;
-    assert_eq!(*status, 200, "{name}: mumps status");
-    let (replayed, replayed_returned) = json_body(body)
-        .and_then(session_of)
-        .map_err(|e| format!("{name}: {e}"))?;
-    assert_same(
-        &format!("{name}: replayed transcript"),
-        &replayed,
-        transcript,
-    );
-    assert_same_optional(
-        &format!("{name}: replayed returned"),
-        replayed_returned.as_deref(),
-        Some(value),
-    );
-    assert_compare(
-        name,
-        &compare,
-        (transcript.as_str(), Some(value)),
-        (transcript.as_str(), returned.as_deref()),
-        "false",
-    )
-}
-
-/// The station prompt, with its default, that every `ok_case` session
-/// writes.
-const STATION_PROMPT: &str = "Select STATION NUMBER ('^' TO EXIT): 500// ";
-
-/// The captured transcript of a normalisation sub-case named `check`:
-/// `transcript` with its station prompt replaced by `prompt`. The text
-/// around the prompt is the same on both sides, and only line feeds may
-/// precede it, so no span of the sub-cases' rules opens before it; each
-/// sub-case's `match` is designed on that. `Err` names the precondition
-/// `transcript` breaks, or a `prompt` that leaves both sides equal.
-fn altered_capture(check: &str, transcript: &str, prompt: &str) -> Result<String, String> {
-    let Some((head, tail)) = transcript.split_once(STATION_PROMPT) else {
-        return Err(format!(
-            "{check}: precondition: the inquire transcript holds no station prompt"
-        ));
-    };
-    if !head.bytes().all(|byte| byte == b'\n') {
-        return Err(format!(
-            "{check}: precondition: text other than line feeds precedes the station prompt"
-        ));
-    }
-    let captured = format!("{head}{prompt}{tail}");
-    if captured == transcript {
-        return Err(format!(
-            "{check}: precondition: the captured transcript equals the inquire transcript"
-        ));
-    }
-    Ok(captured)
-}
-
-#[test]
-fn synthetic_compare_match_true() -> Result<(), String> {
-    let store = synthetic_store()?;
-    let Some(case) = ok_case_or_not_run("synthetic_compare_match_true", &store) else {
-        return Ok(());
-    };
-    let (_, transcript, _) = &case;
-    // The capture is inquire's own session, under no normalisation.
-    compare_sub_case("compare-true", &store, &case, transcript, "", "true")?;
-    // One rule, one span: `Select STATION NUMBER` against
-    // `Select SYNTHETIC-A NUMBER`, both `<NORM>`.
-    let name = "compare-true-one-rule";
-    let captured = altered_capture(
-        name,
-        transcript,
-        "Select SYNTHETIC-A NUMBER ('^' TO EXIT): 500// ",
-    )?;
-    compare_sub_case(name, &store, &case, &captured, "Select \t NUMBER\n", "true")?;
-    // One rule, many spans: space to space. Each prompt holds seven spaces
-    // at the same word boundaries, so the spans pair alike on both sides,
-    // three of them differ (` STATION `, ` ('^' `, ` EXIT): ` against
-    // ` SYNTHETIC-A `, ` SYNTHETIC-B `, ` SYNTHETIC-C: `), and the
-    // seventh opens a span into the identical text after the prompt.
-    let name = "compare-true-many-spans";
-    let captured = altered_capture(
-        name,
-        transcript,
-        "Select SYNTHETIC-A NUMBER SYNTHETIC-B TO SYNTHETIC-C: 500// ",
-    )?;
-    compare_sub_case(name, &store, &case, &captured, " \t \n", "true")?;
-    // Two rules in file order, the second consuming the first's `<NORM>`:
-    // `Select STATION NUMBER ('^' TO EXIT):` and
-    // `Select SYNTHETIC-A NUMBER SYNTHETIC-B:` both end as one `<NORM>`.
-    // Applied in reverse order, the `<NORM>` rule would find nothing yet,
-    // `('^' TO EXIT)` would stand against `SYNTHETIC-B`, and `match` would
-    // be false.
-    let name = "compare-true-rule-order";
-    let captured = altered_capture(
-        name,
-        transcript,
-        "Select SYNTHETIC-A NUMBER SYNTHETIC-B: 500// ",
-    )?;
-    compare_sub_case(
-        name,
-        &store,
-        &case,
-        &captured,
-        "Select \t NUMBER\n<NORM>\t:\n",
-        "true",
-    )
-}
-
-#[test]
-fn synthetic_compare_match_false() -> Result<(), String> {
-    let store = synthetic_store()?;
-    let Some(case) = ok_case_or_not_run("synthetic_compare_match_false", &store) else {
-        return Ok(());
-    };
-    let (_, transcript, _) = &case;
-    let differing = format!("{transcript}SYNTHETIC DIFFERENCE\n");
-    compare_sub_case("compare-false", &store, &case, &differing, "", "false")?;
-    // Equal transcripts, unequal return values. The value keeps its own
-    // trailing newline: of the two newlines that end returned.txt, the
-    // bridge removes only the file's terminator.
-    returned_sub_case(
-        "compare-false-returned",
-        &store,
-        &case,
-        "SYNTHETIC RETURN\n",
-        "SYNTHETIC RETURN\n\n",
-    )?;
-    // A returned.txt of one newline is the empty string, not null, which
-    // only a zero-byte file means.
-    returned_sub_case("compare-false-returned-empty", &store, &case, "", "\n")?;
-    // A span only the capture holds. The rule applies to both sides, so the
-    // capture's `[[SYNTHETIC]]` becomes `<NORM>`, which the Rust side does
-    // not hold: a `<NORM>` stands only for a span, never for absent text.
-    let name = "compare-false-one-sided-span";
-    let captured = altered_capture(
-        name,
-        transcript,
-        "[[SYNTHETIC]]Select STATION NUMBER ('^' TO EXIT): 500// ",
-    )?;
-    compare_sub_case(name, &store, &case, &captured, "[[\t]]\n", "false")?;
-    // An open delimiter with no later close delimiter on either side leaves
-    // the rest of each text unchanged, so `STATION` stands against
-    // `SYNTHETIC-A`.
-    let name = "compare-false-unclosed-rule";
-    let never_closed = "SYNTHETIC-NEVER-CLOSED";
-    if transcript.contains(never_closed) {
-        return Err(format!(
-            "{name}: precondition: the inquire transcript holds the close delimiter"
-        ));
-    }
-    let captured = altered_capture(
-        name,
-        transcript,
-        "Select SYNTHETIC-A NUMBER ('^' TO EXIT): 500// ",
-    )?;
-    let rules = format!("Select \t{never_closed}\n");
-    compare_sub_case(name, &store, &case, &captured, &rules, "false")
-}
-
-// ---------------------------------------------------------------------------
-// 400, on every backend
-// ---------------------------------------------------------------------------
-
-/// Asserts that each of `bodies` is answered 400 with `{"error": string}`
-/// by the rust, mumps and compare backends alike.
-fn assert_400_on_every_backend(test: &str, bodies: &[Vec<u8>]) -> Result<(), String> {
-    with_synthetic_dir(test, |root| {
-        with_server(synthetic_store()?, replay(root), |addr| {
-            for backend in ["rust", "mumps", "compare"] {
-                for (number, body) in (1usize..).zip(bodies) {
-                    let resp = post_session(addr, backend, body)?;
-                    let context = format!("{test}: POST /api/{backend}/session body {number}");
-                    let error = expect_error(&resp, 400, &context)?;
-                    assert!(!error.is_empty(), "{context}: empty error text");
-                }
-            }
-            Ok(())
-        })
-    })
-}
-
-#[test]
-fn synthetic_400_malformed_json() -> Result<(), String> {
-    assert_400_on_every_backend("400-json", &[b"{\"inputs\": [".to_vec()])
-}
-
-#[test]
-fn synthetic_400_inputs_missing_or_not_array() -> Result<(), String> {
-    assert_400_on_every_backend(
-        "400-inputs",
-        &[b"{}".to_vec(), b"{\"inputs\":\"x\"}".to_vec()],
-    )
-}
-
-#[test]
-fn synthetic_400_non_string_element() -> Result<(), String> {
-    assert_400_on_every_backend(
-        "400-element",
-        &[
-            b"{\"inputs\":[1]}".to_vec(),
-            b"{\"inputs\":[null]}".to_vec(),
-        ],
-    )
-}
-
-#[test]
-fn synthetic_400_element_with_line_break() -> Result<(), String> {
-    assert_400_on_every_backend(
-        "400-line-break",
-        &[body_for(&strings(&["a\rb"])), body_for(&strings(&["a\nb"]))],
-    )
-}
-
-#[test]
-fn synthetic_400_invalid_request_target() -> Result<(), String> {
-    // Raw control bytes and DEL in an origin-form target, and absolute-form
-    // targets whose authority is not a host with an optional port.
-    let rejected = [
-        "/bad\x00target",
-        "/a\tb",
-        "/a\rb",
-        "/a\nb",
-        "/a\x01b",
-        "/a\x1fb",
-        "/a\x7fb",
-        "/app.js\x00",
-        "http://[]/",
-        "http://[zz]/",
-        "http://localhost:abc/",
-        "http://h:1:2/",
-        "http://h\x01/app.js",
-    ];
-    let app_js = fs::read(crate_dir().join("frontend").join("app.js"))
-        .map_err(|e| format!("reading frontend/app.js: {e}"))?;
-    with_synthetic_dir("400-target", |root| {
-        with_server(synthetic_store()?, replay(root), |addr| {
-            for target in rejected {
-                let context = format!("GET {}", target.escape_debug());
-                let resp = http(addr, "GET", target, None)?;
-                let error = expect_error(&resp, 400, &context)?;
-                assert_eq!(
-                    error, "BAD REQUEST: INVALID REQUEST TARGET",
-                    "{context}: error text"
-                );
-            }
-            // A valid absolute-form target is still served, and a
-            // percent-encoded NUL is still an unknown path.
-            let absolute = format!("http://{addr}/app.js");
-            let (status, body) = http(addr, "GET", &absolute, None)?;
-            assert_eq!(status, 200, "GET {absolute}: status");
+    let frontend = Path::new(env!("CARGO_MANIFEST_DIR")).join("frontend");
+    let exit_line = format!("const EXIT_INPUT = \"{EXIT_INPUT}\";");
+    with_bridge("static_paths_exact_match", empty_folder, |addr| {
+        for (target, file) in ROWS {
+            let expected = fs::read(frontend.join(file))
+                .map_err(|e| format!("reading frontend/{file}: {e}"))?;
+            let (status, body) = http(addr, "GET", target, None)?;
+            assert_eq!(status, 200, "GET {target}: status");
             assert_same(
-                &format!("GET {absolute} against frontend/app.js"),
+                &format!("GET {target} against frontend/{file}"),
                 &body,
-                &app_js,
+                &expected,
             );
-            let resp = http(addr, "GET", "/%00", None)?;
-            let error = expect_error(&resp, 404, "GET /%00")?;
-            assert_eq!(error, "NOT FOUND", "GET /%00: error text");
-            Ok(())
-        })
-    })
-}
-
-// ---------------------------------------------------------------------------
-// 404
-// ---------------------------------------------------------------------------
-
-/// Asserts that each `(method, target)` is answered 404 with
-/// `{"error": string}`; POST and PUT carry a well-formed session body.
-fn assert_404(test: &str, requests: &[(&str, &str)]) -> Result<(), String> {
-    let body = body_for(&strings(&SESSION_INPUTS));
-    with_synthetic_dir(test, |root| {
-        with_server(synthetic_store()?, replay(root), |addr| {
-            for (method, target) in requests {
-                let sent = match *method {
-                    "POST" | "PUT" => Some(body.as_slice()),
-                    _ => None,
-                };
-                let resp = http(addr, method, target, sent)?;
-                expect_error(&resp, 404, &format!("{test}: {method} {target}"))?;
-            }
-            Ok(())
-        })
-    })
-}
-
-#[test]
-fn synthetic_404_unknown_backend() -> Result<(), String> {
-    assert_404("404-backend", &[("POST", "/api/java/session")])
-}
-
-#[test]
-fn synthetic_404_unknown_path() -> Result<(), String> {
-    assert_404(
-        "404-path",
-        &[
-            ("GET", "/nope"),
-            ("POST", "/nope"),
-            ("POST", "/api/rust/other"),
-        ],
-    )
-}
-
-#[test]
-fn synthetic_404_non_post_on_api() -> Result<(), String> {
-    assert_404(
-        "404-method",
-        &[("GET", "/api/rust/session"), ("PUT", "/api/rust/session")],
-    )
-}
-
-// ---------------------------------------------------------------------------
-// 422
-// ---------------------------------------------------------------------------
-
-#[test]
-fn synthetic_422_unsupported_branch_end_to_end() -> Result<(), String> {
-    // The branch of `?` (help) at the order prompt.
-    const HELP_BRANCH: &str = "PO-09.b4";
-    let store = synthetic_store()?;
-    // RETURN at the station prompt, then `?` (help) at the order prompt.
-    let inputs = strings(&["", "?"]);
-    match inquire(&store, &inputs) {
-        Err(InquiryError::UnsupportedBranch(id)) if id == HELP_BRANCH => {}
-        Err(InquiryError::UnsupportedBranch(id)) => {
-            return Err(format!(
-                "inquire on the help input gave UnsupportedBranch({id}), expected {HELP_BRANCH}"
-            ));
-        }
-        Err(InquiryError::CorruptStore(_)) => {
-            return Err(
-                "inquire on the help input must be UnsupportedBranch, got CorruptStore".to_string(),
-            );
-        }
-        Ok(_) => {
-            return Err("inquire on the help input must be UnsupportedBranch, got Ok".to_string());
-        }
-    }
-    let expected = format!("UNSUPPORTED BRANCH {HELP_BRANCH}");
-    // The MUMPS side only has to replay successfully for compare to reach
-    // the Rust side.
-    let (carrier, carrier_returned) = inquire_carrier(&store, &inputs)?;
-    let body = body_for(&inputs);
-    let (rust, mumps, compare) = with_synthetic_dir("422", |root| {
-        write_case(root, &inputs, &carrier, carrier_returned.as_deref(), "")?;
-        with_server(store, replay(root), |addr| {
-            Ok((
-                post_session(addr, "rust", &body)?,
-                post_session(addr, "mumps", &body)?,
-                post_session(addr, "compare", &body)?,
-            ))
-        })
-    })?;
-    let error = expect_error(&rust, 422, "rust")?;
-    assert_same("rust 422 error text", &error, &expected);
-    assert_eq!(
-        mumps.0, 200,
-        "the synthetic capture must replay, so that compare reaches the Rust side: status"
-    );
-    let error = expect_error(&compare, 422, "compare")?;
-    assert_same("compare 422 error text", &error, &expected);
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// 500
-// ---------------------------------------------------------------------------
-
-/// Two invented lines that [`synthetic_500_corrupt_store_end_to_end`] adds
-/// to [`SYNTHETIC_ZWR`]: order 1, filed under the `C` value `SYN500`, whose
-/// zero node holds a descendant and no value.
-const SYNTHETIC_CORRUPT_ORDER_ZWR: &str = r#"^PRC(442,1,0,1)="SYNTHETIC DESCENDANT: the zero node holds no value"
-^PRC(442,"C","SYN500",1)=""
-"#;
-
-/// The order lookup's `CorruptStore` reaches HTTP 500 end to end, before the
-/// device gate `PO-12.b1`: the candidate's zero node passes `$D` with only a
-/// descendant, so its read `$P(^(0),U)` [DIC3.m:110] finds no value. The
-/// replay carrier's transcript and return value come from `inquire` on the
-/// same store, given the station answer alone.
-#[test]
-fn synthetic_500_corrupt_store_end_to_end() -> Result<(), String> {
-    let text = format!("{SYNTHETIC_ZWR}{SYNTHETIC_CORRUPT_ORDER_ZWR}");
-    let store = Store::from_zwr(&text).map_err(|e| {
-        format!(
-            "SYNTHETIC_ZWR with the corrupt order does not load: {}",
-            store_error_cause(&e)
-        )
-    })?;
-    // RETURN at the station prompt, then the corrupt order's `C` value.
-    let inputs = strings(&["", "SYN500"]);
-    let record = match inquire(&store, &inputs) {
-        Err(InquiryError::CorruptStore(record)) => record,
-        Err(InquiryError::UnsupportedBranch(id)) => {
-            return Err(format!(
-                "inquire on the corrupt order must be CorruptStore, got UnsupportedBranch({id})"
-            ));
-        }
-        Ok(_) => {
-            return Err("inquire on the corrupt order must be CorruptStore, got Ok".to_string());
-        }
-    };
-    // The candidate's zero node, which the lookup reads before PO-12.b1.
-    assert_eq!(
-        record, "^PRC(442,1,0)",
-        "inquire on the corrupt order: CorruptStore record"
-    );
-    let expected = format!("CORRUPT STORE {record}");
-    // The replay carrier: `inquire` on the same store with the station answer
-    // alone ends `Ok` by input exhaustion at the order prompt, before the
-    // lookup reaches the corrupt node. The MUMPS side only has to replay
-    // successfully for compare to reach the Rust side.
-    let station_answer = inputs
-        .get(..1)
-        .ok_or_else(|| "the request inputs must start with the station answer".to_string())?;
-    let carrier = match inquire(&store, station_answer) {
-        Ok(output) => output,
-        Err(InquiryError::UnsupportedBranch(id)) => {
-            return Err(format!(
-                "inquire on the station answer alone must be Ok, got UnsupportedBranch({id})"
-            ));
-        }
-        Err(InquiryError::CorruptStore(node)) => {
-            return Err(format!(
-                "inquire on the station answer alone must be Ok, got CorruptStore({node})"
-            ));
-        }
-    };
-    let body = body_for(&inputs);
-    let (rust, mumps, compare) = with_synthetic_dir("500", |root| {
-        write_case(
-            root,
-            &inputs,
-            &carrier.transcript,
-            carrier.returned.as_deref(),
-            "",
-        )?;
-        with_server(store, replay(root), |addr| {
-            Ok((
-                post_session(addr, "rust", &body)?,
-                post_session(addr, "mumps", &body)?,
-                post_session(addr, "compare", &body)?,
-            ))
-        })
-    })?;
-    let error = expect_error(&rust, 500, "rust")?;
-    assert_same("rust 500 error text", &error, &expected);
-    assert_eq!(
-        mumps.0, 200,
-        "the synthetic capture must replay, so that compare reaches the Rust side: status"
-    );
-    let error = expect_error(&compare, 500, "compare")?;
-    assert_same("compare 500 error text", &error, &expected);
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// 502, on the mumps backend and in compare
-// ---------------------------------------------------------------------------
-
-/// RETURN at the station prompt, then `?` (help) at the order prompt: a
-/// session the Rust side answers 422, so that a compare whose MUMPS side
-/// fails has two failures to choose between.
-const HELP_INPUTS: [&str; 2] = ["", "?"];
-
-/// [`HELP_INPUTS`] with the branch ID that `inquire` names when it answers
-/// them with `UnsupportedBranch` on `store`. Any other answer is an error,
-/// for compare would then have no Rust-side 422 for the MUMPS side's 502 to
-/// precede.
-fn help_session(store: &Store) -> Result<(Vec<String>, String), String> {
-    let inputs = strings(&HELP_INPUTS);
-    match inquire(store, &inputs) {
-        Err(InquiryError::UnsupportedBranch(id)) => Ok((inputs, id)),
-        Err(InquiryError::CorruptStore(_)) => {
-            Err("inquire on the help input must be UnsupportedBranch, got CorruptStore".to_string())
-        }
-        Ok(_) => Err("inquire on the help input must be UnsupportedBranch, got Ok".to_string()),
-    }
-}
-
-/// [`expect_error`] for a body that must hold nothing but its `error`
-/// member: no transcript, return value, side or verdict of a partial
-/// result.
-fn expect_error_alone(resp: &(u16, Vec<u8>), status: u16, context: &str) -> Result<String, String> {
-    let error = expect_error(resp, status, context)?;
-    let json = json_body(&resp.1).map_err(|e| format!("{context}: {e}"))?;
-    let bytes = json.as_bytes();
-    let mut names: Vec<String> = Vec::new();
-    json_object(bytes, skip_whitespace(bytes, 0), &mut |name, _, _| {
-        names.push(name.to_string());
-    })
-    .map_err(|e| format!("{context}: {e}"))?;
-    assert!(
-        names == ["error"],
-        "{context}: the error body must hold only the member \"error\", not {names:?}"
-    );
-    Ok(error)
-}
-
-/// POSTs `inputs`, which the Rust side answers with `UnsupportedBranch(id)`,
-/// to the rust, mumps and compare backends at `addr`. The rust backend must
-/// answer 422 naming `id`, and the mumps backend 502 with exactly `cause`
-/// and nothing else. Compare must answer that same 502, because it consults
-/// its MUMPS side before its Rust side.
-fn assert_mumps_502_before_rust_422(
-    addr: SocketAddr,
-    inputs: &[String],
-    id: &str,
-    cause: &str,
-    context: &str,
-) -> Result<(), String> {
-    let body = body_for(inputs);
-    let rust = post_session(addr, "rust", &body)?;
-    let error = expect_error(&rust, 422, &format!("{context}: rust"))?;
-    assert!(
-        error.contains(id),
-        "{context}: rust 422 error text must name {id}"
-    );
-    for backend in ["mumps", "compare"] {
-        let check = format!("{context}: {backend}");
-        let error = expect_error_alone(&post_session(addr, backend, &body)?, 502, &check)?;
-        assert_same(&format!("{check} 502 error text"), &error, cause);
-    }
-    Ok(())
-}
-
-#[test]
-fn synthetic_502_not_recorded() -> Result<(), String> {
-    let store = synthetic_store()?;
-    let (help, id) = help_session(&store)?;
-    // Each root holds a complete capture of another session, which must not
-    // match.
-    let other = strings(&["SYNTHETIC OTHER INPUT"]);
-    let (other_transcript, other_returned) = inquire_carrier(&store, &other)?;
-    let write_other = |root: &Path| {
-        write_case(
-            root,
-            &other,
-            &other_transcript,
-            other_returned.as_deref(),
-            "",
-        )
-    };
-    with_synthetic_dir("502-not-recorded", |root| {
-        write_other(root)?;
-        let error = mumps_502(replay(root), &strings(&SESSION_INPUTS))?;
-        assert_same("502 error text", &error, "NOT RECORDED");
-        Ok(())
-    })?;
-    // A root holding nothing but SYNTHETIC.txt, and a capture directory
-    // inside it that is never created.
-    with_synthetic_dir("502-not-recorded-no-captures", |root| {
-        for (context, golden_dir) in [
-            ("empty root", root.to_path_buf()),
-            ("absent root", root.join("absent")),
-        ] {
-            let error = mumps_502_named(
-                &format!("{context}: mumps backend"),
-                replay(&golden_dir),
-                &strings(&SESSION_INPUTS),
-            )?;
-            assert_same(
-                &format!("{context}: 502 error text"),
-                &error,
-                "NOT RECORDED",
-            );
-        }
-        Ok(())
-    })?;
-    // Unrecorded on the MUMPS side and unsupported on the Rust side: compare
-    // answers the MUMPS side's 502, never the Rust side's 422.
-    with_synthetic_dir("502-not-recorded-help", |root| {
-        write_other(root)?;
-        with_server(store, replay(root), |addr| {
-            assert_mumps_502_before_rust_422(addr, &help, &id, "NOT RECORDED", "help session")
-        })
-    })
-}
-
-#[test]
-fn synthetic_502_not_recorded_lists_unreadable_input() -> Result<(), String> {
-    with_synthetic_dir("502-unreadable-input", |root| {
-        let input = write_file(root, "GC-01/input.txt", &[0xFF, 0xFE, b'\n'])?;
-        let error = mumps_502(replay(root), &strings(&SESSION_INPUTS))?;
-        // GC-02 to GC-05 are absent, so GC-01's input is the only one listed.
-        assert_same(
-            "502 error text",
-            &error,
-            format!("NOT RECORDED (unreadable: {})", input.display()),
-        );
-        Ok(())
-    })
-}
-
-/// The required files of a matching capture, in the order the bridge reads
-/// them.
-const REQUIRED_CAPTURE_FILES: [&str; 3] = ["transcript.txt", "returned.txt", "normalisation.txt"];
-
-/// Writes a valid capture of `inputs` into `GC-01/` under `root`: the
-/// transcript and return value [`inquire_carrier`] gives on `store`, and
-/// one well-formed normalisation rule, so that damaging any one required
-/// file leaves the others valid. `inquire` returns `None`, so returned.txt
-/// is zero bytes, which is valid.
-fn write_valid_capture(root: &Path, store: &Store, inputs: &[String]) -> Result<(), String> {
-    let (transcript, returned) = inquire_carrier(store, inputs)?;
-    write_case(
-        root,
-        inputs,
-        &transcript,
-        returned.as_deref(),
-        "SYNTHETIC OPEN\tSYNTHETIC CLOSE\n",
-    )
-}
-
-/// One capture-file test over the help session. A first root,
-/// `502-<kind>-intact`, confirms that the undamaged capture replays, so that
-/// compare answers the Rust side's 422. Then, each in its own root
-/// `502-<kind>-<file stem>`, `damage` changes one of
-/// [`REQUIRED_CAPTURE_FILES`] and no other file: the mumps and compare
-/// backends must both answer 502 with exactly
-/// `CAPTURE FILE <path>: <reason>` and nothing else, while the rust backend
-/// still answers 422.
-fn assert_capture_file_502(
-    kind: &str,
-    reason: &str,
-    damage: impl Fn(&Path, &str) -> Result<(), String>,
-) -> Result<(), String> {
-    let store = synthetic_store()?;
-    let (inputs, id) = help_session(&store)?;
-    let intact = format!("502-{kind}-intact");
-    with_synthetic_dir(&intact, |root| {
-        write_valid_capture(root, &store, &inputs)?;
-        with_server(store.clone(), replay(root), |addr| {
-            let body = body_for(&inputs);
-            let (status, _) = post_session(addr, "mumps", &body)?;
-            assert_eq!(status, 200, "{intact}: mumps status");
-            let compare = post_session(addr, "compare", &body)?;
-            let error = expect_error(&compare, 422, &format!("{intact}: compare"))?;
-            assert!(
-                error.contains(&id),
-                "{intact}: compare 422 error text must name {id}"
-            );
-            Ok(())
-        })
-    })?;
-    for name in REQUIRED_CAPTURE_FILES {
-        let label = format!("502-{kind}-{}", name.strip_suffix(".txt").unwrap_or(name));
-        with_synthetic_dir(&label, |root| {
-            write_valid_capture(root, &store, &inputs)?;
-            damage(root, name)?;
-            let cause = format!("CAPTURE FILE {}: {reason}", case_file(root, name).display());
-            with_server(store.clone(), replay(root), |addr| {
-                assert_mumps_502_before_rust_422(addr, &inputs, &id, &cause, &label)
-            })
-        })?;
-    }
-    Ok(())
-}
-
-#[test]
-fn synthetic_502_capture_file_missing() -> Result<(), String> {
-    assert_capture_file_502("missing", "MISSING", |root, name| {
-        fs::remove_file(case_file(root, name))
-            .map_err(|e| format!("removing synthetic GC-01/{name}: {e}"))
-    })
-}
-
-#[test]
-fn synthetic_502_capture_file_unreadable() -> Result<(), String> {
-    // A directory in place of the file is present but unreadable.
-    assert_capture_file_502("unreadable", "UNREADABLE", |root, name| {
-        let path = case_file(root, name);
-        fs::remove_file(&path).map_err(|e| format!("removing synthetic GC-01/{name}: {e}"))?;
-        fs::create_dir(&path).map_err(|e| format!("creating the directory GC-01/{name}: {e}"))
-    })
-}
-
-#[test]
-fn synthetic_502_capture_file_non_utf8() -> Result<(), String> {
-    assert_capture_file_502("non-utf8", "NON-UTF8", |root, name| {
-        fs::write(case_file(root, name), [0xFF, 0xFE])
-            .map_err(|e| format!("writing synthetic GC-01/{name}: {e}"))
-    })
-}
-
-#[test]
-fn synthetic_502_malformed_normalisation() -> Result<(), String> {
-    const MALFORMED: &str = "SYNTHETIC RULE WITHOUT A TAB\n";
-    // A valid rule on line 1, then a malformed line 2.
-    const MALFORMED_LINE_2: &str =
-        "SYNTHETIC OPEN\tSYNTHETIC CLOSE\nSYNTHETIC RULE WITHOUT A TAB\n";
-    let store = synthetic_store()?;
-    let inputs = strings(&SESSION_INPUTS);
-    let (transcript, returned) = inquire_carrier(&store, &inputs)?;
-    let other = strings(&["SYNTHETIC OTHER INPUT"]);
-    let (other_transcript, other_returned) = inquire_carrier(&store, &other)?;
-    // A capture of `inputs` in `case` under the normalisation file `rules`.
-    let capture = |root: &Path, case: &str, rules: &str| {
-        write_case_in(root, case, &inputs, &transcript, returned.as_deref(), rules)
-    };
-    // A complete, valid capture of `inputs` after the first match, which a
-    // broken first match must never fall back to.
-    let duplicate = |root: &Path, case: &str| capture(root, case, "");
-    // Each row: its label, its layout, and the case and line of the
-    // malformed normalisation.txt that the error must name.
-    let layouts: [(&str, Layout<'_>, &str, usize); 3] = [
-        (
-            "502-normalisation",
-            &|root| capture(root, "GC-01", MALFORMED),
-            "GC-01",
-            1,
-        ),
-        (
-            "502-normalisation-no-fallback",
-            &|root| {
-                capture(root, "GC-01", MALFORMED)?;
-                duplicate(root, "GC-02")
-            },
-            "GC-01",
-            1,
-        ),
-        // GC-02 is the first match, past a capture of another session.
-        (
-            "502-normalisation-later-match",
-            &|root| {
-                write_case(
-                    root,
-                    &other,
-                    &other_transcript,
-                    other_returned.as_deref(),
-                    "",
-                )?;
-                capture(root, "GC-02", MALFORMED_LINE_2)?;
-                duplicate(root, "GC-03")
-            },
-            "GC-02",
-            2,
-        ),
-    ];
-    for (label, layout, case, line) in layouts {
-        with_synthetic_dir(label, |root| {
-            layout(root)?;
-            let error = mumps_502_named(&format!("{label}: mumps backend"), replay(root), &inputs)?;
-            let path = case_path(root, case, "normalisation.txt");
-            assert_same(
-                &format!("{label}: 502 error text"),
-                &error,
-                format!("MALFORMED NORMALISATION {} line {line}", path.display()),
-            );
-            Ok(())
-        })?;
-    }
-    Ok(())
-}
-
-#[test]
-fn synthetic_502_malformed_meta() -> Result<(), String> {
-    let inputs = strings(&SESSION_INPUTS);
-    let malformed = meta_text(SYNTHETIC_CONTEXT, "not-json");
-    // Well formed, so reaching it gives a context mismatch, never a run.
-    let valid = meta_text(SYNTHETIC_CONTEXT, r#"["synthetic-never-run"]"#);
-    // Each row: its label, its layout, the bridge's `golden_dir` (the row's
-    // root, or the named entry under it), and the case whose meta.txt the
-    // error must name. A `GC-01/` given only an input file is a case
-    // directory without a meta file.
-    let layouts: [(&str, Layout<'_>, Option<&str>, &str); 11] = [
-        (
-            "502-meta",
-            &|root| write_meta_in(root, "GC-01", malformed.as_bytes()),
-            None,
-            "GC-01",
-        ),
-        // The first meta file decides, though a valid one follows it.
-        (
-            "502-meta-first-malformed",
-            &|root| {
-                write_meta_in(root, "GC-01", malformed.as_bytes())?;
-                write_meta_in(root, "GC-02", valid.as_bytes())
-            },
-            None,
-            "GC-01",
-        ),
-        // An absent case is skipped.
-        (
-            "502-meta-first-case-absent",
-            &|root| write_meta_in(root, "GC-02", malformed.as_bytes()),
-            None,
-            "GC-02",
-        ),
-        // So is a case entry that is a regular file.
-        (
-            "502-meta-first-case-not-a-directory",
-            &|root| {
-                write_case_entry_file(root, "GC-01")?;
-                write_meta_in(root, "GC-02", malformed.as_bytes())
-            },
-            None,
-            "GC-02",
-        ),
-        // So are a case directory without a meta file and an absent GC-02.
-        (
-            "502-meta-first-case-without-meta",
-            &|root| {
-                write_inputs(root, &inputs)?;
-                write_meta_in(root, "GC-03", malformed.as_bytes())
-            },
-            None,
-            "GC-03",
-        ),
-        // A first meta file that is not UTF-8 is malformed, never skipped.
-        (
-            "502-meta-first-non-utf8",
-            &|root| {
-                write_meta_in(root, "GC-01", &[0xFF, 0xFE, b'\n'])?;
-                write_meta_in(root, "GC-02", valid.as_bytes())
-            },
-            None,
-            "GC-01",
-        ),
-        // So is a first meta file that is a directory, which is unreadable.
-        (
-            "502-meta-first-meta-is-a-directory",
-            &|root| {
-                fs::create_dir_all(case_path(root, "GC-01", "meta.txt"))
-                    .map_err(|e| format!("creating the directory GC-01/meta.txt: {e}"))?;
-                write_meta_in(root, "GC-02", valid.as_bytes())
-            },
-            None,
-            "GC-01",
-        ),
-        // With no meta file anywhere, the error names where the first would
-        // be: in a root with case entries, in an empty root, and in a
-        // capture directory that is never created.
-        (
-            "502-meta-none",
-            &|root| {
-                write_inputs(root, &inputs)?;
-                write_case_entry_file(root, "GC-02")
-            },
-            None,
-            "GC-01",
-        ),
-        ("502-meta-empty-root", &|_| Ok(()), None, "GC-01"),
-        ("502-meta-absent-root", &|_| Ok(()), Some("absent"), "GC-01"),
-        // A capture directory that is a regular file fails closed: its first
-        // meta file is unreadable, not missing.
-        (
-            "502-meta-root-is-a-file",
-            &|root| {
-                write_file(
-                    root,
-                    "root-file",
-                    b"SYNTHETIC: a regular file in place of the capture directory\n",
-                )?;
-                Ok(())
-            },
-            Some("root-file"),
-            "GC-01",
-        ),
-    ];
-    for (label, layout, golden, case) in layouts {
-        with_synthetic_dir(label, |root| {
-            layout(root)?;
-            let golden_dir = golden.map_or_else(|| root.to_path_buf(), |name| root.join(name));
-            let error = mumps_502_named(
-                &format!("{label}: mumps backend"),
-                live(&golden_dir),
-                &inputs,
-            )?;
-            let path = case_path(&golden_dir, case, "meta.txt");
-            assert_same(
-                &format!("{label}: 502 error text"),
-                &error,
-                format!("MALFORMED META {}", path.display()),
-            );
-            Ok(())
-        })?;
-    }
-    Ok(())
-}
-
-#[test]
-fn synthetic_502_context_mismatch() -> Result<(), String> {
-    const IOF_MISMATCH: &str = "CONTEXT MISMATCH IOF: expected UNRESOLVED, actual #";
-    // SYNTHETIC_CONTEXT with another DUZ, the first key checked.
-    const DUZ_1_CONTEXT: &str = r##"{"DUZ":"1","IOF":"#","IOSL":"24","STATION":"500"}"##;
-    const EXEC_ARGS: &str = r#"["synthetic-never-run"]"#;
-    let inputs = strings(&SESSION_INPUTS);
-    let synthetic = meta_text(SYNTHETIC_CONTEXT, EXEC_ARGS);
-    let duz_1 = meta_text(DUZ_1_CONTEXT, EXEC_ARGS);
-    // Each row: its label, its layout, and the exact error text.
-    let layouts: [(&str, Layout<'_>, &str); 4] = [
-        (
-            "502-context",
-            &|root| write_meta_in(root, "GC-01", synthetic.as_bytes()),
-            IOF_MISMATCH,
-        ),
-        // The context of the first meta file is checked, not a later one's.
-        (
-            "502-context-first-meta-wins",
-            &|root| {
-                write_meta_in(root, "GC-01", synthetic.as_bytes())?;
-                write_meta_in(root, "GC-02", duz_1.as_bytes())
-            },
-            IOF_MISMATCH,
-        ),
-        // Past an absent GC-01 and a GC-02 that is a regular file.
-        (
-            "502-context-later-meta",
-            &|root| {
-                write_case_entry_file(root, "GC-02")?;
-                write_meta_in(root, "GC-03", duz_1.as_bytes())
-            },
-            "CONTEXT MISMATCH DUZ: expected .5, actual 1",
-        ),
-        // Past a GC-01 that is a regular file.
-        (
-            "502-context-first-case-not-a-directory",
-            &|root| {
-                write_case_entry_file(root, "GC-01")?;
-                write_meta_in(root, "GC-02", synthetic.as_bytes())
-            },
-            IOF_MISMATCH,
-        ),
-    ];
-    for (label, layout, expected) in layouts {
-        with_synthetic_dir(label, |root| {
-            layout(root)?;
-            let error = mumps_502_named(&format!("{label}: mumps backend"), live(root), &inputs)?;
-            // A context error, not a spawn error or an `EXIT` cause, proves the
-            // bridge stopped before it ran `docker`.
-            assert_same(&format!("{label}: 502 error text"), &error, expected);
-            Ok(())
-        })?;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Other
-// ---------------------------------------------------------------------------
-
-/// Probe characters for the JSON round trip: a quote, a backslash, two
-/// characters of the Basic Multilingual Plane, one beyond it, and a control
-/// character.
-const PROBE: &str = "\"\\\u{e9}\u{20ac}\u{1f600}\u{1}";
-
-#[test]
-fn synthetic_json_escaping_round_trip() -> Result<(), String> {
-    // The oracle must reject what RFC 8259 rejects, a leading zero included,
-    // so that json_body cannot certify an invalid bridge body.
-    for text in [
-        "01",
-        "-01",
-        "00",
-        "-00",
-        r#"{"extra":00}"#,
-        "[01]",
-        "-",
-        "1.",
-        ".5",
-    ] {
-        assert!(parse_json(text).is_err(), "the JSON oracle accepts {text}");
-    }
-    for text in [
-        "0",
-        "-0",
-        "10",
-        "0.5",
-        "-0.5e+3",
-        "1E9",
-        r#"{"extra":0}"#,
-        "[0,10]",
-    ] {
-        assert!(parse_json(text).is_ok(), "the JSON oracle rejects {text}");
-    }
-    let store = synthetic_store()?;
-    let Some((case_inputs, case_transcript, _)) =
-        ok_case_or_not_run("synthetic_json_escaping_round_trip", &store)
-    else {
-        return Ok(());
-    };
-    // The probe rides as one extra input line, which the replay must match.
-    let mut inputs = case_inputs;
-    inputs.push(format!("SYNTHETIC PROBE {PROBE}"));
-    // Synthetic: the inquire transcript, then the probe, a tab and BEL,
-    // which the bridge must escape and this parser must decode.
-    let transcript = format!("{case_transcript}{PROBE}\t\u{7}");
-    let body = body_for_ascii(&inputs);
-    assert!(
-        body.is_ascii(),
-        "the request must carry every non-ASCII character escaped"
-    );
-    let sent = String::from_utf8_lossy(&body).into_owned();
-    for escape in [
-        "\\\"",
-        "\\\\",
-        "\\u00e9",
-        "\\u20ac",
-        "\\ud83d\\ude00",
-        "\\u0001",
-    ] {
-        assert!(
-            sent.contains(escape),
-            "the request body lacks the escape {escape}"
-        );
-    }
-    let ((status, response), file) = with_synthetic_dir("json", |root| {
-        write_case(root, &inputs, &transcript, None, "")?;
-        let resp = with_server(store, replay(root), |addr| {
-            post_session(addr, "mumps", &body)
-        })?;
-        let file = fs::read_to_string(case_file(root, "transcript.txt"))
-            .map_err(|e| format!("reading synthetic GC-01/transcript.txt: {e}"))?;
-        Ok((resp, file))
-    })?;
-    assert_eq!(status, 200, "mumps backend: status");
-    let (decoded, _) = session_of(json_body(&response)?)?;
-    assert_same("decoded transcript against transcript.txt", &decoded, &file);
-    Ok(())
-}
-
-/// The interim response the bridge sends to `Expect: 100-continue`.
-const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
-
-/// Reads `stream` until the peer closes it, and returns what arrived. A
-/// reset counts as a close; a read that times out is an error.
-fn read_until_closed(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
-    let mut received = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => return Ok(received),
-            Ok(n) => received.extend_from_slice(buf.get(..n).unwrap_or_default()),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(received),
-            Err(e) => return Err(format!("still open after {} bytes: {e}", received.len())),
-        }
-    }
-}
-
-#[test]
-fn synthetic_shutdown_joins_within_bound() -> Result<(), String> {
-    let store = synthetic_store()?;
-    let inputs = strings(&SESSION_INPUTS);
-    let (transcript, returned) = inquire_carrier(&store, &inputs)?;
-    let body = body_for(&inputs);
-    with_synthetic_dir("shutdown", |root| {
-        // A capture the in-flight session matches, so that a connection
-        // thread running on after shutdown would answer it.
-        write_case(root, &inputs, &transcript, returned.as_deref(), "")?;
-        // The stop bound lies below the server's 5-second read timeout, so a
-        // connection thread blocked in a read must be woken, not waited out:
-        // `with_server_within` fails unless `serve_until` returns `Ok(())`
-        // within the bound.
-        let (mut idle, mut in_flight) =
-            with_server_within(SHUTDOWN_BOUND, store, replay(root), |addr| {
-                // One answered request shows the accept loop was running.
-                let (status, _) = http(addr, "GET", "/", None)?;
-                assert_eq!(status, 200, "GET /: status");
-                // The idle connection sends nothing. Connections are accepted
-                // in arrival order, so once the in-flight one is answered
-                // below, the idle one has been accepted too.
-                let idle = connect(addr)?;
-                let mut in_flight = connect(addr)?;
-                let head = format!(
-                    "POST /api/mumps/session HTTP/1.1\r\nHost: {addr}\r\n\
-                     Content-Type: application/json\r\nContent-Length: {}\r\n\
-                     Expect: 100-continue\r\n\r\n",
-                    body.len()
+            if file == "app.js" {
+                assert!(
+                    contains(&body, exit_line.as_bytes()),
+                    "GET {target}: the served app.js lacks `{exit_line}`"
                 );
-                in_flight
-                    .write_all(head.as_bytes())
-                    .map_err(|e| format!("in-flight connection: sending the head: {e}"))?;
-                // The interim response shows its connection thread is now
-                // blocked reading the body.
-                let mut interim = vec![0u8; CONTINUE.len()];
-                in_flight
-                    .read_exact(&mut interim)
-                    .map_err(|e| format!("in-flight connection: reading 100 Continue: {e}"))?;
-                assert_same("in-flight connection: interim response", &interim, CONTINUE);
-                Ok((idle, in_flight))
-            })?;
-        // The session's resources, its `GC-01/` case, go, as a caller of
-        // `serve_until` may remove them once it has returned. The root stays
-        // for `with_synthetic_dir` to remove. A connection thread still
-        // running would now find no capture and answer 502 NOT RECORDED, or
-        // 200 had it read the capture first.
-        fs::remove_dir_all(root.join("GC-01"))
-            .map_err(|e| format!("removing the synthetic GC-01 directory: {e}"))?;
-        // The server may have reset the connection already, so the send may
-        // fail; only an answer would be wrong.
-        let _ = in_flight.write_all(&body);
-        let in_flight_rest =
-            read_until_closed(&mut in_flight).map_err(|e| format!("in-flight connection: {e}"))?;
-        let started = Instant::now();
-        let idle_rest = read_until_closed(&mut idle);
-        let idle_wait = started.elapsed();
-        assert!(
-            in_flight_rest.is_empty(),
-            "in-flight connection: {} response bytes after shutdown, none expected",
-            in_flight_rest.len()
-        );
-        let idle_rest = idle_rest.map_err(|e| format!("idle connection: {e}"))?;
-        assert!(
-            idle_rest.is_empty(),
-            "idle connection: {} bytes after shutdown, none expected",
-            idle_rest.len()
-        );
-        assert!(
-            idle_wait < SHUTDOWN_BOUND,
-            "idle connection: closed {} ms after serve_until returned",
-            idle_wait.as_millis()
-        );
-        Ok(())
-    })
-}
-
-// ---------------------------------------------------------------------------
-// GC-02 end to end (not synthetic)
-// ---------------------------------------------------------------------------
-
-/// The seven capture files of one case.
-const CAPTURE_FILES: [&str; 7] = [
-    "input.txt",
-    "transcript.txt",
-    "returned.txt",
-    "db-before.zwr",
-    "db-after.zwr",
-    "meta.txt",
-    "normalisation.txt",
-];
-
-/// The eleven repository fixtures, the capture owner's runtime export and
-/// the manifest, under `tests/fixtures/ifcap/`.
-const FIXTURE_FILES: [&str; 13] = [
-    "411.zwr",
-    "411.2.zwr",
-    "420.5.zwr",
-    "420.8.zwr",
-    "440.zwr",
-    "442.3.zwr",
-    "442.4.zwr",
-    "442.5.zwr",
-    "442.8.zwr",
-    "5.zwr",
-    "49.zwr",
-    "cases.zwr",
-    "MANIFEST.txt",
-];
-
-/// GC-02's capture directory, relative to the crate.
-const GC_02_CASE: &str = "tests/golden/ifcap/GC-02";
-/// The fixture directory, relative to the crate.
-const GC_02_FIXTURES: &str = "tests/fixtures/ifcap";
-
-/// The readiness prerequisites of `gc_02_end_to_end_compare`, relative to
-/// the crate, in the order they are reported: GC-02's capture files, then
-/// the fixtures and the manifest.
-fn gc_02_prerequisites() -> Vec<String> {
-    CAPTURE_FILES
-        .iter()
-        .map(|name| format!("{GC_02_CASE}/{name}"))
-        .chain(
-            FIXTURE_FILES
-                .iter()
-                .map(|name| format!("{GC_02_FIXTURES}/{name}")),
-        )
-        .collect()
-}
-
-/// Readiness of the relative paths `required`, as `inspect` answers for
-/// each: `Ok` when something stands at the path, an error of kind
-/// `NotFound` when nothing does. Only those paths are missing, the
-/// classification of the equivalence harness's `disk_is_missing`.
-///
-/// `Ok` lists the missing paths in order; while one is missing the case is
-/// NOT COMPARED. Any other error is a path that cannot be inspected, which
-/// is never missing: once nothing is missing, `Err` names the first such
-/// path and its cause, and the case is FAIL.
-fn missing_prerequisites(
-    required: &[String],
-    inspect: impl Fn(&str) -> io::Result<()>,
-) -> Result<Vec<String>, String> {
-    let mut missing = Vec::new();
-    let mut uninspectable = None;
-    for relative in required {
-        match inspect(relative) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(relative.clone()),
-            Err(e) => {
-                uninspectable.get_or_insert_with(|| format!("{relative}: {e}"));
             }
         }
-    }
-    match uninspectable {
-        Some(cause) if missing.is_empty() => Err(cause),
-        _ => Ok(missing),
-    }
-}
-
-/// The inspector of [`missing_prerequisites`] for paths relative to `base`:
-/// their metadata, following symbolic links, so a dangling link is missing.
-fn disk_inspector(base: &Path) -> impl Fn(&str) -> io::Result<()> {
-    move |relative| fs::metadata(base.join(relative)).map(|_| ())
-}
-
-#[test]
-fn gc_02_end_to_end_compare() -> Result<(), String> {
-    const LABEL: &str = "gc_02_end_to_end_compare (not synthetic)";
-    const GOLDEN: &str = "tests/golden/ifcap";
-    let fail = |step: &str, detail: String| format!("{LABEL}: FAIL at {step}: {detail}");
-    // Every path is named relative to the crate.
-    let missing = missing_prerequisites(&gc_02_prerequisites(), disk_inspector(crate_dir()))
-        .map_err(|cause| fail("readiness", cause))?;
-    if !missing.is_empty() {
-        println!("{LABEL}: NOT COMPARED, missing: {}", missing.join(", "));
-        return Ok(());
-    }
-    let read = |name: &str| {
-        fs::read_to_string(crate_dir().join(GC_02_CASE).join(name))
-            .map_err(|e| fail("reading the capture", format!("{GC_02_CASE}/{name}: {e}")))
-    };
-    let store = load_fixtures(&crate_dir().join(GC_02_FIXTURES))
-        .map_err(|e| fail("load_fixtures", store_error_cause(&e)))?;
-    let inputs = split_input_lines(&read("input.txt")?);
-    let captured_transcript = read("transcript.txt")?;
-    let captured_returned = read("returned.txt")?;
-    let normalisation = read("normalisation.txt")?;
-
-    let mode = MumpsMode::Replay {
-        golden_dir: crate_dir().join(GOLDEN),
-    };
-    let (status, body) = with_server(store, mode, |addr| {
-        post_session(addr, "compare", &body_for(&inputs))
-    })?;
-
-    assert_eq!(status, 200, "{LABEL}: FAIL at status 200");
-    let json = json_body(&body).map_err(|e| fail("the response body", e))?;
-    let matched = member(json, "match").map_err(|e| fail("match", e))?;
-    assert!(matched == "true", "{LABEL}: FAIL at match == true");
-    let rules = parse_normalisation(&normalisation).map_err(|line| {
-        fail(
-            "parse_normalisation",
-            format!("normalisation.txt line {line}"),
-        )
-    })?;
-    let rust = member(json, "rust").map_err(|e| fail("the rust side", e))?;
-    let (rust_transcript, rust_returned) =
-        session_of(rust).map_err(|e| fail("the rust side", e))?;
-    assert_same(
-        &format!("{LABEL}: FAIL at the normalised transcript"),
-        normalise(&rust_transcript, &rules),
-        normalise(&captured_transcript, &rules),
-    );
-    // returned.txt: zero bytes is null, otherwise one trailing newline is
-    // not part of the value.
-    let expected_returned = if captured_returned.is_empty() {
-        None
-    } else {
-        Some(
-            captured_returned
-                .strip_suffix('\n')
-                .unwrap_or(&captured_returned)
-                .to_string(),
-        )
-    };
-    assert_same_optional(
-        &format!("{LABEL}: FAIL at returned against returned.txt"),
-        rust_returned.as_deref(),
-        expected_returned.as_deref(),
-    );
-    println!("{LABEL}: PASS");
-    Ok(())
-}
-
-/// The readiness of `gc_02_end_to_end_compare`: only an absent prerequisite
-/// is missing, and one that cannot be inspected is FAIL, never NOT
-/// COMPARED. The in-memory inspectors answer alike for every user, root
-/// included. The disk layouts lie inside one synthetic directory, each
-/// prerequisite an empty file, since only its presence is inspected.
-#[test]
-fn synthetic_gc_02_readiness_missing_only_when_absent() -> Result<(), String> {
-    let required = gc_02_prerequisites();
-    let input = format!("{GC_02_CASE}/input.txt");
-    assert_eq!(
-        required.first(),
-        Some(&input),
-        "input.txt is the first prerequisite"
-    );
-    let absent = || -> io::Result<()> { Err(io::Error::from(io::ErrorKind::NotFound)) };
-    let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
-
-    // In memory: nothing present, then one present path.
-    assert_eq!(
-        missing_prerequisites(&required, |_| absent()),
-        Ok(required.clone()),
-        "nothing present: every prerequisite missing, in order"
-    );
-    let present = format!("{GC_02_CASE}/meta.txt");
-    let others: Vec<String> = required
-        .iter()
-        .filter(|relative| **relative != present)
-        .cloned()
-        .collect();
-    assert_eq!(
-        others.len() + 1,
-        required.len(),
-        "{present} is one prerequisite"
-    );
-    assert_eq!(
-        missing_prerequisites(&required, |relative| {
-            if relative == present {
-                Ok(())
-            } else {
-                absent()
-            }
-        }),
-        Ok(others),
-        "{present} present: every other prerequisite missing, in order"
-    );
-    // A path that cannot be inspected is FAIL once the rest are present, and
-    // is never listed as missing beside an absent one.
-    let unreadable = format!("{GC_02_FIXTURES}/cases.zwr");
-    let gone = format!("{GC_02_CASE}/db-after.zwr");
-    assert_eq!(
-        missing_prerequisites(&required, |relative| {
-            if relative == unreadable {
-                Err(denied())
-            } else {
-                Ok(())
-            }
-        }),
-        Err(format!("{unreadable}: {}", denied())),
-        "{unreadable} permission denied: FAIL naming it"
-    );
-    assert_eq!(
-        missing_prerequisites(&required, |relative| {
-            if relative == unreadable {
-                Err(denied())
-            } else if relative == gone {
-                absent()
-            } else {
-                Ok(())
-            }
-        }),
-        Ok(vec![gone.clone()]),
-        "{unreadable} permission denied and {gone} absent: only {gone} missing"
-    );
-
-    // On disk: one layout per check, rooted where the crate folder would be.
-    with_synthetic_dir("gc-02-readiness", |root| {
-        let layout = |name: &str, keep: &dyn Fn(&str) -> bool| -> Result<PathBuf, String> {
-            for relative in &required {
-                if keep(relative) {
-                    write_file(root, &format!("{name}/{relative}"), b"")?;
-                }
-            }
-            Ok(root.join(name))
-        };
-        let link = |base: &Path, target: &str| {
-            std::os::unix::fs::symlink(target, base.join(&input))
-                .map_err(|e| format!("linking synthetic {input} to {target}: {e}"))
-        };
-        let all_present = layout("present", &|_| true)?;
-        assert_eq!(
-            missing_prerequisites(&required, disk_inspector(&all_present)),
-            Ok(Vec::new()),
-            "every prerequisite a file: none missing"
-        );
-        let dangling = layout("dangling", &|relative| relative != input)?;
-        link(&dangling, "no-such-file")?;
-        assert_eq!(
-            missing_prerequisites(&required, disk_inspector(&dangling)),
-            Ok(vec![input.clone()]),
-            "input.txt a dangling link: missing"
-        );
-        let looped = layout("loop", &|relative| relative != input)?;
-        link(&looped, "input.txt")?;
-        let outcome = missing_prerequisites(&required, disk_inspector(&looped));
-        assert!(
-            matches!(&outcome, Err(cause) if cause.starts_with(&format!("{input}: "))),
-            "input.txt a link to itself (ELOOP): FAIL naming it, got {outcome:?}"
-        );
-        let not_a_dir = layout("not-a-directory", &|relative| {
-            relative.starts_with(GC_02_FIXTURES)
-        })?;
-        write_file(root, &format!("not-a-directory/{GC_02_CASE}"), b"")?;
-        let outcome = missing_prerequisites(&required, disk_inspector(&not_a_dir));
-        assert!(
-            matches!(&outcome, Err(cause) if cause.starts_with(&format!("{input}: "))),
-            "GC-02 a regular file (ENOTDIR): FAIL naming input.txt, got {outcome:?}"
-        );
         Ok(())
     })
+}
+
+// ---------------------------------------------------------------------------
+// End to end on real captures
+// ---------------------------------------------------------------------------
+
+/// For each case `golden::load_case` reports READY in the checkout's golden
+/// folder, COMPARE with that case's inputs answers 200 with `match` true,
+/// through one bridge started on first need. Every other case prints
+/// `GC-0N NOT COMPARED` and passes. COMPARE answers from the first recorded
+/// case in `CASE_IDS` order whose inputs equal the request's, so a READY
+/// case whose inputs equal an earlier recorded case's fails before any
+/// request, and `match` is trusted only once COMPARE's MUMPS side is the
+/// case's own raw transcript and return value. Nothing here reads a capture
+/// file itself or writes anything.
+#[test]
+fn end_to_end_real_captures() -> Result<(), String> {
+    let golden_dir = default_dir();
+    let mut bridge: Option<(SocketAddr, Server)> = None;
+    let mut recorded: Vec<(&str, Vec<String>)> = Vec::new();
+    for id in CASE_IDS {
+        let case = match load_case(&golden_dir, id) {
+            CaseLoad::Recorded(case) => case,
+            CaseLoad::Absent | CaseLoad::NotRecorded(_) | CaseLoad::Unreadable(_) => {
+                println!("{id} NOT COMPARED");
+                continue;
+            }
+        };
+        let earlier = recorded
+            .iter()
+            .find(|(_, inputs)| *inputs == case.inputs)
+            .map(|&(first, _)| first);
+        if earlier.is_none() {
+            recorded.push((id, case.inputs.clone()));
+        }
+        if !matches!(case.readiness, Readiness::Ready) {
+            println!("{id} NOT COMPARED");
+            continue;
+        }
+        if let Some(first) = earlier {
+            return Err(format!(
+                "{id}: its inputs equal {first}'s, so COMPARE answers from {first}'s capture \
+                 (golden::find_capture takes the first recorded case in CASE_IDS order) and \
+                 {id}'s own capture is never compared"
+            ));
+        }
+        let addr = match &bridge {
+            Some((addr, _)) => *addr,
+            None => {
+                let (addr, server) = start(&golden_dir).map_err(|e| format!("{id}: {e}"))?;
+                bridge = Some((addr, server));
+                addr
+            }
+        };
+        let answered = post_session(addr, "compare", &body_for(&case.inputs))
+            .and_then(|resp| expect_compare(&resp, id));
+        let compared = match answered {
+            Ok(compared) => compared,
+            Err(failure) => {
+                let failure = format!("{id}: {failure}");
+                return Err(match bridge.take() {
+                    Some((_, server)) => explain(failure, server),
+                    None => failure,
+                });
+            }
+        };
+        assert_same(
+            &format!("{id}: COMPARE's mumps transcript against the case's own transcript.txt"),
+            &compared.mumps.transcript,
+            &case.transcript,
+        );
+        assert_eq!(
+            compared.mumps.returned, case.returned,
+            "{id}: COMPARE's mumps returned against the case's own returned.txt"
+        );
+        assert!(compared.matched, "{id}: COMPARE answered match false");
+        println!("{id} MATCH");
+    }
+    Ok(())
 }

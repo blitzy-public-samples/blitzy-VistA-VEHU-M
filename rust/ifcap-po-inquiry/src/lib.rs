@@ -1,16 +1,17 @@
 //! Read-only Rust port of the VistA IFCAP OPTION `PRCH DISPLAY PO`, whose
-//! action is `EN3^PRCHRPT`: one purchase-order display session, reproducing
-//! the original's prompts, messages, field order and formatting over an
-//! immutable [`Store`] of FileMan globals.
+//! action is `EN3^PRCHRPT` [PRCHRPT.m:70-75]: one purchase-order display
+//! session, reproducing the original's prompts, messages, field order and
+//! formatting over an immutable [`Store`] of FileMan globals.
 //!
 //! [`inquire`] is the one inquiry operation. [`bridge`] serves the loopback
-//! front-end and its MUMPS, RUST and COMPARE session endpoints.
+//! front-end and its MUMPS, RUST and COMPARE session endpoints (AAP 0.3.5.1).
 
 #![forbid(unsafe_code)]
 
 // `mumps` is private: nothing in it is wider than `pub(crate)`, so it forms no
 // part of the public API.
 pub mod bridge;
+pub mod golden;
 pub mod inquiry;
 mod mumps;
 pub mod store;

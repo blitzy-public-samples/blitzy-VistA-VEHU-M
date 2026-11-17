@@ -1,382 +1,401 @@
 # Golden captures: PRCH DISPLAY PO (EN3^PRCHRPT)
 
-This folder holds the golden captures of OPTION `PRCH DISPLAY PO` (IEN 1901, action `EN3^PRCHRPT`) recorded on `worldvista/vehu:202609`, one directory per case, `GC-01/` to `GC-05/`. The bridge reads its captures from this folder unless `GOLDEN_DIR` names another (section 11). This README is for the capture owner, who records them, and for every reviewer: it states the conventions the capture readers enforce. It is documentation only, and no code reads it.
+This folder holds the golden captures of OPTION `PRCH DISPLAY PO` (IEN 1901, routine `EN3^PRCHRPT`) [Packages/Kernel/Globals/19+OPTION.zwr:14687-14691]. The team records one folder per case, `GC-01/` to `GC-05/` (`golden::CASE_IDS`), on `worldvista/vehu:202609`, and the Rust port is judged against them.
 
-Each convention below belongs to the file named with it, and this README restates it. Where this README and the owning file differ, the owning file governs.
+- **Baseline.** The folder holds only this README: no case folder, no `.gitkeep` and no placeholder. Every case is ABSENT, and therefore NOT COMPARED.
+- **Location.** `golden::default_dir()` is `tests/golden/ifcap` under the crate folder that Cargo fixes at compile time, which is this folder. The bridge's `GOLDEN_DIR` overrides it for the bridge only; the tests always read this folder.
+- **Authority.** `src/golden.rs` implements these conventions, and `STUB_CONTEXT` in `src/inquiry.rs` holds the context every capture must match. Where this README differs from them, the code governs.
+- This README is documentation only. No code reads it, and it lies outside every case folder.
 
-| Convention | Owner |
-|---|---|
-| `split_input_lines`, `parse_normalisation`, `normalise`, `parse_meta`, `Meta`, `validate_context`; the 400 and 502 error texts | `src/bridge.rs` |
-| The bridge's environment variables `GOLDEN_DIR` and `VEHU_CONTAINER`, how they are read and their defaults; the fixed listener address and the startup messages | `src/bin/bridge.rs` |
-| `STUB_CONTEXT` | `src/inquiry.rs` |
-| `Store::from_zwr`, `load_fixtures` | `src/store.rs` |
-| `evaluate_case`, `comparison_report` | `tests/equivalence.rs` |
-| `gc_02_end_to_end_compare` | `tests/bridge.rs` |
-| Fixture lines and their field order | `tests/fixtures/ifcap/MANIFEST.txt` |
-| Contracts PO-01 to PO-41 and their branch IDs, resolutions R1 to R6, open items O-01 to O-08, conflicts C1 to C18 | `SPEC.md` |
-| `EXIT_INPUT` | `frontend/app.js` |
+## Notation
 
-**Conventions of this README.**
+- Paths are relative to the crate folder `rust/ifcap-po-inquiry/`, except those that begin with `Packages/`, which are relative to the repository root.
+- Source is cited as `[path:line]`.
+- Byte notation: `\n` is a newline (0x0A), `<BEL>` is `$C(7)` (0x07) and `<TAB>` is a tab (0x09).
+- Spaces inside code spans are literal, and every trailing space is also stated in words.
+- "n/e" marks a branch that is not exercised and not implemented. Reaching one ends the Rust session after the last prompt written, with nothing invented after it.
 
-- Paths are relative to the crate folder `rust/ifcap-po-inquiry/`, except those that start with `Packages/`.
-- Source is cited as `[path:line]`, with repository-root paths at commit `dd3fd0f3124c8178657d9fff4173c324da30f7ae`.
-- Byte notation: `\n` is a newline (0x0A), `<BEL>` is `$C(7)` (0x07) and `<TAB>` is a tab (0x09). Spaces inside code spans are literal, and each trailing space is also stated in words.
-- Status words have the meanings given in section 10 and are never merged: NOT COMPARED, FAIL, PASS, BLOCKED, NOT RUN, PENDING.
-- "n/e" marks a branch that is not exercised and not implemented. The Rust side returns `UnsupportedBranch` with its branch ID when it reaches one, and also when it reaches a BLOCKED branch.
+## Part A: Conventions
 
-## 1. Owner, deadline and status
+### 1. The seven files
 
-- **Owner.** Rainman Kemp prepares the test data and records all five captures on `worldvista/vehu:202609`. From the same snapshot he exports `tests/fixtures/ifcap/cases.zwr`, adds its line to `tests/fixtures/ifcap/MANIFEST.txt`, and loads the captures into `GC-01/` to `GC-05/`.
-- **Deadline.** November 13, 2026, 5:00 p.m. Eastern.
-- **Status.** Assigned; captures pending. Until the captures exist, every case is NOT COMPARED, and overall acceptance stays PENDING (B1, B2).
-- **Directories.** The run wrote nothing in this folder except this README: no `GC-0N/` directory, no `.gitkeep` and no placeholder file (conflict C2). A missing directory reads as all seven capture files missing, so its case is NOT COMPARED. The owner creates the directories.
+Each `GC-0N/` folder holds exactly the seven files of `golden::CAPTURE_FILES`, each a regular file:
 
-## 2. Cases
-
-The user's examples, verbatim:
-
-- GC-01: an existing order with one line (2 × $125.50).
-- GC-02: an existing order with three lines (3 × $19.95, 2 × $125.50, 1 × $0.99).
-- GC-03: a syntactically valid order identifier confirmed absent from the fixture database.
-- GC-04: `INVALID!` at the order-selection prompt, then the supported exit input.
-- GC-05: an existing cancelled order with retained line-item history.
-- The fixture totals, $251.00 for GC-01 and $311.84 for GC-02, are sanity checks only. The captures decide.
-
-Notes from source:
-
-- **GC-05 status message.** Status `Cancelled Order` is `^PRCD(442.3,45,0)`, whose supply status order (field .02) is 45 [Packages/IFCAP/Globals/442.3+PURCHASE ORDER STATUS.zwr:26] [Packages/VA FileMan/Globals/DD.zwr:518035]. `EN30` writes `<BEL>` and ` >>> Status makes this record non-specifiable here.` (one leading space) only when that order is below 10 [Packages/IFCAP/Routines/PRCHRPT.m:73], so for 45 no such line is predicted. The order must still pass the lookup screen of section 5, including its MOP condition.
-- **GC-05 profile risk.** The profile of section 5 requires no node 6 (field 50 AMENDMENT [Packages/VA FileMan/Globals/DD.zwr:514981]), no node 11 (field .6 PARTIAL [Packages/VA FileMan/Globals/DD.zwr:514467]) and no item partial receipts (item node 3, field 20 DATE RECEIVED [Packages/VA FileMan/Globals/DD.zwr:516311]). A cancelled order with retained history may carry any of them. If it does, the case leaves the profile and will FAIL. Record that outcome as it is, and never alter data to make the order fit.
-
-## 3. Files per case
-
-Each `GC-0N/` directory holds exactly these seven files:
-
-| File | Content | Read by |
+| File | Content | Read by (`src/golden.rs`) |
 |---|---|---|
-| `input.txt` | The typed inputs, one per line | Bridge replay mode; `tests/equivalence.rs`; `tests/bridge.rs` (GC-02) |
-| `transcript.txt` | The original's standard output | Bridge replay mode; `tests/equivalence.rs`; `tests/bridge.rs` (GC-02) |
-| `returned.txt` | The return value, zero bytes for none | Bridge replay mode; `tests/equivalence.rs`; `tests/bridge.rs` (GC-02) |
-| `db-before.zwr` | ZWR export of the section 8 scope immediately before the session | `tests/equivalence.rs` |
-| `db-after.zwr` | The same export immediately after the session | `tests/equivalence.rs` |
-| `meta.txt` | Seven `key=value` lines describing the run | Bridge live mode; `tests/equivalence.rs` |
-| `normalisation.txt` | Normalisation rules, expected empty | Bridge replay mode; `tests/equivalence.rs`; `tests/bridge.rs` (GC-02) |
+| `input.txt` | The typed inputs, one per line | `split_input_lines` |
+| `transcript.txt` | The original's standard output, byte for byte | Taken raw; compared through `normalise` |
+| `returned.txt` | The return value, zero bytes for none | `read_returned` |
+| `db-before.zwr` | ZWR export of the export scope (Part B step 1) immediately before the session | The `db_before_equals_after` check |
+| `db-after.zwr` | The same export immediately after the session | The `db_before_equals_after` check |
+| `meta.txt` | Eight `key=value` lines describing the run | `parse_meta`, `Meta` |
+| `normalisation.txt` | The case's normalisation rules, zero bytes for none | `parse_normalisation`, `normalise` |
 
-### `input.txt`
+A case's content is loaded only through `golden::load_case` and `golden::find_capture`, which read each file once; `golden::status`, `readiness` and `live_start` read only what the status counts and live mode need. In a case whose `input.txt` and `transcript.txt` are both present, every file that is present, the two exports included, must be readable UTF-8: one that is not makes the whole case `Unreadable`, which is FAIL. A case lacking either file is NOT COMPARED, whatever its other files hold.
 
-- One input per line, with `\n` line endings and no carriage return. The sequences are in section 4.
-- `split_input_lines` in `src/bridge.rs` splits the file on `\n`:
-  - one trailing `\n` ends the last line and adds no empty input;
+Each file has a size limit, enforced while it is read, and every read is fresh:
+
+| File | Size limit |
+|---|---|
+| `input.txt` | 1048576 bytes (1 MiB), the largest request body the bridge accepts |
+| `transcript.txt` | 1048576 bytes (1 MiB), the live adapter's output cap |
+| `returned.txt`, `meta.txt`, `normalisation.txt` | 65536 bytes (64 KiB) each |
+| `db-before.zwr`, `db-after.zwr` | 67108864 bytes (64 MiB) each; an export of the Part B step 1 scope is about 1.2 MB |
+
+- A file larger than its limit is present but unreadable: the case is `Unreadable` with `<path>: larger than <n> bytes`, which is FAIL, and replay answers 502 `NOT RECORDED (unreadable: <path>: larger than <n> bytes)`. Its readiness fails the checks that read it and `no_carriage_return`.
+- The two exports are read together in 64 KiB pieces, compared and checked piece by piece, and never held whole.
+- A case folder whose metadata cannot be read, for example under a golden folder the bridge user cannot search, is not ABSENT: it counts as recorded, the case is `Unreadable` with the folder's path and cause, such as `<golden folder>/GC-01: permission denied`, which is FAIL, and its readiness fails all six checks.
+
+### 2. Capture input and output
+
+- **No pseudo-terminal.** Capture with `docker exec -i`, never `-t`: a pseudo-terminal echoes the typed input into standard output and can rewrite line endings.
+- **Line endings.** Every file uses `\n` only. A carriage return in any present file fails `no_carriage_return`.
+- **`input.txt`.** One input per line, split by `split_input_lines`:
+  - one trailing `\n` ends the last line and adds no input, so end the file with exactly one `\n` after the final `^`; a second one adds an empty input;
   - inner empty lines are inputs, each one a RETURN;
-  - an empty file holds no input;
-  - a carriage return is part of its line and is never stripped.
-- End the file with exactly one `\n` after the final `^`. A second trailing `\n` adds an extra empty input.
-- No input may contain a carriage return or a line feed. The bridge rejects such a request element with 400 (`INPUT <n> CONTAINS A CARRIAGE RETURN OR LINE FEED`). Live mode writes each input followed by one `\n` to the original's standard input, which is the framing of this file.
+  - a zero-byte file holds no input.
+- **Exit input.** The last input is `^`, which is `golden::EXIT_INPUT` and, in `frontend/app.js`, `const EXIT_INPUT = "^";`, the input the screen's EXIT button sends. `^` at the order prompt ends the lookup with no output [Packages/VA FileMan/Routines/DIC11.m:23] [Packages/VA FileMan/Routines/DIC.m:45]. The check is `input_ends_with_exit`.
+- **`transcript.txt`:**
+  - the exact standard-output bytes of the session, with no echo of typed input;
+  - `<BEL>` stays byte 0x07;
+  - standard error is kept apart and is not part of the transcript;
+  - the file must be UTF-8;
+  - the capture command adds nothing of its own to standard output;
+  - nothing is ever cut out by hand, and never by normalisation.
 
-### `transcript.txt`
+### 3. `returned.txt`
 
-- The exact standard-output bytes of the original session, with `\n` line endings and **no echo of typed input**. That is why the capture runs under `docker exec -i` without `-t` (section 7): a pseudo-terminal echoes input and can rewrite line endings.
-- `<BEL>` stays byte 0x07. Standard error is not part of the transcript.
-- The file must be UTF-8. Otherwise the bridge answers 502 `CAPTURE FILE <path>: NON-UTF8`.
-- The capture command must add nothing of its own to standard output, so that the file holds only what the session writes. Output the command cannot suppress is recorded as an O-07 item for the team. It is never cut out by hand, and never by normalisation.
+- `read_returned`: zero bytes is `None`; otherwise the text with one trailing `\n` removed.
+- `EN3^PRCHRPT` is entered by `DO` and quits without a value [Packages/Kernel/Globals/19+OPTION.zwr:14691] [Packages/IFCAP/Routines/PRCHRPT.m:70-75]. Open item O-06 is closed, so **every case writes zero bytes**, with no newline either, and both sides' `returned` is `None`.
 
-### `returned.txt`
+### 4. `db-before.zwr` and `db-after.zwr`
 
-- The return value with one trailing newline removed. Zero bytes means `None`.
-- **Every case is zero bytes**, with no newline either: `EN3^PRCHRPT` is reached by `DO` and is not an extrinsic function [Packages/IFCAP/Routines/PRCHRPT.m:70-75].
+- ZWR exports of the export scope of Part B step 1, taken immediately before and immediately after the session, in the ZWR form stated there.
+- `db_before_equals_after` passes only when both files exist, are readable and are byte-identical. Nothing is parsed or reordered, so take both exports with the same command.
+- The scratch globals that Part B step 1 excludes are outside the scope, so the original's scratch writes do not show.
+- Any other difference between the two files is documented in `meta.txt` `setup`. The check still fails, so such a case is not READY.
 
-### `db-before.zwr` and `db-after.zwr`
+### 5. `meta.txt`
 
-- ZWR exports of the section 8 scope, taken immediately before and immediately after the session, each in the form section 9 requires.
-- They must be identical. The harness loads both with `Store::from_zwr` and compares them; on FAIL it names the first differing node.
-- **Baseline identity.** Every `db-before.zwr` node must be present, with an identical value, in the store that `load_fixtures` builds from `tests/fixtures/ifcap/`.
-
-### `meta.txt`
-
-The format belongs to `parse_meta` and `Meta` in `src/bridge.rs`:
+`parse_meta` reads it:
 
 - `key=value` lines, each split at its first `=`. The value is kept exactly, so write no space around `=`.
-- Exactly the seven keys below, each once. A missing, repeated or unknown key, or a line without `=`, makes the file malformed.
-- Whitespace-only lines are ignored, and one trailing carriage return per line is dropped.
+- Lines that are empty or hold only whitespace are ignored.
+- A non-blank line without `=`, a key outside `golden::META_KEYS`, or a repeated key makes the file unparsable, and the error names its 1-based line. A missing key is not a parse error: `meta_keys_present` reports it.
+- `meta_keys_present` passes only when the file parses and holds all eight `META_KEYS`, which are, in order: `image_digest`, `source_revision`, `snapshot_id`, `record_ids`, `entry_point`, `context`, `setup`, `docker_exec_args`.
 
 | Key | Value |
 |---|---|
-| `image_digest` | The digest of the `worldvista/vehu:202609` image the capture ran on (O-05) |
-| `source_revision` | `dd3fd0f3124c8178657d9fff4173c324da30f7ae` when the runtime routines match that repository commit; otherwise the revision actually found, never this commit by default (O-05) |
-| `snapshot_id` | The identifier of the database snapshot. It must equal the `snapshot_id` that every `MANIFEST.txt` line carries (section 9) |
-| `record_ids` | The case's order: both its IEN and its full PO number (`500-…`). The key is required in every case. GC-03 and GC-04 select no order, and `parse_meta` accepts an empty value |
+| `image_digest` | The digest of the image the capture ran on, from Part B step 2 (b) (O-05) |
+| `source_revision` | The revision of the runtime routines: `dd3fd0f3124c8178657d9fff4173c324da30f7ae` only when they match it, otherwise the revision actually found |
+| `snapshot_id` | The snapshot identifier from Part B step 2 (e), the same for all five cases |
+| `record_ids` | GC-01 `442:990001;440:990001`, GC-02 `442:990002;440:990001`, GC-03 `442:none`, GC-04 `442:none`, GC-05 `442:990005;440:990001` |
 | `entry_point` | `EN3^PRCHRPT` |
-| `context` | A JSON object whose values are all strings, with no repeated key (section 6) |
-| `docker_exec_args` | A JSON array of strings (below) |
+| `context` | The context object of section 6 |
+| `setup` | Free text: the HOME device name, `IOM`, any extra paging pauses, the reason a case is not reproducible, and any documented export difference |
+| `docker_exec_args` | The start arguments of section 7 |
 
-A template, with each `<…>` to be replaced by the recorded value:
+The template, with each `<…>` replaced by the recorded value:
 
 ```text
 image_digest=<image digest>
 source_revision=<revision>
-snapshot_id=<snapshot id, equal to MANIFEST.txt>
-record_ids=<IEN and full PO number>
+snapshot_id=<snapshot id>
+record_ids=<record ids>
 entry_point=EN3^PRCHRPT
 context={"DUZ":".5","IOF":"<IOF>","IOSL":"<IOSL>","STATION":"500"}
-docker_exec_args=["<argument>","<argument>"]
+setup=<free text>
+docker_exec_args=<arguments separated by single spaces>
 ```
 
-**`docker_exec_args`.** Live mode runs `docker` with the argument vector `exec`, `-i`, `<container>`, followed verbatim by the elements of `docker_exec_args`. `<container>` comes only from the bridge's `VEHU_CONTAINER` setting (section 11; O-07), never from a capture or a request. Because the elements follow the container name, Docker options such as `--user vehu` cannot appear in them. If the capture needed such options, record that as an O-07 item for the team to confirm. This README sets no workaround.
+`Meta::get` returns any key's value as recorded; `REPORT.md` part 2 shows each case's `image_digest` and `snapshot_id`.
 
-### `normalisation.txt`
+### 6. `context`
 
-The format belongs to `parse_normalisation` and `normalise` in `src/bridge.rs` (AAP 0.5.4):
+- A flat JSON object whose values are all strings, holding exactly the four keys of `STUB_CONTEXT`: `{"DUZ":".5","IOF":"<value>","IOSL":"<value>","STATION":"500"}`.
+- `Meta::context` reads it. Whitespace between tokens is allowed, and strings take the JSON escapes, `\uXXXX` included, so an `IOF` that holds control characters can be written. A repeated key, a nested value or a value that is not a string makes it fail.
+- `STUB_CONTEXT` is `[("DUZ", Some(".5")), ("IOF", None), ("IOSL", None), ("STATION", Some("500"))]`. `golden::validate_context` checks each of its keys in that order, then every capture key it lacks:
+  - `DUZ` must be `.5` and `STATION` must be `500`. Both are source-resolved: `D DUZ^XUP(.5)` [Packages/Kernel/Routines/ZOSVGUT1.m:13], and station 500, the default `$O(^PRC(411,"AC","Y",0))` [Packages/IFCAP/Routines/PRCFSITE.m:14] [Packages/IFCAP/Globals/411+ADMIN. ACTIVITY SITE PARAMETER.zwr:290];
+  - `IOF` and `IOSL` are unresolved (`None`, open item O-01). Any value is accepted, but both keys must be present;
+  - a missing key, an extra key or a differing value fails, and the first failure is reported as `CONTEXT MISMATCH <key>: expected <value or ABSENT>, actual <value or ABSENT>`, where the expected value of a missing unresolved key is `UNRESOLVED (O-01)`. Examples: `CONTEXT MISMATCH DUZ: expected .5, actual 1`, `CONTEXT MISMATCH IOF: expected UNRESOLVED (O-01), actual ABSENT`, `CONTEXT MISMATCH IOM: expected ABSENT, actual 80`.
+- `IOM` and the HOME device name are diagnostic only. They go in `setup`, never in `context`, where an extra key fails.
 
-- The file is split on `\n`, and nothing is trimmed. A zero-length line is blank and ignored.
-- Every other line holds exactly one `<TAB>`, separating two literal, non-empty delimiters: open, then close. A carriage return before the line end belongs to the close delimiter, so use `\n` line endings.
-- A line with no tab, more than one tab, or an empty delimiter is malformed. The bridge answers 502 `MALFORMED NORMALISATION <path> line <n>`, with the 1-based line number, and the harness reports FAIL.
-- Rules apply in file order, each to the result of the one before. A rule scans left to right and replaces the text from each open delimiter through the next close delimiter after it, both delimiters included, with `<NORM>`. Scanning resumes after the replaced text. An open delimiter with no later close delimiter leaves the rest of the text unchanged.
-- Both sides of a comparison get the same rules, and no other transformation exists.
-- **The file is expected to be empty** (zero bytes), and an empty file is valid. A rule may cover only run-time timestamps, internal record numbers and other variable fields, each documented in the rule's own case. It must leave order IDs, status, quantities, prices, amounts and error text intact. `REPORT.md` reports each rule, in file order, with the original text of every span it replaced on each side as the comparison applied it, to the text the earlier rules left. Where such a span held all or part of an earlier rule's `<NORM>`, the text the rule saw is shown as well, and the original text covers everything that `<NORM>` stood for; a `<NORM>` the captured text holds itself is reported as its own original text (`REPORT.md`, "A8 coverage").
+### 7. `docker_exec_args`
 
-### How the readers use the captures
+- `Meta::docker_exec_args` splits the value on single spaces. An empty value, or an empty argument from a leading, trailing or doubled space, is an error.
+- Live mode runs the program `docker` directly with the arguments `exec`, `-i`, `<container>` and then these arguments, so the command is `docker exec -i <container> <args…>`. No shell runs on the host. `<container>` comes only from the bridge's `VEHU_CONTAINER`, never from a capture or a request.
+- `golden::live_start` takes the arguments and `context` from the first case folder, in `CASE_IDS` order, whose `meta.txt` is readable UTF-8 and parses. With none, live mode answers 502 `NO META.TXT IN <golden_dir>`.
+- `validate_context` runs before any command. A failure is 502 with its `CONTEXT MISMATCH …` text, and nothing runs.
+- Standard input is each input followed by one `\n`, the framing of `input.txt`, and standard output is the transcript. A non-zero exit is 502 `EXIT <code>: <first line of docker's standard error>`.
+- **Open (O-07; conflict K3).** An argument that contains a space cannot be expressed, and the documented start command of Part B step 1 needs one, its `-c` script. Live mode is therefore delivered unverified, and replay is the delivered MUMPS backend. **Question for the team:** supply a start command whose arguments contain no space, or change the convention. This README prescribes no workaround.
 
-- **Replay mode.** The bridge uses it when `VEHU_CONTAINER` is unset or empty (section 11). For `/api/mumps/session` and `/api/compare/session`, the bridge scans `GC-01` to `GC-05` in order, under `GOLDEN_DIR` (by default this folder), for an `input.txt` whose `split_input_lines` equals the request's inputs.
-  - A directory whose `input.txt` is missing does not match. One whose `input.txt` is unreadable or not UTF-8 does not match either, and is listed.
-  - With no match, the answer is 502 `NOT RECORDED`, or `NOT RECORDED (unreadable: <path>, <path>)` when such directories were listed.
-  - In the matching directory, a missing, unreadable or non-UTF-8 `transcript.txt`, `returned.txt` or `normalisation.txt` gives 502 `CAPTURE FILE <path>: MISSING`, `CAPTURE FILE <path>: UNREADABLE` or `CAPTURE FILE <path>: NON-UTF8`. An empty `returned.txt` or `normalisation.txt` is valid.
-  - A matching directory is used whole or not at all.
-- **Compare precedence.** A MUMPS-side failure gives 502 first. Otherwise a Rust-side `CorruptStore` gives 500 and an `UnsupportedBranch` gives 422. Only then is the answer 200, whose `match` is `true` only when the transcripts and the return values are both equal after normalisation. Transcript-only agreement is never a match. While O-01 and O-03 stay open, `SPEC.md` predicts that the Rust side stops at `UnsupportedBranch("PO-12.b1")` for GC-01, GC-02 and GC-05, and at `UnsupportedBranch("PO-09.b14")` for GC-03 and GC-04, so compare on a captured sequence answers 422.
-- **Live mode.** The bridge uses it when `VEHU_CONTAINER` is non-empty (section 11). For the same two endpoints, the bridge reads `context` and `docker_exec_args` from the `meta.txt` of the first `GC-0N` directory under `GOLDEN_DIR` that has one.
-  - A malformed `meta.txt`, or none in any directory, gives 502 `MALFORMED META <path>`. With none present, `<path>` is where `GC-01/meta.txt` would be.
-  - A `context` that differs from `STUB_CONTEXT` gives 502 `CONTEXT MISMATCH <key>: expected <value>, actual <value>` (section 6).
-  - In either case nothing runs.
-  - The live return value is unavailable (O-06), so live `returned` and compare `match` are `null`.
-- **Replay mode never reads `meta.txt`**, and live mode reads nothing else from a capture.
-- **Hashing.** This README sits outside `GC-0N/`, so the bridge never scans it, and `sha256sum tests/golden/ifcap/GC-0*/*` never hashes it.
+### 8. `normalisation.txt`
 
-### Who reads captures
+`parse_normalisation` and `normalise` implement it:
 
-- Only these read golden content (AAP 0.10.4):
-  - the replay, compare and live adapters in `src/bridge.rs`;
-  - `tests/equivalence.rs`;
-  - `gc_02_end_to_end_compare` in `tests/bridge.rs`.
-- `inquire` and `Store` never read captures. The A5 static search of `src/` checks this.
-- Nothing in the crate writes into `GC-0N/`. The synthetic tests in `tests/bridge.rs` create their own temporary directories under `std::env::temp_dir()`, each named with `synthetic` and marked by `SYNTHETIC.txt`, and never touch this folder. Synthetic fixtures are routing tests, never parity evidence.
-- A capture that disagrees with a source-derived contract keeps its case FAIL and reopens that contract and the baseline investigation (AAP 0.10.3). A capture never silently overrides source, and normalisation is never widened to force a match.
+- The file is split on `\n`, and nothing is trimmed. A zero-length line is blank and ignored; a line of spaces is not blank.
+- Every other line is a non-empty open delimiter, exactly one `<TAB>`, and a non-empty close delimiter, both literal. Any other line is a parse error naming its 1-based number (`normalisation line <n>: expected one tab between two non-empty delimiters`), and `normalisation_parses` fails.
+- Rules apply in file order to both sides, each to the result of the one before. Scanning left to right, the span from each open delimiter through the next close delimiter after it, both included, becomes `<NORM>`, and scanning resumes after the span. An open delimiter with no later close delimiter leaves the rest of the text unchanged.
+- No other transformation exists. COMPARE and `tests/equivalence.rs` use this one function.
+- A rule may cover only run-time timestamps, internal record numbers and other variable fields documented in that case's `meta.txt`. It never covers order identifiers, status, quantities, amounts or messages, and no rule is ever added to hide a difference.
+- A zero-byte file is valid and means no rules. `REPORT.md` part 2 lists every rule as `open → close`.
 
-## 4. Input sequences (conflict C9)
+### 9. Readiness and verdicts
 
-**Why the request's sequence is corrected.** The request's two-line `input.txt`, an identifier line and then an exit line, does not end a session cleanly in source. Every session first answers the station prompt, and a found order pauses twice and then re-prompts. Source governs, as `SPEC.md` (section "Source corrections and interface departures") and `REPORT.md` record.
+`golden::readiness` evaluates the six `golden::CHECKS`, in this order:
 
-**The prompts the inputs answer.** Each prompt is shown with its exact bytes. None is followed by a newline: the READ happens on the same line.
+| Check | Passes when |
+|---|---|
+| `seven_files_present` | Each of the seven files exists as a regular file |
+| `meta_keys_present` | `meta.txt` is UTF-8, parses, and holds all eight `META_KEYS` |
+| `input_ends_with_exit` | `input.txt` is UTF-8 and its last input is `^` |
+| `normalisation_parses` | `normalisation.txt` is UTF-8 and parses; a zero-byte file passes |
+| `db_before_equals_after` | `db-before.zwr` and `db-after.zwr` are both readable and byte-identical |
+| `no_carriage_return` | No present file contains a carriage return; a present file that cannot be read fails |
 
-| Prompt, exact bytes | Trailing space | Written just before it | Answer | Source |
+A check passes only when the files it reads exist and satisfy it; `no_carriage_return` tests the files that are present.
+
+- **READY**: all six checks pass.
+- **INCOMPLETE**: at least one check fails, and each failed check is listed by name.
+- **ABSENT**: the `GC-0N` folder does not exist.
+- A case is recorded when its `input.txt` and `transcript.txt` both exist (`golden::is_recorded`): present at all, readable or not, so a directory at either path counts. A case folder that cannot be inspected counts as recorded too. These are the cases `golden::load_case` finds `Recorded` or `Unreadable`.
+
+The verdicts `tests/equivalence.rs` gives:
+
+| Verdict | When |
+|---|---|
+| NOT COMPARED | The folder is absent, or `input.txt` or `transcript.txt` is absent |
+| PASS | The case is READY, `validate_context` accepts its `context`, the normalised transcripts are equal, the `returned` values are equal, and the store equals its pre-call clone |
+| FAIL | Every other recorded case: an INCOMPLETE one (conflict K12), an unreadable or non-UTF-8 file, a transcript or `returned` difference, a context mismatch, a store change, or `CORRUPT STORE` |
+
+- Of the verdicts, only FAIL fails `cargo test`, and `REPORT.md` part 2 names its cause. With no case FAIL, `cargo test` still fails when a harness check fails (`REPORT.md` part 1 lists each with PASS or FAIL), when `SPEC.md` lacks a section the report includes (`MISSING SECTION <heading> IN SPEC.md`, with no report written), when `REPORT.md` cannot be written (`cannot write REPORT.md: <error>`), or when any other test or the build fails. Exit 0 is not acceptance, which needs five PASS.
+- **While O-01 is open.** With `cases.zwr` loaded, the Rust sessions of GC-01, GC-02 and GC-05 end after `P.O./REQ.NO.: ` (with its one trailing space), because the display's `W:$Y>0 @IOF` depends on the unresolved HOME device [Packages/IFCAP/Routines/PRCHDP1.m:12]. Those cases FAIL once captured, until O-01 is answered. The no-match path of GC-03 and GC-04 never reaches that line.
+
+### 10. Bridge use
+
+- **Replay** (when `VEHU_CONTAINER` is unset or empty) answers `POST /api/mumps/session`, and the MUMPS side of `POST /api/compare/session`, through `golden::find_capture`: the first recorded case, in `CASE_IDS` order, whose inputs equal the request's. It reads the folder on every request, so new captures need no restart.
+  - A hit gives 200 with the capture's raw `transcript.txt` and `returned`.
+  - No hit gives 502 `NOT RECORDED`.
+  - A present capture file that cannot be read, or a case folder that cannot be inspected (section 1), met on the way, gives 502 `NOT RECORDED (unreadable: <path>: <cause>)`.
+  - COMPARE puts `MUMPS: ` before a MUMPS-side cause.
+- **COMPARE `match`** is true only when the capture for the inputs is READY, `validate_context` accepts its `context`, the transcripts are equal after its rules, and the `returned` values are equal. Otherwise it is false, inputs with no capture included. Responses always carry the raw transcripts; normalisation applies only inside the comparison.
+- **Status.** `GET /api/status` lists the recorded, READY and INCOMPLETE cases, with each INCOMPLETE case's failed checks, read afresh on every request. The bridge's third startup line reads `RECORDED <n> OF 5 READY <m> OF 5`, and the screen's status line, fetched when the page loads, reads `MUMPS BACKEND: REPLAY RECORDED <n> OF 5 READY <m> OF 5`. Reload the page to refresh the status line after adding captures, restart or not.
+
+### 11. Fixtures and `cases.zwr`
+
+- `tests/fixtures/ifcap/*.zwr` are the 11 supporting fixtures, unchanged copies of repository exports: `411.zwr`, `411.2.zwr`, `420.5.zwr`, `420.8.zwr`, `440.zwr`, `442.3.zwr`, `442.4.zwr`, `442.5.zwr`, `442.8.zwr`, `5.zwr` and `49.zwr`.
+- `tests/fixtures/ifcap/cases.zwr` is the file Part B step 6 builds. `store::load_fixtures` loads every `*.zwr` file in byte order of name with `cases.zwr` last, so it wins on a repeated node; a missing `cases.zwr` is not an error [src/store.rs:323-387].
+- The bridge loads the Store once, when it starts, so restart it after adding `cases.zwr`.
+- Without `cases.zwr` the fixtures hold no `^PRC(442,0)` header, so the order lookup ends before writing its prompt [Packages/VA FileMan/Routines/DIC.m:14] and a Rust session ends after the station prompt (PO-09.b15; conflict K6). The original on VEHU never reaches that state.
+- No hash or listing file is kept beside the fixtures.
+
+### 12. Readers and integrity
+
+- Only `src/golden.rs` reads the capture files. Its callers are `src/bridge.rs`, `src/bin/bridge.rs` (the startup counts), `tests/equivalence.rs` and `tests/bridge.rs`, and none of them re-implements a check. `inquire` and `Store` never read them.
+- No rule is ever derived from capture content (acceptance criterion A4): captures judge the port, and source alone decides its rules.
+- Capture files, `normalisation.txt` and an existing `cases.zwr` are never edited (a run with READY cases checks an existing `cases.zwr` by the preflight of Part B step 6), and no code is special-cased to a transcript.
+- `tests/bridge.rs` writes its synthetic case folders only under `std::env::temp_dir()`, never here.
+- No test sets or reads `GOLDEN_DIR` or `VEHU_CONTAINER`; only `src/bin/bridge.rs` reads them.
+
+### 13. Prompts and echoes
+
+Each prompt is followed by its READ on the same line:
+
+| Prompt | Written just before it | Exact prompt bytes | Trailing space | Source |
 |---|---|---|---|---|
-| `Select STATION NUMBER ('^' TO EXIT): ` followed by the default `500// ` | The prompt ends with one space after the colon; the default ends with one space after `//` | `\n\n\n` | An empty line, accepting the default 500 | [Packages/IFCAP/Routines/PRCFSITE.m:8, 14, 18] [Packages/VA FileMan/Routines/DIC.m:25] [Packages/VA FileMan/Routines/DIC11.m:15-17] |
-| `P.O./REQ.NO.: ` | One space after the colon | `\n\n` [Packages/IFCAP/Routines/PRCHPAT.m:83], then `\n` [Packages/VA FileMan/Routines/DIC.m:25] | The order's `C` value, or `^` | [Packages/IFCAP/Routines/PRCHRPT.m:12] [Packages/IFCAP/Routines/PRCHPAT.m:81] [Packages/VA FileMan/Routines/DIC11.m:15-17] |
-| `ENTER '^' TO HALT: ` | One space after the colon | `\n`, then spaces to column 8 | An empty line | [Packages/IFCAP/Routines/PRCHDP2.m:10] |
-| `END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: ` | One space after the colon | `\n` and `<BEL>` | An empty line | [Packages/IFCAP/Routines/PRCHDP2.m:41] |
+| Station | `\n\n\n` | `Select STATION NUMBER ('^' TO EXIT): 500// ` | One after the colon and one after `//` | [Packages/IFCAP/Routines/PRCFSITE.m:8, 14, 18] [Packages/VA FileMan/Routines/DIC.m:25] [Packages/VA FileMan/Routines/DIC11.m:15-17] |
+| Order | `\n\n` [Packages/IFCAP/Routines/PRCHPAT.m:83], then `\n` [Packages/VA FileMan/Routines/DIC.m:25] | `P.O./REQ.NO.: ` | One after the colon | [Packages/IFCAP/Routines/PRCHRPT.m:12] [Packages/VA FileMan/Routines/DIC11.m:15-17] |
+| Halt | `\n`, then spaces to column 8 (`?8`) | `ENTER '^' TO HALT: ` | One after the colon | [Packages/IFCAP/Routines/PRCHDP2.m:10] |
+| End of display | `\n` and `<BEL>` | `END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: ` | One after the colon | [Packages/IFCAP/Routines/PRCHDP2.m:41] |
 
-Wherever these prompts are quoted below, they keep the trailing space stated here.
+Echoes between the prompts:
 
-Echoes between the prompts, as `SPEC.md` resolves them (open item O-02 is closed by its resolutions R1 to R3, and a capture that disagrees reopens it):
-
-- **Station default accepted (R1).** `      CAMP MASTER`: six leading spaces, no trailing space and no newline [Packages/VA FileMan/Globals/DD.zwr:488724] [Packages/Kernel/Globals/4+INSTITUTION.zwr:494]. The plan's prediction, `  500  CAMP MASTER`, is superseded by R1.
-- **Unique order match (R2).** Two spaces and the full `.01` value, then two spaces before each identifier's output [Packages/VA FileMan/Globals/DD.zwr:514202-514204]:
+- **R1, station default accepted.** `      CAMP MASTER`: six leading spaces, no trailing space and no newline [Packages/VA FileMan/Globals/DD.zwr:488724] [Packages/Kernel/Globals/4+INSTITUTION.zwr:494].
+- **R2, unique order match.** Two spaces and the full `.01` value, then two spaces before each identifier's output [Packages/VA FileMan/Globals/DD.zwr:514202-514204]:
   - `Z.01`: the order date as `MM-DD-YY`;
-  - `Z.02`: the MOP abbreviation, then three spaces and the status name;
-  - `Z.03`: `\n`, 13 spaces, `FCP: ` (one trailing space), the first word of the fund control point (field 1), `     $ ` (five spaces, `$`, one space) and the total with two decimals. No newline follows.
-- **No match (R3).** `<BEL> ??\n\nP.O./REQ.NO.: `, ending with the prompt's one trailing space, then the next READ [Packages/VA FileMan/Routines/DIC.m:25, 63-65, 80-81].
+  - `Z.02`: the method-of-processing abbreviation, three spaces and the status name;
+  - `Z.03`: `\n`, 13 spaces, `FCP: ` (one trailing space), the first word of the fund control point, five spaces, `$ ` (one trailing space) and the order total with two decimals. No newline follows.
+- **R3, no match (PO-09.b14).** `<BEL> ??\n\nP.O./REQ.NO.: `, ending with the prompt's one trailing space, then the next READ, which gets the same read checks and search [Packages/VA FileMan/Routines/DIC.m:25, 63-65, 80-81] [Packages/VA FileMan/Routines/DIC11.m:15-17]. The Rust side implements it: O-03 is closed for the case values under the fixture profile of Part B step 1.
 
-**First line of every case.** An empty line answers the station prompt. The site file holds six sites [Packages/IFCAP/Globals/411+ADMIN. ACTIVITY SITE PARAMETER.zwr:3], more than one, so the prompt always appears [Packages/IFCAP/Routines/PRCFSITE.m:9, 13, 18]. Its default is 500, the first primary station [Packages/IFCAP/Routines/PRCFSITE.m:14] [Packages/IFCAP/Globals/411+ADMIN. ACTIVITY SITE PARAMETER.zwr:290].
+**Identifier.** The value typed at the order prompt is the order's `C` index value, the part of the `.01` number after `500-`: `$P(X,"-",2)` [Packages/VA FileMan/Globals/DD.zwr:514318-514320], on the index `C` that the lookup uses [Packages/IFCAP/Routines/PRCHPAT.m:80]. It meets the input transform's `Z?3UN3N`: three uppercase letters or digits, then three digits [Packages/VA FileMan/Globals/DD.zwr:514312].
 
-**Identifier.** The value typed is the common-numbering part after `500-`, the index `C` value `$P(X,"-",2)` [Packages/VA FileMan/Globals/DD.zwr:514319] [Packages/IFCAP/Routines/PRCHPAT.m:80]. Typing the full `500-…` number is predicted to find nothing (AAP 0.3.6 B; `SPEC.md` R5).
+**`input.txt`, byte for byte:**
 
-**GC-01, GC-02 and GC-05: five lines.**
-
-1. Empty, the station default.
-2. The order's `C` value.
-3. Empty, answering `ENTER '^' TO HALT: `. Any answer containing `^` would halt the display before the line items [Packages/IFCAP/Routines/PRCHDP2.m:10].
-4. Empty, answering `END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: `.
-5. `^`, at the order prompt that `G EN30` asks again [Packages/IFCAP/Routines/PRCHRPT.m:75].
-
-**GC-03: three lines.**
-
-1. Empty, the station default.
-2. A `C` value that is confirmed absent from the snapshot and meets these rules:
-   - it fits the `C` part of the `.01` input transform, `Z?3UN3N`: three characters, each an uppercase letter or a digit, then three digits [Packages/VA FileMan/Globals/DD.zwr:514312];
-   - it contains at least one letter (`SPEC.md` C9). The plan gave this rule to keep the IEN lookup from being taken. `SPEC.md` R5 found that `IX^DIC` never tries the value as an IEN at this prompt [Packages/VA FileMan/Routines/DIC.m:84-85] [Packages/VA FileMan/Routines/DIC5.m:22], and still requires the letter;
-   - the snapshot meets the GC-03 and GC-04 conditions of section 5.
-
-   This README prescribes no specific value. The owner chooses it and records it in `input.txt`. How the pointed-to files' own date and set-of-codes transforms treat the value is open item O-03 (`SPEC.md` R4).
-3. `^`.
-
-**GC-04: three lines.** Empty, `INVALID!`, `^`.
-
-**The files, byte for byte:**
-
-| Case | `input.txt` |
+| Case | Bytes |
 |---|---|
 | GC-01, GC-02, GC-05 | `\n<C value>\n\n\n^\n` |
 | GC-03 | `\n<C value>\n^\n` |
 | GC-04 | `\nINVALID!\n^\n` (12 bytes) |
 
-**Paging.** If the original pages (O-01: `IOSL`) [Packages/IFCAP/Routines/PRCHDP2.m:31, 54], record one more empty line for each extra `ENTER '^' TO HALT: ` prompt it writes.
+**GC-05 notes.**
 
-**Exit input.** The exit input is `^` (the standard VistA up-arrow exit), decided here. Source confirms it: `^` at the order prompt ends the FileMan lookup with no output [Packages/VA FileMan/Routines/DIC11.m:23] [Packages/VA FileMan/Routines/DIC.m:45], and it is the same constant as `EXIT_INPUT = "^"` in `frontend/app.js`, which the front-end's `EXIT` button sends as an ordinary input.
+- Status 45 `Cancelled Order` has status order 45 [tests/fixtures/ifcap/442.3.zwr:26], which is not below 10, so `EN30` writes no ` >>> Status makes this record non-specifiable here.` (one leading space) [Packages/IFCAP/Routines/PRCHRPT.m:73]. The status name prints at column 37 [Packages/IFCAP/Routines/PRCHDP1.m:15], and this path writes no other cancellation message. Status 25, of GC-01 and GC-02, has status order 20 [tests/fixtures/ifcap/442.3.zwr:17], also not below 10.
+- **Profile risk.** A cancelled order with retained history may carry node 6 (field 50 AMENDMENT [Packages/VA FileMan/Globals/DD.zwr:514981]), node 11 (field .6 PARTIAL [Packages/VA FileMan/Globals/DD.zwr:514467]) or item partial receipts (item node 3, field 20 DATE RECEIVED [Packages/VA FileMan/Globals/DD.zwr:516311]). Any of them takes the order off the profile, and the case then FAILs. Record the outcome as it is, and never alter data to make the order fit.
 
-## 5. Predicted-path fixture profile
+## Part B: Capture procedure
 
-The predicted coverage in `SPEC.md` assumes this profile (AAP 0.4.4; `SPEC.md`, section "Source corrections and interface departures", which owns the list). Each item keeps a case off the n/e branch named after it. A record outside the profile reaches that branch, and the Rust side returns `UnsupportedBranch` with its ID; the case then FAILs and its contract reopens. The branch IDs are those of `SPEC.md`.
+The team runs these steps on its Docker host. Nothing here was run by this repository's build or tests: every Docker command is a plan default, unverified, that the team confirms (O-07).
 
-**Every case.**
+### Step 1. Inputs, records, fixture profile, export scope and start command
 
-- `^PRC(442,0)` is present with piece 2 exactly `442I`, as in the repository export [Packages/IFCAP/Globals/442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:3], and at least one `^PRC(442)` subscript collates after `"A["` (PO-09.b15, b16). The eleven repository fixtures do not hold `^PRC(442,0)`, so `cases.zwr` must (section 8).
+**Cases.** Plan defaults the team may change; record any change in `meta.txt` `setup`. In the input lists, `""` is an empty line.
 
-**A found-order case (GC-01, GC-02, GC-05): the order and its records.**
+| Case | `input.txt` lines | Records the team loads | `record_ids` |
+|---|---|---|---|
+| GC-01 | `""`, `GC1001`, `""`, `""`, `^` | Order IEN 990001, `.01` `500-GC1001`, one item: quantity 2 × unit cost `125.5` = `251`; order total `251`; status 25 `Ordered and Obligated` [tests/fixtures/ifcap/442.3.zwr:17]; vendor IEN 990001 `GC TEST VENDOR` | `442:990001;440:990001` |
+| GC-02 | `""`, `GC2002`, `""`, `""`, `^` | Order IEN 990002, `.01` `500-GC2002`, items `3 × 19.95 = 59.85`, `2 × 125.5 = 251` and `1 × .99 = .99`; order total `311.84`; status 25; the same vendor | `442:990002;440:990001` |
+| GC-03 | `""`, `GC3003`, `^` | None: `GC3003` is confirmed absent from every `^PRC(442)` index | `442:none` |
+| GC-04 | `""`, `INVALID!`, `^` | None | `442:none` |
+| GC-05 | `""`, `GC5005`, `""`, `""`, `^` | Order IEN 990005, `.01` `500-GC5005`, status 45 `Cancelled Order` [tests/fixtures/ifcap/442.3.zwr:26], two retained items `1 × 10` and `1 × 5`; order total `15`; the same vendor | `442:990005;440:990001` |
 
-- **Lookup screen.** The order passes it: station 500 in node 0 piece 1, and a MOP in node 0 piece 2 below 10 or equal to 25 [Packages/IFCAP/Routines/PRCHRPT.m:9] [Packages/IFCAP/Routines/PRCHPAT.m:81]. No other order shares its `C` value or has a `C` value beginning with it, and no later index holds a subscript beginning with it (PO-09.b9, b10).
-- **Nodes present.** Nodes 0 and 1 are present (PO-10.b1 to b3).
-- **Excluded nodes and field values:**
-  - no node 11 (PO-10.b5, PO-34.b2);
-  - the vendor is not EDI, or field 116 is `n` (PO-10.b6);
-  - field 65 is not `RMPR` (PO-10.b7);
-  - node 23 piece 7 is empty (PO-11.b2);
-  - field .08 is not `Y` (PO-23.b2);
-  - no node 5 (PO-18.b2), 3 (PO-25.b5), 15 (PO-25.b7), 4 (PO-31.b2) or 13 (PO-32.b2);
-  - no node 6 (PO-32.b3, PO-33.b2, PO-38.b1).
-- **Line items.** At least one line item (PO-25.b3). Every item has:
-  - a zero node, and a node 2 whose EDI status codes are empty (PO-29.b1, b3);
-  - description text that wraps to one line at width 33 under the PO-15 rules, so at most 32 characters in all (PO-27.b2, b3; PO-28.b3), with no `|` (PO-15.b2) and no `| IN ` (PO-28.b2);
-  - no contract number (PO-20.b1);
-  - no partial receipts (PO-27.b5).
-- **Delivery schedule.** None under the order number in `^PRC(442.8,"B")` (PO-36.b3). The repository 442.8 export holds records 56 and 57 and no `B` index [Packages/IFCAP/Globals/442.8+DELIVERY SCHEDULE ORDER.zwr:3-5].
-- **Left free and implemented.** The profile does not constrain these, and the port implements them: the MOP-4 and direct-delivery ship-to; the order-type labels; the `SIMPLIFIED` vendor; a verbal or confirmation copy; the status-order message; the estimated-shipping line; purchase-card item columns.
+- Record numbers avoid `99999949`, which the repository export's index nodes name [Packages/IFCAP/Globals/442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:4-5].
+- The totals $251.00 (GC-01) and $311.84 (GC-02) are sanity checks only. The captures decide.
 
-**GC-03 and GC-04: the snapshot.**
+**Why these lines.**
 
-- No order has a `C` value, and no later index has a subscript, that begins with the typed value.
-- No vendor or other pointed-to entry matches the value and is referenced by an order that passes the lookup screen (PO-09.b11).
+- The empty first line accepts the station default 500. The station prompt is always asked: `^PRC(411,0)` piece 4 is 6 [tests/fixtures/ifcap/411.zwr:3], more than one site, and `PRCF("X")="SP"` contains `S` [Packages/IFCAP/Routines/PRCHRPT.m:5] [Packages/IFCAP/Routines/PRCFSITE.m:13, 18].
+- For a found order, the two `""` lines answer `ENTER '^' TO HALT: ` and `END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: `, and the `^` exits at the order prompt that `G EN30` asks again [Packages/IFCAP/Routines/PRCHRPT.m:75].
+- For GC-03 and GC-04, the `^` answers the order prompt that the no-match sequence asks again. It ends the lookup with no output, and `EN30` quits [Packages/IFCAP/Routines/PRCHRPT.m:72].
+- `INVALID!` passes every read check, because it is `.ANP`, and reaches the search and the no-match response. The read checks run in this order [Packages/VA FileMan/Routines/DIC11.m:15-34]: timeout (line 18), `X'?.ANP` (19), long number (21), `^` exit (23), longer than 250 characters (24), `?` help (26), leading backtick or a lone space (27), empty-answer default (30), `^`-prefixed jump (33).
+- If paging under the unresolved `IOSL` inserts an `ENTER '^' TO HALT: ` pause [Packages/IFCAP/Routines/PRCHDP2.m:31], the first capture shows it. Add one `""` per pause before the `^`, and record the change in `setup` (O-01).
+- These sequences replace the request's two-line convention of an identifier line and an exit line, which would answer the station prompt with the identifier (conflict K2).
 
-## 6. Context
+**Fixture profile.** The team's records must meet it. A record outside it ends the Rust session at an n/e branch, and the case FAILs.
 
-- **Value.** `meta.txt` `context` is `{"DUZ":".5","IOF":…,"IOSL":…,"STATION":"500"}`, with the HOME-device values recorded under section 7 in place of each `…`, each as a JSON string.
-- **Why four keys.** The user example `{"DUZ":".5","STATION":"500"}` is extended with `IOF` and `IOSL` because the display reads them [Packages/IFCAP/Routines/PRCHDP1.m:12] [Packages/IFCAP/Routines/PRCHDP2.m:31, 42].
-- **The constant.** `STUB_CONTEXT` in `src/inquiry.rs` is `[("DUZ", Some(".5")), ("IOF", None), ("IOSL", None), ("STATION", Some("500"))]`. `None` marks an unresolved value.
-- **The comparison.** `validate_context` in `src/bridge.rs` compares the capture's `context` with `STUB_CONTEXT` key by key:
-  - first each `STUB_CONTEXT` key in its order (`DUZ`, `IOF`, `IOSL`, `STATION`), then each capture key that `STUB_CONTEXT` lacks, in capture order;
-  - a missing key, an extra key, a different value, or an unresolved constant fails, and the first mismatch is reported as `CONTEXT MISMATCH <key>: expected <value>, actual <value>`;
-  - for an absent side the message shows `UNRESOLVED` (the expected value of an unresolved constant, which matches nothing), `MISSING` (the actual value of a key the capture lacks) or `ABSENT` (the expected value of an extra capture key);
-  - no capture value overrides a constant.
-- **Expected failures until O-01 closes.** `IOF` and `IOSL` stay unresolved until then, so **every capture FAILs with `CONTEXT MISMATCH IOF: expected UNRESOLVED, actual <value>`** until a recorded correction to `STUB_CONTEXT` lands. Live mode answers 502 with the same text and runs nothing. On the Rust side, GC-01, GC-02 and GC-05 also reach the BLOCKED `PO-12.b1`, and GC-03 and GC-04 the BLOCKED `PO-09.b14` while O-03 stays open (`SPEC.md`, section "Source verification").
-- **No control point** is needed: the path reads none and prompts for none (conflict C11).
+- `^PRC(442,0)` holds piece 2 `442I`, as in the repository export [Packages/IFCAP/Globals/442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:3]. The orders' index nodes give the file a subscript after `"A["`, such as `"C"` [Packages/VA FileMan/Routines/DICM.m:71].
+- Each order's node 0 piece 1 holds its full `.01` number `500-<C value>`, such as `500-GC1001` [Packages/VA FileMan/Globals/DD.zwr:514312], whose part after `500-` is its `C` index value `$P(X,"-",2)` [Packages/VA FileMan/Globals/DD.zwr:514318-514320]. The piece's leading numeric value, 500, is the station the lookup screen compares, and method of processing (field .02, node 0 piece 2) is `1`, which is below 10, so the lookup screen passes [Packages/IFCAP/Routines/PRCHRPT.m:9] [Packages/IFCAP/Routines/PRCHPAT.m:81].
+- No two orders share a `C` value, and no `C` value is a prefix of another.
+- Nodes 0 and 1 are present. None of nodes 11, 5, 3, 15, 4, 13 or 6 is present.
+- Field 5.3 is empty. The vendor is not EDI. Field 65 is not `RMPR`. Node 23 piece 7 is empty. Field .08 is not `Y`.
+- Each item has a zero node and a node 2 whose EDI status codes are empty, and a description of at most 32 characters that contains no `|`.
+- No item has a contract number or a partial receipt, and `^PRC(442.8,"B")` holds no entry for the order.
+- Added for O-03:
+  - fields 46 PURCHASE CARD NUMBER [Packages/VA FileMan/Globals/DD.zwr:514943] and 61 PURCHASE CARD HOLDER [Packages/VA FileMan/Globals/DD.zwr:515047] are empty, and no item carries subfile 442.14 field 11 INVENTORY/DISTRIBUTION POINT [Packages/VA FileMan/Globals/DD.zwr:517723], so the indexes `M`, `MCH` and `G` stay empty;
+  - no subscript of any index of files 440, 442.5 or 442.3 equals or begins with `GC3003` or `INVALID!`. The repository fixtures hold none.
 
-## 7. Capture-command preconditions (O-01, O-07)
+**Export scope** of `db-before.zwr` and `db-after.zwr`:
 
-The exact capture command is the team's to confirm (O-07). This section states what source requires of it and claims no command as verified.
+- Include every global root of the supporting fixtures: `^PRC(411)`, `^PRC(411.2)`, `^PRCD(420.5)`, `^PRCD(420.8)`, `^PRC(440)`, `^PRCD(442.3)`, `^PRC(442.4)`, `^PRCD(442.5)`, `^PRC(442.8)`, `^DIC(5)` and `^DIC(49)`.
+- Include also `^PRC(442)`, `^VA(200,.5)` and `^DIC(4,500)`.
+- Exclude, as scratch that is not business data: `^XUTL`, which `^%ZIS` writes [Packages/Kernel/Routines/ZIS.m:13]; `^UTILITY` and `^TMP`, the word-wrap scratch; and `^DISV`, which FileMan writes on a successful lookup [Packages/VA FileMan/Routines/DIC2.m:65].
 
-- **Sign-on.** Use `D DUZ^XUP(.5)`, the user POSTMASTER [Packages/Kernel/Routines/ZOSVGUT1.m:13] [Packages/Kernel/Globals/200+NEW PERSON.zwr:4, 12]. `DUZ^XUP` sets `DUZ` and its subscripts but no `DTIME` and no `IO*` variable [Packages/Kernel/Routines/XUP.m:54-64], so the command must also set:
-  - `U="^"`;
-  - `DT`, today's date in FileMan format. Without it `^PRCFSITE` calls `NOW^%DTC`, the n/e branch PO-03.b2 [Packages/IFCAP/Routines/PRCFSITE.m:7];
-  - `DTIME`, the READ timeout [Packages/IFCAP/Routines/PRCHDP2.m:10, 41] [Packages/VA FileMan/Routines/DIC11.m:17]. The Rust READ never times out, so no READ may time out during a capture.
+**ZWR form.** The exports and `cases.zwr` use the form `Store::from_zwr` accepts:
 
-  `SPEC.md` O-07 also records that `DIC`, `DO` and `DST` are undefined at option entry.
-- **HOME device (O-01).** `D ^%ZIS` runs with `IOP="HOME"` [Packages/IFCAP/Routines/PRCHDP1.m:12].
-  - It uses the home-device variables that sign-on saves under `^XUTL("XQ",$J)` when they exist [Packages/Kernel/Routines/ZIS.m:28, 82-86]. Otherwise it looks the principal device up, and can write a warning that begins `HOME DEVICE (` to it when the device is not in the DEVICE file [Packages/Kernel/Routines/ZIS.m:31-36].
-  - `IOF` and `IOSL` come from those saved variables, or from pieces 2 and 3 of node 1 of the terminal type [Packages/Kernel/Routines/ZIS2.m:55-60] [Packages/Kernel/Routines/ZIS1.m:103]. An empty `IOF` becomes `#` [Packages/Kernel/Routines/ZIS1.m:106, 113].
-  - Fix the HOME device, and record its terminal type and its `IOF` and `IOSL` values. The candidates are in `Packages/Kernel/Globals/3.2+TERMINAL TYPE.zwr` (`^%ZIS(2,…)`) and `Packages/Kernel/Globals/3.5+DEVICE.zwr` (`^%ZIS(1,…)`). Closing O-01 also needs the first capture to confirm the bytes `W @IOF` writes (`SPEC.md` O-01).
-- **Entry.** Then `D EN3^PRCHRPT`. Nothing the command runs before or after it may write to standard output (section 3).
-- **Invocation.** Run with `docker exec -i`, and **never `-t`**. The plan's research found the WorldVistA batch pattern `docker exec -i --user vehu <container> … '. /home/vehu/etc/env && yottadb -run …'` (AAP 0.4.6). It is not verified here. Feed `input.txt` on standard input, and save standard output byte for byte as `transcript.txt`. Keep standard error apart.
-- **Record.** Put the arguments that follow the container name in `meta.txt` `docker_exec_args` (section 3), and the context in `context` (section 6). Options placed before the container name, such as `--user vehu`, cannot be recorded there and are an O-07 item.
+- lines before the first line that starts with `^` are header lines and are ignored, and so are blank lines;
+- every other line is `^name(subscripts)=value`, and a repeated node replaces the earlier value;
+- an unquoted subscript is a canonical number: no leading zero, no trailing zero after a decimal point, no leading `+`. A quoted subscript is a string, except that a quoted canonical number is stored as a number;
+- inside quotes, `""` stands for one `"`;
+- a value is a quoted string or a canonical number;
+- `$C(n)` and `_` concatenation are rejected. Report such a node to the team, and never edit the export;
+- a malformed line in a fixture is reported as `<path>: MALFORMED ZWR LINE <line>: <message>`, with the 1-based line counting header lines, and the bridge then stops with `bridge: cannot load fixtures: <error>`.
 
-## 8. Export scope (`db-before.zwr`, `db-after.zwr`, `cases.zwr`)
+**Start command** (O-07): unverified and team-owned. Run it from inside the case folder, byte for byte:
 
-- **Include** the case's business globals and their pointer targets:
-  - the `^PRC(442,0)` file header (section 5);
-  - the `^PRC(442,ien,…)` record, with its `C` entry and its entries in the other `^PRC(442)` indexes;
-  - the referenced `^PRC(440)` vendor;
-  - `^PRC(440.2)` and `^DPT`, when field 5.3 is set;
-  - the `^VA(200)` buyer or agent;
-  - the `^PRC(411)`, `^PRCD(442.3)`, `^PRCD(442.5)`, `^PRC(442.4)`, `^PRCD(420.5)`, `^PRCD(420.8)`, `^DIC(5)` and `^DIC(49)` nodes the case reads.
-- **Excluded**, and stated here as excluded:
-  - `^DISV`, which FileMan writes on every successful lookup [Packages/VA FileMan/Routines/DIC2.m:65];
-  - `^TMP`, `^UTILITY` and `^XUTL`, which are scratch.
-
-  None of them is business data, and leaving them out keeps the before and after exports comparable.
-- **No orders in the repository.** The repository snapshot holds no purchase order: the `^PRC(442,0)` count is 0 [Packages/IFCAP/Globals/442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:3]. The five orders reach the fixtures only through `cases.zwr`. It must therefore hold every `db-before.zwr` node that the eleven repository fixtures lack, `^VA(200)` and `^PRC(442)` included.
-- **Runtime values.** Where the runtime snapshot holds a different value for a node the repository fixtures also hold, `cases.zwr` carries the runtime value. It loads last, so that value wins (section 9).
-
-## 9. `cases.zwr` and its `MANIFEST.txt` line
-
-- **Loader rules.** Export `cases.zwr` in ZWR form, UTF-8, in a form `Store::from_zwr` in `src/store.rs` accepts:
-  - header lines before the first line that starts with `^` are ignored, and so are blank lines;
-  - every other line is `^name(subscripts)=value`. A malformed line is an error naming the file and its 1-based line;
-  - a repeated key replaces the earlier value, and one trailing carriage return per line is dropped;
-  - an unquoted subscript must be a canonical number: no leading zero, no trailing zero after a decimal point, no leading `+`. A quoted subscript is a string, except that a quoted canonical number is stored as a number;
-  - inside quotes, `""` stands for one `"`;
-  - a value is a quoted string or a canonical number;
-  - `$C(n)` and `_` concatenation are rejected. ZWRITE writes a value holding control characters in that form, so such a node makes the file unloadable and every case then FAILs. Report the node to the team, and do not edit the export.
-- **Load order.** `load_fixtures` loads every `*.zwr` file of `tests/fixtures/ifcap/` in byte order of name, with `cases.zwr` last, so the runtime export wins on repeated keys.
-- **Manifest line.** Add one line to `tests/fixtures/ifcap/MANIFEST.txt`, ending in `\n`, with four `<TAB>`-separated fields in the order of the existing lines: file name, origin, `snapshot_id`, SHA-256 hex digest. An existing line, and the line to add:
-
-  ```text
-  411.zwr<TAB>repository Packages/IFCAP/Globals/411+ADMIN. ACTIVITY SITE PARAMETER.zwr<TAB>git:dd3fd0f3124c8178657d9fff4173c324da30f7ae<TAB><64 hex digits>
-  cases.zwr<TAB>runtime export<TAB><snapshot_id><TAB><64 hex digits>
-  ```
-
-  The digest is the first field of `sha256sum tests/fixtures/ifcap/cases.zwr`.
-- **Snapshot identity.** Every `MANIFEST.txt` line, the `cases.zwr` line included, and every `meta.txt` must carry one `snapshot_id`. The repository fixtures carry `git:dd3fd0f3124c8178657d9fff4173c324da30f7ae`. Whether the runtime database matches that commit is open item O-05: record the identifier the snapshot really has. A mismatch then FAILs baseline identity.
-- **Consistency.** A `MANIFEST.txt` that lacks the line for any required fixture, `cases.zwr` included, is inconsistent, and a fixture whose digest differs from its line fails too. Either gives FAIL.
-
-## 10. Harness outcomes (AAP 0.8.3)
-
-`evaluate_case` in `tests/equivalence.rs` gives each case one of four outcomes:
-
-- **NOT COMPARED.** A required file is missing:
-  - the case's seven capture files;
-  - the eleven repository fixtures: `411.zwr`, `411.2.zwr`, `420.5.zwr`, `420.8.zwr`, `440.zwr`, `442.3.zwr`, `442.4.zwr`, `442.5.zwr`, `442.8.zwr`, `5.zwr`, `49.zwr`;
-  - `cases.zwr`;
-  - `MANIFEST.txt`.
-
-  The missing-file list is reported. A file that is present never gives NOT COMPARED.
-- **FAIL.** The capture differs; or it is malformed, inconsistent, baseline-mismatched or has a context mismatch; or the Rust side reaches a BLOCKED or n/e branch. The report names the `TAG^ROUTINE`, the contract and branch IDs, and the first differing line or byte.
-- **PASS.** A complete capture matches after normalisation on the transcript, on `returned` and on both database checks.
-- **BLOCKED.** A tool a check needs, such as `sha256sum` for the fixture and capture digests, is unavailable, and no check failed. FAIL takes precedence over BLOCKED. An unresolved contract value and a BLOCKED branch never make a case BLOCKED: both give FAIL. An unresolved `IOF` or `IOSL` in `STUB_CONTEXT` gives `CONTEXT MISMATCH`, and a BLOCKED branch gives `UnsupportedBranch` on the Rust side.
-
-Outside the harness, BLOCKED has a wider meaning, and two more words apply:
-
-- **BLOCKED.** A branch, contract or step is not done because source, workspace, toolchain or tool access failed, or a contract value is unresolvable. Examples are the BLOCKED branch `PO-12.b1` (O-01) and the build on a host without the pinned toolchain. The open-item ID, or the path, command and error, is given.
-- **NOT RUN.** A manual or live check was not executed; the reason is given.
-- **PENDING.** Overall acceptance, until all five cases PASS and the manual (B3, B4) and live checks are complete.
-
-The outcomes are never merged. The equivalence suite exits non-zero on any FAIL, and NOT COMPARED does not fail it. Exit 0 never means acceptance.
-
-**Who reports.**
-
-- `comparison_report` in `tests/equivalence.rs` writes the per-case results into `REPORT.md`, between `<!-- COMPARISON BEGIN -->` and `<!-- COMPARISON END -->`, and nowhere else.
-- `gc_02_end_to_end_compare` in `tests/bridge.rs` posts GC-02's inputs to `/api/compare/session` and is reported apart from the synthetic tests. It prints NOT COMPARED when GC-02's prerequisites are absent.
-
-## 11. Bridge configuration
-
-`main` in `src/bin/bridge.rs` reads the bridge's configuration once at start, and this section restates it.
-
-| Variable | Read by | Type | Unset or empty | Non-empty | Purpose |
-|---|---|---|---|---|---|
-| `GOLDEN_DIR` | `main`, with `env::var_os` | An OS path, taken as given: no UTF-8 check, not canonicalised | `tests/golden/ifcap/` under the crate directory fixed at compile time (`env!("CARGO_MANIFEST_DIR")`): this folder, as an absolute path | That path | The capture root, in both modes. Replay and compare scan `GC-01` to `GC-05` under it for `input.txt`, `transcript.txt`, `returned.txt` and `normalisation.txt`; live mode reads `meta.txt` there (section 3) |
-| `VEHU_CONTAINER` | `main`, with `env::var` | A UTF-8 string | Replay mode | Live mode, with the value, untrimmed, as the Docker container name | Selects the MUMPS side. Live mode runs `docker` with `exec`, `-i`, the value, then the `meta.txt` `docker_exec_args`, directly and never through a shell. The container name comes only from this variable, never from a capture or a request |
-| `RUSTUP_AUTO_INSTALL` | rustup; the crate never reads it | Exactly `0` | Not allowed: when it is unset, rustup downloads a missing pinned toolchain (AAP 0.1.1) | `0`: a missing pinned toolchain fails with an error and nothing is downloaded | Exported in every shell that runs `rustc` or `cargo`: building or starting the bridge, and running the tests. The pin is `channel = "1.99.1"` in `rust-toolchain.toml` |
-
-- **Read once.** `main` reads both bridge variables before it listens and never sets them. A changed value takes effect only when the bridge restarts.
-- **Read per request.** The bridge reads under `GOLDEN_DIR` on each `/api/mumps/session` and `/api/compare/session` request and never checks the directory at start. A directory that does not exist reads as holding no captures: replay and compare answer 502 `NOT RECORDED`, and live mode answers 502 `MALFORMED META <GOLDEN_DIR>/GC-01/meta.txt`. Every 502 body that names a capture file shows a path built from `GOLDEN_DIR`.
-- **Relative paths.** A relative `GOLDEN_DIR` resolves against the bridge process's working directory, which the bridge never changes. The default is absolute and does not depend on it.
-- **What `GOLDEN_DIR` does not move.** It moves only the captures. The fixtures in `tests/fixtures/ifcap/` and the static files in `frontend/` always come from the crate directory fixed at compile time. `tests/equivalence.rs` and `gc_02_end_to_end_compare` in `tests/bridge.rs` always read this folder through `CARGO_MANIFEST_DIR`, and no test reads `GOLDEN_DIR` or `VEHU_CONTAINER`.
-- **Invalid UTF-8.** A `VEHU_CONTAINER` that is set but not valid UTF-8 cannot name a container. The bridge writes `bridge: VEHU_CONTAINER is not valid UTF-8` to standard error and exits with a failure status before it listens. It never falls back to replay.
-- **Address and startup line.** The address `127.0.0.1:8080` is fixed in code (`const ADDRESS`), and no environment variable sets it. Once listening, the bridge writes `bridge listening on http://127.0.0.1:8080 (replay)` or `bridge listening on http://127.0.0.1:8080 (live)` to standard error. The line names the mode and never the container. A failed bind writes `bridge: cannot listen on 127.0.0.1:8080: <OS error>` and exits with a failure status.
-- **Toolchain guard.** `RUSTUP_AUTO_INSTALL=0` is how `SPEC.md` settles conflict C1 (section "Conflict register"; AAP 0.7.2), and `REPORT.md` section "Execution evidence" records it for the evidence commands.
-
-Run from the crate folder, with each `<…>` replaced by a real value. The last three lines are alternatives: each starts one bridge on the fixed address.
-
-```sh
-export RUSTUP_AUTO_INSTALL=0
-cargo build --offline --locked
-./target/debug/bridge                              # replay, captures from this folder
-GOLDEN_DIR=<capture root> ./target/debug/bridge    # replay, captures from <capture root>
-VEHU_CONTAINER=<container> ./target/debug/bridge   # live, meta.txt from this folder
+```text
+docker exec -i vehu su - vehu -c 'source /home/vehu/etc/env && yottadb -run %XCMD "S U=\$C(94),DTIME=300,DT=\$\$DT^XLFDT D DUZ^XUP(.5) D EN3^PRCHRPT"' < input.txt > transcript.txt
 ```
 
-Live mode needs the `docker` CLI and a running container, and is the team's to run. This run's live checks are NOT RUN (AAP 0.7.3).
+- It sets `U`, `DTIME`, `DT` through `$$DT^XLFDT` [Packages/Kernel/Routines/XLFDT.m:159], and `DUZ` through `DUZ^XUP` [Packages/Kernel/Routines/XUP.m:54-64], which sets no `DTIME` and no `IO*` variable.
+- Because `DT` is defined, the `NOW^%DTC` branch PO-03.b2 [Packages/IFCAP/Routines/PRCFSITE.m:7] is not exercised.
+- No READ may time out [Packages/IFCAP/Routines/PRCHDP2.m:10, 41] [Packages/VA FileMan/Routines/DIC11.m:17]: the Rust READ never does.
+- The command calls `D EN3^PRCHRPT` directly, so no menu prompt reaches the transcript, and the workflow returns nothing.
+
+### Step 2. Commands (a) to (f)
+
+On the Docker host. These are plan defaults, unverified: this run had no Docker.
+
+- (a) `docker pull worldvista/vehu:202609`
+- (b) `docker image inspect --format '{{index .RepoDigests 0}}' worldvista/vehu:202609` gives `image_digest`.
+- (c) `docker run -d --name vehu worldvista/vehu:202609`
+- (d) Load the synthetic records of step 1, and confirm the fixture profile.
+- (e) `docker commit vehu vehu-gc-snapshot`, then `docker image inspect --format '{{.Id}}' vehu-gc-snapshot` gives `snapshot_id`.
+- (f) Before each case: `docker rm -f vehu && docker run -d --name vehu vehu-gc-snapshot`.
+
+The VEHU database is inside the container filesystem (`/home/vehu/g/vehu.gld` and `vehu.dat`; the image declares no `VOLUME`), so `docker commit` captures it and (e) and (f) stand as written.
+
+### Step 3. Setup
+
+- Confirm that `DUZ` `.5` is POSTMASTER [Packages/Kernel/Globals/200+NEW PERSON.zwr:4] and that `^VA(200,.5,20)` piece 2 is `POSTMASTER` [Packages/Kernel/Globals/200+NEW PERSON.zwr:12], so `A^PRCFSITE` never writes [Packages/IFCAP/Routines/PRCFSITE.m:34, 37-38].
+- Confirm station 500 `CAMP MASTER` [Packages/Kernel/Globals/4+INSTITUTION.zwr:494] and the `^PRC(442,0)` header of step 1.
+- Determine the `IOF` and `IOSL` that `^%ZIS` sets for the HOME device at [Packages/IFCAP/Routines/PRCHDP1.m:12]:
+  - with `^XUTL("XQ",$J,"IO")` defined, HOME restores the sign-on values [Packages/Kernel/Routines/ZIS.m:28]. Otherwise the device is looked up by `$I`, and a device that is not found writes `HOME DEVICE (…) DOES NOT EXIST IN THE DEVICE FILE` [Packages/Kernel/Routines/ZIS.m:31-38];
+  - an empty `IOF` becomes `#` [Packages/Kernel/Routines/ZIS1.m:103-113];
+  - the candidates disagree. Device 267 `PMT290` (`$I` `0`), terminal type 168, gives `132^#^60` [Packages/Kernel/Globals/3.5+DEVICE.zwr:14-18, 679] [Packages/Kernel/Globals/3.2+TERMINAL TYPE.zwr:816-817]. Device 595 `CONSOLE`, terminal type 230, gives `80^#,$C(27,91,50,74,27,91,72)^24` [Packages/Kernel/Globals/3.5+DEVICE.zwr:36-40] [Packages/Kernel/Globals/3.2+TERMINAL TYPE.zwr:1152-1153].
+- Record `IOF` and `IOSL` in `context`, and `IOM` and the device name in `setup`.
+- Record the bytes the GC-01 transcript shows for `W @IOF`. This answers the O-01 question.
+- If `IOF` shows cursor addressing, such as the `$C(27,91,50,74,27,91,72)` clear-and-home sequence, the workflow-selection stop condition applies: stop and report to the team.
+
+### Step 4. Per-case run
+
+In the team's staging folder `<staging>/GC-0N/`, which is copied into `tests/golden/ifcap/` at playbook phase 8:
+
+1. Restore the snapshot with step 2 (f).
+2. Export `db-before.zwr`.
+3. Run `docker exec -i <container> <docker_exec_args> < input.txt > transcript.txt` from inside the case folder, with the container `vehu` and the arguments written out in the team's shell: the start command of step 1.
+4. Export `db-after.zwr`.
+5. Write a zero-byte `returned.txt` with `: > returned.txt`, and write `meta.txt` (Part A section 5).
+
+### Step 5. Run twice
+
+Run each case a second time from the restored snapshot, and compare the two runs.
+
+- A reproducible case gets a `normalisation.txt` covering only the variable fields its `meta.txt` documents, or a zero-byte one when there are none.
+- A case that is not reproducible keeps no `normalisation.txt`. It is INCOMPLETE, failing `seven_files_present` and `normalisation_parses`, which reads the same file, so it FAILs. `meta.txt` `setup` gives the reason.
+
+### Step 6. `cases.zwr`
+
+- It is the union, over the five `db-before.zwr` files, of the nodes under `^PRC(442)` for the synthetic orders, the `^PRC(442,0)` header, their index nodes, and the synthetic vendor's `^PRC(440)` nodes.
+- Omit any line already present verbatim in a supporting fixture.
+- Keep the lines in ZWR collation order under the two ZWR header lines.
+- Save it as `tests/fixtures/ifcap/cases.zwr`. It loads last and wins on a repeated node [src/store.rs:323-387].
+- Add no other file.
+
+**Conditional path: a run that finds new case folders.** A run that changes the port and finds `GC-0N` folders that were absent when it was planned takes these steps, in order:
+
+1. Before editing any code, record the baseline capture-hash listing with the two lines of step 7, and evaluate the six readiness checks of Part A section 9 for every case.
+2. **No READY case.** Create nothing: no `cases.zwr` is built, and every recorded case is judged as it stands.
+3. **At least one READY case and no `tests/fixtures/ifcap/cases.zwr`.** Build it from the READY cases' `db-before.zwr` only:
+   - the node selection of the first bullet above, each line once;
+   - omit any line already present verbatim in a supporting fixture;
+   - keep the lines in ZWR collation order under the two ZWR header lines;
+   - it is a text transformation and executes no MUMPS;
+   - the after listing records the file on its own line as `CREATED BY RUN`, outside the equality rule of `SPEC.md` "Capture hashes".
+4. **At least one READY case and an existing `cases.zwr`: the preflight.** Leave the file untouched, and before editing any code:
+   - apply the extraction of the first bullet above to the READY cases' `db-before.zwr`;
+   - list every extracted line found neither in `cases.zwr` nor in a supporting fixture;
+   - record that comparison in `SPEC.md` "Run evidence";
+   - for any line listed, add a `SPEC.md` "Open items" entry naming the case and its nodes, with the action "rebuild `cases.zwr` by README step 6";
+   - it is not a harness check: the harness reports those cases by the ordinary comparison, which shows the difference the missing records cause.
+5. Each READY case then ends PASS or FAIL.
+
+Step 6 builds `cases.zwr` only. The buyer node `^VA(200,.5,0)`, which `DIS^PRCHDP1` reads for the buyer or agent name [Packages/IFCAP/Routines/PRCHDP1.m:59], is outside the node selection of this step's first bullet, so `cases.zwr` does not hold it. It is a separate supporting fixture, `tests/fixtures/ifcap/200.zwr`, which holds that one node under the two ZWR header lines. From `rust/ifcap-po-inquiry/`, `grep -F '^VA(200,.5,0)=' tests/golden/ifcap/GC-01/db-before.zwr` extracts the node's line, the same line as [Packages/Kernel/Globals/200+NEW PERSON.zwr:4].
+
+### Step 7. Checks
+
+From `rust/ifcap-po-inquiry/`:
+
+- Run `cargo test --offline --locked`. `REPORT.md` part 2 shows the verdicts and part 3 each case's readiness. The test also prints `GC-0N <verdict>` for each case, which Cargo shows only when the test fails; to see the lines on a passing run, use `cargo test --offline --locked --test equivalence -- --nocapture` (`RUNNING.md` step 2).
+- Restart the bridge with `cargo run --offline --locked --bin bridge`, then reload the page. Confirm the bridge's third startup line `RECORDED <n> OF 5 READY <m> OF 5` and the screen's status line `MUMPS BACKEND: REPLAY RECORDED <n> OF 5 READY <m> OF 5`.
+- Record the capture hashes with these two lines, verbatim:
+
+```text
+find tests/golden/ifcap -type f ! -name README.md -exec sha256sum {} +
+if [ -f tests/fixtures/ifcap/cases.zwr ]; then sha256sum tests/fixtures/ifcap/cases.zwr; else echo "ABSENT tests/fixtures/ifcap/cases.zwr"; fi
+```
+
+## Commands
+
+Run from `rust/ifcap-po-inquiry/`, with each `<…>` replaced by a real value. The last three lines are alternatives: each starts one bridge on the fixed address `127.0.0.1:8080`.
+
+```text
+cargo build --offline --locked
+cargo test --offline --locked
+cargo run --offline --locked --bin bridge
+VEHU_CONTAINER=<container name> cargo run --offline --locked --bin bridge
+GOLDEN_DIR=<folder> cargo run --offline --locked --bin bridge
+```
+
+- Set `RUSTUP_AUTO_INSTALL=0` when offline, so that a missing pinned toolchain fails instead of downloading.
+- The short forms `cargo test` and `cargo run --bin bridge` are equivalent on a prepared host.
+- The bridge prints three lines to standard output: `http://127.0.0.1:8080/`, then `MUMPS MODE: REPLAY` (or `MUMPS MODE: LIVE <container>`), then `RECORDED <n> OF 5 READY <m> OF 5`. A port already taken gives `bridge: port 8080 on 127.0.0.1 is already in use` on standard error and exit status 1, a golden folder that does not exist, or is not a directory, gives `bridge: golden directory missing: <path>`, and one whose metadata cannot be read for another reason, such as a symbolic-link loop or a parent folder that cannot be searched, gives `bridge: golden directory unreadable: <path>: <error>`. After either, the bridge keeps serving: with the folder missing no case is recorded, and with it unreadable every case counts as recorded but unreadable (`RECORDED 5 OF 5 READY 0 OF 5`).
+

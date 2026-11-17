@@ -1,0 +1,46 @@
+
+
+
+Select STATION NUMBER ('^' TO EXIT): 500//       CAMP MASTER
+
+
+P.O./REQ.NO.:   500-GC5005  10-05-26  ST   Cancelled Order  
+             FCP: 123     $ 15.00[5i[6w[4i[?5i[?3h[6w
+PURCHASE ORDER: 500-GC5005           STATUS: Cancelled Order
+M.O.P.: INVOICE/RECEIVING REPORT     LAST PARTIAL RECD.: 
+                                     REQUESTING SERVICE: 
+VENDOR:  GC TEST VENDOR                         SHIP TO: 
+         1 TEST STREET                                   V.A. Medical Center 
+         TESTVILLE, NY  12345                                 
+         555-0100
+
+
+
+
+
+________________________________________________________________________________
+FOB POINT: DESTINATION       |PROPOSAL:                  |AUTHORITY: 
+COST CENTER: 1234            |                           |  
+TYPE:                        |                           |AGENT:
+DELIVER ON/BEFORE 10/15/2026 |CONTRACT:                  |   POSTMASTER
+DISCOUNT TERM:               |                           |DATE: 10/5/2026
+APP: 3600160-123             |                           |
+                             |                           |TOTAL:    15.00
+--------------------------------------------------------------------------------
+        ENTER '^' TO HALT: 
+
+
+                                                       UNIT           TOTAL
+ITEM           DESCRIPTION                QTY UNIT     COST           COST
+--------------------------------------------------------------------------------
+    1  GC TEST ITEM X                       1  AM     10.00          10.00
+        BOC: 2631
+
+    2  GC TEST ITEM Y                       1  AM      5.00           5.00
+        BOC: 2631
+
+
+END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: 
+
+
+P.O./REQ.NO.: 
