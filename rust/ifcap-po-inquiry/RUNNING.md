@@ -77,7 +77,7 @@ This is the state of a checkout without the captures: `tests/golden/ifcap/` hold
 
 - Copy the case folders `GC-01` to `GC-05`, each holding the seven files, into `tests/golden/ifcap/`.
 - Build `tests/fixtures/ifcap/cases.zwr` by README Part B step 6.
-- Run `cargo test --offline --locked`. It judges every recorded case and rewrites `REPORT.md`. With the five captures of this branch it exits 0, and part 2 reads `Verdict: PASS` for all five cases.
+- Run `cargo test --offline --locked`. It judges every recorded case and rewrites `REPORT.md`. With the five captures of this branch it exits 0, and part 2 reads `Verdict: PASS` for all five cases. Without captures, with every case folder absent, it exits 0 when nothing else fails, part 2 reads `Verdict: NOT COMPARED` for all five cases, and part 3 shows each `ABSENT`.
 - **Restart the bridge**, because it loads the fixture Store once, at startup. Replay rereads the capture folders on every request, so new capture folders alone need no restart, but `cases.zwr` and the startup counts do. The screen's status line is read only when the page loads, so reload the page to refresh it after adding captures, restart or not.
 - To serve another capture folder, start the bridge with:
 
