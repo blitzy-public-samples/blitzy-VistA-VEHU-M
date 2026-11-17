@@ -727,7 +727,7 @@ Each residual hit is current, closed or marked as history:
 
 ### Harness checks in this run
 
-- fixtures loaded: PASS — 29873 nodes
+- fixtures loaded: PASS — 29874 nodes
 - per-case readiness evaluated: PASS — 5 of 5 cases
 - store equal to its pre-call clone: PASS — sessions run: 5
 - SPEC.md sections found: PASS — 10 of 10
@@ -736,21 +736,17 @@ Each residual hit is current, closed or marked as history:
 
 ### GC-01
 
-- Verdict: FAIL
+- Verdict: PASS
 - Normalisation rules: none
 - image_digest: `"worldvista/vehu@sha256:e0710df4ab487831ad84d0383637488da2baa37168ce8ac8e71e8cd039590622"`
 - snapshot_id: `"sha256:a8089ad06fcca92d40659c2a1503cd6f4ef829f407df547d939275e6892bace4"`
-- Causes:
-  - transcript differs at line 25: expected `"DELIVER ON/BEFORE 10/15/2026 |CONTRACT:                  |   POSTMASTER"`, actual `"DELIVER ON/BEFORE 10/15/2026 |CONTRACT:                  |   "`, attributed to DIS^PRCHDP1
 
 ### GC-02
 
-- Verdict: FAIL
+- Verdict: PASS
 - Normalisation rules: none
 - image_digest: `"worldvista/vehu@sha256:e0710df4ab487831ad84d0383637488da2baa37168ce8ac8e71e8cd039590622"`
 - snapshot_id: `"sha256:a8089ad06fcca92d40659c2a1503cd6f4ef829f407df547d939275e6892bace4"`
-- Causes:
-  - transcript differs at line 25: expected `"DELIVER ON/BEFORE 10/15/2026 |CONTRACT:                  |   POSTMASTER"`, actual `"DELIVER ON/BEFORE 10/15/2026 |CONTRACT:                  |   "`, attributed to DIS^PRCHDP1
 
 ### GC-03
 
@@ -768,12 +764,10 @@ Each residual hit is current, closed or marked as history:
 
 ### GC-05
 
-- Verdict: FAIL
+- Verdict: PASS
 - Normalisation rules: none
 - image_digest: `"worldvista/vehu@sha256:e0710df4ab487831ad84d0383637488da2baa37168ce8ac8e71e8cd039590622"`
 - snapshot_id: `"sha256:a8089ad06fcca92d40659c2a1503cd6f4ef829f407df547d939275e6892bace4"`
-- Causes:
-  - transcript differs at line 25: expected `"DELIVER ON/BEFORE 10/15/2026 |CONTRACT:                  |   POSTMASTER"`, actual `"DELIVER ON/BEFORE 10/15/2026 |CONTRACT:                  |   "`, attributed to DIS^PRCHDP1
 
 ## Part 3: Capture readiness
 
