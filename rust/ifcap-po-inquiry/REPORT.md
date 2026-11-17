@@ -6,7 +6,7 @@ This file is written in full by `tests/equivalence.rs` on every `cargo test` and
 
 ## Part 1: Run evidence
 
-Each command below ran on 2026-11-15 in this checkout from `rust/ifcap-po-inquiry/` unless its entry says otherwise (the subsections headed "Refine round" ran on 2026-11-17), with `RUSTUP_AUTO_INSTALL=0` set so that a missing toolchain fails instead of downloading. Each entry gives the command, its exit status and its output, standard error included. An output is complete unless its entry says it is trimmed. The read-only searches S5 to S9 are in `SPEC.md` section "Read-only enforcement results", the A7 commands in its section "Source-unchanged verification" and the capture listings in its section "Capture hashes".
+Each command below ran on 2026-11-15 in this checkout from `rust/ifcap-po-inquiry/` unless its entry says otherwise (the subsections headed "Refine round" ran on 2026-11-17), with `RUSTUP_AUTO_INSTALL=0` set so that a missing toolchain fails instead of downloading. Each entry gives the command, its exit status and its output, standard error included. An output is complete unless its entry says it is trimmed. The read-only searches S5 to S9 are in `SPEC.md` section "Read-only enforcement results", the A7 commands in section "Refine round: completion evidence" below and in its section "Source-unchanged verification", and the capture listings in its section "Capture hashes".
 
 ### Refine round: baseline before the first edit
 
@@ -163,7 +163,7 @@ GC-03 and GC-04 now PASS: the baseline difference at their line 10 was the proce
 | GC-04 | 0 of 5 | none: PASS | | | |
 | GC-05 | 0 of 5 | 25 | the same | the same | `DIS^PRCHDP1` [PRCHDP1.m:59] |
 
-**Review fixes.** The later edits of this round to `src/inquiry.rs`, made after review, change only doc comments and the test module (section "Refine round: completion evidence"). They change no rule and no output, so none is a correction attempt, and the counts stay 0 of 5 for every case. The final run of that section gives the same verdicts and the same first differing line as Run 0.
+**Review fixes.** The later edits of this round to `src/inquiry.rs`, made after the first review, change only doc comments and the test module, and the later edit to `src/mumps.rs`, made after the second review, changes only the `Session` doc comment (section "Refine round: completion evidence"). They change no rule and no output, so none is a correction attempt, and the counts stay 0 of 5 for every case. The final run of that section gives the same verdicts and the same first differing line as Run 0.
 
 **Isolation of the line-25 difference.** `DIS^PRCHDP1` writes the agent name with `S Y=+$P(PRCHD1,U,10),Y=$P($G(^VA(200,Y,0)),U,1) W ?57,"|  ",$P(Y,",",2)," ",$P(Y,",",1)` [PRCHDP1.m:59], which `dis_prchdp1` reproduces unchanged. Each of the three orders' node 1 piece 10 (field 16 BUYER [DD.zwr:514742]) is `.5`. `^VA(200,.5,0)="POSTMASTER^.5^…"` is in every `db-before.zwr` and in [200+NEW PERSON.zwr:4], but `grep '^\^VA(200' tests/fixtures/ifcap/*.zwr` prints nothing: no fixture holds file 200, and README Part B step 6 extracts only the `^PRC(442)` and `^PRC(440)` nodes, so `cases.zwr` omits the node. `tests/equivalence.rs` loads the store only from `tests/fixtures/ifcap/`. The Rust side therefore reads `""` through `$G` and writes `|   `, while the original writes `|   POSTMASTER`. A check outside the repository, with a scratch copy of the twelve fixtures plus one file holding only that node, gave transcripts byte-equal to all five captures (GC-01 1664, GC-02 1852, GC-03 101, GC-04 101, GC-05 1745 bytes); over the repository fixtures GC-01, GC-02 and GC-05 are each 10 bytes short. The scratch copy is not part of the crate.
 
@@ -171,16 +171,16 @@ GC-03 and GC-04 now PASS: the baseline difference at their line 10 was the proce
 
 ### Refine round: completion evidence
 
-Run from `rust/ifcap-po-inquiry/` on 2026-11-17 after this round's last edit to `src/` and `tests/`, the review fixes included, at `HEAD` `2476fb27bec9b4f07d795d0c7d394047e1923c77` with the review-fix changes uncommitted. Timings and thread ids are trimmed and the checkout path is shown as `<crate>`.
+Run from `rust/ifcap-po-inquiry/` on 2026-11-17, from 05:37:09Z to 05:38:47Z, after this round's last edit to `src/` and `tests/`, both sets of review fixes included, at `HEAD` `00981dfbb4c0bf92c5cf3e5686b0661fc176d1a1`, which holds the first review fixes, with this review round's fixes uncommitted. The `git` commands ran from the repository root. Timings and thread ids are trimmed and the checkout path is shown as `<crate>`.
 
 | Command | Exit status | Result |
 |---|---|---|
 | `cargo build --offline --locked` | 0 | `Finished` only: the crate was already built from the current sources; no warning |
 | `cargo clippy --offline --locked --all-targets` | 0 | `Finished` only: every target was already checked from the current sources, and cargo replays the stored warnings of a target it does not recheck; no warning |
 | `cargo fmt --check` | 0 | no output |
-| `RUSTDOCFLAGS='-D warnings' cargo doc --offline --locked --no-deps --document-private-items` | 0 | `Documenting ifcap-po-inquiry v0.1.0 (<crate>)`, `Finished`, `Generated <crate>/target/doc/ifcap_po_inquiry/index.html and 1 other file`; no warning |
+| `RUSTDOCFLAGS='-D warnings' cargo doc --offline --locked --no-deps --document-private-items` | 0 | `Finished`, `Generated <crate>/target/doc/ifcap_po_inquiry/index.html and 1 other file`, with no `Documenting` line: the documentation was already generated from the current sources with the same flags; no warning |
 
-`cargo test --offline --locked --no-fail-fast`, started 2026-11-17T03:55:50Z, exit status 101. Output trimmed to cargo's `Finished` line, each target's `Running` or `Doc-tests` line and its `test result:` line, every failure message, and cargo's `error:` lines:
+`cargo test --offline --locked --no-fail-fast`, started 2026-11-17T05:37:39Z, exit status 101. Output trimmed to cargo's `Finished` line, each target's `Running` or `Doc-tests` line and its `test result:` line, every failure message, and cargo's `error:` lines:
 
 ```text
     Finished `test` profile [unoptimized + debuginfo] target(s)
@@ -215,9 +215,9 @@ error: 2 targets failed:
     `--test equivalence`
 ```
 
-185 tests: 183 pass and 2 fail, both on the line-25 difference of O-09. The 164 unit tests include the new exact-value tests of section "Contracts", "Test names". The completion target of five PASS and exit status 0 is not reached: GC-03 and GC-04 PASS, GC-01, GC-02 and GC-05 FAIL, and `end_to_end_real_captures` stops at GC-01's `match` false. `--no-fail-fast` makes cargo run `tests/equivalence.rs` after `tests/bridge.rs` fails.
+185 tests: 183 pass and 2 fail, both on the line-25 difference of O-09. The 164 unit tests include the new exact-value tests of section "Contracts", "Test names". The completion target of five PASS and exit status 0 is not reached: GC-03 and GC-04 PASS, GC-01, GC-02 and GC-05 FAIL, and `end_to_end_real_captures` stops at GC-01's `match` false. `--no-fail-fast` makes cargo run `tests/equivalence.rs` after `tests/bridge.rs` fails. That run rewrote `REPORT.md`, which was then restored with `git checkout -- REPORT.md`; the committed `REPORT.md` is the one of the final run below.
 
-`cargo test --offline --locked`, the plain fail-fast form, started 2026-11-17T03:53:14Z, exit status 101. Output trimmed to cargo's `Compiling` and `Finished` lines, each target's `Running` line and its `test result:` line, the failure message and cargo's `error:` line:
+`cargo test --offline --locked`, the plain fail-fast form, started 2026-11-17T05:37:19Z, exit status 101. Output trimmed to cargo's `Compiling` and `Finished` lines, each target's `Running` line and its `test result:` line, the failure message and cargo's `error:` line:
 
 ```text
    Compiling ifcap-po-inquiry v0.1.0 (<crate>)
@@ -234,9 +234,9 @@ test result: FAILED. 18 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
 error: test failed, to rerun pass `--test bridge`
 ```
 
-Cargo stops at the first failing test target, so `tests/equivalence.rs` did not run: the output has no `Running tests/equivalence.rs` line and no `GC-0N` line. `sha256sum REPORT.md` and its modification time, taken before and after the command, were the same, `b2ece7b88a6631871b7f7fcb3390cb87e0f49264891e1ddc9323e281f5b120ba` at 2026-11-17T03:49:30Z: this command did not write `REPORT.md`.
+Cargo stops at the first failing test target, so `tests/equivalence.rs` did not run: the output has no `Running tests/equivalence.rs` line and no `GC-0N` line. `sha256sum REPORT.md` and `stat -c %y REPORT.md`, taken before and after the command, were the same, `e0faa0c746e81a29afc22ee1281f2956ac68d862534fca98fa3dc3419a96ea93` and `2026-11-17 04:47:33.008079731 +0000`: this command did not write `REPORT.md`.
 
-Audits, each exit status as shown; S5 to S9 are in section "Read-only enforcement results":
+Audits, run 2026-11-17T05:38:04Z, each exit status as shown; S5 to S9 are in section "Read-only enforcement results":
 
 ```text
 $ grep -rnE 'unsafe|\.unwrap\(|\.expect\(|panic!' src/          # S1, exit 0
@@ -252,7 +252,7 @@ $ grep -rcE '<same pattern>' src/golden.rs
 
 The S2 hit is the comment quoting the M code `DIC(0)["E"` [DIC.m:63], not Rust indexing. It was at line 745 before this round and moved with the lines this round added above it.
 
-`git diff --name-only 0b123807c2042e55d006c4812e7fa61b0224ab42`, from the repository root, exit status 0. It compares the working tree with the commit this round started from, so it covers the whole round: the commits `68a7a64a9` and `2476fb27b` and the uncommitted review fixes:
+`git diff --name-only 0b123807c2042e55d006c4812e7fa61b0224ab42`, from the repository root, exit status 0. It compares the working tree with the commit this round started from, so it covers the whole round: the commits `68a7a64a9`, `2476fb27b` and `00981dfbb` and this review round's uncommitted fixes:
 
 ```text
 rust/ifcap-po-inquiry/REPORT.md
@@ -266,11 +266,24 @@ rust/ifcap-po-inquiry/src/mumps.rs
 rust/ifcap-po-inquiry/tests/bridge.rs
 ```
 
-The review fixes change `src/inquiry.rs`, `SPEC.md`, `RUNNING.md`, `runPlaybook.md` and, through the final run below, `REPORT.md`. In `src/inquiry.rs` they change only doc comments, those of `InquiryError`, its `CorruptStore` variant and `inquire`, and the test module: the doc comment of the helper `no_match_transcript`, and `paging_test_writes_nothing_for_one_and_three_items`, whose direct checks now also run at column 74. In `RUNNING.md` they change lines 29, 31, 55 and 108 (base lines 29, 31, 53 and 106), and in `runPlaybook.md` lines 35 and 36: lines 29 and 31 and the phase 4 rows say that, with the five captures present, plain `cargo test` stops at `tests/bridge.rs` and that the `--test equivalence` command prints the verdict lines and rewrites `REPORT.md`; line 55 says which step 4 items also hold with the captures; line 108 gives the COMPARE outcome per case.
+The first review fixes, committed as `00981dfbb`, change `src/inquiry.rs`, `SPEC.md`, `RUNNING.md`, `runPlaybook.md` and `REPORT.md`. In `src/inquiry.rs` they change only doc comments, those of `InquiryError`, its `CorruptStore` variant and `inquire`, and the test module: the doc comment of the helper `no_match_transcript`, and `paging_test_writes_nothing_for_one_and_three_items`, whose direct checks now also run at column 74. In `RUNNING.md` they change lines 29, 31, 55 and 108 (base lines 29, 31, 53 and 106), and in `runPlaybook.md` lines 35 and 36: lines 29 and 31 and the phase 4 rows say that, with the five captures present, plain `cargo test` stops at `tests/bridge.rs` and that the `--test equivalence` command prints the verdict lines and rewrites `REPORT.md`; line 55 says which step 4 items also hold with the captures; line 108 gives the COMPARE outcome per case.
+
+This review round's fixes, uncommitted, change `src/mumps.rs`, `SPEC.md` and, through the final run below, `REPORT.md`. In `src/mumps.rs` they change only the `Session` doc comment, which now quotes YottaDB's `$X` sentence in full ("for every character written to and read from the current device") and states why `Session::read` moves neither `$X` nor `$Y`; no code and no test changes, so no rule and no output changes. In `SPEC.md` they change section "Workflow selection" (the reason the stop condition does not apply), PO-26's outputs in section "Contracts" and section "Places the original looks wrong" (the halt prompt `ENTER '^' TO HALT: ` with its 8 leading spaces, `?8` [PRCHDP2.m:10]), section "Mapping table" (the built-ins gain `WRITE #` to `Session::form_feed` and `SET $X=0,$Y=0` to `Session::reset_position`, and the device I/O row gains `W #`, `W @IOF` with `IOF` `#` and `S $X=0,$Y=0`, with those two functions), the READ and WRITE rule of section "Port rules", O-11's `src/mumps.rs` lines in section "Open items", the `#[cfg(test)]` lines of `src/mumps.rs` and the re-run statement in section "Read-only enforcement results", subsection "Fixture-to-source equality" of this section, and the re-taken measurements of this subsection, of section "Source-unchanged verification" and of section "Capture hashes". A separate fix of this review round, commit `cabfc1ec6`, changes only the "If not" cells of the two phase 4 rows of `runPlaybook.md` (lines 35 and 36), so that each covers both the no-captures state and the five-captures state; it changes no command, `runPlaybook.md` stays 116 lines, and no measurement of this subsection depends on it.
 
 In `src/golden.rs`, `src/bridge.rs` and `tests/bridge.rs` the diff changes only test code: each `IOSL` `"24"` becomes `"60"`, the context with `IOF` `#,$C(27,91,50,74,27,91,72)` moves from accepted to rejected with `CONTEXT MISMATCH IOF: expected #, actual #,$C(27,91,50,74,27,91,72)`, and `CONTEXT MISMATCH IOF: expected UNRESOLVED (O-01), actual ABSENT` becomes `CONTEXT MISMATCH IOF: expected #, actual ABSENT`. The `DUZ` `1` contexts still fail on `DUZ` alone. `RUNNING.md` (lines 29, 31, 39, 51-56 and 106 of the base) and `runPlaybook.md` (lines 8, 35, 36, 42, 43 and 57) keep their no-captures outcome and gain, beside it, the outcome with the five captures present as this run shows it: `GC-03` and `GC-04` PASS, `GC-01`, `GC-02` and `GC-05` FAIL at transcript line 25 (O-09), exit status 101, `RECORDED 5 OF 5 READY 5 OF 5` and `MUMPS BACKEND: REPLAY RECORDED 5 OF 5 READY 5 OF 5`. The outcome the refine round asked them to state, `GC-01 PASS` to `GC-05 PASS` with exit status 0, holds only once O-09 is closed. No command changed. `runPlaybook.md` stays 116 lines. `testingMethods.md` and `tests/golden/ifcap/README.md` are unchanged.
 
-**Runtime check.** The bridge ran in this checkout's namespace `pf-18100`, started by `netns-port-forward 18100 8080 -- ./target/debug/bridge` after `cargo build --offline --locked`, which built it from the current sources. Its standard output:
+**A7, source unchanged.** Both commands ran from the repository root at 2026-11-17T05:38:47Z, at `HEAD` `00981dfbb4c0bf92c5cf3e5686b0661fc176d1a1` with this review round's fixes uncommitted; each exit status 0, and neither printed anything (no output). The same measurement is the last two rows of section "Source-unchanged verification":
+
+```text
+$ git diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION; echo "exit=$?"
+exit=0
+$ git status --porcelain -- . ':!rust/ifcap-po-inquiry'; echo "exit=$?"
+exit=0
+```
+
+`Packages/` and the root files `Packages.csv`, `README.rst`, `LICENSE`, `NOTICE` and `ATTESTATION` are byte-identical to `HEAD`, and no file outside `rust/ifcap-po-inquiry/` is modified or untracked. The `git diff --name-only` output above lists only files under `rust/ifcap-po-inquiry/`, so `Packages/` and the root files are also unchanged since the commit this round started from.
+
+**Runtime check.** The bridge ran in this checkout's namespace `pf-18081`, started at 2026-11-17T05:34:25Z by `netns-port-forward 18081 8080 -- ./target/debug/bridge` after `cargo build --offline --locked`, which built it from the current sources at 05:34:13Z, after the last edit to `src/` at 05:33:41Z. Its standard output:
 
 ```text
 http://127.0.0.1:8080/
@@ -278,13 +291,13 @@ MUMPS MODE: REPLAY
 RECORDED 5 OF 5 READY 5 OF 5
 ```
 
-`curl -s http://127.0.0.1:18100/api/status`, run 2026-11-17T03:56:16Z, exit status 0:
+`curl -s http://127.0.0.1:18081/api/status`, run 2026-11-17T05:38:24Z, exit status 0:
 
 ```text
 {"mumps_mode":"replay","recorded":["GC-01","GC-02","GC-03","GC-04","GC-05"],"ready":["GC-01","GC-02","GC-03","GC-04","GC-05"],"incomplete":{}}
 ```
 
-`POST /api/compare/session` to `http://127.0.0.1:18100/` with each case's `input.txt` sequence, `Content-Type: application/json` and `Origin: http://127.0.0.1:18100`; the byte counts are the lengths of the two transcripts in the answer:
+`POST /api/compare/session` to `http://127.0.0.1:18081/`, run 2026-11-17T05:38:39Z, with each case's `input.txt` sequence, `Content-Type: application/json` and `Origin: http://127.0.0.1:18081`; the byte counts are the lengths of the two transcripts in the answer:
 
 | Case | Inputs | HTTP | `match` | MUMPS bytes | RUST bytes |
 |---|---|---|---|---|---|
@@ -294,11 +307,12 @@ RECORDED 5 OF 5 READY 5 OF 5
 | GC-04 | `""`, `INVALID!`, `^` | 200 | true | 101 | 101 |
 | GC-05 | `""`, `GC5005`, `""`, `""`, `^` | 200 | false | 1745 | 1735 |
 
-For GC-01, GC-02 and GC-05 the two transcripts differ only at line 25, `…|   POSTMASTER` against `…|   `, and each MUMPS transcript is byte-equal to the case's `transcript.txt`. A second instance, `timeout 10 nsenter --net=/run/netns/pf-18100 ./target/debug/bridge`, exited 1, with nothing on standard output and `bridge: port 8080 on 127.0.0.1 is already in use` on standard error. The first instance kept serving: `GET /api/status` answered 200 afterwards.
+For GC-01, GC-02 and GC-05 the two transcripts differ only at line 25, `…|   POSTMASTER` against `…|   `. Each of the five MUMPS transcripts is byte-equal to the case's `transcript.txt`, and so are the RUST transcripts of GC-03 and GC-04. A second instance, `timeout 10 nsenter --net=/run/netns/pf-18081 ./target/debug/bridge`, run from `rust/ifcap-po-inquiry/` at 2026-11-17T05:38:44Z, exited 1, with nothing on standard output and `bridge: port 8080 on 127.0.0.1 is already in use` on standard error. The first instance kept serving: `GET /api/status` answered 200 afterwards.
 
-`REPORT.md` is written by `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, run after this document's last edit and committed as that run wrote it. Plain `cargo test --offline --locked` cannot write it in this state, because it stops at `tests/bridge.rs` before `tests/equivalence.rs` runs (its record above). That command, run after every other edit of this document, exited with status 101. Output complete except the thread id and the timings:
+`REPORT.md` is written by `cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, run after this document's last edit and committed as that run wrote it. Plain `cargo test --offline --locked` cannot write it in this state, because it stops at `tests/bridge.rs` before `tests/equivalence.rs` runs (its record above). That command, run after every other edit of this document, exited with status 101. Output complete except the thread id and the timings, with the checkout path shown as `<crate>`; it recompiles the test because the test includes this document:
 
 ```text
+   Compiling ifcap-po-inquiry v0.1.0 (<crate>)
     Finished `test` profile [unoptimized + debuginfo] target(s)
      Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
 
@@ -397,7 +411,7 @@ Each `GC-0N` folder holds the seven files: `db-after.zwr` and `db-before.zwr` (1
 
 ### Fixture-to-source equality
 
-This `bash` script compares the sha256 of each of the 11 fixtures with that of its `Packages/` source, prints `EQUAL` or `DIFFERENT` per pair, and exits non-zero when a pair differs or the fixture count is not 11. Exit status 0:
+This `bash` script compares the sha256 of each of the 11 supporting fixtures with that of its `Packages/` source, prints `EQUAL` or `DIFFERENT` per pair, and exits non-zero when a pair differs or the count of `tests/fixtures/ifcap/*.zwr` files other than `cases.zwr` is not 11. Run 2026-11-17T05:26:57Z in this refine round, from `rust/ifcap-po-inquiry/`, exit status 0:
 
 ```sh
 status=0
@@ -419,7 +433,7 @@ for pair in \
   if [ "$f" = "$s" ]; then echo "EQUAL $f $fixture Packages/$source"
   else echo "DIFFERENT $fixture $f Packages/$source $s"; status=1; fi
 done
-[ "$(ls tests/fixtures/ifcap/*.zwr | wc -l)" -eq 11 ] || status=1
+[ "$(ls tests/fixtures/ifcap/*.zwr | grep -v '/cases.zwr$' | wc -l)" -eq 11 ] || status=1
 [ "$status" -eq 0 ]
 ```
 
@@ -440,6 +454,8 @@ EQUAL de7af10fbf737fdc948c1c64d50316f22b108515074075e63507c510a70acb0a 49.zwr Pa
 ```
 
 All 11 fixtures are byte-identical to their sources.
+
+History: before this refine round the count guard counted every `.zwr` file in `tests/fixtures/ifcap/`, which was 11 before `cases.zwr` existed; with `cases.zwr` present that guard counts 12, so it now excludes `cases.zwr`, which has no `Packages/` source.
 
 ### Build
 
@@ -687,7 +703,7 @@ awk '/^## Run evidence$/{s=1;next} /^## /{s=0} !s' SPEC.md | grep -oE 'O-01|not 
       2 0 OF 5
       7 ABSENT
       4 NOT COMPARED
-     56 O-01
+     57 O-01
      28 O-05
       3 RUNTIME-VERIFIED
       1 UNRESOLVED
@@ -698,7 +714,7 @@ awk '/^## Run evidence$/{s=1;next} /^## /{s=0} !s' SPEC.md | grep -oE 'O-01|not 
 
 Each residual hit is current, closed or marked as history:
 
-- `O-01`: 11 are the substring of the contract ID `PO-01`; the other 45 name O-01 itself: as closed, or as the team's answer that fixes the HOME device context (`IOF` `#`, `IOSL` `60`), in "Source verification", "Workflow selection", "Contracts", "Mapping table", "Stubs", "Flagged hard-MUMPS features", "Unexercised branches", "Source corrections and interface departures" and "Conflict register"; in the request's statement "O-01 blocks PO-12.b1" ("Existing-state verification", "Confirmed at the time"); in its own closed row of "Open items" and in O-07's reference to the HOME device; in the empty coverage group "Exercised, not implemented pending O-01" (0 rows, "Coverage counts"); in the `UNRESOLVED (O-01)` report, stated as no longer arising ("Stubs"); and in sentences marked as history ("Before this refine round", "Before the answer", "while O-01 was open").
+- `O-01`: 11 are the substring of the contract ID `PO-01`; the other 46 name O-01 itself: as closed, or as the team's answer that fixes the HOME device context (`IOF` `#`, `IOSL` `60`), in "Source verification", "Workflow selection", "Contracts", "Mapping table", "Stubs", "Flagged hard-MUMPS features", "Unexercised branches", "Source corrections and interface departures" and "Conflict register"; as that answer which, with this refine round's instruction, places the device-open bytes outside the stop condition ("Workflow selection", "Stop condition"); in the request's statement "O-01 blocks PO-12.b1" ("Existing-state verification", "Confirmed at the time"); in its own closed row of "Open items" and in O-07's reference to the HOME device; in the empty coverage group "Exercised, not implemented pending O-01" (0 rows, "Coverage counts"); in the `UNRESOLVED (O-01)` report, stated as no longer arising ("Stubs"); and in sentences marked as history ("Before this refine round", "Before the answer", "while O-01 was open").
 - `O-05`: 25 are the substring of `PO-05`; the other 3 name O-05 as closed with the recorded digest and snapshot ("Source verification" baseline row and "Closure criteria", "Open items").
 - `not implemented (O-01)`: the former coverage label, in sentences marked as history (the status vocabulary, "Branch granularity", "Scope statement", K9).
 - `RUNTIME-VERIFIED`: the status vocabulary, which limits it to GC-03 and GC-04, and the "Capture mapping" row, which applies it to those two cases only.
@@ -1001,7 +1017,7 @@ Each line was re-read at the baseline commit. Each is reproduced where it lies o
 - **The label `M.O.P.` reads a file named `PAT TYPE`.** `W !,"M.O.P.: ",$P($G(^PRCD(442.5,+$P(PRCHD0,U,2),0)),U,1)` [PRCHDP1.m:16] reads file 442.5, whose header is `^PRCD(442.5,0)="PAT TYPE^442.5^26^13"` [442.5+PAT TYPE.zwr:3]. Reproduced in `prchdp1`, which runs past PO-12.b1 for a found order (GC-01, GC-02, GC-05).
 - **`^DD(411,0,"ID",.1)` is exported twice,** with identical text [DD.zwr:488724, 488748]. Recorded. The identifier is evaluated once, into the R1 constant.
 - **Two index nodes of file 442 point to a record that does not exist.** `^PRC(442,"AH",31,99999949)=""` and `^PRC(442,"AI",31,99999949)=""` [442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:4-5] sit under a header that counts 0 entries [442+PROCUREMENT & ACCOUNTING TRANSACTIONS.zwr:3], and the export has no `^PRC(442,99999949,…)` node. Recorded. The 442 export is not a fixture.
-- **The documented `WRITE #` differs from what the captures show.** The column header `HDR W:$Y>0 @IOF,!!?55,"UNIT",…` [PRCHDP2.m:42], with `IOF` `#`, is `W #,!!…`. The YottaDB Programmer's Guide, "Input/Output Processing", gives `#` as `<FF><LF>` only for sequential files (SD): its READ/WRITE Operations table, which covers STREAM, VARIABLE and FIXED format sequential files, gives "Write <FF>,<LF>, set $X to 0, increment $Y" for STREAM and VARIABLE format, and the FFLF deviceparameter, "Applies to: SD", has `<FF><LF>` as its default. This is the reading this run's plan took; neither citation covers a terminal device. In GC-01, GC-02 and GC-05, after `       ENTER '^' TO HALT: ` is read [PRCHDP2.m:10], the bytes are `0A 0C 0A 0A`, then 55 spaces and `UNIT`: the `!!` gives the last two `0A`, so `W #` contributes `0A 0C`, a line feed ending the record in progress and then the form feed, with no line feed after it. The same Guide's "Maintenance of $X and $Y" says `#` "Sets $X and $Y to zero (0), and terminates the logical record in progress", which agrees with the captures. The captures judge: `Session::form_feed` writes `\n` when `$X>0`, then `\f`, and leaves `$X` and `$Y` 0. At PRCHDP1.m:12 `W:$Y>0 @IOF` writes nothing, because `$Y` is 0 after the device open [ZIS4GTM.m:35] [ZIS1.m:25].
+- **The documented `WRITE #` differs from what the captures show.** The column header `HDR W:$Y>0 @IOF,!!?55,"UNIT",…` [PRCHDP2.m:42], with `IOF` `#`, is `W #,!!…`. The YottaDB Programmer's Guide, "Input/Output Processing", gives `#` as `<FF><LF>` only for sequential files (SD): its READ/WRITE Operations table, which covers STREAM, VARIABLE and FIXED format sequential files, gives "Write <FF>,<LF>, set $X to 0, increment $Y" for STREAM and VARIABLE format, and the FFLF deviceparameter, "Applies to: SD", has `<FF><LF>` as its default. This is the reading this run's plan took; neither citation covers a terminal device. In GC-01, GC-02 and GC-05, after `        ENTER '^' TO HALT: ` is read [PRCHDP2.m:10], the bytes are `0A 0C 0A 0A`, then 55 spaces and `UNIT`: the `!!` gives the last two `0A`, so `W #` contributes `0A 0C`, a line feed ending the record in progress and then the form feed, with no line feed after it. The same Guide's "Maintenance of $X and $Y" says `#` "Sets $X and $Y to zero (0), and terminates the logical record in progress", which agrees with the captures. The captures judge: `Session::form_feed` writes `\n` when `$X>0`, then `\f`, and leaves `$X` and `$Y` 0. At PRCHDP1.m:12 `W:$Y>0 @IOF` writes nothing, because `$Y` is 0 after the device open [ZIS4GTM.m:35] [ZIS1.m:25].
 
 ## Existing items outside the layout
 
@@ -1029,7 +1045,7 @@ Each existing item outside the request's layout is kept only when the layout or 
 | O-08 | Pinned toolchain presence on the build host | Planning host: `rustc: command not found` | **CLOSED for this run's host.** Rust 1.99.1 and the C linker `cc` are verified: section "Run evidence", "Toolchain" |
 | O-09 | GC-01, GC-02 and GC-05: node `^VA(200,.5,0)`, read by `DIS^PRCHDP1` for the agent name, is in neither `cases.zwr` nor a supporting fixture | `S Y=+$P(PRCHD1,U,10),Y=$P($G(^VA(200,Y,0)),U,1) W ?57,"\|  ",$P(Y,",",2)," ",$P(Y,",",1)` [PRCHDP1.m:59]; each order's node 1 piece 10 (field 16 BUYER [DD.zwr:514742]) is `.5`; `^VA(200,.5,0)="POSTMASTER^.5^…"` is in every `db-before.zwr` and in [200+NEW PERSON.zwr:4]; `tests/equivalence.rs` loads only `tests/fixtures/ifcap/` | **OPEN; blocks GC-01, GC-02 and GC-05.** The capture writes `\|   POSTMASTER` at column 57 of transcript line 25; the Rust side reads no value through `$G` and writes `\|   `, so the three cases FAIL at line 25 and at no other line (section "Run evidence", "Refine round: correction cycle"). README Part B step 6 extracts only `^PRC(442)` and the vendor's `^PRC(440)` nodes, so `cases.zwr` omits it, and the D4 preflight, which applies that step, finds no missing line. No source line supports a code change; the port's reading of PRCHDP1.m:59 is the original's. **Action for the team, in a new request with a revised scope:** extend README Part B step 6 to the records the display reads outside file 442 (at least `^VA(200,.5,0)`) and rebuild `cases.zwr` by that step, or add a supporting fixture holding the node. Neither edit is allowed in this round |
 | O-10 | Process exit after normal completion: the `\n` that ends every capture after the final `P.O./REQ.NO.: ` | The five transcripts end `P.O./REQ.NO.: \n` (GC-03 and GC-04 101 bytes, GC-01 1664, GC-02 1852, GC-05 1745); YottaDB documents that CLOSE completes a partial record with `WRITE !` and that it ignores CLOSE of `$PRINCIPAL` (Programmer's Guide, "Input/Output Processing", CLOSE; the READ/WRITE Operations table: "After a WRITE, if $X > 0, Write <LF>"), and states no such rule for HALT or process exit | **OPEN, asking the team to confirm.** The port implements the rule as the refine round states it (K14): when `EN3` returns after `^` at the final order prompt, `run` writes `\n` if `$X>0`; a session cut at `Halt::InputExhausted` or `Halt::Unexercised` gets none. The rule keys on `$X`, never on a transcript. **Question for the team:** confirm that the process exit of `yottadb -run %XCMD` on the piped principal device completes the record in progress as the documented CLOSE does |
-| O-11 | One Rust session's work and transcript are bounded only by the bridge's request admission: each repetition of a found order's inputs runs one more full display, and the session keeps every byte it writes (CWE-400) | `EN30 D PO Q:'$D(PRCHPO)` … `S D0=PRCHPO D ^PRCHDP1,K`, `G EN30` [PRCHRPT.m:72-75] is the `loop` of `en30_prchrpt` [src/inquiry.rs:592-609]; with PO-12.b1 implemented, `pct_zis` returns `Ok` [src/inquiry.rs:1637-1645], so each pass runs `prchdp1` [src/inquiry.rs:604] through both display pauses and back to the order prompt, and `Session::write` and `nl` append to one `String` with no budget [src/mumps.rs:596-606]. The bridge admits a body of up to `MAX_BODY`, 1 MiB [src/bridge.rs:71], and up to `MAX_HELD_INPUTS`, 524,288 decoded inputs across the sessions with more than `FREE_INPUTS` 1024 [src/bridge.rs:102, 109]; `REQUEST_TIME`, 5 s [src/bridge.rs:67], bounds reading the request only [src/bridge.rs:497], and `rust_session` runs `inquire` to its end with no deadline or cancellation [src/bridge.rs:1933-1941]. Measured on the replay bridge (2026-11-17), `POST /api/rust/session` with inputs `""`, N × `"GC1001","",""`, `"^"` (a 19+15N-byte body; N=1 is GC-01's `input.txt`): N=1, 200, 1,766 bytes in 0.009 s, 1 display; N=100, 200, 164,621 bytes in 0.17 s, 100 displays; N=1000, 200, 1,645,121 bytes in 1.59 s, 1,000 displays. Output and time grow linearly, about 1.6 KB and 1.6 ms per repetition; the largest admitted body, N=69,903 (1,048,564 bytes, 209,711 inputs), extends that to about 115 MB and 111 s for one request (linear extension, not run) | **OPEN, not blocking the five cases; for a new request with a revised scope.** Each case runs at most one display, and its transcript is unaffected. The original has the same unbounded `G EN30` loop [PRCHRPT.m:75], which the port reproduces; the missing bound is the bridge's, not the workflow's. **Action:** bound session work or output, or cancel execution at a deadline, before or during Rust execution, keeping the five cases' transcripts unchanged. That needs a change to the bridge's admission, the private `Halt` type or the session model, which this round freezes, so the port adds no guard |
+| O-11 | One Rust session's work and transcript are bounded only by the bridge's request admission: each repetition of a found order's inputs runs one more full display, and the session keeps every byte it writes (CWE-400) | `EN30 D PO Q:'$D(PRCHPO)` … `S D0=PRCHPO D ^PRCHDP1,K`, `G EN30` [PRCHRPT.m:72-75] is the `loop` of `en30_prchrpt` [src/inquiry.rs:592-609]; with PO-12.b1 implemented, `pct_zis` returns `Ok` [src/inquiry.rs:1637-1645], so each pass runs `prchdp1` [src/inquiry.rs:604] through both display pauses and back to the order prompt, and `Session::write` and `nl` append to one `String` with no budget [src/mumps.rs:610-620]. The bridge admits a body of up to `MAX_BODY`, 1 MiB [src/bridge.rs:71], and up to `MAX_HELD_INPUTS`, 524,288 decoded inputs across the sessions with more than `FREE_INPUTS` 1024 [src/bridge.rs:102, 109]; `REQUEST_TIME`, 5 s [src/bridge.rs:67], bounds reading the request only [src/bridge.rs:497], and `rust_session` runs `inquire` to its end with no deadline or cancellation [src/bridge.rs:1933-1941]. Measured on the replay bridge (2026-11-17), `POST /api/rust/session` with inputs `""`, N × `"GC1001","",""`, `"^"` (a 19+15N-byte body; N=1 is GC-01's `input.txt`): N=1, 200, 1,766 bytes in 0.009 s, 1 display; N=100, 200, 164,621 bytes in 0.17 s, 100 displays; N=1000, 200, 1,645,121 bytes in 1.59 s, 1,000 displays. Output and time grow linearly, about 1.6 KB and 1.6 ms per repetition; the largest admitted body, N=69,903 (1,048,564 bytes, 209,711 inputs), extends that to about 115 MB and 111 s for one request (linear extension, not run) | **OPEN, not blocking the five cases; for a new request with a revised scope.** Each case runs at most one display, and its transcript is unaffected. The original has the same unbounded `G EN30` loop [PRCHRPT.m:75], which the port reproduces; the missing bound is the bridge's, not the workflow's. **Action:** bound session work or output, or cancel execution at a deadline, before or during Rust execution, keeping the five cases' transcripts unchanged. That needs a change to the bridge's admission, the private `Halt` type or the session model, which this round freezes, so the port adds no guard |
 
 ## Scope statement
 

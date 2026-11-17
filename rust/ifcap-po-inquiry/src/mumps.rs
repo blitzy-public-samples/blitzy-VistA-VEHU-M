@@ -535,12 +535,26 @@ pub(crate) fn order<S: Ord + Clone + Default>(
 /// The original is captured without a terminal, so typed input is never
 /// echoed: a READ leaves the transcript, `$X` and `$Y` unchanged. Every
 /// character written, a control character included, advances `$X` by one:
-/// "Generally, YottaDB increments `$X` for every character written" (YottaDB
-/// Programmer's Guide, Intrinsic Special Variables, `$X`,
+/// "Generally, YottaDB increments `$X` for every character written to and
+/// read from the current device" (YottaDB Programmer's Guide, Intrinsic
+/// Special Variables, `$X`,
 /// <https://docs.yottadb.com/ProgrammersGuide/isv.html#x>), and by default
 /// "YottaDB does not screen output for escape sequences" (Input/Output
 /// Processing, `FILTER`,
 /// <https://docs.yottadb.com/ProgrammersGuide/ioproc.html#filter>).
+///
+/// [`Session::read`] does not count the characters read, which that
+/// sentence also covers: the input is piped (`docker exec -i`, no `-t`) and
+/// never echoed, so nothing read reaches the transcript, and `$X` and `$Y`
+/// stay as the prompt left them. The captures show that a READ does not end
+/// the record in progress: after the halt prompt `ENTER '^' TO HALT: ` is
+/// read at PRCHDP2.m:10, `W @IOF` at PRCHDP2.m:42 writes the LF that ends
+/// it before its FF (`0A 0C`), and after the final `P.O./REQ.NO.: ` is read
+/// every capture ends with the process-exit `\n` (`SPEC.md` K14). Their
+/// `$X>0` tests, in [`Session::form_feed`] and in the normal-completion arm
+/// of `run` in `inquiry.rs`, are the only exercised uses of `$X` between a
+/// READ and the next `W !`, and the prompt has already left `$X` above 0, so
+/// whether a read character also counts in `$X` is not observed.
 ///
 /// The form feed `W @IOF`, with the HOME device's `IOF` `#` (PRCHDP1.m:12,
 /// PRCHDP2.m:42), is [`Session::form_feed`], and the position reset of the
