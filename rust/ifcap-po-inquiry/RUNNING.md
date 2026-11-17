@@ -26,20 +26,21 @@ cargo run --offline --locked --bin bridge
 - The short forms `cargo test` and `cargo run --bin bridge` are equivalent on a prepared host.
 - **`cargo build`** exits 0.
 - **`cargo test`** runs the unit tests, `tests/bridge.rs` and `tests/equivalence.rs`.
-  - It exits 0 when no case is FAIL and nothing else fails. With no capture, all five cases, `GC-01` to `GC-05`, are NOT COMPARED, so none is FAIL and it exits 0. With the five captures present, as committed on this branch, it exits 101 at `tests/bridge.rs`, whose `end_to_end_real_captures` fails with `GC-01: COMPARE answered match false` (`SPEC.md` open item O-09). Cargo stops at the first failing test target, so `tests/equivalence.rs` does not run: it prints no verdict line and does not rewrite `REPORT.md`. The verdicts, `GC-03` and `GC-04` PASS and `GC-01`, `GC-02` and `GC-05` FAIL at transcript line 25, come from `cargo test --offline --locked --test equivalence -- --nocapture`, which exits 101 and rewrites `REPORT.md`.
+  - It exits 0 when no case is FAIL and nothing else fails. With the five captures present, as committed on this branch, all five cases, `GC-01` to `GC-05`, PASS and it exits 0: `tests/bridge.rs`'s `end_to_end_real_captures` gets COMPARE `match` true for each READY case, and `tests/equivalence.rs` runs and rewrites `REPORT.md`, whose part 2 reads `Verdict: PASS` for all five. With no capture, all five cases are NOT COMPARED, so none is FAIL and it exits 0.
   - `tests/equivalence.rs` rewrites `REPORT.md` in full on every run. Part 2 holds each case's verdict and part 3 its capture readiness.
-  - The test also prints one `GC-0N <verdict>` line per case, such as `GC-01 NOT COMPARED`. Cargo shows test output only for a failing test, so to see the lines on a passing run use `cargo test --offline --locked --test equivalence -- --nocapture`. With the five captures present, plain `cargo test` stops at `tests/bridge.rs` before this test runs, and that equivalence command prints `GC-01 FAIL`, `GC-02 FAIL`, `GC-03 PASS`, `GC-04 PASS` and `GC-05 FAIL`.
+  - The test also prints one `GC-0N <verdict>` line per case, such as `GC-01 PASS`. Cargo shows test output only for a failing test, so to see the lines on a passing run use `cargo test --offline --locked --test equivalence -- --nocapture`. With the five captures present that command prints `GC-01 PASS` to `GC-05 PASS`; with no capture it prints `GC-01 NOT COMPARED` to `GC-05 NOT COMPARED`.
   - It exits non-zero when any case is FAIL, and `REPORT.md` part 2 names the cause. With no case FAIL, it still exits non-zero when a harness check fails (`REPORT.md` part 1 lists each under "Harness checks in this run" with PASS or FAIL), when `SPEC.md` lacks a section the report includes (`MISSING SECTION <heading> IN SPEC.md`, with no report written), when `REPORT.md` cannot be written (`cannot write REPORT.md: <error>`), or when any other test or the build fails.
   - Exit 0 is never acceptance. Acceptance needs five PASS.
+  - On macOS run `cargo test --offline --locked -- --test-threads=1`, and see `SPEC.md` open item O-12 for the one known failing unit test.
 - **`cargo run`** starts the bridge, which serves until it is stopped (Ctrl-C). Once listening, it writes three lines to standard output:
 
   ```text
   http://127.0.0.1:8080/
   MUMPS MODE: REPLAY
-  RECORDED 0 OF 5 READY 0 OF 5
+  RECORDED 5 OF 5 READY 5 OF 5
   ```
 
-  With the five captures present the third line is `RECORDED 5 OF 5 READY 5 OF 5`.
+  That third line is the one this branch gives, with its five captures present. Without the captures it is `RECORDED 0 OF 5 READY 0 OF 5`.
 
   The third line counts the recorded and READY cases in the golden folder at startup. Its diagnostics go to standard error (see "Failure messages").
 
@@ -52,7 +53,7 @@ cargo run --offline --locked --bin bridge
 
 ## Step 4. With no captures
 
-This is the state of a checkout without the captures: `tests/golden/ifcap/` holds only its README, and `tests/fixtures/ifcap/cases.zwr` does not exist. A fresh checkout of this branch holds the five captures and `cases.zwr`. The first two items below also give that outcome. The MUMPS and COMPARE item and the RUST item hold only without the captures: with them, MUMPS and COMPARE answer 200 to a recorded case's whole input sequence, and 502 `NOT RECORDED` and `MUMPS: NOT RECORDED` to a sequence no capture records (step 6), and RUST reaches the order prompt `P.O./REQ.NO.: `, as the item on a loaded `cases.zwr` describes.
+This is the state of a checkout without the captures: `tests/golden/ifcap/` holds only its README, and `tests/fixtures/ifcap/cases.zwr` does not exist. A fresh checkout of this branch holds the five captures and `cases.zwr`, with which all five cases PASS (step 2). The first two items below give the outcome both without and with the captures. The MUMPS and COMPARE item and the RUST item hold only without the captures: with them, MUMPS and COMPARE answer 200 to a recorded case's whole input sequence, COMPARE with `"match":true` for each of `GC-01` to `GC-05`, and 502 `NOT RECORDED` and `MUMPS: NOT RECORDED` to a sequence no capture records (step 6), and RUST reaches the order prompt `P.O./REQ.NO.: `, as the item on a loaded `cases.zwr` describes.
 
 - The bridge's third startup line is `RECORDED 0 OF 5 READY 0 OF 5`; with the five captures present it is `RECORDED 5 OF 5 READY 5 OF 5`.
 - The status line reads `MUMPS BACKEND: REPLAY RECORDED 0 OF 5 READY 0 OF 5`; with the five captures present it reads `MUMPS BACKEND: REPLAY RECORDED 5 OF 5 READY 5 OF 5`.
@@ -64,7 +65,7 @@ This is the state of a checkout without the captures: `tests/golden/ifcap/` hold
   - The original's no-match response is `<BEL> ??`, a blank line, and the re-asked `P.O./REQ.NO.: `. `<BEL>` is byte 0x07. The Rust side writes it only over a `cases.zwr` built by README Part B step 6, which holds the header and the orders' index nodes. Those give `^PRC(442)` a subscript after `"A["`, such as `"C"`, as the README Part B step 1 fixture profile requires. Over a `cases.zwr` holding only the header, an absent order ends the session after `P.O./REQ.NO.: ` with no no-match response, at branch PO-09.b16, which the port does not implement.
   - It is written for GC-03's `GC3003`, GC-04's `INVALID!` and any other absent value the O-03 guard admits (`SPEC.md` R5 step 6): a value with no lowercase letter and no comma, of at most 30 characters, that is not a canonical number, is neither `S` nor `1` nor a prefix of `SUPPLY WAREHOUSE` or `INACTIVATED`, and neither equals nor begins any subscript of an index of files 440, 442.5 or 442.3, while `^PRC(442,"G")`, `("M")` and `("MCH")` hold no entry, as the fixture profile requires.
   - Any other absent order, for example the number `123456` or the lowercase `gc3003`, reaches a branch the port does not implement: PO-09.b11, or PO-09.b13 when the uppercase retry finds a candidate. The session then ends after `P.O./REQ.NO.: `, as when input runs out.
-  - While open item O-01 (the HOME device) is unanswered, the Rust session for an order that is found ends after `P.O./REQ.NO.: `.
+  - Open item O-01 (the HOME device) is closed, with `IOF` `#` and `IOSL` `60`. The Rust session for an order that is found, such as GC-01's `GC1001`, GC-02's `GC2002` or GC-05's `GC5005`, writes the order's display with its pauses and returns to `P.O./REQ.NO.: `, and with the case's whole `input.txt` sequence its transcript equals the capture.
 
 ## Step 5. Load captures
 
@@ -76,7 +77,7 @@ This is the state of a checkout without the captures: `tests/golden/ifcap/` hold
 
 - Copy the case folders `GC-01` to `GC-05`, each holding the seven files, into `tests/golden/ifcap/`.
 - Build `tests/fixtures/ifcap/cases.zwr` by README Part B step 6.
-- Run `cargo test --offline --locked`. It judges every recorded case and rewrites `REPORT.md`.
+- Run `cargo test --offline --locked`. It judges every recorded case and rewrites `REPORT.md`. With the five captures of this branch it exits 0, and part 2 reads `Verdict: PASS` for all five cases.
 - **Restart the bridge**, because it loads the fixture Store once, at startup. Replay rereads the capture folders on every request, so new capture folders alone need no restart, but `cases.zwr` and the startup counts do. The screen's status line is read only when the page loads, so reload the page to refresh it after adding captures, restart or not.
 - To serve another capture folder, start the bridge with:
 
@@ -105,7 +106,7 @@ This is the state of a checkout without the captures: `tests/golden/ifcap/` hold
   curl -s -X POST -H 'Content-Type: application/json' -d '{"inputs":[""]}' http://127.0.0.1:8080/api/rust/session
   ```
 
-  `GET /api/status` reports the mode and the recorded, READY and INCOMPLETE cases, with each INCOMPLETE case's failed checks. With no captures it answers `{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}`; with the five captures present, `{"mumps_mode":"replay","recorded":["GC-01","GC-02","GC-03","GC-04","GC-05"],"ready":["GC-01","GC-02","GC-03","GC-04","GC-05"],"incomplete":{}}`. A RUST session request answers 200 `{"transcript":"…","returned":null}`, and so does a MUMPS one, with `mumps` in place of `rust`. A COMPARE request, with `compare` in place of `rust`, answers 200 `{"mumps":{"transcript":"…","returned":null},"rust":{"transcript":"…","returned":null},"match":false}`: both raw outputs, never normalised, and the boolean `match`, which is `true` when the screen shows `MATCH`. With the five captures present, a COMPARE request with a case's whole `input.txt` sequence answers 200 with `"match":true` for `GC-03` and `GC-04`, and with `"match":false` for `GC-01`, `GC-02` and `GC-05`, whose RUST transcript lacks the agent name `POSTMASTER` on transcript line 25 (`SPEC.md` open item O-09). A sequence that no capture records, such as `[""]` or only part of a case's sequence, answers 502 `{"error":"MUMPS: NOT RECORDED"}`, with the captures or without them. `returned` is always `null`, because the workflow returns nothing. An error answers `{"error":"<cause>"}` (see "Failure messages").
+  `GET /api/status` reports the mode and the recorded, READY and INCOMPLETE cases, with each INCOMPLETE case's failed checks. With no captures it answers `{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}`; with the five captures present, `{"mumps_mode":"replay","recorded":["GC-01","GC-02","GC-03","GC-04","GC-05"],"ready":["GC-01","GC-02","GC-03","GC-04","GC-05"],"incomplete":{}}`. A RUST session request answers 200 `{"transcript":"…","returned":null}`, and so does a MUMPS one, with `mumps` in place of `rust`. A COMPARE request, with `compare` in place of `rust`, answers 200 `{"mumps":{"transcript":"…","returned":null},"rust":{"transcript":"…","returned":null},"match":true}`: both raw outputs, never normalised, and the boolean `match`, which is `true` when the screen shows `MATCH`. With the five captures present, a COMPARE request with a case's whole `input.txt` sequence answers 200 with `"match":true` for each of `GC-01` to `GC-05`. A sequence that no capture records, such as `[""]` or only part of a case's sequence, answers 502 `{"error":"MUMPS: NOT RECORDED"}`, with the captures or without them. `returned` is always `null`, because the workflow returns nothing. An error answers `{"error":"<cause>"}` (see "Failure messages").
 
 ## Step 7. Live mode
 

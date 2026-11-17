@@ -368,6 +368,8 @@ Run each case a second time from the restored snapshot, and compare the two runs
    - it is not a harness check: the harness reports those cases by the ordinary comparison, which shows the difference the missing records cause.
 5. Each READY case then ends PASS or FAIL.
 
+Step 6 builds `cases.zwr` only. The buyer node `^VA(200,.5,0)`, which `DIS^PRCHDP1` reads for the buyer or agent name [Packages/IFCAP/Routines/PRCHDP1.m:59], is outside the node selection of this step's first bullet, so `cases.zwr` does not hold it. It is a separate supporting fixture, `tests/fixtures/ifcap/200.zwr`, which holds that one node under the two ZWR header lines. From `rust/ifcap-po-inquiry/`, `grep -F '^VA(200,.5,0)=' tests/golden/ifcap/GC-01/db-before.zwr` extracts the node's line, the same line as [Packages/Kernel/Globals/200+NEW PERSON.zwr:4].
+
 ### Step 7. Checks
 
 From `rust/ifcap-po-inquiry/`:
