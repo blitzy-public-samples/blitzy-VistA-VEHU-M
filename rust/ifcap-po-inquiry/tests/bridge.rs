@@ -170,11 +170,11 @@ const RAW_TRANSCRIPT: &str = "\n\n\nSelect STATION NUMBER ('^' TO EXIT): 501// \
 /// A capture context that `golden::validate_context` accepts: the two
 /// resolved stub constants, and values for `IOF` and `IOSL`, which stay
 /// unresolved while open item O-01 stands and so accept any value.
-const SYNTHETIC_CONTEXT: &str = r##"{"DUZ":".5","IOF":"#","IOSL":"24","STATION":"500"}"##;
+const SYNTHETIC_CONTEXT: &str = r##"{"DUZ":".5","IOF":"#","IOSL":"60","STATION":"500"}"##;
 
 /// [`SYNTHETIC_CONTEXT`] with `DUZ` `1`, which `golden::validate_context`
 /// rejects.
-const DUZ_1_CONTEXT: &str = r##"{"DUZ":"1","IOF":"#","IOSL":"24","STATION":"500"}"##;
+const DUZ_1_CONTEXT: &str = r##"{"DUZ":"1","IOF":"#","IOSL":"60","STATION":"500"}"##;
 
 /// One normalisation rule whose delimiters no Rust transcript holds.
 const SYNTHETIC_RULES: &str = "<<SYNTHETIC-OPEN\tSYNTHETIC-CLOSE>>\n";

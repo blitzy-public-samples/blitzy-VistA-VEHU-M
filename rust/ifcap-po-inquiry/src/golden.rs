@@ -1572,7 +1572,7 @@ mod tests {
         "   \n",
         "record_ids=442:990001;440:990001\n",
         "entry_point=EN3^PRCHRPT\n",
-        "context={\"DUZ\":\".5\",\"IOF\":\"#\",\"IOSL\":\"24\",\"STATION\":\"500\"}\n",
+        "context={\"DUZ\":\".5\",\"IOF\":\"#\",\"IOSL\":\"60\",\"STATION\":\"500\"}\n",
         "setup=IOM=80 HOME=CONSOLE\n",
         "docker_exec_args=su - vehu -c X\n",
     );
@@ -1799,11 +1799,11 @@ mod tests {
     fn context_reads_flat_object_of_strings() -> Result<(), String> {
         let context = |value: &str| parse_meta(&format!("context={value}\n"))?.context();
         assert_eq!(
-            context(r#"{"DUZ":".5","IOF":"\u001b[2J","IOSL":"24","STATION":"500"}"#),
+            context(r#"{"DUZ":".5","IOF":"\u001b[2J","IOSL":"60","STATION":"500"}"#),
             Ok(pairs(&[
                 ("DUZ", ".5"),
                 ("IOF", "\u{1b}[2J"),
-                ("IOSL", "24"),
+                ("IOSL", "60"),
                 ("STATION", "500"),
             ]))
         );
@@ -1848,46 +1848,47 @@ mod tests {
 
     #[test]
     fn validate_context_against_stub_context() {
-        let accepted = [
-            pairs(&[
-                ("DUZ", ".5"),
-                ("IOF", "#"),
-                ("IOSL", "24"),
-                ("STATION", "500"),
-            ]),
-            pairs(&[
-                ("STATION", "500"),
-                ("IOSL", "60"),
-                ("IOF", "#,$C(27,91,50,74,27,91,72)"),
-                ("DUZ", ".5"),
-            ]),
-        ];
+        let accepted = [pairs(&[
+            ("DUZ", ".5"),
+            ("IOF", "#"),
+            ("IOSL", "60"),
+            ("STATION", "500"),
+        ])];
         for context in accepted {
             assert_eq!(validate_context(&context), Ok(()), "for {context:?}");
         }
         let rejected = [
             (
                 pairs(&[
+                    ("STATION", "500"),
+                    ("IOSL", "60"),
+                    ("IOF", "#,$C(27,91,50,74,27,91,72)"),
+                    ("DUZ", ".5"),
+                ]),
+                "CONTEXT MISMATCH IOF: expected #, actual #,$C(27,91,50,74,27,91,72)",
+            ),
+            (
+                pairs(&[
                     ("DUZ", "1"),
                     ("IOF", "#"),
-                    ("IOSL", "24"),
+                    ("IOSL", "60"),
                     ("STATION", "500"),
                 ]),
                 "CONTEXT MISMATCH DUZ: expected .5, actual 1",
             ),
             (
-                pairs(&[("DUZ", ".5"), ("IOF", "#"), ("IOSL", "24")]),
+                pairs(&[("DUZ", ".5"), ("IOF", "#"), ("IOSL", "60")]),
                 "CONTEXT MISMATCH STATION: expected 500, actual ABSENT",
             ),
             (
-                pairs(&[("DUZ", ".5"), ("IOSL", "24"), ("STATION", "500")]),
-                "CONTEXT MISMATCH IOF: expected UNRESOLVED (O-01), actual ABSENT",
+                pairs(&[("DUZ", ".5"), ("IOSL", "60"), ("STATION", "500")]),
+                "CONTEXT MISMATCH IOF: expected #, actual ABSENT",
             ),
             (
                 pairs(&[
                     ("DUZ", ".5"),
                     ("IOF", "#"),
-                    ("IOSL", "24"),
+                    ("IOSL", "60"),
                     ("STATION", "500"),
                     ("IOM", "80"),
                 ]),
@@ -1898,7 +1899,7 @@ mod tests {
                     ("DUZ", ".5"),
                     ("DUZ", "1"),
                     ("IOF", "#"),
-                    ("IOSL", "24"),
+                    ("IOSL", "60"),
                     ("STATION", "500"),
                 ]),
                 "CONTEXT MISMATCH DUZ: expected .5, actual 1",
@@ -2875,7 +2876,7 @@ mod tests {
                 pairs(&[
                     ("DUZ", ".5"),
                     ("IOF", "#"),
-                    ("IOSL", "24"),
+                    ("IOSL", "60"),
                     ("STATION", "500"),
                 ])
             ))

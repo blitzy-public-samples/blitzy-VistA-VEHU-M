@@ -10,11 +10,10 @@
 //! globals are only read, through the borrowed [`Store`]; output goes to the
 //! transcript of a `Session`, which never echoes input.
 //!
-//! A branch that no case exercises, or one that open item O-01 (the HOME
-//! device's `IOF` and `IOSL`) leaves unresolved, is not implemented. Reaching
-//! it, at the point the original decides it, ends the session after the last
-//! prompt written, as input running out does: the transcript is cut there
-//! and nothing is invented. Validation, no-match and cancellation messages
+//! A branch that no case exercises is not implemented. Reaching it, at the
+//! point the original decides it, ends the session after the last prompt
+//! written, as input running out does: the transcript is cut there and
+//! nothing is invented. Validation, no-match and cancellation messages
 //! are transcript text under `Ok`. Only a read of a node holding no value
 //! where M raises `UNDEF` is an error, `CorruptStore`. No M code is
 //! interpreted: the screens and identifiers FileMan XECUTEs are literal
@@ -47,8 +46,9 @@ use crate::store::{Store, Sub};
 pub struct InquiryOutput {
     /// The original's output, in order, with `\n` line endings and no echo
     /// of input. A session that ends where `EN3` quits, `Q:'$D(PRCHPO)`
-    /// [PRCHRPT.m:72], keeps all of it. One that ends early, as [`inquire`]
-    /// sets out (input running out at a READ, or an unimplemented branch),
+    /// [PRCHRPT.m:72], keeps all of it, followed by one `\n` when its last
+    /// record is incomplete. One that ends early, as [`inquire`] sets out
+    /// (input running out at a READ, or an unimplemented branch),
     /// keeps only what was written through its last prompt: anything written
     /// after the last READ, such as the station or order echo, is dropped,
     /// and a session that never READ gives `""`.
@@ -92,17 +92,24 @@ impl std::error::Error for InquiryError {}
 /// `DUZ` is POSTMASTER, `.5`, as the Kernel test code signs on with
 /// `D DUZ^XUP(.5)` [ZOSVGUT1.m:13]. `STATION` is the snapshot's primary
 /// station, `$O(^PRC(411,"AC","Y",0))` = 500 [PRCFSITE.m:14]. `IOF` and
-/// `IOSL` come from the HOME device that `^%ZIS` opens [PRCHDP1.m:12]
-/// [ZIS1.m:103-113] and are unresolved (`None`) while open item O-01 stands.
+/// `IOSL` are those of the HOME device that `^%ZIS` opens [PRCHDP1.m:12],
+/// `$I` `0`: `SYS..0` names device 267 `PMT290` [3.5+DEVICE.zwr:679], of
+/// TYPE `TRM` and SUBTYPE 168 [3.5+DEVICE.zwr:14-18], whose terminal type
+/// `PK-VTMT` holds `132^#^60^$C(8)` [3.2+TERMINAL TYPE.zwr:816-817]. `ST^%ZIS3`
+/// takes `%Z91` from that node for subtype `%A` [ZIS2.m:54] [ZIS3.m:71-73],
+/// and `IOM=+%Z91,IOF=$P(%Z91,"^",2),IOSL=$P(%Z91,"^",3)` [ZIS1.m:103] makes
+/// `IOF` `#` and `IOSL` `60`. These two values are the team's answer to open
+/// item O-01, as each capture's recorded `context` and `setup` give it (HOME
+/// device 0, `IOM` 132): an input to the port, not a rule derived from a
+/// capture.
 ///
 /// The capture reader validates each capture's recorded context against this
-/// table key by key: every key must be present and no other, a resolved
-/// value must be equal, and a `None` key accepts any capture value and is
-/// reported unresolved.
+/// table key by key: every key must be present and no other, and every value
+/// must be equal.
 pub const STUB_CONTEXT: [(&str, Option<&str>); 4] = [
     ("DUZ", Some(".5")),
-    ("IOF", None),
-    ("IOSL", None),
+    ("IOF", Some("#")),
+    ("IOSL", Some("60")),
     ("STATION", Some("500")),
 ];
 
@@ -110,10 +117,22 @@ pub const STUB_CONTEXT: [(&str, Option<&str>); 4] = [
 /// `PRCH DISPLAY PO` against `store`, answering its READs from `inputs`,
 /// each one typed line without its terminator.
 ///
-/// Input that runs out at a prompt, or a branch that is not implemented
-/// (exercised by no case, or left unresolved by open item O-01), ends the
-/// session after the last prompt written, as `Ok`, with nothing invented
-/// after it. Lines left over when `EN3` returns are ignored. `Err` is only
+/// A session that `EN3` completes, by the `^` that selects nothing at the
+/// order prompt [PRCHRPT.m:72], ends as the process does when `EN3`
+/// returns: when the last record is incomplete (`$X` above 0), one `\n`
+/// completes it. YottaDB documents this for CLOSE, "If a partial record has
+/// been output, a WRITE ! is done to complete it" (YottaDB Programmer's
+/// Guide, Input/Output Processing, CLOSE,
+/// <https://docs.yottadb.com/ProgrammersGuide/ioproc.html#close>), and
+/// gives the sequential-file CLOSE as "After a WRITE, if `$X` > 0, Write
+/// `<LF>`" (READ/WRITE Operations). It also says it ignores CLOSE of the
+/// principal device and states no such rule for process exit, so `SPEC.md`
+/// "Open items" asks the team to confirm it. The rule keys on `$X` alone.
+///
+/// Input that runs out at a prompt, or a branch that no case exercises and
+/// that is not implemented, ends the session after the last prompt written,
+/// as `Ok`, with nothing invented after it and no `\n` added. Lines left
+/// over when `EN3` returns are ignored. `Err` is only
 /// [`InquiryError::CorruptStore`], at the unguarded reads of a node holding
 /// no value where M raises `UNDEF`. `store` is never written.
 pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, InquiryError> {
@@ -123,6 +142,8 @@ pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, Inquir
 /// The session of [`inquire`], also returning the `SPEC.md` branch ID of the
 /// unimplemented branch that ended it, if one did. It exists so unit tests
 /// can assert which branch ended a session; the ID never leaves the crate.
+/// Only the normal completion, `Ok(())`, gets the closing `\n` of the
+/// process exit; the cut sessions end at their last prompt.
 fn run(
     store: &Store,
     inputs: &[String],
@@ -132,13 +153,20 @@ fn run(
     let result =
         st_prchrpt(&mut s, store, &mut v).and_then(|()| en30_prchrpt(&mut s, store, &mut v));
     match result {
-        Ok(()) => (
-            Ok(InquiryOutput {
-                transcript: s.into_transcript(),
-                returned: None,
-            }),
-            None,
-        ),
+        Ok(()) => {
+            // EN3 has returned and the process ends: a partial record ($X>0)
+            // is completed by a WRITE !.
+            if s.x() > 0 {
+                s.nl();
+            }
+            (
+                Ok(InquiryOutput {
+                    transcript: s.into_transcript(),
+                    returned: None,
+                }),
+                None,
+            )
+        }
         Err(Halt::InputExhausted) => (
             Ok(InquiryOutput {
                 transcript: s.into_transcript_at_prompt(),
@@ -247,18 +275,23 @@ fn set_first_piece(text: &str, value: &str) -> String {
     }
 }
 
-/// M `W:$Y>0 @IOF` [PRCHDP1.m:12], and as the postcondition of the whole
-/// column-header WRITE [PRCHDP2.m:42]. With `$Y` at 0 nothing is written.
-/// Otherwise the form feed runs: the HOME device's `IOF`
-/// ([`STUB_CONTEXT`]), the bytes `W @IOF` writes for it and `$Y` after it
-/// are all open item O-01, and `Session` models no form feed, so the branch
-/// `id` is not implemented while O-01 stands and the session ends at the
-/// last prompt written, whatever value `IOF` is given.
-fn form_feed(s: &Session, id: &'static str) -> Result<(), Halt> {
-    if s.y() > 0 {
-        return Err(Halt::Unexercised(id));
+/// M `W:$Y>0 @IOF` [PRCHDP1.m:12], and the same postcondition and first
+/// argument of the whole column-header WRITE [PRCHDP2.m:42]: true when `$Y`
+/// is above 0, and then the form feed is written. The HOME device's `IOF` is
+/// `#` ([`STUB_CONTEXT`]), so `W @IOF` is `W #`, [`Session::form_feed`],
+/// which leaves `$X` and `$Y` at 0; no indirection is evaluated. With `$Y` at
+/// 0 nothing is written and the result is false.
+///
+/// At PRCHDP1.m:12, on the page-1 header branch PO-10.b4, `$Y` is always 0,
+/// because `^%ZIS` returns with it reset ([`pct_zis`]), so nothing is written
+/// there. At PRCHDP2.m:42 (PO-26.b1), after the page-1 display and the halt
+/// prompt, it is above 0.
+fn form_feed(s: &mut Session) -> bool {
+    if s.y() == 0 {
+        return false;
     }
-    Ok(())
+    s.form_feed();
+    true
 }
 
 /// `DIC("A")` of the station lookup [PRCFSITE.m:18].
@@ -1243,9 +1276,8 @@ fn write_order_echo(s: &mut Session, st: &Store, ien: &Sub) -> Result<String, Ha
 
 /// PO-10 `^PRCHDP1` [PRCHDP1.m:4-52]: the page-1 header of order `D0`,
 /// falling into the FOB block (PO-13) and from there through the rest of
-/// page 1 into the line items. `^%ZIS` (PO-12) is not implemented while
-/// open item O-01 stands, so the session ends there at the last prompt
-/// written; the header after it is ported as source gives it.
+/// page 1 into the line items. `^%ZIS` (PO-12) opens the HOME device and
+/// leaves `$Y` at 0, so the `W:$Y>0 @IOF` after it writes nothing.
 fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     let d0 = v.d0.clone().unwrap_or_default();
     // S PRCHD0=$G(^PRC(442,D0,0)),PRCHD1=$G(^(1)),X=0   [PRCHDP1.m:4]; ^(1) is ^PRC(442,D0,1)
@@ -1303,7 +1335,7 @@ fn prchdp1(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
     // (PRCHDHSP, ^PRC(411,PRCHDSIT,3), is read whole and never displayed.)
     v.prchdst = Some(st.get_or_empty(&key("PRC", &["411", &prchdsit, "0"])));
     pct_zis(s, st, v)?;
-    form_feed(s, "PO-10.b4")?;
+    form_feed(s);
     // S PRCHTYPE=$P($G(^PRC(442,D0,23)),U,11)   [PRCHDP1.m:13]
     // I PRCHTYPE="P"!(PRCHTYPE="S") S PRCHTYPE="P"   [PRCHDP1.m:14]
     let mut prchtype = piece(&node23, "^", 11).to_string();
@@ -1560,14 +1592,48 @@ fn ftyp_prchfpnt(_s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Hal
     Ok(())
 }
 
-/// PO-12 `^%ZIS` [ZIS.m:28-37] [ZIS1.m:103-113], stub: opens the HOME
-/// device (`IOP="HOME"`, `%ZIS=""`). What the HOME device set-up writes, and
-/// the `IOF` and `IOSL` it sets, depend on the runtime device and are open
-/// item O-01 ([`STUB_CONTEXT`] holds them unresolved). The device open
-/// requires a runtime shim, not converted: PO-12.b1 is not implemented (O-01),
-/// and the session ends at the last prompt written.
-fn pct_zis(_s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt> {
-    Err(Halt::Unexercised("PO-12.b1"))
+/// What the open execute of terminal type 168 `PK-VTMT` writes, node
+/// `^%ZIS(2,168,2)` [3.2+TERMINAL TYPE.zwr:818]:
+/// `W:$S($D(PGM):$S(PGM="XMR":0,1:1),1:1) *27,"[5i",*27,"[6w",*27,"[4i",*27,"[?5i",*27,"[?3h",*27,"[6w"`.
+/// Each `*27` is the one character ESC, code 27 (`WRITE *`, YottaDB
+/// Programmer's Guide, Input/Output Processing,
+/// <https://docs.yottadb.com/ProgrammersGuide/ioproc.html#write-star>), so
+/// the six sequences are, in order, `*27,"[5i"`, `*27,"[6w"`, `*27,"[4i"`,
+/// `*27,"[?5i"`, `*27,"[?3h"` and `*27,"[6w"`, all on that line: 26 bytes,
+/// with no line terminator. The postcondition is true unless `PGM` is
+/// MailMan's `"XMR"`, which this session never sets.
+const HOME_OPEN_EXECUTE: &str = "\u{1b}[5i\u{1b}[6w\u{1b}[4i\u{1b}[?5i\u{1b}[?3h\u{1b}[6w";
+
+/// PO-12 `^%ZIS`, called as `S IOP="HOME",%ZIS="" ... D ^%ZIS`
+/// [PRCHDP1.m:12]: opens the HOME device, `$I` `0`, which `SYS..0` names as
+/// device 267 `PMT290` [3.5+DEVICE.zwr:679], of TYPE `TRM` and SUBTYPE 168
+/// [3.5+DEVICE.zwr:14-18]. A fixed-context rule equivalent of the open: no
+/// M code is evaluated, and the effect below is the fixed effect of the
+/// literal node for this fixed device ([`STUB_CONTEXT`]).
+///
+/// The path through Kernel: `D L2^%ZIS2` [ZIS1.m:19] reaches `TRM^%ZIS3`
+/// [ZIS3.m:12, 21], whose `D W("")` [ZIS3.m:24] writes nothing because `IOP`
+/// is defined [ZIS3.m:50-51], then `D O^%ZIS4` [ZIS3.m:25], whose GT.M and
+/// YottaDB form is `ZIS4GTM.m`. That sets `U IO S $X=0,$Y=0` [ZIS4GTM.m:35]
+/// and goes to `OXECUTE^%ZIS6` [ZIS4GTM.m:38], which XECUTEs the subtype's
+/// node 2:
+/// `I $D(^%ZIS(2,%ZISIOST(0),2))=1 S %Y=^(2) D 2` [ZIS6.m:6], `U IO D %Y^ZISX`
+/// [ZIS6.m:21], `%Y D XECUTE($G(%Y))` [ZISX.m:15] and `X NODE` [ZISX.m:21-30].
+/// The node writes [`HOME_OPEN_EXECUTE`]. Back in `EXIT^%ZIS1`, the TRM reset
+/// `S:'(IO=IO(0)&'$D(IO("S"))&'$D(ZTQUEUED)) $X=0,$Y=0` [ZIS1.m:25] runs,
+/// because `IO("S")` is set for the HOME device [ZIS2.m:44], so `$X` and
+/// `$Y` are 0 when `^%ZIS` returns.
+///
+/// The open requires a runtime shim, not converted: `SPEC.md` "Flagged
+/// hard-MUMPS features" records this rule as its equivalent.
+fn pct_zis(s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt> {
+    // U IO S $X=0,$Y=0   [ZIS4GTM.m:35]
+    s.reset_position();
+    // X ^%ZIS(2,168,2)   [ZIS6.m:6] [ZISX.m:21-30] [3.2+TERMINAL TYPE.zwr:818]
+    s.write(HOME_OPEN_EXECUTE);
+    // S:'(IO=IO(0)&'$D(IO("S"))&'$D(ZTQUEUED)) $X=0,$Y=0   [ZIS1.m:25]
+    s.reset_position();
+    Ok(())
 }
 
 /// PO-13 `FOB^PRCHDP1` [PRCHDP1.m:53-57]: the FOB point, the proposal
@@ -2093,13 +2159,38 @@ fn prchdp2(s: &mut Session, st: &Store, v: &mut Locals) -> Result<(), Halt> {
 }
 
 /// PO-26 `HDR^PRCHDP2` [PRCHDP2.m:42-43]: the form feed and the column
-/// header, all one WRITE under `$Y>0`, then 80 dashes. The form feed is not
-/// implemented (O-01); the session ends at the last prompt written (see
-/// [`form_feed`]).
+/// header, all one WRITE under the postcondition `$Y>0`, then 80 dashes
+/// unconditionally. On PO-26.b1, `$Y>0`, the WRITE gives, after the READ of
+/// the halt prompt [PRCHDP2.m:10], the bytes `0A 0C` for `@IOF`
+/// ([`form_feed`]) and `0A 0A` for `!!`, then 55 spaces and `UNIT`, column
+/// 70 `TOTAL`, `\n`, `ITEM`, column 15 `DESCRIPTION`, column 42 `QTY`,
+/// column 46 `UNIT`, column 55 `COST`, column 70 `COST` and `\n`; `$Y` is
+/// then 4, counted from the form feed. With `$Y` at 0 only the dashes are
+/// written.
 fn hdr_prchdp2(s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt> {
     // HDR W:$Y>0 @IOF,!!?55,"UNIT",?70,"TOTAL",!,"ITEM",?15,"DESCRIPTION",?42,"QTY",?46,"UNIT",
     //  ?55,"COST",?70,"COST",! F I=1:1:80 W "-"
-    form_feed(s, "PO-26.b1")?;
+    if form_feed(s) {
+        s.nl();
+        s.nl();
+        s.tab(55);
+        s.write("UNIT");
+        s.tab(70);
+        s.write("TOTAL");
+        s.nl();
+        s.write("ITEM");
+        s.tab(15);
+        s.write("DESCRIPTION");
+        s.tab(42);
+        s.write("QTY");
+        s.tab(46);
+        s.write("UNIT");
+        s.tab(55);
+        s.write("COST");
+        s.tab(70);
+        s.write("COST");
+        s.nl();
+    }
     s.write(&"-".repeat(80));
     Ok(())
 }
@@ -2359,15 +2450,18 @@ fn edistat_prchutl(
     Err(Halt::Unexercised("PO-29.b3"))
 }
 
-/// PO-30 `ASK^PRCHDP2` [PRCHDP2.m:31-32]: the paging test `$Y+5>IOSL`. The
-/// HOME device's `IOSL` ([`STUB_CONTEXT`]) is open item O-01, so the test
-/// cannot be decided: its exercised outcome, no prompt, is not implemented
-/// (O-01), and the session ends at the last prompt written.
+/// PO-30 `ASK^PRCHDP2` [PRCHDP2.m:31-32]: the paging test `$Y+5>IOSL`, with
+/// the HOME device's `IOSL` `60` ([`STUB_CONTEXT`]). `$Y` counts from the
+/// form feed of the item page: [`hdr_prchdp2`] leaves it at 4, the first
+/// item line makes it 5 at that item's `D ASK` [PRCHDP2.m:60], and an item
+/// with no detail lines adds 3 more (its `BOC:` line, the blank line and the
+/// next item line), so for such items the test is false through the 17th.
+/// False (PO-30.b1): nothing is written and `ASK` quits. True: the paging
+/// prompt and `HDR` (PO-30.b2) are not implemented, and the session ends at
+/// the last prompt written.
 fn ask_prchdp2(s: &mut Session, _st: &Store, _v: &mut Locals) -> Result<(), Halt> {
     // ASK I $Y+5>IOSL W !?8,"ENTER '^' TO HALT: " R X:DTIME S:X contains "^" PRCHDQ=1 D:'PRCHDQ HDR Q
-    let Some(iosl) = stub_value("IOSL") else {
-        return Err(Halt::Unexercised("PO-30.b1"));
-    };
+    let iosl = stub_value("IOSL").unwrap_or_default();
     let line = add(&s.y().to_string(), "5");
     if num_cmp(&line, iosl) == Ordering::Greater {
         return Err(Halt::Unexercised("PO-30.b2"));
@@ -2555,9 +2649,29 @@ mod tests {
     /// the O-03 guard does not hold: the n/e pointer-candidate branch.
     const GUARD_FAILS: &str = "PO-09.b11";
 
-    /// `SPEC.md` "Consequences": a found order ends at `^%ZIS`, not
-    /// implemented while open item O-01 stands.
-    const DEVICE_GATE: &str = "PO-12.b1";
+    /// The 26 bytes of the HOME device's open execute, ESC `[5i`, ESC `[6w`,
+    /// ESC `[4i`, ESC `[?5i`, ESC `[?3h`, ESC `[6w`
+    /// [3.2+TERMINAL TYPE.zwr:818].
+    const DEVICE_OPEN_BYTES: [u8; 26] = [
+        0x1b, 0x5b, 0x35, 0x69, 0x1b, 0x5b, 0x36, 0x77, 0x1b, 0x5b, 0x34, 0x69, 0x1b, 0x5b, 0x3f,
+        0x35, 0x69, 0x1b, 0x5b, 0x3f, 0x33, 0x68, 0x1b, 0x5b, 0x36, 0x77,
+    ];
+
+    /// What `HDR` [PRCHDP2.m:42] writes after the READ of the halt prompt
+    /// [PRCHDP2.m:10]: `@IOF` (`0A 0C`), `!!`, the two header lines and the
+    /// 80 dashes.
+    fn column_header_bytes() -> String {
+        format!(
+            "\n\u{c}\n\n{}UNIT{}TOTAL\nITEM{}DESCRIPTION{}QTY UNIT{}COST{}COST\n{}",
+            " ".repeat(55),
+            " ".repeat(11),
+            " ".repeat(11),
+            " ".repeat(16),
+            " ".repeat(5),
+            " ".repeat(11),
+            "-".repeat(80)
+        )
+    }
 
     /// File 442 with one order, `500-A12345`, that passes the lookup screen,
     /// filed under index `C` as `A12345`, with its status and MOP entries.
@@ -2598,6 +2712,23 @@ mod tests {
         load(&format!("{ORDER_FILE}{extra}"))
     }
 
+    /// `count` line items for order 1 of [`ORDER_FILE`], numbered 1 up, each
+    /// with one description line, quantity 2 at 125.50 and no detail lines,
+    /// and their unit, so that a found order runs the whole display.
+    fn order_items(count: usize) -> String {
+        let mut text = format!("^PRC(442,1,2,0)=\"^442.01IA^{count}^{count}\"\n");
+        for item in 1..=count {
+            text.push_str(&format!(
+                "^PRC(442,1,2,{item},0)=\"{item}^2^1^2696 SUPPLIES^^^^^125.5\"\n\
+                 ^PRC(442,1,2,{item},1,0)=\"^^1^1^3261028^\"\n\
+                 ^PRC(442,1,2,{item},1,1,0)=\"WIDGET {item}\"\n\
+                 ^PRC(442,1,2,{item},2)=\"251\"\n"
+            ));
+        }
+        text.push_str("^PRCD(420.5,1,0)=\"EACH\"\n");
+        text
+    }
+
     fn inputs(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|line| (*line).to_string()).collect()
     }
@@ -2616,6 +2747,12 @@ mod tests {
         id: Option<&'static str>,
     ) -> (Result<InquiryOutput, InquiryError>, Option<&'static str>) {
         (ok_transcript(transcript), id)
+    }
+
+    /// The outcome of a session that `EN3` completes after `transcript`: the
+    /// process exit completes the record in progress with one `\n`.
+    fn exited(transcript: &str) -> (Result<InquiryOutput, InquiryError>, Option<&'static str>) {
+        ended(&format!("{transcript}\n"), None)
     }
 
     /// The session-end outcome of unimplemented branch `id` after `transcript`.
@@ -2674,7 +2811,7 @@ mod tests {
     fn leftover_input_ignored() -> Result<(), String> {
         let store = order_store("")?;
         let exact = inquire(&store, &inputs(&["", "^"]));
-        assert_eq!(exact, ok_transcript(ORDER_PROMPT_BYTES));
+        assert_eq!(exact, ok_transcript(&format!("{ORDER_PROMPT_BYTES}\n")));
         assert_eq!(inquire(&store, &inputs(&["", "^", "A12345", "x"])), exact);
         Ok(())
     }
@@ -2709,23 +2846,27 @@ mod tests {
         let store = order_store("")?;
         let long = "A".repeat(251);
         let long_number = "1".repeat(26);
-        let cases: [(&str, Option<&'static str>); 8] = [
-            ("\u{1}A", Some("PO-09.b2")),
-            (&long_number, Some("PO-09.b2")),
-            (&long, Some("PO-09.b2")),
-            ("??", Some("PO-09.b4")),
-            ("`12", Some("PO-09.b5")),
-            (" ", Some("PO-09.b5")),
-            ("", Some("PO-09.b6")),
-            ("^ABC", None),
+        let cases: [(&str, &'static str); 7] = [
+            ("\u{1}A", "PO-09.b2"),
+            (&long_number, "PO-09.b2"),
+            (&long, "PO-09.b2"),
+            ("??", "PO-09.b4"),
+            ("`12", "PO-09.b5"),
+            (" ", "PO-09.b5"),
+            ("", "PO-09.b6"),
         ];
         for (answer, id) in cases {
             assert_eq!(
                 run(&store, &inputs(&["", answer])),
-                ended(ORDER_PROMPT_BYTES, id),
+                ends_at(ORDER_PROMPT_BYTES, id),
                 "answer {answer:?}"
             );
         }
+        // A `^`-prefixed answer exits the lookup, and EN3 completes.
+        assert_eq!(
+            run(&store, &inputs(&["", "^ABC"])),
+            exited(ORDER_PROMPT_BYTES)
+        );
         Ok(())
     }
 
@@ -2761,7 +2902,7 @@ mod tests {
         for value in ["ABC123", "INVALID!", "XYZ999"] {
             assert_eq!(
                 run(&store, &inputs(&["", value, "^"])),
-                ended(&no_match_transcript(1), None),
+                exited(&no_match_transcript(1)),
                 "value {value:?}"
             );
         }
@@ -2770,23 +2911,47 @@ mod tests {
 
     #[test]
     fn no_match_sequence_asks_again() -> Result<(), String> {
-        let store = order_store("")?;
-        let cases: [(&[&str], usize, Option<&'static str>); 5] = [
+        let store = order_store(&order_items(1))?;
+        // What a found order writes after the order prompt, when it is found
+        // at the first prompt and EN3 then completes.
+        let found = run(&store, &inputs(&["", "A12345", "", "", "^"]))
+            .0
+            .map_err(|error| error.to_string())?
+            .transcript;
+        let display = found
+            .strip_prefix(ORDER_PROMPT_BYTES)
+            .ok_or("the found order's session starts with the order prompt")?;
+        let cases: [(&[&str], String, Option<&'static str>); 5] = [
             // A further value that matches nothing repeats the sequence.
-            (&["", "ABC123", "XYZ999", "^"], 2, None),
+            (
+                &["", "ABC123", "XYZ999", "^"],
+                format!("{}\n", no_match_transcript(2)),
+                None,
+            ),
             // Input running out at the re-asked prompt ends the session there.
-            (&["", "ABC123"], 1, None),
+            (&["", "ABC123"], no_match_transcript(1), None),
             // The re-asked prompt applies the same read checks [DIC11.m:19-33]
-            (&["", "ABC123", "?"], 1, Some("PO-09.b4")),
-            (&["", "ABC123", "^ABC"], 1, None),
-            // and the same search: a found order is selected and reaches the
-            // device gate, its echo dropped.
-            (&["", "ABC123", "A12345", "", "", "^"], 1, Some(DEVICE_GATE)),
+            (
+                &["", "ABC123", "?"],
+                no_match_transcript(1),
+                Some("PO-09.b4"),
+            ),
+            (
+                &["", "ABC123", "^ABC"],
+                format!("{}\n", no_match_transcript(1)),
+                None,
+            ),
+            // and the same search: a found order is selected and displayed.
+            (
+                &["", "ABC123", "A12345", "", "", "^"],
+                format!("{}{display}", no_match_transcript(1)),
+                None,
+            ),
         ];
-        for (answers, times, id) in cases {
+        for (answers, transcript, id) in cases {
             assert_eq!(
                 run(&store, &inputs(answers)),
-                ended(&no_match_transcript(times), id),
+                ended(&transcript, id),
                 "answers {answers:?}"
             );
         }
@@ -2995,7 +3160,7 @@ mod tests {
         let store = order_store(SCREENED_ORDERS)?;
         assert_eq!(
             run(&store, &inputs(&["", "B22222", "^"])),
-            ended(&no_match_transcript(1), None)
+            exited(&no_match_transcript(1))
         );
         Ok(())
     }
@@ -3037,12 +3202,22 @@ mod tests {
     fn order_filed_under_two_indexes_is_one_candidate() -> Result<(), String> {
         // Order 1 is the exact match on `C` and is filed again under `E`, a
         // later index that is not a pointer index: it stays one candidate,
-        // selected (PO-09.b8), so the session reaches the device gate rather
-        // than the choose list (PO-09.b10).
-        let store = order_store("^PRC(442,\"E\",\"A12345\",1)=\"\"\n")?;
-        assert_eq!(
-            run(&store, &inputs(&["", "A12345", "", "", "^"])),
-            ends_at(ORDER_PROMPT_BYTES, DEVICE_GATE)
+        // selected (PO-09.b8), so the session displays it, as when it is
+        // filed under `C` alone, rather than reaching the choose list
+        // (PO-09.b10).
+        let answers = inputs(&["", "A12345", "", "", "^"]);
+        let filed_once = order_store(&order_items(1))?;
+        let filed_twice = order_store(&format!(
+            "{}^PRC(442,\"E\",\"A12345\",1)=\"\"\n",
+            order_items(1)
+        ))?;
+        let outcome = run(&filed_twice, &answers);
+        assert_eq!(outcome, run(&filed_once, &answers));
+        assert_eq!(outcome.1, None);
+        let transcript = outcome.0.map_err(|error| error.to_string())?.transcript;
+        assert!(
+            transcript.ends_with("TO HALT: \n\n\nP.O./REQ.NO.: \n"),
+            "{transcript:?}"
         );
         Ok(())
     }
@@ -3211,13 +3386,185 @@ mod tests {
     }
 
     #[test]
-    fn found_order_stops_at_device_gate() -> Result<(), String> {
-        // The order echo is written, then ^%ZIS (O-01) ends the session at the
-        // order prompt and the echo is dropped.
-        let store = order_store("")?;
+    fn found_order_opens_home_device_and_displays_order() -> Result<(), String> {
+        // The order echo, then the device open of ^%ZIS with no line
+        // terminator before or after it, then `W:$Y>0 @IOF`, which writes
+        // nothing, and the `W !` that starts the page-1 header [PRCHDP1.m:15].
+        let store = order_store(&order_items(1))?;
+        let (outcome, id) = run(&store, &inputs(&["", "A12345", "", "", "^"]));
+        assert_eq!(id, None);
+        let transcript = outcome.map_err(|error| error.to_string())?.transcript;
+        let mut opening = format!(
+            "{ORDER_PROMPT_BYTES}  500-A12345  10-28-26  RQ   {}  \n{}FCP: 101     $ 251.00",
+            "Ordered (No Fiscal Action Required",
+            " ".repeat(13)
+        )
+        .into_bytes();
+        opening.extend_from_slice(&DEVICE_OPEN_BYTES);
+        opening.extend_from_slice(b"\nPURCHASE ORDER: 500-A12345");
+        assert!(
+            transcript.as_bytes().starts_with(&opening),
+            "{transcript:?}"
+        );
+        // The item page: the form feed after the halt prompt, the header, the
+        // item with no paging pause, the closing prompt, the order prompt the
+        // `^` answers, and the closing `\n` of the process exit.
+        let closing = format!(
+            "\n        ENTER '^' TO HALT: {}\n    1  WIDGET 1{}2  EACH  125.50{}251.00\n        \
+             BOC: 2696\n\n\n\u{7}END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: \n\n\n\
+             P.O./REQ.NO.: \n",
+            column_header_bytes(),
+            " ".repeat(29),
+            " ".repeat(9)
+        );
+        assert!(transcript.ends_with(&closing), "{transcript:?}");
+        assert_eq!(transcript.matches('\u{c}').count(), 1);
         assert_eq!(
-            run(&store, &inputs(&["", "A12345", "", "", "^"])),
-            ends_at(ORDER_PROMPT_BYTES, DEVICE_GATE)
+            transcript.matches("\n        ENTER '^' TO HALT: ").count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pct_zis_writes_home_device_open_execute() -> Result<(), String> {
+        let store = order_store("")?;
+        let no_input: Vec<String> = Vec::new();
+        let mut s = Session::new(&no_input);
+        s.nl();
+        s.write("FCP: 101     $ 251.00");
+        let mut v = order_locals(&store);
+        assert_eq!(pct_zis(&mut s, &store, &mut v), Ok(()));
+        let mut expected = b"\nFCP: 101     $ 251.00".to_vec();
+        expected.extend_from_slice(&DEVICE_OPEN_BYTES);
+        assert_eq!(s.transcript().as_bytes(), expected.as_slice());
+        assert_eq!(HOME_OPEN_EXECUTE.as_bytes(), DEVICE_OPEN_BYTES.as_slice());
+        // `^%ZIS` returns with `$X` and `$Y` reset [ZIS4GTM.m:35] [ZIS1.m:25].
+        assert_eq!((s.x(), s.y()), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn form_feed_writes_nothing_after_device_open_and_lf_ff_at_column_header() -> Result<(), String>
+    {
+        let store = order_store("")?;
+        let answers = inputs(&[""]);
+        let mut s = Session::new(&answers);
+        let mut v = order_locals(&store);
+        // PRCHDP1.m:12: `D ^%ZIS W:$Y>0 @IOF` writes the device open only.
+        s.nl();
+        s.write("FCP: 101     $ 251.00");
+        assert_eq!(pct_zis(&mut s, &store, &mut v), Ok(()));
+        let after_open = s.transcript().to_string();
+        assert!(!form_feed(&mut s));
+        assert_eq!(s.transcript(), after_open);
+        // PRCHDP2.m:10 and 42: the halt prompt, its READ, then `HDR`, whose
+        // `@IOF` gives `0A 0C` and whose `!!` gives the next two `0A`.
+        s.nl();
+        s.tab(8);
+        s.write("ENTER '^' TO HALT: ");
+        assert_eq!(read(&mut s), Ok(String::new()));
+        let before_header = s.transcript().len();
+        assert_eq!(hdr_prchdp2(&mut s, &store, &mut v), Ok(()));
+        let header = s.transcript().get(before_header..).unwrap_or_default();
+        assert_eq!(header, column_header_bytes());
+        let mut leading = b"\n\x0c\n\n".to_vec();
+        leading.extend_from_slice(" ".repeat(55).as_bytes());
+        leading.extend_from_slice(b"UNIT");
+        assert!(header.as_bytes().starts_with(&leading), "{header:?}");
+        // `$Y` counts from the form feed: `!!` and the two header lines' `!`.
+        assert_eq!((s.x(), s.y()), (80, 4));
+        // With `$Y` at 0 the whole WRITE is skipped and only the dashes remain.
+        let mut top = Session::new(&answers);
+        assert_eq!(hdr_prchdp2(&mut top, &store, &mut v), Ok(()));
+        assert_eq!(top.transcript(), "-".repeat(80));
+        Ok(())
+    }
+
+    #[test]
+    fn paging_test_writes_nothing_for_one_and_three_items() -> Result<(), String> {
+        // `$Y+5>IOSL` [PRCHDP2.m:31] with `IOSL` 60: false at every item's
+        // `D ASK` [PRCHDP2.m:60] of a one-item and a three-item order, so the
+        // item page holds no paging pause.
+        let sp = |n: usize| " ".repeat(n);
+        for count in [1, 3] {
+            let store = order_store(&order_items(count))?;
+            let (outcome, id) = run(&store, &inputs(&["", "A12345", "", "", "^"]));
+            assert_eq!(id, None, "{count} items");
+            let transcript = outcome.map_err(|error| error.to_string())?.transcript;
+            let items: String = (1..=count)
+                .map(|item| {
+                    format!(
+                        "\n    {item}  WIDGET {item}{}2  EACH  125.50{}251.00\n        BOC: 2696\n",
+                        sp(29),
+                        sp(9)
+                    )
+                })
+                .collect();
+            let page = format!(
+                "{}{items}\n\n\u{7}END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: ",
+                column_header_bytes()
+            );
+            assert!(transcript.contains(&page), "{count} items: {transcript:?}");
+            assert_eq!(
+                transcript.matches("\n        ENTER '^' TO HALT: ").count(),
+                1,
+                "{count} items"
+            );
+        }
+        // Directly: `$Y` 5, 8 and 11 at the three items' tests, and the
+        // boundary, where `$Y` 55 gives 60, not above `IOSL`, and 56 gives 61.
+        let store = order_store("")?;
+        let mut v = order_locals(&store);
+        let no_input: Vec<String> = Vec::new();
+        for (lines, expected) in [
+            (5, Ok(())),
+            (8, Ok(())),
+            (11, Ok(())),
+            (55, Ok(())),
+            (56, Err(Halt::Unexercised("PO-30.b2"))),
+        ] {
+            let mut s = Session::new(&no_input);
+            for _ in 0..lines {
+                s.nl();
+            }
+            let before = s.transcript().to_string();
+            assert_eq!(ask_prchdp2(&mut s, &store, &mut v), expected, "$Y {lines}");
+            assert_eq!(s.transcript(), before, "$Y {lines}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn normal_completion_ends_with_process_exit_newline() -> Result<(), String> {
+        // `^` at the final order prompt: EN3 returns, and the record in
+        // progress, the prompt, is completed by one `\n`.
+        let store = order_store(&order_items(1))?;
+        for answers in [inputs(&["", "^"]), inputs(&["", "A12345", "", "", "^"])] {
+            let (outcome, id) = run(&store, &answers);
+            assert_eq!(id, None, "{answers:?}");
+            let transcript = outcome.map_err(|error| error.to_string())?.transcript;
+            assert!(
+                transcript.ends_with("P.O./REQ.NO.: \n"),
+                "{answers:?}: {transcript:?}"
+            );
+        }
+        assert_eq!(run(&store, &inputs(&["", "^"])), exited(ORDER_PROMPT_BYTES));
+        // Input running out at the same prompt keeps the cut there, with no
+        // `\n`.
+        for answers in [inputs(&[""]), inputs(&["", "A12345", "", ""])] {
+            let (outcome, id) = run(&store, &answers);
+            assert_eq!(id, None, "{answers:?}");
+            let transcript = outcome.map_err(|error| error.to_string())?.transcript;
+            assert!(
+                transcript.ends_with("P.O./REQ.NO.: "),
+                "{answers:?}: {transcript:?}"
+            );
+        }
+        // So does a branch that is not implemented, here PO-09.b4.
+        assert_eq!(
+            run(&store, &inputs(&["", "?"])),
+            ends_at(ORDER_PROMPT_BYTES, "PO-09.b4")
         );
         Ok(())
     }
@@ -3453,7 +3800,7 @@ mod tests {
     }
 
     #[test]
-    fn page_one_block_runs_to_column_header_gate() -> Result<(), String> {
+    fn page_one_block_runs_through_column_header() -> Result<(), String> {
         let store = order_store(
             r#"^PRC(442,1,14,0)="^442.12P^1^1"
 ^PRC(442,1,14,1,0)="3"
@@ -3465,9 +3812,10 @@ mod tests {
         let answers = inputs(&[""]);
         let mut s = Session::new(&answers);
         let mut v = order_locals(&store);
+        // After the column header, an order with no item is the n/e PO-25.b3.
         assert_eq!(
             fob_prchdp1(&mut s, &store, &mut v),
-            Err(Halt::Unexercised("PO-26.b1"))
+            Err(Halt::Unexercised("PO-25.b3"))
         );
         let sp = |n: usize| " ".repeat(n);
         let expected = [
@@ -3491,7 +3839,7 @@ mod tests {
             format!("APP: 3660160-101{}|{}|", sp(13), sp(27)),
             format!("{}|{}|TOTAL:   251.00", sp(29), sp(27)),
             "-".repeat(80),
-            format!("{}ENTER '^' TO HALT: ", sp(8)),
+            format!("{}ENTER '^' TO HALT: {}", sp(8), column_header_bytes()),
         ]
         .join("\n");
         assert_eq!(s.transcript(), expected);
@@ -3499,7 +3847,7 @@ mod tests {
     }
 
     #[test]
-    fn item_line_runs_to_paging_gate() -> Result<(), String> {
+    fn item_line_runs_through_paging_test() -> Result<(), String> {
         // Item IEN 7 holds line number 3 in piece 1 of its zero node, so the
         // printed number shows which of the two the line was built from.
         let store = order_store(
@@ -3520,14 +3868,14 @@ mod tests {
             prchdq: Some("0".to_string()),
             ..order_locals(&store)
         };
-        assert_eq!(
-            item_prchdp2(&mut s, &store, &mut v),
-            Err(Halt::Unexercised("PO-30.b1"))
-        );
+        // `ASK` with `$Y` 2 and `IOSL` 60 writes nothing (PO-30.b1); the item
+        // then ends with its `BOC:` line [PRCHDP2.m:61-65].
+        assert_eq!(item_prchdp2(&mut s, &store, &mut v), Ok(()));
         let sp = |n: usize| " ".repeat(n);
         let expected = format!(
-            "\n    3  WIDGET, BLUE {}    2  EACH  125.50{} 251.00\n{}STK#: STK-9",
+            "\n    3  WIDGET, BLUE {}    2  EACH  125.50{} 251.00\n{}STK#: STK-9\n{}BOC: 2696\n",
             sp(20),
+            sp(8),
             sp(8),
             sp(8)
         );
@@ -3570,10 +3918,7 @@ mod tests {
                 prchdq: Some("0".to_string()),
                 ..order_locals(&store)
             };
-            assert_eq!(
-                item_prchdp2(&mut s, &store, &mut v),
-                Err(Halt::Unexercised("PO-30.b1"))
-            );
+            assert_eq!(item_prchdp2(&mut s, &store, &mut v), Ok(()));
             let line = s
                 .transcript()
                 .lines()

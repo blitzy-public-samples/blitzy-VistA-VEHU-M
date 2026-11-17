@@ -533,10 +533,18 @@ pub(crate) fn order<S: Ord + Clone + Default>(
 /// moves them.
 ///
 /// The original is captured without a terminal, so typed input is never
-/// echoed: a READ leaves the transcript, `$X` and `$Y` unchanged. Form feed
-/// (`W @IOF` at PRCHDP1.m:12 and PRCHDP2.m:42) is not modelled, because the
-/// HOME device's `IOF` is unresolved (open item O-01), so reaching it ends
-/// the session after the last prompt written.
+/// echoed: a READ leaves the transcript, `$X` and `$Y` unchanged. Every
+/// character written, a control character included, advances `$X` by one:
+/// "Generally, YottaDB increments `$X` for every character written" (YottaDB
+/// Programmer's Guide, Intrinsic Special Variables, `$X`,
+/// <https://docs.yottadb.com/ProgrammersGuide/isv.html#x>), and by default
+/// "YottaDB does not screen output for escape sequences" (Input/Output
+/// Processing, `FILTER`,
+/// <https://docs.yottadb.com/ProgrammersGuide/ioproc.html#filter>).
+///
+/// The form feed `W @IOF`, with the HOME device's `IOF` `#` (PRCHDP1.m:12,
+/// PRCHDP2.m:42), is [`Session::form_feed`], and the position reset of the
+/// device open `^%ZIS` is [`Session::reset_position`]; both leave `$Y` at 0.
 #[derive(Debug)]
 pub(crate) struct Session<'a> {
     inputs: &'a [String],
@@ -617,6 +625,48 @@ impl<'a> Session<'a> {
     /// no-match response `DING^DIC` at DIC.m:63-65 (PO-09).
     pub(crate) fn bell(&mut self) {
         self.write("\u{7}");
+    }
+
+    /// M `SET $X=0,$Y=0`: moves the virtual cursor to column 0, line 0 and
+    /// writes nothing. YottaDB permits an M routine to SET `$X` and `$Y`, and
+    /// "SET `$X` does not automatically issue device commands or escape
+    /// sequences to reposition the physical cursor" (YottaDB Programmer's
+    /// Guide, Intrinsic Special Variables, `$X` and `$Y`,
+    /// <https://docs.yottadb.com/ProgrammersGuide/isv.html#x>).
+    ///
+    /// Uses: the HOME device open of `^%ZIS` (PO-12), which sets both before
+    /// and after its open execute, `U IO S $X=0,$Y=0` [ZIS4GTM.m:35] and the
+    /// TRM reset `S:'(IO=IO(0)&'$D(IO("S"))&'$D(ZTQUEUED)) $X=0,$Y=0`
+    /// [ZIS1.m:25].
+    pub(crate) fn reset_position(&mut self) {
+        self.x = 0;
+        self.y = 0;
+    }
+
+    /// M `WRITE #`, the form feed `W @IOF` of a device whose `IOF` is `#`:
+    /// "`#` Sets `$X` and `$Y` to zero (0), and terminates the logical record
+    /// in progress" (YottaDB Programmer's Guide, Input/Output Processing,
+    /// Maintenance of `$X` and `$Y`,
+    /// <https://docs.yottadb.com/ProgrammersGuide/ioproc.html#maintenance-of-x-and-y>).
+    /// A record is in progress when `$X` is above 0, and is terminated by one
+    /// LF, the record terminator of the principal device; then FF is written,
+    /// with no LF after it, and `$X` and `$Y` become 0.
+    ///
+    /// The captures judge the bytes: after the READ of `ENTER '^' TO HALT: `
+    /// [PRCHDP2.m:10] the WRITE `@IOF,!!` [PRCHDP2.m:42] gives `0A 0C 0A 0A`.
+    /// The sequential-device table of the same chapter gives `WRITE #` as
+    /// `<FF>,<LF>`, which does not match them (`SPEC.md` "Places the
+    /// original looks wrong").
+    ///
+    /// Uses: `W:$Y>0 @IOF` at PRCHDP1.m:12 (PO-10) and the column header
+    /// `HDR` at PRCHDP2.m:42 (PO-26).
+    pub(crate) fn form_feed(&mut self) {
+        if self.x > 0 {
+            self.out.push('\n');
+        }
+        self.out.push('\u{c}');
+        self.x = 0;
+        self.y = 0;
     }
 
     /// M `$X`: the current column.
@@ -965,6 +1015,48 @@ mod tests {
         assert_eq!(session.x(), 4);
         assert_eq!(session.y(), 1);
         assert_eq!(session.into_transcript(), "ABC     \n\u{7} ??");
+    }
+
+    #[test]
+    fn control_characters_count_in_x_and_reset_position_writes_nothing() {
+        let inputs: Vec<String> = Vec::new();
+        let mut session = Session::new(&inputs);
+        session.nl();
+        session.write("AB");
+        session.write("\u{1b}[?5i");
+        assert_eq!((session.x(), session.y()), (7, 1));
+        session.reset_position();
+        assert_eq!((session.x(), session.y()), (0, 0));
+        assert_eq!(session.transcript(), "\nAB\u{1b}[?5i");
+        session.tab(3);
+        assert_eq!(session.into_transcript(), "\nAB\u{1b}[?5i   ");
+    }
+
+    #[test]
+    fn form_feed_terminates_record_in_progress_then_writes_ff() {
+        let inputs = vec![String::new()];
+        // A record in progress: the prompt, then its READ, which moves
+        // nothing; `W #` writes LF and FF, and `$X` and `$Y` become 0.
+        let mut session = Session::new(&inputs);
+        session.nl();
+        session.tab(8);
+        session.write("ENTER '^' TO HALT: ");
+        assert_eq!(session.read(), Some(String::new()));
+        session.form_feed();
+        assert_eq!((session.x(), session.y()), (0, 0));
+        session.nl();
+        session.nl();
+        assert_eq!(
+            session.into_transcript(),
+            "\n        ENTER '^' TO HALT: \n\u{c}\n\n"
+        );
+        // At column 0 no record is in progress: FF alone.
+        let mut session = Session::new(&inputs);
+        session.write("LINE");
+        session.nl();
+        session.form_feed();
+        assert_eq!((session.x(), session.y()), (0, 0));
+        assert_eq!(session.into_transcript(), "LINE\n\u{c}");
     }
 
     #[test]

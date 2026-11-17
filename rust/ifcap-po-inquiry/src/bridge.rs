@@ -3965,7 +3965,7 @@ mod tests {
 
     /// The `STUB_CONTEXT` keys with sample device values, which
     /// `golden::validate_context` accepts.
-    const CONTEXT: &str = r##"{"DUZ":".5","IOF":"#","IOSL":"24","STATION":"500"}"##;
+    const CONTEXT: &str = r##"{"DUZ":".5","IOF":"#","IOSL":"60","STATION":"500"}"##;
 
     /// Site (a) of `SPEC.md` "Contracts": the only order filed under `C` has
     /// a zero node holding only a descendant, so the lookup's read of
@@ -4015,7 +4015,7 @@ mod tests {
     fn decide_match_is_the_pass_rule() -> Result<(), String> {
         let valid = Some(golden::parse_meta(&meta_text(CONTEXT))?);
         let duz_one = Some(golden::parse_meta(&meta_text(
-            r##"{"DUZ":"1","IOF":"#","IOSL":"24","STATION":"500"}"##,
+            r##"{"DUZ":"1","IOF":"#","IOSL":"60","STATION":"500"}"##,
         ))?);
         let unparsable = Some(golden::parse_meta(&meta_text("not json"))?);
         let ready = Readiness::Ready;
@@ -4244,7 +4244,7 @@ mod tests {
         assert_eq!(live(container, scratch.path(), &inputs), Err(none.clone()));
         assert_eq!(mumps_session(&mumps, &inputs), (502, error_body(&none)));
         // Recorded start arguments whose context names another user.
-        let duz_one = r##"{"DUZ":"1","IOF":"#","IOSL":"24","STATION":"500"}"##;
+        let duz_one = r##"{"DUZ":"1","IOF":"#","IOSL":"60","STATION":"500"}"##;
         scratch.write("GC-01", capture_file("meta")?, &meta_text(duz_one))?;
         let mismatch = "CONTEXT MISMATCH DUZ: expected .5, actual 1";
         assert_eq!(
