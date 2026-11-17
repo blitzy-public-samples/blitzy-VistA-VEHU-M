@@ -3085,8 +3085,10 @@ mod tests {
     #[test]
     fn no_match_guard_holds_for_case_values_over_repository_fixtures() -> Result<(), String> {
         // AAP fixture profile: no subscript of a 440, 442.5 or 442.3 index in
-        // the eleven repository fixtures equals or begins with the GC-03 or
-        // GC-04 value, and they hold no file 442 node.
+        // the twelve supporting fixtures (the eleven export copies and
+        // `200.zwr`) or `cases.zwr` equals or begins with the GC-03 or GC-04
+        // value, and none of them holds a `^PRC(442,"G")`, `^PRC(442,"M")` or
+        // `^PRC(442,"MCH")` entry.
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ifcap");
         let store = crate::store::load_fixtures(&dir).map_err(|error| error.to_string())?;
         for value in ["GC3003", "INVALID!"] {
