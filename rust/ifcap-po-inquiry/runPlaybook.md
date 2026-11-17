@@ -5,7 +5,7 @@ Twelve phases, in order, take a clean checkout to a recorded acceptance decision
 - **Owners.** `Developer` works on the build host. `Capture owner` is the team member on the Docker host with `worldvista/vehu:202609`. `Reviewer` judges the results and records acceptance.
 - **Commands** are quoted verbatim from `RUNNING.md` and `tests/golden/ifcap/README.md` ("README" below), each with the section it comes from. Run them from `rust/ifcap-po-inquiry/` unless the phase says otherwise, with each `<…>` replaced by a real value.
 - Where this playbook differs from those files or from the code, the code governs, then `RUNNING.md` and the README.
-- Phases 1 to 6 need no capture. On a clean checkout they end with exit 0, five NOT COMPARED and `RECORDED 0 OF 5`.
+- Phases 1 to 6 need no capture. On a clean checkout without the captures they end with exit 0, five NOT COMPARED and `RECORDED 0 OF 5`. With the five captures present, as committed on this branch, phase 4 exits 101 (`GC-03` and `GC-04` PASS; `GC-01`, `GC-02` and `GC-05` FAIL at transcript line 25, `SPEC.md` open item O-09) and phase 5 shows `RECORDED 5 OF 5 READY 5 OF 5`.
 
 ## Phase 1. Prepare the host
 
@@ -32,15 +32,15 @@ From the repository root (criterion A7; `SPEC.md` "Source-unchanged verification
 
 | Owner | Do | Expect | If not |
 |---|---|---|---|
-| Developer | `cargo test --offline --locked` (`RUNNING.md` step 2) | Exit status 0. `REPORT.md` is rewritten: part 2 gives all five cases NOT COMPARED, and part 3 gives each `ABSENT` | A FAIL names its cause in `REPORT.md` part 2 and in the failure message, `GC-0N FAIL: <cause>`. A missing `SPEC.md` heading fails the run, names the heading and writes no report: restore `SPEC.md` from git |
-| Developer | `cargo test --offline --locked --test equivalence -- --nocapture` (`RUNNING.md` step 2) | The lines `GC-01 NOT COMPARED` to `GC-05 NOT COMPARED` | Another verdict means `tests/golden/ifcap/` holds a case folder: this phase needs a clean checkout |
+| Developer | `cargo test --offline --locked` (`RUNNING.md` step 2) | Exit status 0. `REPORT.md` is rewritten: part 2 gives all five cases NOT COMPARED, and part 3 gives each `ABSENT`. With the five captures present: exit status 101; part 2 gives `GC-03` and `GC-04` PASS and `GC-01`, `GC-02` and `GC-05` FAIL at transcript line 25 (O-09), and part 3 gives each READY | A FAIL names its cause in `REPORT.md` part 2 and in the failure message, `GC-0N FAIL: <cause>`. A missing `SPEC.md` heading fails the run, names the heading and writes no report: restore `SPEC.md` from git |
+| Developer | `cargo test --offline --locked --test equivalence -- --nocapture` (`RUNNING.md` step 2) | The lines `GC-01 NOT COMPARED` to `GC-05 NOT COMPARED`. With the five captures present: `GC-01 FAIL`, `GC-02 FAIL`, `GC-03 PASS`, `GC-04 PASS`, `GC-05 FAIL` | Another verdict means `tests/golden/ifcap/` holds a case folder: this phase needs a clean checkout |
 
 ## Phase 5. Start the bridge with zero captures
 
 | Owner | Do | Expect | If not |
 |---|---|---|---|
-| Developer | `cargo run --offline --locked --bin bridge` (`RUNNING.md` step 2), and leave it running | Standard output, in order: `http://127.0.0.1:8080/`, `MUMPS MODE: REPLAY`, `RECORDED 0 OF 5 READY 0 OF 5` | Look up the standard-error line in `RUNNING.md` "Failure messages" |
-| Developer | Open `http://127.0.0.1:8080/` in current Chrome or Firefox (`RUNNING.md` step 3) | The title `PURCHASE ORDER DISPLAY`, and the status line `MUMPS BACKEND: REPLAY RECORDED 0 OF 5 READY 0 OF 5` | `BRIDGE UNREACHABLE` or a blank page: open the page through that URL, never `file://`, and reload |
+| Developer | `cargo run --offline --locked --bin bridge` (`RUNNING.md` step 2), and leave it running | Standard output, in order: `http://127.0.0.1:8080/`, `MUMPS MODE: REPLAY`, `RECORDED 0 OF 5 READY 0 OF 5`; with the five captures present the third line is `RECORDED 5 OF 5 READY 5 OF 5` | Look up the standard-error line in `RUNNING.md` "Failure messages" |
+| Developer | Open `http://127.0.0.1:8080/` in current Chrome or Firefox (`RUNNING.md` step 3) | The title `PURCHASE ORDER DISPLAY`, and the status line `MUMPS BACKEND: REPLAY RECORDED 0 OF 5 READY 0 OF 5`, or, with the five captures present, `MUMPS BACKEND: REPLAY RECORDED 5 OF 5 READY 5 OF 5` | `BRIDGE UNREACHABLE` or a blank page: open the page through that URL, never `file://`, and reload |
 | Developer | `curl -s http://127.0.0.1:8080/api/status` (`RUNNING.md` step 6) | `{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}` | A listed case means a case folder is present: use a clean checkout |
 | Developer | Select RUST and SEND an empty line, or run `curl -s -X POST -H 'Content-Type: application/json' -d '{"inputs":[""]}' http://127.0.0.1:8080/api/rust/session` (`RUNNING.md` step 6) | 200. The transcript ends after the station prompt `Select STATION NUMBER ('^' TO EXIT): 500// `, with its one trailing space, because the fixtures hold no `^PRC(442,0)` header (PO-09.b15; `RUNNING.md` step 4) | 500 `CORRUPT STORE <node>` names a fixture node: restore `tests/fixtures/ifcap/` from git and restart the bridge |
 | Developer | Keep the sequence and select MUMPS, then COMPARE | MUMPS answers 502 `NOT RECORDED`, and COMPARE 502 `MUMPS: NOT RECORDED`. The bottom line shows the error body, such as `{"error":"NOT RECORDED"}`, and the transcript area stays empty | A 200 means a capture matched: this phase needs a clean checkout |
@@ -54,7 +54,7 @@ From the repository root (criterion A7; `SPEC.md` "Source-unchanged verification
 | Developer | Block `/api/status` in the browser's developer tools (Network panel, block request URL), reload the page, then unblock it | The status line reads `BRIDGE UNREACHABLE`, with no shake. A reload with the bridge stopped shows the browser's own connection error instead, because the bridge serves the page with `Cache-Control: no-store`; blocking the request fails it the same way | Record the failing checklist item |
 | Developer | Stop the bridge (Ctrl-C), then SEND a line | The bottom line shows `REQUEST FAILED: <error>`, and the transcript stays as last rendered | Record the failing checklist item |
 
-Phases 1 to 6 on a clean checkout give exit 0, five NOT COMPARED and `RECORDED 0 OF 5`.
+Phases 1 to 6 on a clean checkout without the captures give exit 0, five NOT COMPARED and `RECORDED 0 OF 5`. With the five captures present, phase 4 exits 101 (`GC-03` and `GC-04` PASS; `GC-01`, `GC-02` and `GC-05` FAIL, O-09) and phase 5 shows `RECORDED 5 OF 5 READY 5 OF 5`.
 
 ## Phase 7. Prepare the capture environment
 

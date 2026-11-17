@@ -26,9 +26,9 @@ cargo run --offline --locked --bin bridge
 - The short forms `cargo test` and `cargo run --bin bridge` are equivalent on a prepared host.
 - **`cargo build`** exits 0.
 - **`cargo test`** runs the unit tests, `tests/bridge.rs` and `tests/equivalence.rs`.
-  - It exits 0 when no case is FAIL and nothing else fails. With no capture, all five cases, `GC-01` to `GC-05`, are NOT COMPARED, so none is FAIL and it exits 0.
+  - It exits 0 when no case is FAIL and nothing else fails. With no capture, all five cases, `GC-01` to `GC-05`, are NOT COMPARED, so none is FAIL and it exits 0. With the five captures present, as committed on this branch, `GC-03` and `GC-04` PASS and `GC-01`, `GC-02` and `GC-05` FAIL at transcript line 25 (`SPEC.md` open item O-09), so it exits 101.
   - `tests/equivalence.rs` rewrites `REPORT.md` in full on every run. Part 2 holds each case's verdict and part 3 its capture readiness.
-  - The test also prints one `GC-0N <verdict>` line per case, such as `GC-01 NOT COMPARED`. Cargo shows test output only for a failing test, so to see the lines on a passing run use `cargo test --offline --locked --test equivalence -- --nocapture`.
+  - The test also prints one `GC-0N <verdict>` line per case, such as `GC-01 NOT COMPARED`, or, with the five captures present, `GC-01 FAIL`, `GC-02 FAIL`, `GC-03 PASS`, `GC-04 PASS` and `GC-05 FAIL`. Cargo shows test output only for a failing test, so to see the lines on a passing run use `cargo test --offline --locked --test equivalence -- --nocapture`.
   - It exits non-zero when any case is FAIL, and `REPORT.md` part 2 names the cause. With no case FAIL, it still exits non-zero when a harness check fails (`REPORT.md` part 1 lists each under "Harness checks in this run" with PASS or FAIL), when `SPEC.md` lacks a section the report includes (`MISSING SECTION <heading> IN SPEC.md`, with no report written), when `REPORT.md` cannot be written (`cannot write REPORT.md: <error>`), or when any other test or the build fails.
   - Exit 0 is never acceptance. Acceptance needs five PASS.
 - **`cargo run`** starts the bridge, which serves until it is stopped (Ctrl-C). Once listening, it writes three lines to standard output:
@@ -38,6 +38,8 @@ cargo run --offline --locked --bin bridge
   MUMPS MODE: REPLAY
   RECORDED 0 OF 5 READY 0 OF 5
   ```
+
+  With the five captures present the third line is `RECORDED 5 OF 5 READY 5 OF 5`.
 
   The third line counts the recorded and READY cases in the golden folder at startup. Its diagnostics go to standard error (see "Failure messages").
 
@@ -50,10 +52,10 @@ cargo run --offline --locked --bin bridge
 
 ## Step 4. With no captures
 
-This is the state of a fresh checkout: `tests/golden/ifcap/` holds only its README, and `tests/fixtures/ifcap/cases.zwr` does not exist.
+This is the state of a checkout without the captures: `tests/golden/ifcap/` holds only its README, and `tests/fixtures/ifcap/cases.zwr` does not exist. A fresh checkout of this branch holds the five captures and `cases.zwr`; each item below also gives that outcome.
 
-- The bridge's third startup line is `RECORDED 0 OF 5 READY 0 OF 5`.
-- The status line reads `MUMPS BACKEND: REPLAY RECORDED 0 OF 5 READY 0 OF 5`.
+- The bridge's third startup line is `RECORDED 0 OF 5 READY 0 OF 5`; with the five captures present it is `RECORDED 5 OF 5 READY 5 OF 5`.
+- The status line reads `MUMPS BACKEND: REPLAY RECORDED 0 OF 5 READY 0 OF 5`; with the five captures present it reads `MUMPS BACKEND: REPLAY RECORDED 5 OF 5 READY 5 OF 5`.
 - **MUMPS** answers 502 `NOT RECORDED`. **COMPARE** answers 502 `MUMPS: NOT RECORDED`. The screen shows the error body in its bottom line, for example `{"error":"NOT RECORDED"}`, and leaves the transcript as it was.
 - **RUST** answers 200, and its transcript ends after the station prompt `Select STATION NUMBER ('^' TO EXIT): 500// `, which ends with one space.
   - The repository fixtures hold no file 442 header `^PRC(442,0)`, so the order lookup ends before it writes its prompt (branch PO-09.b15).
@@ -103,7 +105,7 @@ This is the state of a fresh checkout: `tests/golden/ifcap/` holds only its READ
   curl -s -X POST -H 'Content-Type: application/json' -d '{"inputs":[""]}' http://127.0.0.1:8080/api/rust/session
   ```
 
-  `GET /api/status` reports the mode and the recorded, READY and INCOMPLETE cases, with each INCOMPLETE case's failed checks. With no captures it answers `{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}`. A RUST session request answers 200 `{"transcript":"…","returned":null}`, and so does a MUMPS one, with `mumps` in place of `rust`. A COMPARE request, with `compare` in place of `rust`, answers 200 `{"mumps":{"transcript":"…","returned":null},"rust":{"transcript":"…","returned":null},"match":false}`: both raw outputs, never normalised, and the boolean `match`, which is `true` when the screen shows `MATCH`. `returned` is always `null`, because the workflow returns nothing. An error answers `{"error":"<cause>"}` (see "Failure messages").
+  `GET /api/status` reports the mode and the recorded, READY and INCOMPLETE cases, with each INCOMPLETE case's failed checks. With no captures it answers `{"mumps_mode":"replay","recorded":[],"ready":[],"incomplete":{}}`; with the five captures present, `{"mumps_mode":"replay","recorded":["GC-01","GC-02","GC-03","GC-04","GC-05"],"ready":["GC-01","GC-02","GC-03","GC-04","GC-05"],"incomplete":{}}`. A RUST session request answers 200 `{"transcript":"…","returned":null}`, and so does a MUMPS one, with `mumps` in place of `rust`. A COMPARE request, with `compare` in place of `rust`, answers 200 `{"mumps":{"transcript":"…","returned":null},"rust":{"transcript":"…","returned":null},"match":false}`: both raw outputs, never normalised, and the boolean `match`, which is `true` when the screen shows `MATCH`. `returned` is always `null`, because the workflow returns nothing. An error answers `{"error":"<cause>"}` (see "Failure messages").
 
 ## Step 7. Live mode
 
