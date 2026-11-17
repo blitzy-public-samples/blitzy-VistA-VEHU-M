@@ -1386,6 +1386,8 @@ Criterion A7: every file outside `rust/ifcap-po-inquiry/` stays as it is, and ev
 | After this refine round's review fixes, same time | `git status --porcelain -- . ':!rust/ifcap-po-inquiry'` | none | 0 |
 | After this refine round's second review fixes, 2026-11-17T05:38:47Z, `HEAD` `00981dfbb4c0bf92c5cf3e5686b0661fc176d1a1` with the fixes uncommitted | `git diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION` | none | 0 |
 | After this refine round's second review fixes, same time | `git status --porcelain -- . ':!rust/ifcap-po-inquiry'` | none | 0 |
+| Before round two's first edit, 2026-11-17T10:16:27Z, HEAD 64482eef86c9d7bfbc3e141576f054bd944dee3b | `git diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION` | none | 0 |
+| Before round two's first edit, 2026-11-17T10:16:27Z, HEAD 64482eef86c9d7bfbc3e141576f054bd944dee3b | `git status --porcelain -- . ':!rust/ifcap-po-inquiry'` | none | 0 |
 
 Result: A7 holds. `HEAD` is the branch tip this document was edited on; its own commit changes only files under `rust/ifcap-po-inquiry/`. The last measurement is also recorded, with the commands' output, in section "Run evidence", "Refine round: completion evidence". Before this run the evidence was saved under `test-results/<run-id>/source-unchanged.txt`; that folder is deleted (section "Existing items outside the layout"), and the measurements live here.
 
@@ -1564,6 +1566,7 @@ if [ -f tests/fixtures/ifcap/cases.zwr ]; then sha256sum tests/fixtures/ifcap/ca
 | After (history) | Before this round, 2026-11-15T12:25:06Z, after the earlier run's edits | 0, 0 | `ABSENT tests/fixtures/ifcap/cases.zwr` (`find` printed nothing) |
 | Before | 2026-11-17T01:16:34Z, before this refine round's first edit | 0, 0 | 39 `find` lines (35 case files of `GC-01` to `GC-05`, 4 files of `state/`) and the `cases.zwr` line `9dd56f96bf29c5bb8e0e373cbaf2fb3f912daab4b41bf65fec1df76485da32a0`, verbatim below |
 | After | 2026-11-17T05:38:20Z, after this refine round's last edit, both sets of review fixes included, except the later edits of this document and the `REPORT.md` its final run writes; re-taken after the second review fixes, with the same output as when first taken at 2026-11-17T03:59:37Z, after the first | 0, 0 | Identical to the before listing, line for line, verbatim below: `diff` of the two outputs and `diff` of sorted copies each exit status 0. The same 40 lines, with no `CREATED BY RUN` line. Every file of the listing has the same hash, so the equality rule holds |
+| Before (round two) | 2026-11-17T10:17:14Z, before round two's first edit, at `HEAD` `64482eef86c9d7bfbc3e141576f054bd944dee3b` | 0, 0; `sha256sum tests/fixtures/ifcap/200.zwr` 0 | 39 `find` lines (35 case files of `GC-01` to `GC-05`, 4 files of `state/`), the `cases.zwr` line `9dd56f96…32a0` and the `200.zwr` line `836c6a9b…c9da`, verbatim below under "Round two, before the first edit". Sorted, the 40 listing lines equal the before listing taken at 2026-11-17T01:16:34Z line for line |
 
 Before listing, verbatim, in `find`'s order:
 
@@ -1656,6 +1659,62 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/i
 2405b8a73b3a1ad0a8359742354a6ab1cb618136cd3d9fba9eda30a855421c47  tests/golden/ifcap/GC-05/meta.txt
 9dd56f96bf29c5bb8e0e373cbaf2fb3f912daab4b41bf65fec1df76485da32a0  tests/fixtures/ifcap/cases.zwr
 ```
+
+Round two, before the first edit: the `200.zwr` hash and the listing, run at 2026-11-17T10:17:14Z from `rust/ifcap-po-inquiry/` at `HEAD` `64482eef86c9d7bfbc3e141576f054bd944dee3b`, before any edit of round two. The `find` output is piped to `sort -k2`, so it is in path order rather than `find`'s order. Commands, each exit status 0:
+
+```sh
+sha256sum tests/fixtures/ifcap/200.zwr
+find tests/golden/ifcap -type f ! -name README.md -exec sha256sum {} + | sort -k2
+if [ -f tests/fixtures/ifcap/cases.zwr ]; then sha256sum tests/fixtures/ifcap/cases.zwr; else echo "ABSENT tests/fixtures/ifcap/cases.zwr"; fi
+```
+
+Output, verbatim, in command order:
+
+```text
+836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da  tests/fixtures/ifcap/200.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-01/db-after.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-01/db-before.zwr
+112aa35c053a710cc49bcff142a9d3d72a72c96d3c207d6ace9f07f9a71e5402  tests/golden/ifcap/GC-01/input.txt
+3a6cef3e8d1ba147e17dec2b329cee83b80c87e59bfac534efa531e83e5517e7  tests/golden/ifcap/GC-01/meta.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-01/normalisation.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-01/returned.txt
+29c7965a1b173dd124d2f163ff5409cd50b12c5c48b05c97aba629e7a95f2afb  tests/golden/ifcap/GC-01/transcript.txt
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-02/db-after.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-02/db-before.zwr
+4b0a1f354b802ef12507d90b389bea6319ba0cd91e4fa406d79dfd10c7660e82  tests/golden/ifcap/GC-02/input.txt
+7fdcbe2d04824a9558991933ae0f42a449f590bf08ec48eb6aaf58ea3118a1e7  tests/golden/ifcap/GC-02/meta.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-02/normalisation.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-02/returned.txt
+957c66a058cc34da2d5ac2baf0c00b308b54c1b37b33b46090b5162e600d138a  tests/golden/ifcap/GC-02/transcript.txt
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-03/db-after.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-03/db-before.zwr
+8e76c0670933551cd793d4379c79e150b35b274de0bb8e9706a05c3fc515d2cd  tests/golden/ifcap/GC-03/input.txt
+1158766445c7896b5dcfbd203410323b1aa5ab397a89b4a6b3c6b3044029613f  tests/golden/ifcap/GC-03/meta.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-03/normalisation.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-03/returned.txt
+601da39ed3c2b99ad4789667d9392cfc53c0fd81b916f2cbc361e4e8d4ecc88c  tests/golden/ifcap/GC-03/transcript.txt
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-04/db-after.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-04/db-before.zwr
+8f9db75ffd52550d253ba92433776555248b0cfe3d3b75463c9f86646538102a  tests/golden/ifcap/GC-04/input.txt
+1158766445c7896b5dcfbd203410323b1aa5ab397a89b4a6b3c6b3044029613f  tests/golden/ifcap/GC-04/meta.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-04/normalisation.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-04/returned.txt
+601da39ed3c2b99ad4789667d9392cfc53c0fd81b916f2cbc361e4e8d4ecc88c  tests/golden/ifcap/GC-04/transcript.txt
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-05/db-after.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-05/db-before.zwr
+d2894b17a31f8aa5193b83a861967e014d67dfe7eafcc9b66c7f757770a6fcad  tests/golden/ifcap/GC-05/input.txt
+2405b8a73b3a1ad0a8359742354a6ab1cb618136cd3d9fba9eda30a855421c47  tests/golden/ifcap/GC-05/meta.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-05/normalisation.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-05/returned.txt
+46fd6902ce254390c747150498f4412efd3ddbdd602fc002cc324ba4ecb46f8f  tests/golden/ifcap/GC-05/transcript.txt
+9770243ac24b819dc5b6a27391d94bc87285f42d50ef3ceabd8aa522880e92f9  tests/golden/ifcap/state/MANIFEST.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/state/export.stderr
+20ebce847e6359d430f01ee794572618cfe28a524509b6266bcb0485d28ee7ae  tests/golden/ifcap/state/state.zwr
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/state/verify.stderr
+9dd56f96bf29c5bb8e0e373cbaf2fb3f912daab4b41bf65fec1df76485da32a0  tests/fixtures/ifcap/cases.zwr
+```
+
+Every hash the team stated for round two holds in this listing, each checked by an exact match of its hash and path against one line, 17 of 17: `cases.zwr` `9dd56f96…32a0`; each `db-before.zwr` and `db-after.zwr` of `GC-01` to `GC-05` `c229942c…c476`; the transcripts of `GC-01` `29c7965a…2afb`, `GC-02` `957c66a0…138a`, `GC-03` and `GC-04` `601da39e…c88c` and `GC-05` `46fd6902…6f8f`; and `state/state.zwr` `20ebce84…e7ae`. `tests/fixtures/ifcap/200.zwr` has sha256 `836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da`, the hash it must still have after round two's last edit. `tests/fixtures/ifcap/` holds 13 files: the 11 supporting fixtures, `200.zwr` and `cases.zwr`.
 
 **Equality rule.** Every file present in the baseline listing must have the same hash in the after listing. A `cases.zwr` that a run builds, because it finds READY captures and no `cases.zwr`, is the one permitted addition; it is recorded on its own line as `CREATED BY RUN` and is not part of the equality. An existing `cases.zwr` is never edited: with READY captures, a run checks it before editing code by the preflight of `tests/golden/ifcap/README.md` Part B step 6, which lists every line extracted from the READY captures' `db-before.zwr` that is found neither in `cases.zwr` nor in a supporting fixture; the run records that comparison in section "Run evidence" and opens a section "Open items" entry for each affected case, naming its nodes, with the action "rebuild `cases.zwr` by README step 6". Before this round no capture file and no `cases.zwr` existed, so no file was listed. In this round the rule covers all 40 files of the before listing, the four `state/` files included; `cases.zwr` already exists, so no file is created, and the preflight is in section "Run evidence".
 
@@ -2379,6 +2438,98 @@ Each residual hit is current, closed or marked as history:
 - `NOT COMPARED`: the verdict for a case with no capture (C2, K12) and the "Existing-state verification" row marked "at the time".
 - `0 OF 5`: the zero-captures check of section "Front-end checklist", item 14, a check the team runs on such a checkout.
 - `ABSENT`: the `CONTEXT MISMATCH` message format, C2, and the history rows of "Capture hashes" with the listing command's `ABSENT` branch.
+
+### Round two: baseline before the first edit
+
+These commands ran on 2026-11-17 at commit `64482eef86c9d7bfbc3e141576f054bd944dee3b`, before any edit of round two other than this record, with `RUSTUP_AUTO_INSTALL=0` set and the five capture folders, `tests/fixtures/ifcap/cases.zwr` and `tests/fixtures/ifcap/200.zwr` present. They ran from `rust/ifcap-po-inquiry/`, except `git rev-parse HEAD` and the two A7 commands, which ran from the repository root. The A7 results are also the two "Before round two's first edit" rows of section "Source-unchanged verification", and the `200.zwr` hash and the capture listing, taken at 2026-11-17T10:17:14Z, are the "Before (round two)" row of section "Capture hashes".
+
+`git rev-parse HEAD`, 2026-11-17T10:16:27Z, exit status 0:
+
+```text
+64482eef86c9d7bfbc3e141576f054bd944dee3b
+```
+
+The two A7 commands, at the same time, each followed by `echo "exit=$?"`. Neither command printed anything:
+
+```sh
+git diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION; echo "exit=$?"
+git status --porcelain -- . ':!rust/ifcap-po-inquiry'; echo "exit=$?"
+```
+
+```text
+exit=0
+exit=0
+```
+
+`cargo test --offline --locked --no-fail-fast`, started 2026-11-17T10:16:32Z and finished 2026-11-17T10:16:50Z, exit status 0. Output trimmed: the 185 lines `test <name> ... ok` are omitted; every other line, standard error included, is shown:
+
+```text
+   Compiling ifcap-po-inquiry v0.1.0 (/tmp/blitzy/blitzy-VistA-VEHU-M/blitzy-cba44d3a-fb41-4a16-9c11-e135b780df6e-w-003_0d7014/rust/ifcap-po-inquiry)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.09s
+     Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
+
+running 164 tests
+
+test result: ok. 164 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.61s
+
+     Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
+
+running 19 tests
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.07s
+
+     Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
+
+running 2 tests
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.80s
+
+   Doc-tests ifcap_po_inquiry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Total over the five test targets: 185 passed (unit tests of `src/lib.rs` 164, `src/bin/bridge.rs` 0, `tests/bridge.rs` 19, `tests/equivalence.rs` 2, doc-tests 0), 0 failed, 0 ignored.
+
+`grep -n 'Verdict' REPORT.md`, on the `REPORT.md` that command wrote, exit status 0:
+
+```text
+739:- Verdict: PASS
+746:- Verdict: PASS
+753:- Verdict: PASS
+760:- Verdict: PASS
+767:- Verdict: PASS
+```
+
+The five lines are the part 2 blocks of `GC-01`, `GC-02`, `GC-03`, `GC-04` and `GC-05`, in that order, headed at lines 737, 744, 751, 758 and 765. Part 3 gave all five READY. The file that run wrote has sha256 `df579b85d883fb2380de8747423bb84d29911e3debcbc12ec168a1527203da6d`, byte-identical to the `REPORT.md` of commit `64482eef8`.
+
+`cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, run next to read the per-case lines, exit status 0. Output complete:
+
+```text
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
+
+running 2 tests
+test equivalence_report ... GC-01 PASS
+GC-02 PASS
+GC-03 PASS
+GC-04 PASS
+GC-05 PASS
+ok
+test spec_has_report_sections ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.67s
+```
+
+The baseline is the one the team expected: exit status 0, 185 passed, 0 failed, and `Verdict: PASS` for all five cases, so the round-two stop condition does not apply and no correction cycle runs. The `REPORT.md` these runs wrote was restored with `git checkout -- REPORT.md`; the committed `REPORT.md` is the one written by the last `cargo test` after this document's final edit.
 
 ## Acceptance record
 
