@@ -879,37 +879,40 @@ The baseline is the one the team expected: exit status 0, 185 passed, 0 failed, 
 
 ### Round two: completion evidence
 
-These commands ran on 2026-11-17, from 18:40:12Z to 18:42:44Z, on the Linux build host at commit `acf7a2d6591b04d53bbfcb9e3b5a0aec59d0e682`, the observed commit, with no uncommitted change. It is a work-branch commit, and delivery may re-apply it to the destination branch under another hash, so its trees identify it as well: its `src/` tree is `ab0e513abe212e15008b7768e86e45d0d87917dd` and its `tests/` tree `c50b59787bf846560e7d5109a39c553f4b7152dd`, which `git rev-parse <commit>:rust/ifcap-po-inquiry/src` and `git rev-parse <commit>:rust/ifcap-po-inquiry/tests` check on any commit. It holds every round-two change to `src/`, `tests/`, the golden README, `RUNNING.md` and `runPlaybook.md`; its own change to `src/` is the comment of the test `no_match_guard_holds_for_case_values_over_repository_fixtures` in `src/inquiry.rs`. Its parent, `a774d277019f844167af1d813552e8226b0a106e` on the destination branch, differs from it in `src/` and `tests/` only in that comment: `git diff --stat a774d2770 acf7a2d65 -- rust/ifcap-po-inquiry/src rust/ifcap-po-inquiry/tests`, from the repository root, prints `rust/ifcap-po-inquiry/src/inquiry.rs | 6 ++++--` and `1 file changed, 4 insertions(+), 2 deletions(-)`; its `src/` tree is `28dbb56524f28c8e4973d0a9067477c4f6d824a8` and its `tests/` tree the same `c50b5978…52dd`. The same commands, run at `a774d2770` with no uncommitted change from 18:31:23Z to 18:31:54Z, `cargo clean` first, gave the same results: `cargo test --offline --locked` exit status 0 with 191 passed and 0 failed; `Verdict: PASS` for all five cases; `GC-01 MATCH` to `GC-05 MATCH` and `GC-01 PASS` to `GC-05 PASS`; build, clippy, format and documentation exit status 0 with no warning; audit and A7 outputs identical to this record's, and the same 41 capture-listing lines; and the sha256 of `REPORT.md`, `48b7fb1b30a473df4bbfcaddfb3cd71f3def059122c568de6222fbf5807ae984`, unchanged by the test runs. On the destination branch the commit that delivers this record follows `a774d2770` and carries `acf7a2d65`'s change to `src/inquiry.rs` together with this document and `REPORT.md`, so its `src/` and `tests/` trees are those of `acf7a2d65`, `ab0e513a…17dd` and `c50b5978…52dd`. The commands ran from `rust/ifcap-po-inquiry/` with `RUSTUP_AUTO_INSTALL=0` set, except `git rev-parse HEAD`, the tree IDs, the A7 commands, the commit-order check and the `--stat`, which ran from the repository root. The checkout path is shown as `<crate>`. `cargo clean` ran first, so the build, the tests, clippy and the documentation were compiled from the committed sources in this run. This record replaces the one committed in `a774d2770`, which named as its observed commit a work-branch commit that is not on the destination branch. That record had replaced the one first taken at commit `5534d6cd2`, with 189 passed and 0 failed, before `a774d2770` added the review and QA fixes to `src/inquiry.rs`, `src/mumps.rs` and `tests/bridge.rs`.
+These commands ran on 2026-11-17, from 19:40:07Z to 19:42:54Z, on the Linux build host at commit `7c79593579ddf421edadc798575611669d74c1f6`, the observed commit, with no uncommitted change. It is on the destination branch, `origin/blitzy-cba44d3a-fb41-4a16-9c11-e135b780df6e` (the `git branch -r --contains` output below). Its `src/` tree is `ab0e513abe212e15008b7768e86e45d0d87917dd` and its `tests/` tree `c50b59787bf846560e7d5109a39c553f4b7152dd`, which `git rev-parse <commit>:rust/ifcap-po-inquiry/src` and `git rev-parse <commit>:rust/ifcap-po-inquiry/tests` check on any commit. It holds every round-two change to `src/`, `tests/`, the golden README, `RUNNING.md` and `runPlaybook.md`; its own change to `src/` is the comment of the test `no_match_guard_holds_for_case_values_over_repository_fixtures` in `src/inquiry.rs`. Its parent, `a774d277019f844167af1d813552e8226b0a106e`, also on the destination branch, differs from it in `src/` and `tests/` only in that comment: `git diff --stat a774d2770 7c7959357 -- rust/ifcap-po-inquiry/src rust/ifcap-po-inquiry/tests`, from the repository root, prints `rust/ifcap-po-inquiry/src/inquiry.rs | 6 ++++--` and `1 file changed, 4 insertions(+), 2 deletions(-)`; its `src/` tree is `28dbb56524f28c8e4973d0a9067477c4f6d824a8` and its `tests/` tree the same `c50b5978…52dd`. The same commands, run at `a774d2770` with no uncommitted change from 18:31:23Z to 18:31:54Z, `cargo clean` first, gave the same results: `cargo test --offline --locked` exit status 0 with 191 passed and 0 failed; `Verdict: PASS` for all five cases; `GC-01 MATCH` to `GC-05 MATCH` and `GC-01 PASS` to `GC-05 PASS`; build, clippy, format and documentation exit status 0 with no warning; audit and A7 outputs identical to this record's, and the same 41 capture-listing lines; and the sha256 of `REPORT.md`, `48b7fb1b30a473df4bbfcaddfb3cd71f3def059122c568de6222fbf5807ae984`, unchanged by the test runs. The commit that delivers this record follows `7c7959357` and changes only this document and `REPORT.md`, so its `src/` and `tests/` trees are those of `7c7959357`, `ab0e513a…17dd` and `c50b5978…52dd`, and on it `git diff --quiet 7c7959357 HEAD -- src tests`, run from `rust/ifcap-po-inquiry/`, exits 0. The commands ran from `rust/ifcap-po-inquiry/` with `RUSTUP_AUTO_INSTALL=0` set, except `git rev-parse HEAD`, the tree IDs, the `git branch` check, the A7 commands, the commit-order check and the `--stat`, which ran from the repository root. The checkout path is shown as `<crate>`. `cargo clean` ran first, so the build, the tests, clippy and the documentation were compiled from the committed sources in this run. This record replaces the one committed in `7c7959357`, which named as its observed commit a work-branch commit that delivery did not carry. That record had replaced the one committed in `a774d2770`, which also named a work-branch commit that is not on the destination branch, and that one had replaced the one first taken at commit `5534d6cd2`, with 189 passed and 0 failed, before `a774d2770` added the review and QA fixes to `src/inquiry.rs`, `src/mumps.rs` and `tests/bridge.rs`.
 
-**Observed commit.** At 2026-11-17T18:40:12Z: `git rev-parse HEAD`, exit status 0; then `git status --porcelain -- rust/ifcap-po-inquiry/src rust/ifcap-po-inquiry/tests` and `git status --porcelain`, each exit status 0 with no output; then the two tree IDs, exit status 0:
+**Observed commit.** At 2026-11-17T19:40:07Z: `git rev-parse HEAD`, exit status 0; then `git status --porcelain -- rust/ifcap-po-inquiry/src rust/ifcap-po-inquiry/tests` and `git status --porcelain`, each exit status 0 with no output; then the two tree IDs and the remote branches that contain the commit, each exit status 0:
 
 ```text
 $ git rev-parse HEAD
-acf7a2d6591b04d53bbfcb9e3b5a0aec59d0e682
+7c79593579ddf421edadc798575611669d74c1f6
 $ echo src $(git rev-parse HEAD:rust/ifcap-po-inquiry/src); echo tests $(git rev-parse HEAD:rust/ifcap-po-inquiry/tests)
 src ab0e513abe212e15008b7768e86e45d0d87917dd
 tests c50b59787bf846560e7d5109a39c553f4b7152dd
+$ git branch -r --contains 7c7959357
+  origin/HEAD -> origin/blitzy-cba44d3a-fb41-4a16-9c11-e135b780df6e
+  origin/blitzy-cba44d3a-fb41-4a16-9c11-e135b780df6e
 ```
 
-**Build, lint, format and documentation.** `cargo clean` ran at 18:40:12Z, exit status 0, printing `Removed 1887 files, 373.5MiB total`. The build ran at 18:40:12Z, and the other three ran in sequence from 18:40:45Z to 18:40:48Z. Each exited 0 with no warning. Output complete:
+**Build, lint, format and documentation.** `cargo clean` ran at 19:40:14Z, exit status 0, printing `Removed 2008 files, 388.4MiB total`. The build ran at 19:40:14Z, and the other three ran in sequence from 19:40:16Z to 19:40:19Z, before the tests. Each exited 0 with no warning. Output complete:
 
 | Command | Exit status | Output |
 |---|---|---|
-| `cargo build --offline --locked` | 0 | `Compiling ifcap-po-inquiry v0.1.0 (<crate>)`, then ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.02s`` |
-| `cargo clippy --offline --locked --all-targets` | 0 | `Checking ifcap-po-inquiry v0.1.0 (<crate>)`, then ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.98s`` |
+| `cargo build --offline --locked` | 0 | `Compiling ifcap-po-inquiry v0.1.0 (<crate>)`, then ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.86s`` |
+| `cargo clippy --offline --locked --all-targets` | 0 | `Checking ifcap-po-inquiry v0.1.0 (<crate>)`, then ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.84s`` |
 | `cargo fmt --check` | 0 | none |
-| `RUSTDOCFLAGS='-D warnings' cargo doc --offline --locked --no-deps --document-private-items` | 0 | `Documenting ifcap-po-inquiry v0.1.0 (<crate>)`, `Checking ifcap-po-inquiry v0.1.0 (<crate>)`, ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.66s``, `Generated <crate>/target/doc/ifcap_po_inquiry/index.html and 1 other file` |
+| `RUSTDOCFLAGS='-D warnings' cargo doc --offline --locked --no-deps --document-private-items` | 0 | `Documenting ifcap-po-inquiry v0.1.0 (<crate>)`, `Checking ifcap-po-inquiry v0.1.0 (<crate>)`, ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.96s``, `Generated <crate>/target/doc/ifcap_po_inquiry/index.html and 1 other file` |
 
-**Tests.** `cargo test --offline --locked`, started 2026-11-17T18:40:14Z, at a 1-minute load average of 19.31 from other work on the host (4 CPUs), and finished 18:40:40Z, exit status 0. Output trimmed: the 191 lines `test <name> ... ok` are omitted; every other line, standard error included, is shown:
+**Tests.** `cargo test --offline --locked`, started 2026-11-17T19:40:25Z, at a 1-minute load average of 25.19 from other work on the host (4 CPUs), and finished 19:40:53Z, exit status 0. Output trimmed: the 191 lines `test <name> ... ok` are omitted; every other line, standard error included, is shown:
 
 ```text
    Compiling ifcap-po-inquiry v0.1.0 (<crate>)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.48s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.90s
      Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
 
 running 169 tests
 
-test result: ok. 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.59s
+test result: ok. 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.25s
 
      Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
 
@@ -921,24 +924,24 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 running 20 tests
 
-test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.18s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.93s
 
      Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
 
 running 2 tests
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.41s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.39s
 
    Doc-tests ifcap_po_inquiry
 
 running 0 tests
 
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
 Total over the five test targets: 191 passed (unit tests of `src/lib.rs` 169, `src/bin/bridge.rs` 0, `tests/bridge.rs` 20, `tests/equivalence.rs` 2, doc-tests 0), 0 failed, 0 ignored. That is the baseline's 185 plus six round-two tests: `mumps::tests::output_limit_refuses_the_write_that_would_pass_it`, `mumps::tests::output_limit_counts_every_byte_of_tab_and_form_feed`, `inquiry::tests::output_limit_ends_session_at_last_prompt`, `inquiry::tests::repeated_found_order_ends_at_the_output_limit`, `inquiry::tests::refused_write_ends_session_before_a_later_halt` and `rust_session_stops_at_the_output_limit` in `tests/bridge.rs`, each `... ok` in this run.
 
-`grep -n 'Verdict' REPORT.md`, 2026-11-17T18:40:40Z, on the `REPORT.md` that command wrote, exit status 0. Output trimmed: the five prose lines that name the verdict, 848, 878, 937 and 1099 in part 1 and 1435 in the copied "Acceptance record", are omitted; every line that reads `- Verdict:` is shown:
+`grep -n 'Verdict' REPORT.md`, 2026-11-17T19:40:59Z, on the `REPORT.md` that command wrote, exit status 0. Output trimmed: the six prose lines that name the verdict, 848, 878, 882, 941 and 1115 in part 1 and 1451 in the copied "Acceptance record", are omitted; every line that reads `- Verdict:` is shown:
 
 ```text
 851:739:- Verdict: PASS
@@ -946,31 +949,41 @@ Total over the five test targets: 191 passed (unit tests of `src/lib.rs` 169, `s
 853:753:- Verdict: PASS
 854:760:- Verdict: PASS
 855:767:- Verdict: PASS
-940:851:739:- Verdict: PASS
-941:852:746:- Verdict: PASS
-942:853:753:- Verdict: PASS
-943:854:760:- Verdict: PASS
-944:855:767:- Verdict: PASS
-945:940:891:- Verdict: PASS
-946:941:898:- Verdict: PASS
-947:942:905:- Verdict: PASS
-948:943:912:- Verdict: PASS
-949:944:919:- Verdict: PASS
-950:1099:- Verdict: PASS
-951:1106:- Verdict: PASS
-952:1113:- Verdict: PASS
-953:1120:- Verdict: PASS
-954:1127:- Verdict: PASS
-1112:- Verdict: PASS
-1119:- Verdict: PASS
-1126:- Verdict: PASS
-1133:- Verdict: PASS
-1140:- Verdict: PASS
+944:851:739:- Verdict: PASS
+945:852:746:- Verdict: PASS
+946:853:753:- Verdict: PASS
+947:854:760:- Verdict: PASS
+948:855:767:- Verdict: PASS
+949:940:851:739:- Verdict: PASS
+950:941:852:746:- Verdict: PASS
+951:942:853:753:- Verdict: PASS
+952:943:854:760:- Verdict: PASS
+953:944:855:767:- Verdict: PASS
+954:945:940:891:- Verdict: PASS
+955:946:941:898:- Verdict: PASS
+956:947:942:905:- Verdict: PASS
+957:948:943:912:- Verdict: PASS
+958:949:944:919:- Verdict: PASS
+959:950:1099:- Verdict: PASS
+960:951:1106:- Verdict: PASS
+961:952:1113:- Verdict: PASS
+962:953:1120:- Verdict: PASS
+963:954:1127:- Verdict: PASS
+964:1112:- Verdict: PASS
+965:1119:- Verdict: PASS
+966:1126:- Verdict: PASS
+967:1133:- Verdict: PASS
+968:1140:- Verdict: PASS
+1128:- Verdict: PASS
+1135:- Verdict: PASS
+1142:- Verdict: PASS
+1149:- Verdict: PASS
+1156:- Verdict: PASS
 ```
 
-The first twenty lines are in part 1, which copies section "Run evidence": they quote the `grep` outputs of round two's baseline and of this subsection's earlier record. The last five are the part 2 blocks of `GC-01`, `GC-02`, `GC-03`, `GC-04` and `GC-05`, in that order, headed at lines 1110, 1117, 1124, 1131 and 1138 under `## Part 2: Case results` at line 1108. Part 1 reads `SPEC.md sections found: PASS — 10 of 10`, and part 3 gives all five READY. The line numbers belong to the file that run wrote, from this document before this record replaced the earlier one; the committed `REPORT.md` carries this record in part 1, so its line numbers differ.
+The first thirty lines are in part 1, which copies section "Run evidence": they quote the `grep` outputs of round two's baseline and of this subsection's earlier record, which itself quoted the baseline's and those of the records before it. The last five are the part 2 blocks of `GC-01`, `GC-02`, `GC-03`, `GC-04` and `GC-05`, in that order, headed at lines 1126, 1133, 1140, 1147 and 1154 under `## Part 2: Case results` at line 1124. Part 1 reads `SPEC.md sections found: PASS — 10 of 10`, and part 3 gives all five READY. The line numbers belong to the file that run wrote, which is byte-identical to the `REPORT.md` committed in `7c7959357` and carries this subsection's earlier record; the committed `REPORT.md` carries this record in part 1, so its line numbers differ.
 
-`cargo test --offline --locked --test bridge end_to_end_real_captures -- --nocapture`, 2026-11-17T18:40:40Z, exit status 0. Output complete. The test prints `GC-0N MATCH` only after its assertion that COMPARE answered `match` true for that READY case:
+`cargo test --offline --locked --test bridge end_to_end_real_captures -- --nocapture`, 2026-11-17T19:41:14Z, exit status 0. Output complete. The test prints `GC-0N MATCH` only after its assertion that COMPARE answered `match` true for that READY case:
 
 ```text
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
@@ -984,10 +997,10 @@ GC-04 MATCH
 GC-05 MATCH
 test end_to_end_real_captures ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 2.16s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 2.04s
 ```
 
-`cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, 2026-11-17T18:40:42Z, exit status 0. Output complete:
+`cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, 2026-11-17T19:41:16Z, exit status 0. Output complete:
 
 ```text
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
@@ -1002,10 +1015,10 @@ GC-05 PASS
 ok
 test spec_has_report_sections ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
 ```
 
-**Audits**, run 2026-11-17T18:40:48Z to 18:40:49Z, each exit status as shown. S6 to S9 gave the outputs recorded in section "Read-only enforcement results" (`diff` of the S6, S7 and S8 outputs against the listings there, each exit status 0):
+**Audits**, run 2026-11-17T19:41:32Z, each exit status as shown. S6 to S9 gave the outputs recorded in section "Read-only enforcement results" (`diff` of the S6, S7 and S8 outputs against the listings there, each exit status 0):
 
 ```text
 $ grep -rnE 'unsafe|\.unwrap\(|\.expect\(|panic!' src/          # S1, exit 0
@@ -1023,18 +1036,18 @@ $ grep -rn '&mut Store' src/                                    # S5, exit 1, no
 $ grep -n '&mut self' src/store.rs                              # S5, exit 1, no output
 ```
 
-S1 has exactly one hit, the allowlisted crate attribute. The one S2 hit, reviewed, is the comment quoting the M code `DIC(0)["E"` [DIC.m:63], not Rust indexing; it was at line 786 at commit `64482eef8` and at line 827 at commit `5534d6cd2`, and moved with the lines the O-11 change and the review fixes of `a774d2770` added above it; `acf7a2d65` did not move it. S3 and S5 print nothing. All 82 S4 hits are in `src/golden.rs`.
+S1 has exactly one hit, the allowlisted crate attribute. The one S2 hit, reviewed, is the comment quoting the M code `DIC(0)["E"` [DIC.m:63], not Rust indexing; it was at line 786 at commit `64482eef8` and at line 827 at commit `5534d6cd2`, and moved with the lines the O-11 change and the review fixes of `a774d2770` added above it; `7c7959357` did not move it. S3 and S5 print nothing. All 82 S4 hits are in `src/golden.rs`.
 
-**A7, source unchanged.** Both commands ran from the repository root at 2026-11-17T18:40:49Z, at `HEAD` `acf7a2d6591b04d53bbfcb9e3b5a0aec59d0e682` with no uncommitted change; each exit status 0, and neither printed anything. The same measurement is the two "After round two's last edit" rows of section "Source-unchanged verification":
+**A7, source unchanged.** Both commands ran from the repository root at 2026-11-17T19:41:42Z, at `HEAD` `7c79593579ddf421edadc798575611669d74c1f6` with no uncommitted change; each exit status 0, and neither printed anything. The same measurement is the two "After round two's last edit" rows of section "Source-unchanged verification":
 
 ```text
 $ git diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION     # exit 0, no output
 $ git status --porcelain -- . ':!rust/ifcap-po-inquiry'                                    # exit 0, no output
 ```
 
-**Capture and fixture hashes.** The `200.zwr` hash and the capture listing, taken at 2026-11-17T18:42:02Z, are the "After (round two)" row of section "Capture hashes", with the listing verbatim there. It is identical to round two's before listing (`diff` exit status 0), and all 18 stated hashes hold: `200.zwr` `836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da`, `cases.zwr` `9dd56f96bf29c5bb8e0e373cbaf2fb3f912daab4b41bf65fec1df76485da32a0`, the ten `db-before.zwr` and `db-after.zwr` `c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476`, the five transcripts and `state/state.zwr`.
+**Capture and fixture hashes.** The `200.zwr` hash and the capture listing, taken at 2026-11-17T19:41:42Z, are the "After (round two)" row of section "Capture hashes", with the listing verbatim there. It is identical to round two's before listing (`diff` exit status 0), and all 18 stated hashes hold: `200.zwr` `836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da`, `cases.zwr` `9dd56f96bf29c5bb8e0e373cbaf2fb3f912daab4b41bf65fec1df76485da32a0`, the ten `db-before.zwr` and `db-after.zwr` `c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476`, the five transcripts and `state/state.zwr`.
 
-**Runtime check.** The bridge ran in this checkout's own network namespace, `pf-18090`, never in the host's, started at 2026-11-17T18:37:00Z, before this run's `cargo clean`, by `netns-port-forward 18090 8080 -- ./target/debug/bridge` after `cargo build --offline --locked` at the same commit `acf7a2d65`. Its standard output:
+**Runtime check.** The bridge ran in this checkout's own network namespace, `pf-18094`, never in the host's, started at 2026-11-17T19:37:33Z, before this run's `cargo clean`, by `netns-port-forward 18094 8080 -- ./target/debug/bridge` after `cargo build --offline --locked` at the same commit `7c7959357`. Its standard output:
 
 ```text
 http://127.0.0.1:8080/
@@ -1042,13 +1055,13 @@ MUMPS MODE: REPLAY
 RECORDED 5 OF 5 READY 5 OF 5
 ```
 
-`curl -s http://127.0.0.1:18090/api/status`, 2026-11-17T18:42:42Z, exit status 0:
+`curl -s http://127.0.0.1:18094/api/status`, 2026-11-17T19:42:10Z, exit status 0:
 
 ```text
 {"mumps_mode":"replay","recorded":["GC-01","GC-02","GC-03","GC-04","GC-05"],"ready":["GC-01","GC-02","GC-03","GC-04","GC-05"],"incomplete":{}}
 ```
 
-`POST /api/compare/session` to `http://127.0.0.1:18090/`, 2026-11-17T18:42:42Z, with each case's `input.txt` sequence, `Content-Type: application/json` and `Origin: http://127.0.0.1:18090`. The byte counts are the lengths of the two transcripts in the answer, read with `jq -j`, and each transcript was compared with the case's `transcript.txt` by `cmp`:
+`POST /api/compare/session` to `http://127.0.0.1:18094/`, 2026-11-17T19:42:10Z, with each case's `input.txt` sequence, `Content-Type: application/json` and `Origin: http://127.0.0.1:18094`. The byte counts are the lengths of the two transcripts in the answer, read with `jq -j`, and each transcript was compared with the case's `transcript.txt` by `cmp`:
 
 | Case | Inputs | HTTP | `match` | MUMPS bytes | RUST bytes | Both equal to `transcript.txt` |
 |---|---|---|---|---|---|---|
@@ -1058,9 +1071,9 @@ RECORDED 5 OF 5 READY 5 OF 5
 | GC-04 | `""`, `INVALID!`, `^` | 200 | true | 101 | 101 | yes |
 | GC-05 | `""`, `GC5005`, `""`, `""`, `^` | 200 | true | 1745 | 1745 | yes |
 
-At 2026-11-17T18:42:43Z, `POST /api/rust/session` with `{"inputs":[""]}` answered 200 with an 80-byte transcript ending `P.O./REQ.NO.: `, the order prompt over `cases.zwr`, and `POST /api/mumps/session` with the same body answered 502 `{"error":"NOT RECORDED"}`. Then, at a 1-minute load average of 17.00, `POST /api/rust/session` with a 900,004-byte body, `""`, then 59,999 × `"GC1001","",""`, then `"^"`, answered 200 in 1.253 s with a 1,048,026-byte transcript, within `SESSION_OUTPUT_LIMIT` (1,048,576), ending `P.O./REQ.NO.: ` with no `\n`, and `returned` null. At 18:42:44Z a second instance, `timeout 10 nsenter --net=/run/netns/pf-18090 ./target/debug/bridge`, run from `rust/ifcap-po-inquiry/`, exited 1 with `bridge: port 8080 on 127.0.0.1 is already in use`, and `GET /api/status` still answered 200 afterwards.
+At 2026-11-17T19:42:10Z, `POST /api/rust/session` with `{"inputs":[""]}` answered 200 with an 80-byte transcript ending `P.O./REQ.NO.: `, the order prompt over `cases.zwr`, and `POST /api/mumps/session` with the same body answered 502 `{"error":"NOT RECORDED"}`. Then, at 19:42:19Z and a 1-minute load average of 25.89, `POST /api/rust/session` with a 900,004-byte body, `""`, then 59,999 × `"GC1001","",""`, then `"^"`, answered 200 in 1.268 s with a 1,048,026-byte transcript, within `SESSION_OUTPUT_LIMIT` (1,048,576), ending `P.O./REQ.NO.: ` with no `\n`, and `returned` null. At 19:42:25Z a second instance, `timeout 10 nsenter --net=/run/netns/pf-18094 ./target/debug/bridge`, run from `rust/ifcap-po-inquiry/`, exited 1 with `bridge: port 8080 on 127.0.0.1 is already in use`, and `GET /api/status` still answered 200 afterwards.
 
-**Fence verification**, run at 2026-11-17T18:41:30Z at `HEAD` `acf7a2d6591b04d53bbfcb9e3b5a0aec59d0e682`, with no uncommitted change, against round two's base commit `64482eef86c9d7bfbc3e141576f054bd944dee3b`. From `rust/ifcap-po-inquiry/`, each exit status 0 unless shown:
+**Fence verification**, run at 2026-11-17T19:42:38Z at `HEAD` `7c79593579ddf421edadc798575611669d74c1f6`, with no uncommitted change, against round two's base commit `64482eef86c9d7bfbc3e141576f054bd944dee3b`. From `rust/ifcap-po-inquiry/`, each exit status 0 unless shown:
 
 ```text
 $ git diff --name-status 64482eef86c9d7bfbc3e141576f054bd944dee3b -- .
@@ -1090,12 +1103,12 @@ $ grep -E '^\| PO-[0-9]+\.b' SPEC.md | grep -c '| not exercised, not implemented
 61
 ```
 
-- Every changed path is in round two's file list; `REPORT.md`, also in it, changes only through `cargo test`. The one listed is the file a `cargo test` wrote, committed in `a774d2770`; the committed `REPORT.md` is now the one the last `cargo test` wrote after this document's final edit, committed with this record in the commit that delivers it. `src/bridge.rs` (its test module included), `src/lib.rs`, `src/golden.rs`, `src/store.rs`, `src/bin/bridge.rs`, `tests/equivalence.rs`, `frontend/`, `testingMethods.md`, `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` are byte-identical to the base, and so are the fixtures and the capture folders. From the repository root, `git diff --quiet 64482eef8 -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION` exits 0 and `git diff --name-only 64482eef8 -- . ':!rust/ifcap-po-inquiry'` prints nothing.
+- Every changed path is in round two's file list; `REPORT.md`, also in it, changes only through `cargo test`. The one listed is the file a `cargo test` wrote, committed in `7c7959357`; the committed `REPORT.md` is now the one the last `cargo test` wrote after this document's final edit, committed with this record in the commit that delivers it. `src/bridge.rs` (its test module included), `src/lib.rs`, `src/golden.rs`, `src/store.rs`, `src/bin/bridge.rs`, `tests/equivalence.rs`, `frontend/`, `testingMethods.md`, `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` are byte-identical to the base, and so are the fixtures and the capture folders. From the repository root, `git diff --quiet 64482eef8 -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION` exits 0 and `git diff --name-only 64482eef8 -- . ':!rust/ifcap-po-inquiry'` prints nothing.
 - `Session::into_transcript_at_prompt` is unchanged: its body and doc comment, with 12 lines before and 10 after, extracted from `src/mumps.rs` at the base (line 713) and now (line 776), compare equal (`diff` exit status 0).
 - The golden README diff removes no line and adds two, one paragraph and its blank line, at the end of Part B step 6, before `### Step 7. Checks`. The paragraph gives the command `grep -F '^VA(200,.5,0)=' tests/golden/ifcap/GC-01/db-before.zwr`.
 - The O-07, O-10 and K14 rows are unchanged. The branch inventory has 108 rows, with coverage 47/0/61, and every heading `tests/equivalence.rs` needs is present once: "Run evidence", "Scope statement" and the nine static sections, "Acceptance record" and "Open items" among them.
 - `Halt` has four variants, `InputExhausted`, `OutputLimit`, `Unexercised(&'static str)` and `Corrupt(String)`, and no derive or visibility line of it changed. `rust-toolchain.toml` pins `1.99.1`, `Cargo.toml` gives edition `2024` and an empty `[dependencies]`, and `src/lib.rs:9` is `#![forbid(unsafe_code)]`.
-- `git log --reverse --format='%h %s' 64482eef8..acf7a2d65`, run from the repository root at `acf7a2d65`, where `64482eef8..HEAD` gives the same output, exit status 0, gives the order of work: the baseline, then the documents and O-09, then O-11, then the first completion record, the run-guide fixes, the review and QA fixes, and the fixture-wording fix:
+- `git log --reverse --format='%h %s' 64482eef8..HEAD`, run from the repository root at `7c7959357`, exit status 0, gives the order of work: the baseline, then the documents and O-09, then O-11, then the first completion record, the run-guide fixes, the review and QA fixes, and the fixture-wording fix with the record this one replaces:
 
 ```text
 109a4af2c ifcap-po-inquiry: record the round-two baseline, A7 before-check and the 200.zwr hash
@@ -1105,14 +1118,14 @@ f2cc2811d ifcap-po-inquiry: close O-09, list 200.zwr, reconcile SPEC.md present 
 d09596d44 ifcap-po-inquiry: round-two completion evidence and acceptance record
 ffe6f90cd ifcap-po-inquiry: correct the run guides' status, idle-screen and test outcomes
 a774d2770 ifcap-po-inquiry: refused write ends the session at the output limit; O-11 tests run without cases.zwr; bridge test harness waits for serve
-acf7a2d65 ifcap-po-inquiry: name 200.zwr in the SPEC fixture-set sentences; correct the repository-fixtures guard test comment
+7c7959357 ifcap-po-inquiry: name 200.zwr in the fixture-set sentences; anchor the round-two completion evidence on reachable commits
 ```
 
-On the destination branch, `git log --reverse --format='%h %s' 64482eef8..HEAD` gives the same first seven lines, and its eighth is the commit that delivers this record, which carries `acf7a2d65`'s change.
+On the destination branch the same command lists the commit that delivers this record after these eight lines; that commit changes only this document and `REPORT.md`.
 
-**Document limits.** At 18:40:49Z, `wc -l -w testingMethods.md` gives `52  600 testingMethods.md`, and `wc -l runPlaybook.md` gives `116 runPlaybook.md`, each exit status 0 (at most 60 lines and 600 words, and at most 150 lines).
+**Document limits.** At 19:42:54Z, `wc -l -w testingMethods.md` gives `52  600 testingMethods.md`, and `wc -l runPlaybook.md` gives `116 runPlaybook.md`, each exit status 0 (at most 60 lines and 600 words, and at most 150 lines).
 
-**Result.** Every completion condition of round two holds on the Linux build host at commit `acf7a2d65`, whose `src/` and `tests/` trees are `ab0e513a…17dd` and `c50b5978…52dd`, and at its parent `a774d2770` on the destination branch: `cargo test --offline --locked` exits 0 with 191 passed and 0 failed; `REPORT.md` part 2 reads `Verdict: PASS` for all five cases; `end_to_end_real_captures` gets `match` true for each READY case; build, clippy, format and documentation exit 0 with no warning; S1 has one hit, S3 and S5 none, and S4 hits only `src/golden.rs`; A7 holds; every stated hash holds. This round records no acceptance (section "Acceptance record"). These runs left `REPORT.md` unchanged, sha256 `48b7fb1b…e984` before and after, and it was restored with `git checkout -- REPORT.md`. The committed `REPORT.md` is the one `cargo test --offline --locked` wrote after this document's final edit; a second run left its sha256 unchanged, which shows it current.
+**Result.** Every completion condition of round two holds on the Linux build host at commit `7c7959357`, on the destination branch, whose `src/` and `tests/` trees are `ab0e513a…17dd` and `c50b5978…52dd`, and at its parent `a774d2770`: `cargo test --offline --locked` exits 0 with 191 passed and 0 failed; `REPORT.md` part 2 reads `Verdict: PASS` for all five cases; `end_to_end_real_captures` gets `match` true for each READY case; build, clippy, format and documentation exit 0 with no warning; S1 has one hit, S3 and S5 none, and S4 hits only `src/golden.rs`; A7 holds; every stated hash holds. This round records no acceptance (section "Acceptance record"). These runs left `REPORT.md` unchanged, sha256 `917e70c7…ab66` before and after, and `git status --porcelain` printed nothing after them, so no restore was needed. The committed `REPORT.md` is the one `cargo test --offline --locked` wrote after this document's final edit; a second run left its sha256 unchanged, which shows it current.
 
 ### Harness checks in this run
 
@@ -1450,9 +1463,9 @@ Not accepted.
 
 Observed result, on the Linux build host: `cargo test --offline --locked` exits 0, with 191 passed and 0 failed; `REPORT.md` part 2 reads `Verdict: PASS` for all five cases, `GC-01` to `GC-05`; the bridge reports `RECORDED 5 OF 5 READY 5 OF 5`; and `end_to_end_real_captures` gets `match` true for each READY case (section "Run evidence", "Round two: completion evidence").
 
-Observed on commit: `acf7a2d6591b04d53bbfcb9e3b5a0aec59d0e682`.
+Observed on commit: `7c79593579ddf421edadc798575611669d74c1f6`.
 
-Its `src/` and `tests/` trees are `ab0e513abe212e15008b7768e86e45d0d87917dd` and `c50b59787bf846560e7d5109a39c553f4b7152dd`, and its parent `a774d2770`, on the destination branch, gave the same result.
+It is on the destination branch. Its `src/` and `tests/` trees are `ab0e513abe212e15008b7768e86e45d0d87917dd` and `c50b59787bf846560e7d5109a39c553f4b7152dd`, and its parent `a774d2770`, also on the destination branch, gave the same result.
 
 - Date:
 - image_digest:
