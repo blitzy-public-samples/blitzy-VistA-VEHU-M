@@ -60,18 +60,26 @@ pub struct InquiryOutput {
 }
 
 /// Why a session of `EN3^PRCHRPT` [PRCHRPT.m:70-75] could not be
-/// reproduced: the original stops with an M `UNDEF` error in its order
-/// lookup, the `IX^DIC` of `EN3^PRCHPAT` [PRCHPAT.m:78-83], which
-/// `EN30 D PO` [PRCHRPT.m:72] reaches through `D EN3^PRCHPAT`
-/// [PRCHRPT.m:13].
+/// reproduced: on an implemented path the original stops with an M `UNDEF`
+/// error, either in its order lookup, the `IX^DIC` of `EN3^PRCHPAT`
+/// [PRCHPAT.m:78-83], which `EN30 D PO` [PRCHRPT.m:72] reaches through
+/// `D EN3^PRCHPAT` [PRCHRPT.m:13], or, once `D ^%ZIS` has opened the HOME
+/// device (PO-12.b1) [PRCHDP1.m:12], in the display that
+/// `S D0=PRCHPO D ^PRCHDP1` [PRCHRPT.m:74] runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InquiryError {
-    /// A read of a node holding no value on an exercised path, where the
-    /// original raises an M `UNDEF` error: a node holding only descendants
-    /// that passed a bare `$D` test, at sites (a) to (f) of `SPEC.md`
-    /// "Contracts", for example the candidate order's zero node, read for
-    /// piece 1, file 442 field .01 PURCHASE ORDER NUMBER at `0;1`
-    /// [DD.zwr:514312], by `S DIY=$P(^(0),U)` in `S^DIC3` [DIC3.m:110].
+    /// A required value read from a node holding no value on an implemented
+    /// path, where the original raises an M `UNDEF` error: an unguarded
+    /// read, or a read after a bare `$D` test, which a node holding only
+    /// descendants passes. The sites are those `SPEC.md` "Contracts",
+    /// "`CorruptStore` sites" lists. In the order lookup they are sites (a)
+    /// to (f), for example the candidate order's zero node, read for piece
+    /// 1, file 442 field .01 PURCHASE ORDER NUMBER at `0;1` [DD.zwr:514312],
+    /// by `S DIY=$P(^(0),U)` in `S^DIC3` [DIC3.m:110]. In the display, after
+    /// `^%ZIS`, they include the zero node `^PRC(442,D0,2,n,0)` of an entry
+    /// of file 442 field 40 ITEM, subfile 442.01 at `2;0` [DD.zwr:514888],
+    /// whose piece 1 is field .01 LINE ITEM NUMBER [DD.zwr:515986], read
+    /// unguarded by `S PRCHDI0=^(PRCHDI,0)` in `^PRCHDP2` [PRCHDP2.m:11].
     /// Carries the node's global reference as [`Store::format_ref`] writes
     /// it, such as `^PRC(442,1,0)`.
     CorruptStore(String),
@@ -133,8 +141,8 @@ pub const STUB_CONTEXT: [(&str, Option<&str>); 4] = [
 /// that is not implemented, ends the session after the last prompt written,
 /// as `Ok`, with nothing invented after it and no `\n` added. Lines left
 /// over when `EN3` returns are ignored. `Err` is only
-/// [`InquiryError::CorruptStore`], at the unguarded reads of a node holding
-/// no value where M raises `UNDEF`. `store` is never written.
+/// [`InquiryError::CorruptStore`], where M raises `UNDEF` reading a node
+/// with no value, unguarded or after a bare `$D`. `store` is never written.
 pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, InquiryError> {
     run(store, inputs).0
 }
@@ -2763,8 +2771,10 @@ mod tests {
         ended(transcript, Some(id))
     }
 
-    /// The order prompt, the no-match sequence `times` times, then the exit
-    /// at the last re-asked prompt (GC-03 and GC-04).
+    /// The transcript prefix through the last re-asked order prompt: the
+    /// order prompt, then the no-match sequence `times` times (GC-03 and
+    /// GC-04). It holds no normal-completion `\n`; a caller whose session
+    /// `EN3` completes appends it, through `exited` or explicitly.
     fn no_match_transcript(times: usize) -> String {
         format!("{ORDER_PROMPT_BYTES}{}", NO_MATCH_BYTES.repeat(times))
     }
@@ -3514,23 +3524,35 @@ mod tests {
         }
         // Directly: `$Y` 5, 8 and 11 at the three items' tests, and the
         // boundary, where `$Y` 55 gives 60, not above `IOSL`, and 56 gives 61.
+        // Each position is taken at column 0 and at column 74, where the item
+        // line ends when its `D ASK` runs [PRCHDP2.m:53, 60]: the test writes
+        // nothing and moves neither `$X` nor `$Y`, so the `W:$X>1 !` after it
+        // [PRCHDP2.m:61] still ends that line.
         let store = order_store("")?;
         let mut v = order_locals(&store);
         let no_input: Vec<String> = Vec::new();
-        for (lines, expected) in [
-            (5, Ok(())),
-            (8, Ok(())),
-            (11, Ok(())),
-            (55, Ok(())),
-            (56, Err(Halt::Unexercised("PO-30.b2"))),
-        ] {
-            let mut s = Session::new(&no_input);
-            for _ in 0..lines {
-                s.nl();
+        for column in [0, 74] {
+            for (lines, expected) in [
+                (5, Ok(())),
+                (8, Ok(())),
+                (11, Ok(())),
+                (55, Ok(())),
+                (56, Err(Halt::Unexercised("PO-30.b2"))),
+            ] {
+                let mut s = Session::new(&no_input);
+                for _ in 0..lines {
+                    s.nl();
+                }
+                if column > 0 {
+                    s.tab(column);
+                }
+                let before = s.transcript().to_string();
+                let result = ask_prchdp2(&mut s, &store, &mut v);
+                assert_eq!(result, expected, "$Y {lines}, column {column}");
+                assert_eq!(s.transcript(), before, "$Y {lines}, column {column}");
+                assert_eq!(s.x(), column, "$Y {lines}, column {column}");
+                assert_eq!(s.y(), lines, "$Y {lines}, column {column}");
             }
-            let before = s.transcript().to_string();
-            assert_eq!(ask_prchdp2(&mut s, &store, &mut v), expected, "$Y {lines}");
-            assert_eq!(s.transcript(), before, "$Y {lines}");
         }
         Ok(())
     }
