@@ -31,7 +31,7 @@ cargo run --offline --locked --bin bridge
   - The test also prints one `GC-0N <verdict>` line per case, such as `GC-01 PASS`. Cargo shows test output only for a failing test, so to see the lines on a passing run use `cargo test --offline --locked --test equivalence -- --nocapture`. With the five captures present that command prints `GC-01 PASS` to `GC-05 PASS`; with no capture it prints `GC-01 NOT COMPARED` to `GC-05 NOT COMPARED`.
   - It exits non-zero when any case is FAIL, and `REPORT.md` part 2 names the cause. With no case FAIL, it still exits non-zero when a harness check fails (`REPORT.md` part 1 lists each under "Harness checks in this run" with PASS or FAIL), when `SPEC.md` lacks a section the report includes (`MISSING SECTION <heading> IN SPEC.md`, with no report written), when `REPORT.md` cannot be written (`cannot write REPORT.md: <error>`), or when any other test or the build fails.
   - Exit 0 is never acceptance. Acceptance needs five PASS.
-  - On macOS run `cargo test --offline --locked -- --test-threads=1`, and see `SPEC.md` open item O-12 for the one known failing unit test.
+  - On macOS run `cargo test --offline --locked --no-fail-fast -- --test-threads=1`, which runs every test target even when one fails, and see `SPEC.md` open item O-12 for the one known failing unit test.
 - **`cargo run`** starts the bridge, which serves until it is stopped (Ctrl-C). Once listening, it writes three lines to standard output:
 
   ```text
