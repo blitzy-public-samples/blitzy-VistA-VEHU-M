@@ -1394,8 +1394,10 @@ Criterion A7: every file outside `rust/ifcap-po-inquiry/` stays as it is, and ev
 | After this refine round's second review fixes, same time | `git status --porcelain -- . ':!rust/ifcap-po-inquiry'` | none | 0 |
 | Before round two's first edit, 2026-11-17T10:16:27Z, HEAD 64482eef86c9d7bfbc3e141576f054bd944dee3b | `git diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION` | none | 0 |
 | Before round two's first edit, 2026-11-17T10:16:27Z, HEAD 64482eef86c9d7bfbc3e141576f054bd944dee3b | `git status --porcelain -- . ':!rust/ifcap-po-inquiry'` | none | 0 |
+| After round two's last edit, 2026-11-17T15:38:29Z, HEAD 5534d6cd22ed5587da1885f5ca776de074ed283c | `git diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION` | none | 0 |
+| After round two's last edit, 2026-11-17T15:38:29Z, HEAD 5534d6cd22ed5587da1885f5ca776de074ed283c | `git status --porcelain -- . ':!rust/ifcap-po-inquiry'` | none | 0 |
 
-Result: A7 holds. `HEAD` is the branch tip this document was edited on; its own commit changes only files under `rust/ifcap-po-inquiry/`. Round one's last measurement is also recorded, with the commands' output, in section "Run evidence", "Round one: completion evidence". Before this run the evidence was saved under `test-results/<run-id>/source-unchanged.txt`; that folder is deleted (section "Existing items outside the layout"), and the measurements live here.
+Result: A7 holds. `HEAD` is the branch tip this document was edited on; its own commit changes only files under `rust/ifcap-po-inquiry/`. Round one's last measurement is also recorded, with the commands' output, in section "Run evidence", "Round one: completion evidence", and round two's in "Round two: baseline before the first edit" and "Round two: completion evidence". The round-two after-rows were taken after round two's last edit to any file outside `SPEC.md` and `REPORT.md`; the commit that adds them changes only those two files, both under `rust/ifcap-po-inquiry/`. Before this run the evidence was saved under `test-results/<run-id>/source-unchanged.txt`; that folder is deleted (section "Existing items outside the layout"), and the measurements live here.
 
 ## Front-end checklist
 
@@ -1473,7 +1475,7 @@ Each existing item outside the request's layout is kept only when the layout or 
 
 ## Read-only enforcement results
 
-Criterion A9. Each search ran on 2026-11-17, in this refine round, from `rust/ifcap-po-inquiry/`, with POSIX extended regular expressions, so a bare `|` is alternation, and ran again at 05:38:12Z, after the last change to `src/` and `frontend/` (the second review fixes), with every output and exit status identical to those below, the `#[cfg(test)]` lines included. Every hit is explained.
+Criterion A9. Each search ran on 2026-11-17, in this refine round, from `rust/ifcap-po-inquiry/`, with POSIX extended regular expressions, so a bare `|` is alternation, and ran again at 05:38:12Z, after round one's last change to `src/` and `frontend/` (the second review fixes), with every output and exit status identical to those below, the `#[cfg(test)]` lines included. In round two they ran again at 2026-11-17T15:37:47Z, after round two's last change to `src/` (commit `5534d6cd2`): every output and exit status is again identical to those below, and of the `#[cfg(test)]` lines only those of `src/inquiry.rs` and `src/mumps.rs` moved, with the lines the O-11 output limit added above them (section "Run evidence", "Round two: completion evidence"). Every hit is explained.
 
 | A9 check | How the design satisfies it | Confirming search or test | Result |
 |---|---|---|---|
@@ -1534,7 +1536,7 @@ src/golden.rs:2810:                Made::Bytes(bytes) => fs::write(&path, bytes)
 src/golden.rs:2812:                Made::Directory => fs::create_dir(&path).map_err(|e| e.to_string())?,
 ```
 
-The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2680`, `src/golden.rs:1483`, `src/inquiry.rs:2639`, `src/mumps.rs:114`, `src/mumps.rs:699`, `src/mumps.rs:726`, `src/store.rs:619`.
+The `#[cfg(test)]` lines, from `grep -n '#\[cfg(test)\]' src/*.rs`: `src/bridge.rs:2680`, `src/golden.rs:1483`, `src/inquiry.rs:2680`, `src/mumps.rs:114`, `src/mumps.rs:762`, `src/mumps.rs:789`, `src/store.rs:619`. Before round two's O-11 change they were `src/inquiry.rs:2639`, `src/mumps.rs:699` and `src/mumps.rs:726`, the others as now.
 
 S8, exit status 0:
 
@@ -1573,6 +1575,7 @@ if [ -f tests/fixtures/ifcap/cases.zwr ]; then sha256sum tests/fixtures/ifcap/ca
 | Before (round one, history; commit `0b123807c`) | 2026-11-17T01:16:34Z, before this refine round's first edit | 0, 0 | 39 `find` lines (35 case files of `GC-01` to `GC-05`, 4 files of `state/`) and the `cases.zwr` line `9dd56f96bf29c5bb8e0e373cbaf2fb3f912daab4b41bf65fec1df76485da32a0`, verbatim below |
 | After (round one, history; commit `00981dfbb` and the fixes committed as `4aae4dba6`) | 2026-11-17T05:38:20Z, after this refine round's last edit, both sets of review fixes included, except the later edits of this document and the `REPORT.md` its final run writes; re-taken after the second review fixes, with the same output as when first taken at 2026-11-17T03:59:37Z, after the first | 0, 0 | Identical to the before listing, line for line, verbatim below: `diff` of the two outputs and `diff` of sorted copies each exit status 0. The same 40 lines, with no `CREATED BY RUN` line. Every file of the listing has the same hash, so the equality rule holds |
 | Before (round two) | 2026-11-17T10:17:14Z, before round two's first edit, at `HEAD` `64482eef86c9d7bfbc3e141576f054bd944dee3b` | 0, 0; `sha256sum tests/fixtures/ifcap/200.zwr` 0 | 39 `find` lines (35 case files of `GC-01` to `GC-05`, 4 files of `state/`), the `cases.zwr` line `9dd56f96…32a0` and the `200.zwr` line `836c6a9b…c9da`, verbatim below under "Round two, before the first edit". Sorted, the 40 listing lines equal the before listing taken at 2026-11-17T01:16:34Z line for line |
+| After (round two) | 2026-11-17T15:38:14Z, after round two's last edit to any file other than this document and `REPORT.md`, at `HEAD` `5534d6cd22ed5587da1885f5ca776de074ed283c` | 0, 0; `sha256sum tests/fixtures/ifcap/200.zwr` 0 | The same three commands, output verbatim below under "Round two, after the last edit": identical to round two's before output, line for line (`diff` exit status 0), 41 lines with no `CREATED BY RUN` line. `200.zwr` is `836c6a9b…c9da`, as recorded before the first edit, and every file of the before listing has the same hash, so the equality rule holds |
 
 Round one's before listing, verbatim, in `find`'s order:
 
@@ -1722,7 +1725,55 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/i
 
 Every hash the team stated for round two holds in this listing, each checked by an exact match of its hash and path against one line, 17 of 17: `cases.zwr` `9dd56f96…32a0`; each `db-before.zwr` and `db-after.zwr` of `GC-01` to `GC-05` `c229942c…c476`; the transcripts of `GC-01` `29c7965a…2afb`, `GC-02` `957c66a0…138a`, `GC-03` and `GC-04` `601da39e…c88c` and `GC-05` `46fd6902…6f8f`; and `state/state.zwr` `20ebce84…e7ae`. `tests/fixtures/ifcap/200.zwr` has sha256 `836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da`, the hash it must still have after round two's last edit. `tests/fixtures/ifcap/` holds 13 files: the 11 supporting fixtures, `200.zwr` and `cases.zwr`.
 
-**Equality rule.** Every file present in the baseline listing must have the same hash in the after listing. A `cases.zwr` that a run builds, because it finds READY captures and no `cases.zwr`, is the one permitted addition; it is recorded on its own line as `CREATED BY RUN` and is not part of the equality. An existing `cases.zwr` is never edited: with READY captures, a run checks it before editing code by the preflight of `tests/golden/ifcap/README.md` Part B step 6, which lists every line extracted from the READY captures' `db-before.zwr` that is found neither in `cases.zwr` nor in a supporting fixture; the run records that comparison in section "Run evidence" and opens a section "Open items" entry for each affected case, naming its nodes, with the action "rebuild `cases.zwr` by README step 6". Before this round no capture file and no `cases.zwr` existed, so no file was listed. In this round the rule covers all 40 files of the before listing, the four `state/` files included; `cases.zwr` already exists, so no file is created, and the preflight is in section "Run evidence".
+Round two, after the last edit: the same three commands, run at 2026-11-17T15:38:14Z from `rust/ifcap-po-inquiry/` at `HEAD` `5534d6cd22ed5587da1885f5ca776de074ed283c`, after round two's last edit to any file other than this document and `REPORT.md`, with no uncommitted change; each exit status 0. Output, verbatim, in command order:
+
+```text
+836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da  tests/fixtures/ifcap/200.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-01/db-after.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-01/db-before.zwr
+112aa35c053a710cc49bcff142a9d3d72a72c96d3c207d6ace9f07f9a71e5402  tests/golden/ifcap/GC-01/input.txt
+3a6cef3e8d1ba147e17dec2b329cee83b80c87e59bfac534efa531e83e5517e7  tests/golden/ifcap/GC-01/meta.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-01/normalisation.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-01/returned.txt
+29c7965a1b173dd124d2f163ff5409cd50b12c5c48b05c97aba629e7a95f2afb  tests/golden/ifcap/GC-01/transcript.txt
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-02/db-after.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-02/db-before.zwr
+4b0a1f354b802ef12507d90b389bea6319ba0cd91e4fa406d79dfd10c7660e82  tests/golden/ifcap/GC-02/input.txt
+7fdcbe2d04824a9558991933ae0f42a449f590bf08ec48eb6aaf58ea3118a1e7  tests/golden/ifcap/GC-02/meta.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-02/normalisation.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-02/returned.txt
+957c66a058cc34da2d5ac2baf0c00b308b54c1b37b33b46090b5162e600d138a  tests/golden/ifcap/GC-02/transcript.txt
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-03/db-after.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-03/db-before.zwr
+8e76c0670933551cd793d4379c79e150b35b274de0bb8e9706a05c3fc515d2cd  tests/golden/ifcap/GC-03/input.txt
+1158766445c7896b5dcfbd203410323b1aa5ab397a89b4a6b3c6b3044029613f  tests/golden/ifcap/GC-03/meta.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-03/normalisation.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-03/returned.txt
+601da39ed3c2b99ad4789667d9392cfc53c0fd81b916f2cbc361e4e8d4ecc88c  tests/golden/ifcap/GC-03/transcript.txt
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-04/db-after.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-04/db-before.zwr
+8f9db75ffd52550d253ba92433776555248b0cfe3d3b75463c9f86646538102a  tests/golden/ifcap/GC-04/input.txt
+1158766445c7896b5dcfbd203410323b1aa5ab397a89b4a6b3c6b3044029613f  tests/golden/ifcap/GC-04/meta.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-04/normalisation.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-04/returned.txt
+601da39ed3c2b99ad4789667d9392cfc53c0fd81b916f2cbc361e4e8d4ecc88c  tests/golden/ifcap/GC-04/transcript.txt
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-05/db-after.zwr
+c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476  tests/golden/ifcap/GC-05/db-before.zwr
+d2894b17a31f8aa5193b83a861967e014d67dfe7eafcc9b66c7f757770a6fcad  tests/golden/ifcap/GC-05/input.txt
+2405b8a73b3a1ad0a8359742354a6ab1cb618136cd3d9fba9eda30a855421c47  tests/golden/ifcap/GC-05/meta.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-05/normalisation.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/GC-05/returned.txt
+46fd6902ce254390c747150498f4412efd3ddbdd602fc002cc324ba4ecb46f8f  tests/golden/ifcap/GC-05/transcript.txt
+9770243ac24b819dc5b6a27391d94bc87285f42d50ef3ceabd8aa522880e92f9  tests/golden/ifcap/state/MANIFEST.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/state/export.stderr
+20ebce847e6359d430f01ee794572618cfe28a524509b6266bcb0485d28ee7ae  tests/golden/ifcap/state/state.zwr
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  tests/golden/ifcap/state/verify.stderr
+9dd56f96bf29c5bb8e0e373cbaf2fb3f912daab4b41bf65fec1df76485da32a0  tests/fixtures/ifcap/cases.zwr
+```
+
+This listing is identical to round two's before listing above, line for line: `diff` of the two outputs exits 0. Every hash the team stated for round two holds after round two's last edit, each checked by an exact match of its hash and path against one line, 18 of 18: `200.zwr` `836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da`, the value recorded before the first edit; `cases.zwr` `9dd56f96…32a0`; each `db-before.zwr` and `db-after.zwr` of `GC-01` to `GC-05` `c229942c…c476`; the transcripts of `GC-01` `29c7965a…2afb`, `GC-02` `957c66a0…138a`, `GC-03` and `GC-04` `601da39e…c88c` and `GC-05` `46fd6902…6f8f`; and `state/state.zwr` `20ebce84…e7ae`. `tests/fixtures/ifcap/` still holds 13 files. Round two edited no file under `tests/golden/ifcap/` except the README paragraph and no file under `tests/fixtures/ifcap/`, so the equality rule holds for all 41 files.
+
+**Equality rule.** Every file present in the baseline listing must have the same hash in the after listing. A `cases.zwr` that a run builds, because it finds READY captures and no `cases.zwr`, is the one permitted addition; it is recorded on its own line as `CREATED BY RUN` and is not part of the equality. An existing `cases.zwr` is never edited: with READY captures, a run checks it before editing code by the preflight of `tests/golden/ifcap/README.md` Part B step 6, which lists every line extracted from the READY captures' `db-before.zwr` that is found neither in `cases.zwr` nor in a supporting fixture; the run records that comparison in section "Run evidence" and opens a section "Open items" entry for each affected case, naming its nodes, with the action "rebuild `cases.zwr` by README step 6". Before this round no capture file and no `cases.zwr` existed, so no file was listed. In this round the rule covers all 40 files of the before listing, the four `state/` files included; `cases.zwr` already exists, so no file is created, and the preflight is in section "Run evidence". In round two it covers the 41 files of round two's before listing, `200.zwr` included, and holds (row "After (round two)").
 
 ## Run evidence
 
@@ -2597,6 +2648,225 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 The baseline is the one the team expected: exit status 0, 185 passed, 0 failed, and `Verdict: PASS` for all five cases, so the round-two stop condition does not apply and no correction cycle runs. The `REPORT.md` these runs wrote was restored with `git checkout -- REPORT.md`; the committed `REPORT.md` is the one written by the last `cargo test` after this document's final edit.
 
+### Round two: completion evidence
+
+These commands ran on 2026-11-17, from 15:35:49Z to 15:39:11Z, on the Linux build host at commit `5534d6cd22ed5587da1885f5ca776de074ed283c`, the observed commit: it holds every round-two change to `src/`, `tests/`, `RUNNING.md`, `runPlaybook.md` and the golden README, and the tree had no uncommitted change. Only this document and `REPORT.md` change after it. They ran from `rust/ifcap-po-inquiry/` with `RUSTUP_AUTO_INSTALL=0` set, except `git rev-parse HEAD`, the A7 commands and the commit-order check, which ran from the repository root. The checkout path is shown as `<crate>`. `cargo clean` ran first, so the build, the tests, clippy and the documentation were compiled from the committed sources in this run.
+
+**Observed commit.** `git rev-parse HEAD`, 2026-11-17T15:35:49Z, exit status 0, then `git status --porcelain -- rust/ifcap-po-inquiry/src rust/ifcap-po-inquiry/tests` and `git status --porcelain`, each exit status 0 with no output:
+
+```text
+5534d6cd22ed5587da1885f5ca776de074ed283c
+```
+
+**Build, lint, format and documentation.** The build ran at 15:35:57Z, and the other three ran in sequence from 15:37:34Z to 15:37:36Z. Each exited 0 with no warning. Output complete:
+
+| Command | Exit status | Output |
+|---|---|---|
+| `cargo build --offline --locked` | 0 | `Compiling ifcap-po-inquiry v0.1.0 (<crate>)`, then ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.81s`` |
+| `cargo clippy --offline --locked --all-targets` | 0 | `Checking ifcap-po-inquiry v0.1.0 (<crate>)`, then ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.45s`` |
+| `cargo fmt --check` | 0 | none |
+| `RUSTDOCFLAGS='-D warnings' cargo doc --offline --locked --no-deps --document-private-items` | 0 | `Checking ifcap-po-inquiry v0.1.0 (<crate>)`, `Documenting ifcap-po-inquiry v0.1.0 (<crate>)`, ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.68s``, `Generated <crate>/target/doc/ifcap_po_inquiry/index.html and 1 other file` |
+
+**Tests.** `cargo test --offline --locked`, started 2026-11-17T15:36:17Z and finished 15:37:07Z, exit status 0. Output trimmed: the 189 lines `test <name> ... ok` are omitted; every other line, standard error included, is shown:
+
+```text
+   Compiling ifcap-po-inquiry v0.1.0 (<crate>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.37s
+     Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
+
+running 167 tests
+
+test result: ok. 167 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.27s
+
+     Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
+
+running 20 tests
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.46s
+
+     Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
+
+running 2 tests
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.00s
+
+   Doc-tests ifcap_po_inquiry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Total over the five test targets: 189 passed (unit tests of `src/lib.rs` 167, `src/bin/bridge.rs` 0, `tests/bridge.rs` 20, `tests/equivalence.rs` 2, doc-tests 0), 0 failed, 0 ignored. That is the baseline's 185 plus the four O-11 tests: `mumps::tests::output_limit_refuses_the_write_that_would_pass_it`, `inquiry::tests::output_limit_ends_session_at_last_prompt`, `inquiry::tests::repeated_found_order_ends_at_the_output_limit` and `rust_session_stops_at_the_output_limit` in `tests/bridge.rs`, each `... ok` in this run.
+
+`grep -n 'Verdict' REPORT.md`, on the `REPORT.md` that command wrote, exit status 0:
+
+```text
+891:- Verdict: PASS
+898:- Verdict: PASS
+905:- Verdict: PASS
+912:- Verdict: PASS
+919:- Verdict: PASS
+```
+
+The five lines are the part 2 blocks of `GC-01`, `GC-02`, `GC-03`, `GC-04` and `GC-05`, in that order, headed at lines 889, 896, 903, 910 and 917 under `## Part 2: Case results` at line 887. Part 1 reads `SPEC.md sections found: PASS — 10 of 10`, and part 3 gives all five READY. The line numbers belong to the file that run wrote; the committed `REPORT.md`, written after this subsection was added, carries it in part 1, so its line numbers are later.
+
+`cargo test --offline --locked --test bridge end_to_end_real_captures -- --nocapture`, 2026-11-17T15:37:21Z, exit status 0. Output complete. The test prints `GC-0N MATCH` only after its assertion that COMPARE answered `match` true for that READY case:
+
+```text
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
+
+running 1 test
+GC-01 MATCH
+GC-02 MATCH
+GC-03 MATCH
+GC-04 MATCH
+GC-05 MATCH
+test end_to_end_real_captures ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 1.60s
+```
+
+`cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, 2026-11-17T15:37:22Z, exit status 0. Output complete:
+
+```text
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
+
+running 2 tests
+test equivalence_report ... GC-01 PASS
+GC-02 PASS
+GC-03 PASS
+GC-04 PASS
+GC-05 PASS
+ok
+test spec_has_report_sections ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.13s
+```
+
+**Audits**, run 2026-11-17T15:37:47Z, each exit status as shown. S6 to S9 gave the outputs recorded in section "Read-only enforcement results":
+
+```text
+$ grep -rnE 'unsafe|\.unwrap\(|\.expect\(|panic!' src/          # S1, exit 0
+src/lib.rs:9:#![forbid(unsafe_code)]
+$ grep -rnE '[A-Za-z_)]\[[^]]+\]' src/                          # S2, exit 0
+src/inquiry.rs:827:        // W:DIC(0)["E" ! ends the line before G ASK [DIC.m:63], whose W ! and
+$ grep -n 'golden' src/inquiry.rs src/store.rs src/mumps.rs     # S3, exit 1, no output
+$ grep -rlE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/   # S4, exit 0
+src/golden.rs
+$ grep -rnE '<same pattern>' src/ | wc -l
+82
+$ grep -rcE '<same pattern>' src/golden.rs
+82
+$ grep -rn '&mut Store' src/                                    # S5, exit 1, no output
+$ grep -n '&mut self' src/store.rs                              # S5, exit 1, no output
+```
+
+S1 has exactly one hit, the allowlisted crate attribute. The one S2 hit, reviewed, is the comment quoting the M code `DIC(0)["E"` [DIC.m:63], not Rust indexing; it was at line 786 at commit `64482eef8` and moved with the lines the O-11 change added above it. S3 and S5 print nothing. All 82 S4 hits are in `src/golden.rs`.
+
+**A7, source unchanged.** Both commands ran from the repository root at 2026-11-17T15:38:29Z, at `HEAD` `5534d6cd22ed5587da1885f5ca776de074ed283c` with no uncommitted change; each exit status 0, and neither printed anything. The same measurement is the two "After round two's last edit" rows of section "Source-unchanged verification":
+
+```text
+$ git diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION; echo "exit=$?"
+exit=0
+$ git status --porcelain -- . ':!rust/ifcap-po-inquiry'; echo "exit=$?"
+exit=0
+```
+
+**Capture and fixture hashes.** The `200.zwr` hash and the capture listing, taken at 2026-11-17T15:38:14Z, are the "After (round two)" row of section "Capture hashes", with the listing verbatim there. It is identical to round two's before listing (`diff` exit status 0), and all 18 stated hashes hold: `200.zwr` `836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da`, `cases.zwr` `9dd56f96bf29c5bb8e0e373cbaf2fb3f912daab4b41bf65fec1df76485da32a0`, the ten `db-before.zwr` and `db-after.zwr` `c229942c5a7b9f817ab06bfee1eb0f96bbc63d87e4be48478ccc62f249f5c476`, the five transcripts and `state/state.zwr`.
+
+**Runtime check.** The bridge ran in this checkout's own network namespace, `pf-18080`, never in the host's, started at 2026-11-17T15:38:37Z by `netns-port-forward 18080 8080 -- ./target/debug/bridge` after `cargo build --offline --locked` (`Finished` only, the build above being current). Its standard output:
+
+```text
+http://127.0.0.1:8080/
+MUMPS MODE: REPLAY
+RECORDED 5 OF 5 READY 5 OF 5
+```
+
+`curl -s http://127.0.0.1:18080/api/status`, 2026-11-17T15:38:48Z, exit status 0:
+
+```text
+{"mumps_mode":"replay","recorded":["GC-01","GC-02","GC-03","GC-04","GC-05"],"ready":["GC-01","GC-02","GC-03","GC-04","GC-05"],"incomplete":{}}
+```
+
+`POST /api/compare/session` to `http://127.0.0.1:18080/`, 2026-11-17T15:38:48Z, with each case's `input.txt` sequence, `Content-Type: application/json` and `Origin: http://127.0.0.1:18080`. The byte counts are the lengths of the two transcripts in the answer, read with `jq -j`, and each transcript was compared with the case's `transcript.txt` by `cmp`:
+
+| Case | Inputs | HTTP | `match` | MUMPS bytes | RUST bytes | Both equal to `transcript.txt` |
+|---|---|---|---|---|---|---|
+| GC-01 | `""`, `GC1001`, `""`, `""`, `^` | 200 | true | 1664 | 1664 | yes |
+| GC-02 | `""`, `GC2002`, `""`, `""`, `^` | 200 | true | 1852 | 1852 | yes |
+| GC-03 | `""`, `GC3003`, `^` | 200 | true | 101 | 101 | yes |
+| GC-04 | `""`, `INVALID!`, `^` | 200 | true | 101 | 101 | yes |
+| GC-05 | `""`, `GC5005`, `""`, `""`, `^` | 200 | true | 1745 | 1745 | yes |
+
+At 2026-11-17T15:38:58Z, `POST /api/rust/session` with `{"inputs":[""]}` answered 200 with an 80-byte transcript ending `P.O./REQ.NO.: `, the order prompt over `cases.zwr`, and `POST /api/mumps/session` with the same body answered 502 `{"error":"NOT RECORDED"}`. At 15:39:11Z, `POST /api/rust/session` with a 900,004-byte body, `""`, then 59,999 × `"GC1001","",""`, then `"^"`, answered 200 in 1.194 s with a 1,048,026-byte transcript, within `SESSION_OUTPUT_LIMIT` (1,048,576), ending `P.O./REQ.NO.: ` with no `\n`. A second instance, `timeout 10 nsenter --net=/run/netns/pf-18080 ./target/debug/bridge`, run from `rust/ifcap-po-inquiry/`, exited 1 with `bridge: port 8080 on 127.0.0.1 is already in use`, and `GET /api/status` still answered 200 afterwards. The bridge was then stopped, and no socket was left listening on port 18080.
+
+**Fence verification**, run at `HEAD` `5534d6cd22ed5587da1885f5ca776de074ed283c` with no uncommitted change, against round two's base commit `64482eef86c9d7bfbc3e141576f054bd944dee3b`. From `rust/ifcap-po-inquiry/`, each exit status 0 unless shown:
+
+```text
+$ git diff --name-status 64482eef86c9d7bfbc3e141576f054bd944dee3b -- .
+M	rust/ifcap-po-inquiry/RUNNING.md
+M	rust/ifcap-po-inquiry/SPEC.md
+M	rust/ifcap-po-inquiry/runPlaybook.md
+M	rust/ifcap-po-inquiry/src/inquiry.rs
+M	rust/ifcap-po-inquiry/src/mumps.rs
+M	rust/ifcap-po-inquiry/tests/bridge.rs
+M	rust/ifcap-po-inquiry/tests/golden/ifcap/README.md
+$ git diff --quiet 64482eef8 -- src/bridge.rs src/lib.rs src/golden.rs src/store.rs src/bin/bridge.rs tests/equivalence.rs frontend testingMethods.md Cargo.toml Cargo.lock rust-toolchain.toml; echo $?
+0
+$ git diff --quiet 64482eef8 -- tests/fixtures tests/golden/ifcap/GC-01 tests/golden/ifcap/GC-02 tests/golden/ifcap/GC-03 tests/golden/ifcap/GC-04 tests/golden/ifcap/GC-05 tests/golden/ifcap/state; echo $?
+0
+$ git diff -U0 64482eef8 -- tests/golden/ifcap/README.md | grep '^@@'
+@@ -370,0 +371,2 @@ Run each case a second time from the restored snapshot, and compare the two runs
+$ git diff 64482eef8 -- SPEC.md | grep -E '^[-+]\| (O-07|O-10|K14) '; echo $?
+1
+$ grep -c '^| PO-' SPEC.md
+108
+$ grep -E '^\| PO-[0-9]+\.b' SPEC.md | grep -cE '\| exercised by GC-0[1-5][^;|]* \|$'
+47
+$ grep -E '^\| PO-[0-9]+\.b' SPEC.md | grep -c '| exercised by GC-01, GC-02, GC-05; not implemented (O-01) |$'
+0
+$ grep -E '^\| PO-[0-9]+\.b' SPEC.md | grep -c '| not exercised, not implemented'
+61
+```
+
+- Every changed path is in round two's file list; `REPORT.md`, also in it, changes only through `cargo test`. `src/bridge.rs` (its test module included), `src/lib.rs`, `src/golden.rs`, `src/store.rs`, `src/bin/bridge.rs`, `tests/equivalence.rs`, `frontend/`, `testingMethods.md`, `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` are byte-identical to the base, and so are the fixtures and the capture folders. From the repository root, `git diff --quiet 64482eef8 -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION` exits 0 and `git diff --name-only 64482eef8 -- . ':!rust/ifcap-po-inquiry'` prints nothing.
+- `Session::into_transcript_at_prompt` is unchanged: its body and doc comment, with 12 lines before and 10 after, extracted from `src/mumps.rs` at the base (line 713) and now (line 776), compare equal (`diff` exit status 0).
+- The golden README diff removes no line and adds two, one paragraph and its blank line, at the end of Part B step 6, before `### Step 7. Checks`. The paragraph gives the command `grep -F '^VA(200,.5,0)=' tests/golden/ifcap/GC-01/db-before.zwr`.
+- The O-07, O-10 and K14 rows are unchanged. The branch inventory has 108 rows, with coverage 47/0/61, and every heading `tests/equivalence.rs` needs is present once: "Run evidence", "Scope statement" and the nine static sections, "Acceptance record" and "Open items" among them.
+- `Halt` has four variants, `InputExhausted`, `OutputLimit`, `Unexercised(&'static str)` and `Corrupt(String)`, and no derive or visibility line of it changed. `rust-toolchain.toml` pins `1.99.1`, `Cargo.toml` gives edition `2024` and an empty `[dependencies]`, and `src/lib.rs:9` is `#![forbid(unsafe_code)]`.
+- `git log --reverse --format='%h %s' 64482eef8..5534d6cd2`, from the repository root, gives the order of work: the baseline, then the documents and O-09, then O-11:
+
+```text
+109a4af2c ifcap-po-inquiry: record the round-two baseline, A7 before-check and the 200.zwr hash
+f4f3a07e9 ifcap-po-inquiry: state the five-PASS outcome in the run guides; buyer-node note; open items O-12 to O-14
+f2cc2811d ifcap-po-inquiry: close O-09, list 200.zwr, reconcile SPEC.md present tense
+5534d6cd2 ifcap-po-inquiry: bound one Rust session's output (O-11, K15)
+```
+
+**Document limits.** `wc -l -w testingMethods.md` gives `52  600 testingMethods.md`, and `wc -l runPlaybook.md` gives `116 runPlaybook.md`, each exit status 0 (at most 60 lines and 600 words, and at most 150 lines).
+
+**Result.** Every completion condition of round two holds on the Linux build host at commit `5534d6cd2`: `cargo test --offline --locked` exits 0 with 189 passed and 0 failed; `REPORT.md` part 2 reads `Verdict: PASS` for all five cases; `end_to_end_real_captures` gets `match` true for each READY case; build, clippy, format and documentation exit 0 with no warning; S1 has one hit, S3 and S5 none, and S4 hits only `src/golden.rs`; A7 holds; every stated hash holds. This round records no acceptance (section "Acceptance record"). The `REPORT.md` these runs wrote was restored with `git checkout -- REPORT.md`. The committed `REPORT.md` is the one `cargo test --offline --locked` wrote after this document's final edit; a second run left its sha256 unchanged, which shows it current.
+
+
 ## Acceptance record
 
-Not accepted. The five captures are committed and every case is READY; in this refine round's final run GC-03 and GC-04 PASS, and GC-01, GC-02 and GC-05 FAIL at transcript line 25 because the fixture store lacks `^VA(200,.5,0)` (O-09). The team records acceptance here, at playbook phase 12; this round records none.
+Not accepted.
+
+Observed result, on the Linux build host: `cargo test --offline --locked` exits 0, with 189 passed and 0 failed; `REPORT.md` part 2 reads `Verdict: PASS` for all five cases, `GC-01` to `GC-05`; the bridge reports `RECORDED 5 OF 5 READY 5 OF 5`; and `end_to_end_real_captures` gets `match` true for each READY case (section "Run evidence", "Round two: completion evidence").
+
+Observed on commit: `5534d6cd22ed5587da1885f5ca776de074ed283c`.
+
+- Date:
+- image_digest:
+- snapshot_id:
+
+The team records acceptance here at `runPlaybook.md` phase 12, filling the three fields with the date, `image_digest` and `snapshot_id`. This round records no acceptance.
