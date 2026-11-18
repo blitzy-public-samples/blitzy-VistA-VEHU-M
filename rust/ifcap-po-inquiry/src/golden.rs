@@ -1480,6 +1480,648 @@ pub fn default_dir() -> PathBuf {
         .join("ifcap")
 }
 
+// ---------------------------------------------------------------------------
+// Parity corpus
+// ---------------------------------------------------------------------------
+
+// The parity corpus folder, `corpus` inside the golden folder, holds per
+// case `<id>/input.txt` and, once recorded, `<id>/transcript.txt`, and per
+// recording run `meta.txt`, `SHA256SUMS`, `run-summary.txt` and `BASE.txt`.
+// `corpus_gen` writes the inputs, `load_corpus.sh` writes `BASE.txt` and
+// `record_corpus.sh` writes the rest. The rules below are the five-case
+// reader's rules applied to the corpus: every file is read within its
+// budget, a present file must be UTF-8 and free of `\r`, and a failure is
+// `<path>: <cause>`, the cause free of parentheses. The corpus generator,
+// its gate and the equivalence harness read these case and run files only
+// through the items below, and nothing here writes.
+
+/// The recording run's digest list, `shasum -a 256` output over the run's
+/// files, written last by `record_corpus.sh`.
+const SHA256SUMS: &str = "SHA256SUMS";
+/// The recording run's summary: export and run identity, each case's
+/// status, and every difference the run collected.
+const RUN_SUMMARY: &str = "run-summary.txt";
+/// The loaded corpus snapshot's identity, written by `load_corpus.sh`
+/// before any recording.
+const BASE_FILE: &str = "BASE.txt";
+
+/// The keys of a corpus recording run's `meta.txt`, each required exactly
+/// once ([`parse_corpus_meta`]), in the order `record_corpus.sh` writes them.
+pub const CORPUS_META_KEYS: [&str; 5] = [
+    "image_digest",
+    "snapshot_id",
+    "source_revision",
+    "context",
+    "start_command",
+];
+
+/// The corpus case id series in report order: each id is the prefix and a
+/// number from 1 to the count, zero-padded to the width.
+const CORPUS_ID_SERIES: [(&str, usize, usize); 3] =
+    [("CP-", 200, 3), ("CE-", 26, 2), ("CR-", 5, 2)];
+
+/// The parity corpus folder of this checkout, `corpus` inside
+/// [`default_dir`]: the one place its name is given.
+pub fn corpus_dir() -> PathBuf {
+    default_dir().join("corpus")
+}
+
+/// The 231 corpus case ids in report order, computed rather than found by
+/// walking a folder: `CP-001` to `CP-200`, `CE-01` to `CE-26`, then `CR-01`
+/// to `CR-05`. Each is also its case folder's name.
+pub fn corpus_case_ids() -> Vec<String> {
+    CORPUS_ID_SERIES
+        .iter()
+        .flat_map(|&(prefix, count, width)| {
+            (1..=count).map(move |number| format!("{prefix}{number:0width$}"))
+        })
+        .collect()
+}
+
+/// The path of case `case_id`'s `input.txt` under the corpus folder
+/// `corpus_dir`.
+pub fn corpus_input_path(corpus_dir: &Path, case_id: &str) -> PathBuf {
+    corpus_dir.join(case_id).join(INPUT)
+}
+
+/// Whether `case_id` is one of [`corpus_case_ids`], judged from the same
+/// series without allocating. Every corpus reader refuses any other id, so
+/// no id can lead a path outside its case folder.
+fn corpus_case_known(case_id: &str) -> bool {
+    CORPUS_ID_SERIES.iter().any(|&(prefix, count, width)| {
+        case_id.strip_prefix(prefix).is_some_and(|digits| {
+            digits.len() == width
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+                && digits
+                    .parse::<usize>()
+                    .is_ok_and(|number| (1..=count).contains(&number))
+        })
+    })
+}
+
+/// The error for an id outside [`corpus_case_ids`].
+fn unknown_corpus_case(case_id: &str) -> String {
+    format!("{case_id}: not a corpus case id")
+}
+
+/// The corpus file `name` of `dir`, read whole within its budget: `None`
+/// when nothing is at its path. A file that is present but unreadable, over
+/// budget or not UTF-8 is `Err` as [`CaptureFile::failure`] gives it, and
+/// one holding a `\r` is `Err` with the cause `carriage return`.
+fn read_corpus_text(dir: &Path, name: &'static str) -> Result<Option<String>, String> {
+    let file = CaptureFile::read(dir, name, true);
+    if let Some(cause) = file.failure() {
+        return Err(cause);
+    }
+    let path = file.path.display().to_string();
+    let text = match file.content {
+        Content::Missing => return Ok(None),
+        Content::Bytes(bytes) => {
+            String::from_utf8(bytes).map_err(|_| format!("{path}: not UTF-8"))?
+        }
+        Content::Unreadable(cause) => return Err(format!("{path}: {cause}")),
+        // A kept file is never scanned; this arm only keeps the match whole.
+        Content::Scanned { .. } => return Err(format!("{path}: not read whole")),
+    };
+    if text.contains('\r') {
+        return Err(format!("{path}: carriage return"));
+    }
+    Ok(Some(text))
+}
+
+/// The text of corpus case `case_id`'s `input.txt` under `corpus_dir`,
+/// exactly as stored, never touching its `transcript.txt`. It is `Err`, as
+/// `<path>: <cause>`, when the id is not one of [`corpus_case_ids`], the
+/// case folder or the file is missing, the file is unreadable, over its
+/// 1 MiB budget, not UTF-8 or holds a `\r`, it is empty, or the last of
+/// its [`split_input_lines`] does not begin with `^`: every corpus session
+/// ends with a caret-prefixed exit, `SPEC.md` "Exit input" (PO-09.b3). The
+/// five-case check that the last input is exactly [`EXIT_INPUT`] does not
+/// apply, since an edge case may exit with `^FOO`.
+pub fn read_corpus_input(corpus_dir: &Path, case_id: &str) -> Result<String, String> {
+    if !corpus_case_known(case_id) {
+        return Err(unknown_corpus_case(case_id));
+    }
+    let case_dir = corpus_dir.join(case_id);
+    match probe_folder(&case_dir) {
+        Folder::Present => {}
+        Folder::Absent => return Err(format!("{}: missing", case_dir.display())),
+        Folder::Uninspectable(cause) => return Err(cause),
+    }
+    let path = case_dir.join(INPUT);
+    let Some(text) = read_corpus_text(&case_dir, INPUT)? else {
+        return Err(format!("{}: missing", path.display()));
+    };
+    if text.is_empty() {
+        return Err(format!("{}: empty", path.display()));
+    }
+    if !input_lines(&text)
+        .next_back()
+        .is_some_and(|last| last.starts_with('^'))
+    {
+        return Err(format!(
+            "{}: last input does not begin with ^",
+            path.display()
+        ));
+    }
+    Ok(text)
+}
+
+/// One corpus case as stored: its inputs and, once recorded, the original's
+/// raw standard output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorpusCase {
+    /// The case id, one of [`corpus_case_ids`], which is also its folder
+    /// name.
+    pub id: String,
+    /// [`split_input_lines`] of `input.txt`, as [`read_corpus_input`]
+    /// accepts it.
+    pub inputs: Vec<String>,
+    /// Raw `transcript.txt`, never normalised; `None` while the case is not
+    /// recorded.
+    pub transcript: Option<String>,
+}
+
+/// Loads corpus case `case_id` from `corpus_dir`, read afresh on every
+/// call. The folder comes first, as for [`load_case`], so that a caller may
+/// point it at any corpus folder. The inputs are [`read_corpus_input`]'s,
+/// with its errors. A missing `transcript.txt` leaves the case unrecorded;
+/// a present one must be readable within its 1 MiB budget, UTF-8, free of
+/// `\r` and not empty, else the case is `Err` as `<path>: <cause>`.
+pub fn load_corpus_case(corpus_dir: &Path, case_id: &str) -> Result<CorpusCase, String> {
+    let inputs = split_input_lines(&read_corpus_input(corpus_dir, case_id)?);
+    let case_dir = corpus_dir.join(case_id);
+    let transcript = read_corpus_text(&case_dir, TRANSCRIPT)?;
+    if transcript.as_deref() == Some("") {
+        return Err(format!("{}: empty", case_dir.join(TRANSCRIPT).display()));
+    }
+    Ok(CorpusCase {
+        id: case_id.to_string(),
+        inputs,
+        transcript,
+    })
+}
+
+/// One parsed corpus `meta.txt`: each of the [`CORPUS_META_KEYS`] exactly
+/// once, in document order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorpusMeta {
+    entries: Vec<(String, String)>,
+}
+
+impl CorpusMeta {
+    /// The value of `key` exactly as recorded, or `None` for a key outside
+    /// [`CORPUS_META_KEYS`].
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Parses a corpus `meta.txt` by the line rules of [`parse_meta`]:
+/// `key=value` lines split at the first `=`, whitespace-only lines ignored
+/// and values kept exactly. A non-blank line without `=`, a key outside
+/// [`CORPUS_META_KEYS`] or a repeated key is `Err` naming the 1-based line.
+/// Unlike [`parse_meta`], a missing key is `Err` too, naming the first one
+/// missing in [`CORPUS_META_KEYS`] order.
+pub fn parse_corpus_meta(text: &str) -> Result<CorpusMeta, String> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for (index, line) in text.split('\n').enumerate() {
+        let number = index.saturating_add(1);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("meta line {number}: no '='"));
+        };
+        if !CORPUS_META_KEYS.contains(&key) {
+            return Err(format!("meta line {number}: unknown key {key}"));
+        }
+        if entries.iter().any(|(seen, _)| seen == key) {
+            return Err(format!("meta line {number}: repeated key {key}"));
+        }
+        entries.push((key.to_string(), value.to_string()));
+    }
+    if let Some(key) = CORPUS_META_KEYS
+        .iter()
+        .find(|key| !entries.iter().any(|(seen, _)| seen == *key))
+    {
+        return Err(format!("meta: missing key {key}"));
+    }
+    Ok(CorpusMeta { entries })
+}
+
+/// The state of the corpus recording run, as [`load_corpus_run`] verifies
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CorpusRun {
+    /// Nothing is recorded: the corpus folder does not exist, or it holds
+    /// no `transcript.txt` in any case folder and none of `meta.txt`,
+    /// `SHA256SUMS` and `run-summary.txt`. A `BASE.txt` alone, written
+    /// before any recording, is still absent.
+    Absent,
+    /// A recording run whose files all verified.
+    Recorded {
+        /// The run's `meta.txt`.
+        meta: CorpusMeta,
+        /// The ids `run-summary.txt` marks `QUARANTINED`, in file order:
+        /// cases whose transcript shows a paging prompt.
+        quarantined: Vec<String>,
+        /// The SHA-256 of the export taken before the run, as
+        /// `run-summary.txt` records it: 64 lower-case hex digits.
+        export_sha256: String,
+    },
+}
+
+/// The recording run of the corpus folder `corpus_dir` for the cases
+/// `case_ids`, verified, read afresh on every call.
+///
+/// Every id must be one of [`corpus_case_ids`]. A missing corpus folder,
+/// or one holding no `transcript.txt` for any of `case_ids` and none of
+/// `meta.txt`, `SHA256SUMS` and `run-summary.txt`, is
+/// [`CorpusRun::Absent`]; a case folder whose metadata cannot be read
+/// counts as holding a transcript, since its absence cannot be confirmed.
+/// Otherwise all three run files must exist, each readable within its
+/// 64 KiB budget, UTF-8 and free of `\r`, and:
+///
+/// - `meta.txt` must pass [`parse_corpus_meta`];
+/// - `run-summary.txt` must hold exactly one `exports=IDENTICAL`, one
+///   `runs=IDENTICAL` and one `export_sha256=` line with 64 lower-case hex
+///   digits, then case lines `<id>\t<status>\t<exit 1>\t<exit 2>` whose
+///   first field is one of `case_ids`, once each, and whose second is
+///   `RECORDED` or `QUARANTINED`. The exit statuses are evidence only and
+///   are not read. A `DIFF\t` line, a difference the run collected, and
+///   any other line are `Err`;
+/// - each `SHA256SUMS` line is 64 lower-case hex digits, two spaces or a
+///   space and `*`, and a path relative to the corpus folder that is
+///   exactly `BASE.txt`, `meta.txt`, `run-summary.txt`,
+///   `<id>/input.txt` or `<id>/transcript.txt` for an id of `case_ids`,
+///   listed once. Each listed file must exist, be readable within its
+///   budget, UTF-8, free of `\r`, not empty when it is a transcript, and
+///   have that SHA-256 ([`sha256_hex`]);
+/// - every `transcript.txt` of `case_ids` that exists must be listed.
+///
+/// Each failure is `Err` as `<path>: <cause>`, the cause free of
+/// parentheses.
+pub fn load_corpus_run(corpus_dir: &Path, case_ids: &[String]) -> Result<CorpusRun, String> {
+    if let Some(unknown) = case_ids.iter().find(|id| !corpus_case_known(id)) {
+        return Err(unknown_corpus_case(unknown));
+    }
+    match probe_folder(corpus_dir) {
+        Folder::Present => {}
+        Folder::Absent => return Ok(CorpusRun::Absent),
+        Folder::Uninspectable(cause) => return Err(cause),
+    }
+    let recorded: Vec<&str> = case_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| corpus_transcript_exists(corpus_dir, id))
+        .collect();
+    if recorded.is_empty()
+        && ![META, SHA256SUMS, RUN_SUMMARY]
+            .into_iter()
+            .any(|name| exists(&corpus_dir.join(name)))
+    {
+        return Ok(CorpusRun::Absent);
+    }
+    let meta_text = read_run_file(corpus_dir, META)?;
+    let sums_text = read_run_file(corpus_dir, SHA256SUMS)?;
+    let summary_text = read_run_file(corpus_dir, RUN_SUMMARY)?;
+    let meta = parse_corpus_meta(&meta_text)
+        .map_err(|cause| format!("{}: {cause}", corpus_dir.join(META).display()))?;
+    let known: HashSet<&str> = case_ids.iter().map(String::as_str).collect();
+    let summary = parse_run_summary(&corpus_dir.join(RUN_SUMMARY), &summary_text, &known)?;
+    let listed = verify_sha256sums(corpus_dir, &sums_text, &known)?;
+    if let Some(id) = recorded.into_iter().find(|id| !listed.contains(id)) {
+        return Err(format!(
+            "{}: not listed in SHA256SUMS",
+            corpus_dir.join(id).join(TRANSCRIPT).display()
+        ));
+    }
+    Ok(CorpusRun::Recorded {
+        meta,
+        quarantined: summary.quarantined,
+        export_sha256: summary.export_sha256,
+    })
+}
+
+/// Whether corpus case `case_id` holds a `transcript.txt`, readable or
+/// not, by the rule [`is_recorded`] applies: a case folder whose metadata
+/// cannot be read is taken to hold one.
+fn corpus_transcript_exists(corpus_dir: &Path, case_id: &str) -> bool {
+    let case_dir = corpus_dir.join(case_id);
+    match probe_folder(&case_dir) {
+        Folder::Absent => false,
+        Folder::Uninspectable(_) => true,
+        Folder::Present => exists(&case_dir.join(TRANSCRIPT)),
+    }
+}
+
+/// The run file `name` of `corpus_dir`, which must exist and pass
+/// [`read_corpus_text`].
+fn read_run_file(corpus_dir: &Path, name: &'static str) -> Result<String, String> {
+    read_corpus_text(corpus_dir, name)?
+        .ok_or_else(|| format!("{}: missing", corpus_dir.join(name).display()))
+}
+
+/// Whether `text` is a SHA-256 digest as `shasum -a 256` prints it: 64
+/// lower-case hex digits.
+fn is_sha256_hex(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// What a verified `run-summary.txt` records beyond its identity lines.
+struct RunSummary {
+    quarantined: Vec<String>,
+    export_sha256: String,
+}
+
+/// Parses the `run-summary.txt` at `path` by the rules of
+/// [`load_corpus_run`], for the cases `case_ids`. Blank lines are ignored,
+/// and line numbers are 1-based.
+fn parse_run_summary(
+    path: &Path,
+    text: &str,
+    case_ids: &HashSet<&str>,
+) -> Result<RunSummary, String> {
+    let path = path.display().to_string();
+    let mut exports = false;
+    let mut runs = false;
+    let mut export_sha256: Option<&str> = None;
+    let mut cases: HashSet<&str> = HashSet::new();
+    let mut quarantined = Vec::new();
+    for (index, line) in text.split('\n').enumerate() {
+        let number = index.saturating_add(1);
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("exports=") {
+            identity_line(&path, number, "exports", value, &mut exports)?;
+        } else if let Some(value) = line.strip_prefix("runs=") {
+            identity_line(&path, number, "runs", value, &mut runs)?;
+        } else if let Some(value) = line.strip_prefix("export_sha256=") {
+            if export_sha256.replace(value).is_some() {
+                return Err(format!("{path}: line {number}: repeated export_sha256="));
+            }
+            if !is_sha256_hex(value) {
+                return Err(format!(
+                    "{path}: line {number}: export_sha256 is not 64 lower-case hex digits"
+                ));
+            }
+        } else if let Some(rest) = line.strip_prefix("DIFF\t") {
+            return Err(format!("{path}: difference recorded: {rest}"));
+        } else if let Some((id, rest)) = line.split_once('\t') {
+            // Only the id and the status are read: the two exit statuses
+            // after them are evidence for people, never for a verdict.
+            let status = rest.split('\t').next().unwrap_or_default();
+            if !case_ids.contains(id) {
+                return Err(format!("{path}: line {number}: unexpected case {id}"));
+            }
+            if !cases.insert(id) {
+                return Err(format!("{path}: line {number}: repeated case {id}"));
+            }
+            match status {
+                "RECORDED" => {}
+                "QUARANTINED" => quarantined.push(id.to_string()),
+                _ => {
+                    return Err(format!(
+                        "{path}: line {number}: status {status} is neither RECORDED nor QUARANTINED"
+                    ));
+                }
+            }
+        } else {
+            return Err(format!("{path}: line {number}: not recognised"));
+        }
+    }
+    if !exports {
+        return Err(format!("{path}: missing exports= line"));
+    }
+    if !runs {
+        return Err(format!("{path}: missing runs= line"));
+    }
+    let Some(export_sha256) = export_sha256 else {
+        return Err(format!("{path}: missing export_sha256= line"));
+    };
+    Ok(RunSummary {
+        quarantined,
+        export_sha256: export_sha256.to_string(),
+    })
+}
+
+/// One `exports=` or `runs=` line of a `run-summary.txt`: it may appear
+/// once only, and its value must be `IDENTICAL`. `seen` records that it
+/// appeared.
+fn identity_line(
+    path: &str,
+    number: usize,
+    key: &str,
+    value: &str,
+    seen: &mut bool,
+) -> Result<(), String> {
+    if std::mem::replace(seen, true) {
+        return Err(format!("{path}: line {number}: repeated {key}="));
+    }
+    if value != "IDENTICAL" {
+        return Err(format!("{path}: {key}={value}"));
+    }
+    Ok(())
+}
+
+/// One file a `SHA256SUMS` line may list: its folder, its name, and the
+/// case id when it is a case's transcript.
+struct RunMember<'a> {
+    dir: PathBuf,
+    name: &'static str,
+    transcript_of: Option<&'a str>,
+}
+
+/// The file the `SHA256SUMS` path `listed` names, when it is one the run
+/// may list: `BASE.txt`, `meta.txt` or `run-summary.txt` in `corpus_dir`,
+/// or `input.txt` or `transcript.txt` in the folder of an id of
+/// `case_ids`. Any other path, such as an absolute one, one through `..`
+/// or one starting `./`, is `None`.
+fn run_member<'a>(
+    corpus_dir: &Path,
+    listed: &'a str,
+    case_ids: &HashSet<&str>,
+) -> Option<RunMember<'a>> {
+    let run_file = |name: &'static str| RunMember {
+        dir: corpus_dir.to_path_buf(),
+        name,
+        transcript_of: None,
+    };
+    match listed {
+        BASE_FILE => return Some(run_file(BASE_FILE)),
+        META => return Some(run_file(META)),
+        RUN_SUMMARY => return Some(run_file(RUN_SUMMARY)),
+        _ => {}
+    }
+    let (id, file) = listed.split_once('/')?;
+    if !case_ids.contains(id) {
+        return None;
+    }
+    let dir = corpus_dir.join(id);
+    match file {
+        INPUT => Some(RunMember {
+            dir,
+            name: INPUT,
+            transcript_of: None,
+        }),
+        TRANSCRIPT => Some(RunMember {
+            dir,
+            name: TRANSCRIPT,
+            transcript_of: Some(id),
+        }),
+        _ => None,
+    }
+}
+
+/// Verifies `text`, the `SHA256SUMS` of `corpus_dir`, by the rules of
+/// [`load_corpus_run`] for the cases `case_ids`, and gives the ids whose
+/// transcript it lists. Blank lines are ignored, and line numbers are
+/// 1-based.
+fn verify_sha256sums<'a>(
+    corpus_dir: &Path,
+    text: &'a str,
+    case_ids: &HashSet<&str>,
+) -> Result<HashSet<&'a str>, String> {
+    let sums_path = corpus_dir.join(SHA256SUMS).display().to_string();
+    let mut listed: HashSet<&str> = HashSet::new();
+    let mut transcripts: HashSet<&str> = HashSet::new();
+    for (index, line) in text.split('\n').enumerate() {
+        let number = index.saturating_add(1);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed = line.split_at_checked(64).and_then(|(digest, rest)| {
+            let path = rest
+                .strip_prefix("  ")
+                .or_else(|| rest.strip_prefix(" *"))?;
+            is_sha256_hex(digest).then_some((digest, path))
+        });
+        let Some((digest, listed_path)) = parsed else {
+            return Err(format!(
+                "{sums_path}: line {number}: not a SHA-256 digest and path"
+            ));
+        };
+        let Some(member) = run_member(corpus_dir, listed_path, case_ids) else {
+            return Err(format!("{sums_path}: line {number}: path not allowed"));
+        };
+        if !listed.insert(listed_path) {
+            return Err(format!("{sums_path}: line {number}: path listed twice"));
+        }
+        let file_path = member.dir.join(member.name).display().to_string();
+        let Some(content) = read_corpus_text(&member.dir, member.name)? else {
+            return Err(format!("{file_path}: listed in SHA256SUMS but missing"));
+        };
+        if member.transcript_of.is_some() && content.is_empty() {
+            return Err(format!("{file_path}: empty"));
+        }
+        if sha256_hex(content.as_bytes()) != digest {
+            return Err(format!("{file_path}: SHA-256 differs from SHA256SUMS"));
+        }
+        transcripts.extend(member.transcript_of);
+    }
+    Ok(transcripts)
+}
+
+/// The SHA-256 round constants, FIPS 180-4 section 4.2.2: the first 32 bits
+/// of the fractional parts of the cube roots of the first 64 primes.
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+/// The SHA-256 initial hash value, FIPS 180-4 section 5.3.3: the first 32
+/// bits of the fractional parts of the square roots of the first 8 primes.
+const SHA256_H0: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+/// The SHA-256 digest of `bytes`, FIPS 180-4, as 64 lower-case hex digits:
+/// the digest `shasum -a 256` prints, with which [`load_corpus_run`]
+/// verifies a `SHA256SUMS` listing.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    // Padding: one 1 bit, zeros up to 56 bytes past a block boundary, then
+    // the message length in bits as a big-endian 64-bit number.
+    let mut message = bytes.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&(bytes.len() as u64).wrapping_mul(8).to_be_bytes());
+    let mut state = SHA256_H0;
+    // Fixed-size `as_chunks` rather than `chunks_exact`, which clippy's
+    // `chunks_exact_to_as_chunks` rejects for a constant size. The padding
+    // leaves no remainder, and the words need neither indexing nor a fallible
+    // conversion.
+    for block in message.as_chunks::<64>().0 {
+        let mut schedule: Vec<u32> = block
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_be_bytes(*word))
+            .collect();
+        while schedule.len() < 64 {
+            let t = schedule.len();
+            let back = |distance: usize| {
+                schedule
+                    .get(t.wrapping_sub(distance))
+                    .copied()
+                    .unwrap_or_default()
+            };
+            let (w2, w7, w15, w16) = (back(2), back(7), back(15), back(16));
+            let sigma0 = w15.rotate_right(7) ^ w15.rotate_right(18) ^ (w15 >> 3);
+            let sigma1 = w2.rotate_right(17) ^ w2.rotate_right(19) ^ (w2 >> 10);
+            schedule.push(
+                w16.wrapping_add(sigma0)
+                    .wrapping_add(w7)
+                    .wrapping_add(sigma1),
+            );
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for (constant, word) in SHA256_K.iter().zip(&schedule) {
+            let big_sigma1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ (!e & g);
+            let temp1 = h
+                .wrapping_add(big_sigma1)
+                .wrapping_add(choose)
+                .wrapping_add(*constant)
+                .wrapping_add(*word);
+            let big_sigma0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = big_sigma0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (word, add) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *word = word.wrapping_add(add);
+        }
+    }
+    let mut hex = String::with_capacity(64);
+    for word in state {
+        hex.push_str(&format!("{word:08x}"));
+    }
+    hex
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
