@@ -1,3 +1,5 @@
 target/
 captures-work/
 *_report.txt
+
+.demo/
