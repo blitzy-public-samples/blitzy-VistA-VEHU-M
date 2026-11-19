@@ -359,9 +359,9 @@ pub fn ne_branches(spec: &str) -> Vec<String> {
 /// World B: every node of `world_a` and every data line of `corpus_zwr`,
 /// parsed once by [`Store::from_zwr`] from one text made of the corpus
 /// header lines, each world A node as `<reference>="<value>"` with every `"`
-/// doubled, and the corpus lines from its first line beginning `^`. The
-/// corpus text's own header lines are skipped, because a header line after
-/// the first data line does not parse.
+/// doubled (`WorldAText`), and the corpus lines from its first line
+/// beginning `^` (`merge`). The corpus text's own header lines are
+/// skipped, because a header line after the first data line does not parse.
 ///
 /// A text that is not a corpus text, or that would change world A, is
 /// refused, so a corpus line can never overwrite a world A node:
@@ -382,8 +382,12 @@ pub fn ne_branches(spec: &str) -> Vec<String> {
 /// corpus file is located from the error: a missing or different header
 /// line gives its own number, 1 or 2; a third line that is missing or is no
 /// data line gives 3; and keys world A holds give the first data line that
-/// names one. Malformed lines are reported before keys world A holds. A
-/// world A node's line keeps its number in the merged text.
+/// names one. Malformed lines are reported before keys world A holds: the
+/// corpus text is parsed alone once, and the keys of that parse, each data
+/// line's being the key it parses to alone, are the ones checked against
+/// world A; only a refusal reads the lines again, to find the first that
+/// names a held key. A world A node's line keeps its number in the merged
+/// text.
 pub fn world_b(world_a: &Store, corpus_zwr: &str) -> Result<Store, StoreError> {
     let refused = |line: usize, message: &str| StoreError::Parse {
         file: None,
@@ -405,37 +409,75 @@ pub fn world_b(world_a: &Store, corpus_zwr: &str) -> Result<Store, StoreError> {
             "expected a data line after the corpus header",
         ));
     }
-    Store::from_zwr(corpus_zwr)?;
-    let held = corpus_zwr
-        .split('\n')
-        .enumerate()
-        .skip(ZWR_HEADER.len())
-        .find(|(_, line)| {
-            Store::from_zwr(line)
-                .is_ok_and(|node| node.iter().any(|(key, _)| world_a.data(key) != 0))
-        });
-    if let Some((index, _)) = held {
+    let corpus = Store::from_zwr(corpus_zwr)?;
+    if corpus.iter().any(|(key, _)| world_a.data(key) != 0) {
+        // Every non-blank line from the first data line went into `corpus`
+        // with the key it parses to alone, so the search finds the first
+        // line naming a held key; the first data line stands in should it
+        // not.
+        let held = corpus_zwr
+            .split('\n')
+            .enumerate()
+            .skip(ZWR_HEADER.len())
+            .find(|(_, line)| {
+                Store::from_zwr(line)
+                    .is_ok_and(|node| node.iter().any(|(key, _)| world_a.data(key) != 0))
+            })
+            .map_or(ZWR_HEADER.len(), |(index, _)| index);
         return Err(refused(
-            index.saturating_add(1),
+            held.saturating_add(1),
             "the key already exists in world A",
         ));
     }
-    let mut text = String::new();
-    for header in ZWR_HEADER {
-        text.push_str(header);
-        text.push('\n');
+    merge(&WorldAText::new(world_a), corpus_zwr)
+}
+
+/// World A as the text every world B is parsed from: the two corpus header
+/// lines, then each world A node as `<reference>="<value>"` with every `"`
+/// doubled, each line ending `\n`. [`world_b`] writes it for its one world
+/// B; [`generate`] writes it once and builds every world B of its rounds
+/// and attributions on it.
+struct WorldAText {
+    /// The text.
+    text: String,
+    /// The number of lines of `text`.
+    lines: usize,
+}
+
+impl WorldAText {
+    /// The text of `world_a`'s nodes, in collation order.
+    fn new(world_a: &Store) -> WorldAText {
+        let mut text = String::new();
+        for header in ZWR_HEADER {
+            text.push_str(header);
+            text.push('\n');
+        }
+        for (key, value) in world_a.iter() {
+            text.push_str(&Store::format_ref(key));
+            text.push_str("=\"");
+            text.push_str(&value.replace('"', "\"\""));
+            text.push_str("\"\n");
+        }
+        let lines = text.bytes().filter(|byte| *byte == b'\n').count();
+        WorldAText { text, lines }
     }
-    for (key, value) in world_a.iter() {
-        text.push_str(&Store::format_ref(key));
-        text.push_str("=\"");
-        text.push_str(&value.replace('"', "\"\""));
-        text.push_str("\"\n");
-    }
-    let merged_before_corpus = text.bytes().filter(|byte| *byte == b'\n').count();
+}
+
+/// World B from `base`, world A's text, and the corpus text `corpus_zwr`:
+/// `base` followed by the corpus lines from the first line beginning `^`,
+/// parsed once by [`Store::from_zwr`]. It makes no check of its own: the
+/// caller has made sure that `corpus_zwr` holds no key world A holds, as
+/// [`world_b`] does and as [`generate`]'s clash check and round trip do. A
+/// malformed corpus line's error carries the line's own 1-based number in
+/// `corpus_zwr`, its header lines counted, and a world A line's error its
+/// number in `base`.
+fn merge(base: &WorldAText, corpus_zwr: &str) -> Result<Store, StoreError> {
     let skipped = corpus_zwr
         .lines()
         .take_while(|line| !line.starts_with('^'))
         .count();
+    let mut text = String::with_capacity(base.text.len() + corpus_zwr.len());
+    text.push_str(&base.text);
     for line in corpus_zwr.lines().skip(skipped) {
         text.push_str(line);
         text.push('\n');
@@ -446,9 +488,8 @@ pub fn world_b(world_a: &Store, corpus_zwr: &str) -> Result<Store, StoreError> {
             line,
             message,
         } = error;
-        let line = if line > merged_before_corpus {
-            line.saturating_sub(merged_before_corpus)
-                .saturating_add(skipped)
+        let line = if line > base.lines {
+            line.saturating_sub(base.lines).saturating_add(skipped)
         } else {
             line
         };
@@ -607,6 +648,9 @@ pub struct Corpus {
     pub largest_item_count: usize,
     /// The largest [`order_worst_y`] of any order.
     pub worst_y: usize,
+    /// The corpus ZWR text of `records`, rendered once by [`generate`]: the
+    /// text world B was built from.
+    pub zwr: String,
 }
 
 /// Why the corpus could not be generated. `Display` gives
@@ -1877,13 +1921,17 @@ type Retained = BTreeMap<usize, (Built, &'static str)>;
 /// stream started at [`SEED`], then each order of `retained` in place of
 /// the one built at its position, so that no other order's draws move;
 /// all checked to add no node world A holds and to survive their own ZWR
-/// text unchanged, and world B built from them.
+/// text unchanged. Those two checks, on a text that starts with the corpus
+/// header and holds the orders' nodes, are the guard [`world_b`] makes, so
+/// world B is built from that text on `base`, world A's text, by `merge`
+/// alone. It returns the orders, world B and the corpus ZWR text.
 fn run_round(
     world_a: &Store,
+    base: &WorldAText,
     refs: &References,
     lists: &Lists,
     retained: &Retained,
-) -> Result<(Vec<Built>, Store), CorpusError> {
+) -> Result<(Vec<Built>, Store, String), CorpusError> {
     let mut rng = Xorshift64::new(SEED);
     let mut built = plans(lists)?
         .iter()
@@ -1925,9 +1973,9 @@ fn run_round(
             "the corpus ZWR text does not parse back to exactly the generated nodes",
         ));
     }
-    let world = world_b(world_a, &text)
-        .map_err(|error| CorpusError::new(None, "world B", error.to_string()))?;
-    Ok((built, world))
+    let world =
+        merge(base, &text).map_err(|error| CorpusError::new(None, "world B", error.to_string()))?;
+    Ok((built, world, text))
 }
 
 /// One single-dimension reversion of an order: which value it reverts and
@@ -2212,11 +2260,53 @@ fn isolation_breach(original: &Built, candidate: &Built, reversion: &Reversion) 
     None
 }
 
-/// The dimension and value that make CP order `index` of `built` halt at a
-/// not-implemented branch: the first of its [`reversions`] after which its
-/// session runs to its end. The reversions are taken one at a time, and
-/// each candidate is built only when its turn comes and dropped before the
-/// next, so no later reversion is prepared once one has decided.
+/// Where the attribution of one CP case stands in [`attribute`].
+enum Attribution {
+    /// Its next reversion is still to run.
+    Pending,
+    /// The dimension and the value whose reversion lets its session end.
+    Found(String, String),
+    /// Why its attribution stopped.
+    Stopped(CorpusError),
+}
+
+/// One CP case under [`attribute`].
+struct Attempt<'a, R> {
+    /// The position of the case's order among the round's orders.
+    index: usize,
+    /// That order.
+    target: &'a Built,
+    /// Its reversions not yet taken, in their order.
+    remaining: R,
+    /// The candidate of the step under way, with its reversion.
+    candidate: Option<(Built, Reversion)>,
+    /// Where its attribution stands.
+    state: Attribution,
+}
+
+/// The dimension and value that make each CP order of `built` at the
+/// positions `unresolved` halt at a not-implemented branch, in the order of
+/// `unresolved`: for each, the first of its [`reversions`] after which its
+/// session runs to its end.
+///
+/// The cases are attributed together, one step at a time. At each step
+/// every case not yet decided, up to the first whose attribution has
+/// stopped, takes its next reversion, and one world B is built for the
+/// step, by `merge` on `base`, world A's text, from the round's orders with
+/// each case's candidate in place of its order; every candidate's case then
+/// runs on it. Of the corpus nodes, a CP session reads only its own order
+/// and the `B` and `C` index nodes, and the `C` values are distinct
+/// five-character values none of which is a prefix of another, while a
+/// candidate keeps its order's IEN, `C` value, item count and index nodes
+/// ([`isolation_breach`]). So a case's session on the step's world is the
+/// one it would have on a world B in which only its own order is replaced,
+/// the premise on which [`run_round`] runs every CP case on one world B,
+/// and each case meets its reversions in their order with the outcomes it
+/// would meet alone. A round
+/// builds as many worlds as the deepest step its cases reach, not one per
+/// reversion of every case. Each candidate is built only when its case's
+/// turn comes and is dropped once its session has run, so no later
+/// reversion of a case is prepared once one has decided.
 ///
 /// Each candidate is [`revert`]'s: the order's own draft with only the
 /// reverted dimension changed, its new drawn values from a fresh draw
@@ -2225,70 +2315,157 @@ fn isolation_breach(original: &Built, candidate: &Built, reversion: &Reversion) 
 /// thinning included, stays as it was, and nothing is thinned again.
 /// Before its session runs, the candidate must differ from the order only
 /// in the reverted dimension's tag and in the nodes and pieces that
-/// dimension writes ([`isolation_breach`]), else the attribution stops
-/// with an `attribution isolation` error; world B is then rebuilt around
-/// it. A candidate whose session fails stops the attribution with a
+/// dimension writes ([`isolation_breach`]), else the case's attribution
+/// stops with an `attribution isolation` error. Every node a candidate may
+/// change lies below its order's key, which [`run_round`] has found absent
+/// from world A, so a step's world needs no world A check of its own. A
+/// candidate whose session fails stops the case's attribution with a
 /// `session failure` error naming the reversion and the cause, since a
-/// failure is never accepted; one that halts again gives way to the next
-/// reversion, and with none left the case's item count is all that
+/// failure is never accepted; one that halts again gives way to the case's
+/// next reversion, and with none left the case's item count is all that
 /// remains, an `item-count attribution` error.
+///
+/// The cases decide in their order, as when each is attributed after the
+/// one before it: before each step, the first case not yet attributed
+/// decides, and the error that stopped it is the result; once every case is
+/// attributed, the result is their dimensions and values. A step's world
+/// that does not build is a `world B` error of the step's first case, the
+/// one that decides.
 fn attribute(
-    world_a: &Store,
+    base: &WorldAText,
     refs: &References,
     lists: &Lists,
     built: &[Built],
-    index: usize,
+    unresolved: &[usize],
     not_implemented: &[String],
-) -> Result<(String, String), CorpusError> {
-    let target = built
-        .get(index)
-        .ok_or_else(|| CorpusError::new(None, "item-count attribution", "no order to attribute"))?;
-    let case = target.record.case_id.as_str();
-    for reversion in reversions(&target.plan, lists) {
-        let candidate = revert(target, refs, &reversion)?;
-        if let Some(breach) = isolation_breach(target, &candidate, &reversion) {
-            return Err(CorpusError::new(
-                Some(case),
-                "attribution isolation",
-                format!(
-                    "reverting {} from {} also changes more: {breach}",
-                    reversion.tag_name(),
-                    tag_value(&reversion.current)
-                ),
+) -> Result<Vec<(String, String)>, CorpusError> {
+    let mut attempts = Vec::with_capacity(unresolved.len());
+    // A position with no order stops there, after every case before it.
+    let mut missing = None;
+    for &index in unresolved {
+        let Some(target) = built.get(index) else {
+            missing = Some(CorpusError::new(
+                None,
+                "item-count attribution",
+                "no order to attribute",
             ));
+            break;
+        };
+        attempts.push(Attempt {
+            index,
+            target,
+            remaining: reversions(&target.plan, lists),
+            candidate: None,
+            state: Attribution::Pending,
+        });
+    }
+    loop {
+        let undecided = attempts
+            .iter()
+            .find(|attempt| !matches!(attempt.state, Attribution::Found(..)));
+        match undecided.map(|attempt| &attempt.state) {
+            None => break,
+            Some(Attribution::Stopped(error)) => return Err(error.clone()),
+            Some(_) => {}
         }
-        let text = render_nodes(built.iter().enumerate().flat_map(|(at, order)| {
-            if at == index {
-                candidate.record.nodes.iter()
-            } else {
-                order.record.nodes.iter()
+        for attempt in &mut attempts {
+            match attempt.state {
+                Attribution::Found(..) => continue,
+                Attribution::Stopped(_) => break,
+                Attribution::Pending => {}
             }
-        }));
-        let world = world_b(world_a, &text)
-            .map_err(|error| CorpusError::new(Some(case), "world B", error.to_string()))?;
-        let run = run_case(&world, &cp_inputs(&candidate.record.c_value));
-        match classify(&run, not_implemented) {
-            Outcome::End => return Ok((reversion.dimension, reversion.current)),
-            Outcome::Failure(cause) => {
-                return Err(CorpusError::new(
+            let target = attempt.target;
+            let case = target.record.case_id.as_str();
+            let Some(reversion) = attempt.remaining.next() else {
+                attempt.state = Attribution::Stopped(CorpusError::new(
                     Some(case),
-                    "session failure",
-                    format!(
-                        "with {} reverted from {}: {cause}",
-                        reversion.tag_name(),
-                        tag_value(&reversion.current)
-                    ),
+                    "item-count attribution",
+                    "no single-dimension reversion lets the session run to its end, which leaves \
+                     only its item count, and item counts are never dropped",
                 ));
+                break;
+            };
+            let candidate = revert(target, refs, &reversion).and_then(|candidate| {
+                match isolation_breach(target, &candidate, &reversion) {
+                    Some(breach) => Err(CorpusError::new(
+                        Some(case),
+                        "attribution isolation",
+                        format!(
+                            "reverting {} from {} also changes more: {breach}",
+                            reversion.tag_name(),
+                            tag_value(&reversion.current)
+                        ),
+                    )),
+                    None => Ok(candidate),
+                }
+            });
+            match candidate {
+                Ok(candidate) => attempt.candidate = Some((candidate, reversion)),
+                Err(error) => {
+                    attempt.state = Attribution::Stopped(error);
+                    break;
+                }
             }
-            Outcome::Unimplemented(_) | Outcome::Implemented(_) => {}
+        }
+        let Some(first) = attempts
+            .iter()
+            .find(|attempt| attempt.candidate.is_some())
+            .map(|attempt| attempt.target)
+        else {
+            continue;
+        };
+        let swapped: BTreeMap<usize, &OrderRecord> = attempts
+            .iter()
+            .filter_map(|attempt| {
+                let (candidate, _) = attempt.candidate.as_ref()?;
+                Some((attempt.index, &candidate.record))
+            })
+            .collect();
+        let text = render_nodes(built.iter().enumerate().flat_map(|(at, order)| {
+            swapped
+                .get(&at)
+                .copied()
+                .unwrap_or(&order.record)
+                .nodes
+                .iter()
+        }));
+        let world = merge(base, &text).map_err(|error| {
+            CorpusError::new(Some(&first.record.case_id), "world B", error.to_string())
+        })?;
+        for attempt in &mut attempts {
+            let Some((candidate, reversion)) = attempt.candidate.take() else {
+                continue;
+            };
+            let run = run_case(&world, &cp_inputs(&candidate.record.c_value));
+            match classify(&run, not_implemented) {
+                Outcome::End => {
+                    attempt.state = Attribution::Found(reversion.dimension, reversion.current);
+                }
+                Outcome::Failure(cause) => {
+                    attempt.state = Attribution::Stopped(CorpusError::new(
+                        Some(&attempt.target.record.case_id),
+                        "session failure",
+                        format!(
+                            "with {} reverted from {}: {cause}",
+                            reversion.tag_name(),
+                            tag_value(&reversion.current)
+                        ),
+                    ));
+                }
+                Outcome::Unimplemented(_) | Outcome::Implemented(_) => {}
+            }
         }
     }
-    Err(CorpusError::new(
-        Some(case),
-        "item-count attribution",
-        "no single-dimension reversion lets the session run to its end, which leaves only its \
-         item count, and item counts are never dropped",
-    ))
+    if let Some(error) = missing {
+        return Err(error);
+    }
+    Ok(attempts
+        .into_iter()
+        .filter_map(|attempt| match attempt.state {
+            Attribution::Found(dimension, value) => Some((dimension, value)),
+            Attribution::Pending | Attribution::Stopped(_) => None,
+        })
+        .collect())
 }
 
 /// One edge or replay case before its outcome is applied.
@@ -2551,11 +2728,13 @@ fn resolve_case(
     })
 }
 
-/// What the CP rounds settled: the final round's orders, world B and CP
-/// outcomes, the drops of every round, and the number of rounds run.
+/// What the CP rounds settled: the final round's orders, world B, corpus
+/// ZWR text and CP outcomes, the drops of every round, and the number of
+/// rounds run.
 struct Settled {
     built: Vec<Built>,
     world: Store,
+    zwr: String,
     outcomes: Vec<Outcome>,
     drops: Vec<DroppedVariant>,
     rounds: usize,
@@ -2571,27 +2750,32 @@ fn outcome_text(outcome: &Outcome) -> String {
     }
 }
 
-/// The CP rounds of [`generate`], starting from `lists`. Each round
-/// ([`run_round`]) builds the orders, with every order kept for a finding
-/// in its place, and runs every CP case once on its world B. A failed
-/// session stops the rounds. A kept order must halt at its branch again,
-/// else the rounds stop with a `finding evidence` error. An order that
-/// first halts at an implemented branch is kept, record and inputs, for
-/// every later round. An order that halts at a not-implemented branch has
-/// its variant attributed ([`attribute`]) and dropped from its list, and
-/// another round starts, up to [`MAX_ROUNDS`].
+/// The CP rounds of [`generate`], starting from `lists`. World A's text is
+/// written once, and each round ([`run_round`]) builds its world B on it.
+/// Each round builds the orders, with every order kept for a finding in its
+/// place, and runs every CP case once on its world B. A failed session
+/// stops the rounds. A kept order must halt at its branch again, else the
+/// rounds stop with a `finding evidence` error. An order that first halts at
+/// an implemented branch is kept, record and inputs, for every later round.
+/// The orders that halt at a not-implemented branch have their variants
+/// attributed together under the round's lists ([`attribute`]), and the
+/// error of the first of them in case order whose attribution fails stops
+/// the rounds. Otherwise each attributed value leaves its list in case
+/// order, once, a value an earlier case of the round already dropped being
+/// passed over, and another round starts, up to [`MAX_ROUNDS`].
 fn settle_cp(
     world_a: &Store,
     refs: &References,
     mut lists: Lists,
     not_implemented: &[String],
 ) -> Result<Settled, CorpusError> {
+    let base = WorldAText::new(world_a);
     let mut drops: Vec<DroppedVariant> = Vec::new();
     let mut retained: Retained = BTreeMap::new();
     let mut round = 0;
     loop {
         round += 1;
-        let (built, world) = run_round(world_a, refs, &lists, &retained)?;
+        let (built, world, zwr) = run_round(world_a, &base, refs, &lists, &retained)?;
         let mut outcomes = Vec::with_capacity(built.len());
         let mut unresolved = Vec::new();
         for (index, order) in built.iter().enumerate() {
@@ -2632,6 +2816,7 @@ fn settle_cp(
             return Ok(Settled {
                 built,
                 world,
+                zwr,
                 outcomes,
                 drops,
                 rounds: round,
@@ -2660,10 +2845,9 @@ fn settle_cp(
                 ),
             ));
         }
-        let round_lists = lists.clone();
-        for (index, branch) in unresolved {
-            let (dimension, value) =
-                attribute(world_a, refs, &round_lists, &built, index, not_implemented)?;
+        let positions: Vec<usize> = unresolved.iter().map(|(index, _)| *index).collect();
+        let attributions = attribute(&base, refs, &lists, &built, &positions, not_implemented)?;
+        for ((index, branch), (dimension, value)) in unresolved.into_iter().zip(attributions) {
             if !lists.list(&dimension).contains(&value) {
                 continue;
             }
@@ -2698,11 +2882,13 @@ fn settle_cp(
 ///    node world A holds, and the corpus ZWR text must parse back to exactly
 ///    the generated nodes. Every CP case then runs once on world B. A halt
 ///    at an implemented branch keeps that order, its record and inputs, for
-///    every later round, where it must halt at that branch again. A halt at
-///    a not-implemented branch is attributed to the first single-dimension
-///    reversion that lets the session end (`attribute`), and that value
-///    leaves its list; while any CP case halts at a not-implemented branch
-///    the next round starts, up to five rounds.
+///    every later round, where it must halt at that branch again. Each halt
+///    at a not-implemented branch is attributed to the first
+///    single-dimension reversion that lets its session end, the round's
+///    halted cases taking their reversions together, a step at a time, on
+///    one world B per step (`attribute`), and each value found leaves its
+///    list once; while any CP case halts at a not-implemented branch the
+///    next round starts, up to five rounds.
 /// 3. On the final world B each CE and CR case runs once, and its outcome
 ///    keeps, moves or records it. The final round's outcomes, the kept
 ///    orders' included, give the CP findings.
@@ -2735,6 +2921,7 @@ pub fn generate(world_a: &Store, spec: &str) -> Result<Corpus, CorpusError> {
     let Settled {
         built,
         world,
+        zwr,
         outcomes,
         drops,
         rounds,
@@ -2838,6 +3025,7 @@ pub fn generate(world_a: &Store, spec: &str) -> Result<Corpus, CorpusError> {
         findings,
         rounds,
         worst_y: worst,
+        zwr,
     };
     let violations = minimum_violations_with_refs(&refs, world_a, &world, &corpus);
     if !violations.is_empty() {
@@ -3750,13 +3938,13 @@ const MANIFEST_HEADER: &str =
     "case\tclass\tseed\torder_ien\tc_value\titem_count\ttags\texpected_branch";
 
 impl Corpus {
-    /// The corpus ZWR text: the header lines
-    /// `OSEHRA ZGO Export: IFCAP PO INQUIRY PARITY CORPUS` and `ZWR`, then
-    /// every node of every order in collation order as
+    /// The corpus ZWR text, [`Corpus::zwr`] as [`generate`] rendered it: the
+    /// header lines `OSEHRA ZGO Export: IFCAP PO INQUIRY PARITY CORPUS` and
+    /// `ZWR`, then every node of every order in collation order as
     /// `<reference>=<value>`, the value bare when it is a canonical number
     /// and otherwise quoted with each `"` doubled, each line ending `\n`.
     pub fn render_zwr(&self) -> String {
-        render_nodes(self.records.iter().flat_map(|record| record.nodes.iter()))
+        self.zwr.clone()
     }
 
     /// The manifest: the header row, then one tab-separated row per case in
@@ -3798,7 +3986,8 @@ impl Corpus {
             .collect()
     }
 
-    /// The 233 generated files and their contents: the corpus ZWR file, the
+    /// The 233 generated files and their contents: the corpus ZWR file,
+    /// whose text is [`Corpus::zwr`], rendered once by [`generate`], the
     /// manifest in the corpus folder, then each case's input file in case
     /// order.
     pub fn files(&self) -> Vec<(PathBuf, String)> {

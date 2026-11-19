@@ -4792,6 +4792,7 @@ fn corpus_reader_edited_transcript() {
         rounds: 2,
         largest_item_count: 8,
         worst_y: 44,
+        zwr: "OSEHRA ZGO Export: IFCAP PO INQUIRY PARITY CORPUS\nZWR\n".to_string(),
     };
     let entries = corpus_entries(&model);
     let ids: Vec<String> = entries.iter().map(|entry| entry.id.clone()).collect();
