@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use crate::golden::{corpus_case_ids, corpus_dir, corpus_input_path};
 use crate::inquiry::inquire_traced;
-use crate::mumps::{SESSION_OUTPUT_LIMIT, is_canonical, num, num_cmp, piece};
+use crate::mumps::{SESSION_OUTPUT_LIMIT, is_canonical};
 use crate::store::{Store, StoreError, Sub};
 
 // ---------------------------------------------------------------------------
@@ -192,6 +192,10 @@ const DESCRIPTION_HEADER: &str = "^^1^1^3261001^";
 
 /// The characters of stream text.
 const ALPHABET: &[u8; 36] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// The highest FOOD GROUP code: field 442.01/41 is a set of the codes `1`
+/// to `6` [DD.zwr:516400].
+const FOOD_GROUPS: usize = 6;
 
 /// The folder of the world A fixtures, which `store::load_fixtures` loads.
 pub fn world_a_dir() -> PathBuf {
@@ -651,11 +655,11 @@ fn vendor_properties(store: &Store, ien: &str) -> Vec<bool> {
     let node2 = store.get_or_empty(&key("PRC", &["440", ien, "2"]));
     let mut out = Vec::with_capacity(16);
     for field in VENDOR_PIECES {
-        let present = !piece(&node0, "^", field).is_empty();
+        let present = !crate::mumps::piece(&node0, "^", field).is_empty();
         out.push(present);
         out.push(!present);
     }
-    let present = !piece(&node2, "^", 1).is_empty();
+    let present = !crate::mumps::piece(&node2, "^", 1).is_empty();
     out.push(present);
     out.push(!present);
     out
@@ -671,9 +675,9 @@ fn vendor_eligible(store: &Store, ien: &str) -> bool {
         return false;
     };
     let node3 = store.get_or_empty(&key("PRC", &["440", ien, "3"]));
-    let state = piece(node0, "^", 7);
-    piece(&node3, "^", 2) != "Y"
-        && (state.is_empty() || resolves(store, "DIC", "5", &num(state)))
+    let state = crate::mumps::piece(node0, "^", 7);
+    crate::mumps::piece(&node3, "^", 2) != "Y"
+        && (state.is_empty() || resolves(store, "DIC", "5", &crate::mumps::num(state)))
         && ["2", "3"]
             .iter()
             .all(|node| store.data(&key("PRC", &["440", ien, node])) != 10)
@@ -717,19 +721,24 @@ impl References {
         let low_statuses: Vec<String> = statuses
             .iter()
             .filter(|ien| {
-                let level = piece(&status_name(ien), "^", 2).to_string();
-                level.is_empty() || num_cmp(&level, "10") == Ordering::Less
+                let level = crate::mumps::piece(&status_name(ien), "^", 2).to_string();
+                level.is_empty() || crate::mumps::num_cmp(&level, "10") == Ordering::Less
             })
             .cloned()
             .collect();
         let long_statuses: Vec<String> = statuses
             .iter()
-            .filter(|ien| piece(&status_name(ien), "^", 1).chars().count() > 34)
+            .filter(|ien| {
+                crate::mumps::piece(&status_name(ien), "^", 1)
+                    .chars()
+                    .count()
+                    > 34
+            })
             .cloned()
             .collect();
         let mops: Vec<String> = file_entries(world_a, "PRCD", "442.5")
             .into_iter()
-            .filter(|ien| num_cmp(ien, "10") == Ordering::Less)
+            .filter(|ien| crate::mumps::num_cmp(ien, "10") == Ordering::Less)
             .collect();
         let sources = file_entries(world_a, "PRCD", "420.8");
         let services: Vec<String> = file_entries(world_a, "DIC", "49")
@@ -1091,6 +1100,24 @@ fn digits(rng: &mut Xorshift64, length: usize) -> String {
         .collect()
 }
 
+/// An NSN in the 16-character shape the input transform of field 442.01/9.5
+/// accepts [DD.zwr:516208]: 4 stream digits, `-`, 2 stream characters, `-`,
+/// 3 stream characters, `-` and 4 stream digits. The stream characters of
+/// [`ALPHABET`] are the pattern's `UN` class.
+fn nsn_code(rng: &mut Xorshift64) -> String {
+    let group = digits(rng, 4);
+    let first: String = (0..2).map(|_| letter(rng)).collect();
+    let second: String = (0..3).map(|_| letter(rng)).collect();
+    let serial = digits(rng, 4);
+    format!("{group}-{first}-{second}-{serial}")
+}
+
+/// A FOOD GROUP code of field 442.01/41, `1` to [`FOOD_GROUPS`]
+/// [DD.zwr:516400].
+fn food_group_code(rng: &mut Xorshift64) -> String {
+    (1 + pick(rng, FOOD_GROUPS)).to_string()
+}
+
 /// A canonical decimal with an integer part of 1 to `whole_below` and
 /// `places` fraction digits, the last 1 to 9.
 fn decimal(rng: &mut Xorshift64, whole_below: usize, places: usize) -> String {
@@ -1214,11 +1241,12 @@ struct Built {
 /// text, when present), the proposal text, the APP digits, the fund control
 /// point's three digits and word, the cost center's four digits; then per
 /// item the description text, the quantity, the unit cost (none for
-/// `N/C`), the extended cost, the STK#, NSN and FOOD GROUP words and the
-/// Items per count when present, and the BOC with its words. Orders of
-/// five or more items are then thinned until [`worst_y`] is within
-/// [`PAGING_BOUND`]: from the last item back, Items per, FOOD GROUP, NSN and
-/// STK#, one printed line at a time.
+/// `N/C`), the extended cost, the STK# word, the NSN code ([`nsn_code`]),
+/// the FOOD GROUP code ([`food_group_code`]) and the Items per count when
+/// present, and the BOC with its words. Orders of five or more items are
+/// then thinned until [`worst_y`] is within [`PAGING_BOUND`]: from the last
+/// item back, Items per, FOOD GROUP, NSN and STK#, one printed line at a
+/// time.
 fn build_record(
     plan: &Plan,
     refs: &References,
@@ -1282,10 +1310,9 @@ fn build_record(
         } else {
             decimal(rng, 9999, 1)
         };
-        let mut optional = |name: &str| (field(name) == "present").then(|| word(rng));
-        let stk = optional("stk");
-        let nsn = optional("nsn");
-        let food = optional("food");
+        let stk = (field("stk") == "present").then(|| word(rng));
+        let nsn = (field("nsn") == "present").then(|| nsn_code(rng));
+        let food = (field("food") == "present").then(|| food_group_code(rng));
         let per = (field("per") == "present").then(|| (1 + pick(rng, 99)).to_string());
         let boc = if field("boc") == "several" {
             format!("{} {} {}", digits(rng, 4), word(rng), word(rng))
@@ -1307,7 +1334,7 @@ fn build_record(
         });
     }
 
-    let shipping = num_cmp(plan.value("shipping"), "0") == Ordering::Greater;
+    let shipping = crate::mumps::num_cmp(plan.value("shipping"), "0") == Ordering::Greater;
     if drafts.len() >= 5 {
         let shapes = |drafts: &[ItemDraft]| -> Vec<(usize, usize)> {
             drafts
@@ -1949,7 +1976,7 @@ pub fn generate(world_a: &Store, spec: &str) -> Result<Corpus, CorpusError> {
     // Without these file attributes every lookup ends at PO-09.b15 before
     // any order is read, which no reversion could attribute.
     let header = world_a.get_or_empty(&key("PRC", &["442", "0"]));
-    if piece(&header, "^", 2) != "442I" {
+    if crate::mumps::piece(&header, "^", 2) != "442I" {
         return Err(CorpusError::new(
             None,
             "profile violation",
@@ -2180,7 +2207,7 @@ struct OrderFacts {
 fn order_facts(store: &Store, ien: &str) -> OrderFacts {
     let order = key("PRC", &["442", ien]);
     let read = |subs: &[&str]| store.get_or_empty(&under(&order, subs));
-    let order_type = piece(&read(&["23"]), "^", 11).to_string();
+    let order_type = crate::mumps::piece(&read(&["23"]), "^", 11).to_string();
     let purchase_card = order_type == "S";
     let items = numeric_children(store, &under(&order, &["2"]))
         .iter()
@@ -2191,15 +2218,16 @@ fn order_facts(store: &Store, ien: &str) -> OrderFacts {
             let present = |text: &str| !text.is_empty();
             ItemFacts {
                 desc: read(&["2", j, "1", "1", "0"]),
-                qty: piece(&item0, "^", 2).to_string(),
-                unit: piece(&item0, "^", 3).to_string(),
-                cost: piece(&item0, "^", 9).to_string(),
-                ext: piece(&node2, "^", 1).to_string(),
-                stk: present(piece(&item0, "^", 6)),
-                nsn: present(piece(&item0, "^", 13)),
-                food: present(piece(&node4, "^", 12)),
-                per: !purchase_card && num(piece(&item0, "^", 12)) != "0",
-                boc: piece(&item0, "^", 4).to_string(),
+                qty: crate::mumps::piece(&item0, "^", 2).to_string(),
+                unit: crate::mumps::piece(&item0, "^", 3).to_string(),
+                cost: crate::mumps::piece(&item0, "^", 9).to_string(),
+                ext: crate::mumps::piece(&node2, "^", 1).to_string(),
+                stk: present(crate::mumps::piece(&item0, "^", 6)),
+                nsn: present(crate::mumps::piece(&item0, "^", 13)),
+                food: present(crate::mumps::piece(&node4, "^", 12)),
+                per: !purchase_card
+                    && crate::mumps::num(crate::mumps::piece(&item0, "^", 12)) != "0",
+                boc: crate::mumps::piece(&item0, "^", 4).to_string(),
                 purchase_card,
             }
         })
@@ -2214,24 +2242,60 @@ fn order_facts(store: &Store, ien: &str) -> OrderFacts {
     }
 }
 
+/// Whether `value` passes the input transform of field 442.01/9.5 NSN
+/// [DD.zwr:516208], a length of 16 or 17 and `X?4N1"-"2UN1"-"3UN1"-"4N.UN`:
+/// four digits, `-`, two upper-case letters or digits, `-`, three more,
+/// `-`, four digits, and at most one more upper-case letter or digit.
+fn is_nsn(value: &str) -> bool {
+    let digits_only = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    let codes_only = |part: &str| {
+        part.bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    };
+    let parts: Vec<&str> = value.split('-').collect();
+    let [group, first, second, last] = parts.as_slice() else {
+        return false;
+    };
+    let Some((serial, extra)) = last.split_at_checked(4) else {
+        return false;
+    };
+    group.len() == 4
+        && digits_only(group)
+        && first.len() == 2
+        && codes_only(first)
+        && second.len() == 3
+        && codes_only(second)
+        && digits_only(serial)
+        && extra.len() <= 1
+        && codes_only(extra)
+}
+
+/// Whether `value` is a FOOD GROUP code of field 442.01/41, `1` to
+/// [`FOOD_GROUPS`] [DD.zwr:516400].
+fn is_food_group(value: &str) -> bool {
+    (1..=FOOD_GROUPS).any(|code| code.to_string() == value)
+}
+
 /// The fixture profile of `SPEC.md` "Parity corpus" for order `ien` of
 /// `world_b`, every reference resolved in `world_a`: each violation names
 /// the order and the rule, and an order on the profile gives none. It
 /// checks the `^PRC(442,0)` attributes `442I`, nodes 0 and 1, a method of
 /// processing below 10, no node 11, 5, 3, 15, 4, 13, 6 or 24, field 5.3
 /// empty, node 23 pieces 7, 8 and 22 empty and piece 11 `P`, `S` or `D`, no
-/// `M`, `MCH` or `G` index, a non-EDI vendor, status and `.08` ESTIMATED
-/// ORDER? (node 7 piece 3) empty, at least one item, each with one
-/// description line of at most 32 characters and no `|`, a node 2 with
-/// pieces 2, 8, 9 and 11 empty and no node 3, no item `AC` index, no 442.8
-/// `B` index, every vendor, state, service, ship-to, unit, source code,
-/// authority, method and status pointer resolved, and an agent of `.5` or
-/// empty.
+/// `M`, `MCH` or `G` index, a non-EDI vendor, a status that resolves in
+/// 442.3, `.08` ESTIMATED ORDER? (node 7 piece 3) empty, at least one item,
+/// each with one description line of at most 32 characters and no `|`, a
+/// node 2 with pieces 2, 8, 9 and 11 empty and no node 3, an NSN (node 0
+/// piece 13) empty or in the shape field 442.01/9.5 accepts, a FOOD GROUP
+/// (node 4 piece 12) empty or a code of field 442.01/41, no item `AC`
+/// index, no 442.8 `B` index, every vendor, state, service, ship-to, unit,
+/// source code, authority, method and status pointer resolved, and an agent
+/// of `.5` or empty.
 pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut fail = |rule: String| out.push(format!("order {ien}: {rule}"));
     let header = world_a.get_or_empty(&key("PRC", &["442", "0"]));
-    if piece(&header, "^", 2) != "442I" {
+    if crate::mumps::piece(&header, "^", 2) != "442I" {
         fail("the world A file 442 header piece 2 is not 442I".to_string());
     }
     let order = key("PRC", &["442", ien]);
@@ -2245,8 +2309,10 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
     }
     let node0 = node0.unwrap_or("");
     let node1 = node1.unwrap_or("");
-    let mop = piece(node0, "^", 2);
-    if !resolves(world_a, "PRCD", "442.5", mop) || num_cmp(mop, "10") != Ordering::Less {
+    let mop = crate::mumps::piece(node0, "^", 2);
+    if !resolves(world_a, "PRCD", "442.5", mop)
+        || crate::mumps::num_cmp(mop, "10") != Ordering::Less
+    {
         fail(format!(
             "method of processing {} is not a 442.5 entry below 10",
             tag_value(mop)
@@ -2257,18 +2323,18 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
             fail(format!("node {sub} is present"));
         }
     }
-    if !piece(node1, "^", 12).is_empty() {
+    if !crate::mumps::piece(node1, "^", 12).is_empty() {
         fail("field 5.3, node 1 piece 12, is not empty".to_string());
     }
     let node23 = under(&order, &["23"]);
     if world_b.data(&node23) != 0 {
         let node23 = world_b.get_or_empty(&node23);
         for field in [7, 8, 22] {
-            if !piece(&node23, "^", field).is_empty() {
+            if !crate::mumps::piece(&node23, "^", field).is_empty() {
                 fail(format!("node 23 piece {field} is not empty"));
             }
         }
-        if !["P", "S", "D"].contains(&piece(&node23, "^", 11)) {
+        if !["P", "S", "D"].contains(&crate::mumps::piece(&node23, "^", 11)) {
             fail("node 23 piece 11 is not P, S or D".to_string());
         }
     }
@@ -2277,7 +2343,7 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
             fail(format!("the file 442 index {index} holds entries"));
         }
     }
-    let vendor = piece(node1, "^", 1);
+    let vendor = crate::mumps::piece(node1, "^", 1);
     match world_a.get(&key("PRC", &["440", vendor, "0"])) {
         None => fail(format!(
             "vendor {} does not resolve in file 440",
@@ -2285,11 +2351,11 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
         )),
         Some(vendor0) => {
             let node3 = world_a.get_or_empty(&key("PRC", &["440", vendor, "3"]));
-            if piece(&node3, "^", 2) == "Y" {
+            if crate::mumps::piece(&node3, "^", 2) == "Y" {
                 fail(format!("vendor {vendor} is an EDI vendor"));
             }
-            let state = piece(vendor0, "^", 7);
-            if !state.is_empty() && !resolves(world_a, "DIC", "5", &num(state)) {
+            let state = crate::mumps::piece(vendor0, "^", 7);
+            if !state.is_empty() && !resolves(world_a, "DIC", "5", &crate::mumps::num(state)) {
                 fail(format!(
                     "vendor {vendor} state {state} does not resolve in file 5"
                 ));
@@ -2297,14 +2363,14 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
         }
     }
     let node7 = world_b.get_or_empty(&under(&order, &["7"]));
-    let status = piece(&node7, "^", 1);
+    let status = crate::mumps::piece(&node7, "^", 1);
     if !resolves(world_a, "PRCD", "442.3", status) {
         fail(format!(
             "status {} does not resolve in file 442.3",
             tag_value(status)
         ));
     }
-    if !piece(&node7, "^", 3).is_empty() {
+    if !crate::mumps::piece(&node7, "^", 3).is_empty() {
         fail("field .08, node 7 piece 3, is not empty".to_string());
     }
     let items = under(&order, &["2"]);
@@ -2333,7 +2399,7 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
             None => fail(format!("item {j} node 2 is absent")),
             Some(node2) => {
                 for field in [2, 8, 9, 11] {
-                    if !piece(node2, "^", field).is_empty() {
+                    if !crate::mumps::piece(node2, "^", field).is_empty() {
                         fail(format!("item {j} node 2 piece {field} is not empty"));
                     }
                 }
@@ -2342,21 +2408,34 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
         if world_b.data(&under(&item, &["3"])) != 0 {
             fail(format!("item {j} node 3 is present"));
         }
-        let unit = piece(item0, "^", 3);
+        let unit = crate::mumps::piece(item0, "^", 3);
         if !unit.is_empty() && !resolves(world_a, "PRCD", "420.5", unit) {
             fail(format!(
                 "item {j} unit {unit} does not resolve in file 420.5"
+            ));
+        }
+        let nsn = crate::mumps::piece(item0, "^", 13);
+        if !nsn.is_empty() && !is_nsn(nsn) {
+            fail(format!(
+                "item {j} NSN {nsn} is not 4N-2UN-3UN-4N with at most one more UN character"
+            ));
+        }
+        let node4 = world_b.get_or_empty(&under(&item, &["4"]));
+        let food = crate::mumps::piece(&node4, "^", 12);
+        if !food.is_empty() && !is_food_group(food) {
+            fail(format!(
+                "item {j} FOOD GROUP {food} is not a code 1 to {FOOD_GROUPS}"
             ));
         }
     }
     if world_b.data(&key("PRC", &["442.8", "B"])) != 0 {
         fail("the file 442.8 index B holds entries".to_string());
     }
-    let service = piece(node1, "^", 2);
+    let service = crate::mumps::piece(node1, "^", 2);
     if !service.is_empty() && !resolves(world_a, "DIC", "49", service) {
         fail(format!("service {service} does not resolve in file 49"));
     }
-    let ship_to = piece(node1, "^", 3);
+    let ship_to = crate::mumps::piece(node1, "^", 3);
     if !ship_to.is_empty()
         && world_a
             .get(&key("PRC", &["411", STATION, "1", ship_to, "0"]))
@@ -2366,7 +2445,7 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
             "ship-to {ship_to} does not resolve under station {STATION}"
         ));
     }
-    let source = piece(node1, "^", 7);
+    let source = crate::mumps::piece(node1, "^", 7);
     if !source.is_empty() && !resolves(world_a, "PRCD", "420.8", source) {
         fail(format!(
             "source code {source} does not resolve in file 420.8"
@@ -2379,7 +2458,7 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
             fail(format!("authority {j} does not resolve in file 442.4"));
         }
     }
-    let agent = piece(node1, "^", 10);
+    let agent = crate::mumps::piece(node1, "^", 10);
     if !(agent.is_empty() || (agent == ".5" && resolves(world_a, "VA", "200", ".5"))) {
         fail(format!("agent {agent} is not .5 or empty"));
     }
@@ -2408,7 +2487,8 @@ pub fn order_worst_y(world_b: &Store, ien: &str) -> usize {
             (details, usize::from(item.per))
         })
         .collect();
-    let shipping = num_cmp(piece(&facts.node0, "^", 13), "0") == Ordering::Greater;
+    let shipping =
+        crate::mumps::num_cmp(crate::mumps::piece(&facts.node0, "^", 13), "0") == Ordering::Greater;
     worst_y(&shapes, shipping)
 }
 
@@ -2500,8 +2580,8 @@ fn presence(present: bool) -> String {
 /// The order row labels of one world B order, as the rotation lists name
 /// them.
 fn order_labels(facts: &OrderFacts) -> Vec<(&'static str, String)> {
-    let p0 = |field: usize| piece(&facts.node0, "^", field).to_string();
-    let p1 = |field: usize| piece(&facts.node1, "^", field).to_string();
+    let p0 = |field: usize| crate::mumps::piece(&facts.node0, "^", field).to_string();
+    let p1 = |field: usize| crate::mumps::piece(&facts.node1, "^", field).to_string();
     let verbal = match (p1(4).as_str(), p1(5).as_str()) {
         ("Y", "") => "verbal",
         ("Y", "Y") => "confirmation",
@@ -2509,7 +2589,10 @@ fn order_labels(facts: &OrderFacts) -> Vec<(&'static str, String)> {
         _ => "other",
     };
     vec![
-        ("status", piece(&facts.node7, "^", 1).to_string()),
+        (
+            "status",
+            crate::mumps::piece(&facts.node7, "^", 1).to_string(),
+        ),
         ("type", facts.order_type.clone()),
         ("source", p1(7)),
         ("mop", p0(2)),
@@ -2709,7 +2792,7 @@ pub fn minimum_violations(world_a: &Store, world_b: &Store, corpus: &Corpus) -> 
     if tally.drops_in("vendor") == 0 {
         let held: Vec<Vec<bool>> = facts
             .iter()
-            .map(|order| vendor_properties(world_a, piece(&order.node1, "^", 1)))
+            .map(|order| vendor_properties(world_a, crate::mumps::piece(&order.node1, "^", 1)))
             .collect();
         for (index, property) in vendor_property_names().into_iter().enumerate() {
             let found = held
@@ -2760,7 +2843,7 @@ pub fn minimum_violations(world_a: &Store, world_b: &Store, corpus: &Corpus) -> 
     let positive: Vec<&str> = SHIPPING
         .iter()
         .copied()
-        .filter(|value| num_cmp(value, "0") == Ordering::Greater)
+        .filter(|value| crate::mumps::num_cmp(value, "0") == Ordering::Greater)
         .collect();
     let shipped: usize = positive
         .iter()
