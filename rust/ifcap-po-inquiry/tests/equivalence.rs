@@ -643,6 +643,14 @@ const CORPUS_HEADING: &str = "### Parity corpus";
 /// The start of the block's recording run line.
 const RUN_LINE: &str = "Recording run: ";
 
+/// The recording run line for the integrity failure `cause`. A cause may
+/// quote text read from a rejected recording, a `meta.txt` key or a
+/// `run-summary.txt` value, so it is shown through [`quote`], a code span
+/// in which no Markdown or HTML it holds renders.
+fn integrity_line(cause: &str) -> String {
+    format!("{RUN_LINE}INTEGRITY FAIL: {}", quote(cause))
+}
+
 /// One corpus case to judge: its id, its final class label, the inputs the
 /// model generated for it and, for a CR case, the GC case it replays.
 struct CorpusEntry {
@@ -682,7 +690,8 @@ struct CorpusVerdict {
 struct CorpusJudgement {
     /// The recording run line: `none`, the run's `meta.txt` values, or
     /// `INTEGRITY FAIL: <cause>` with the first integrity failure, the
-    /// run's when the run failed, else the first case's.
+    /// run's when the run failed, else the first case's, quoted as
+    /// [`integrity_line`] gives it.
     /// Its format characters are shown by [`escape_format`].
     run_line: String,
     verdicts: Vec<CorpusVerdict>,
@@ -699,14 +708,9 @@ struct CorpusJudgement {
 
 /// Judges `entries` from the corpus folder `corpus_dir` on `world_b`, and
 /// labels each CR case against its GC capture in `gc_dir`, by the
-/// precedence of the module doc (AAP 0.5.7). The recording run is verified
-/// once. A case that fails to load, or whose committed input differs from
-/// the model's, fails its own integrity check: its cause names the file at
-/// fault, and the case is NOT COMPARED unless it is BOUNDARY, while every
-/// other case keeps its own verdict. So only a committed input equal to the
-/// model's is run, and only for a usable capture, so with no recording none
-/// runs. The run line shows the first integrity failure, of the run or
-/// else of a case.
+/// precedence of the module doc (AAP 0.5.7): the recording run of the
+/// entries' ids is verified once, and [`judge_with_run`] judges every case
+/// against that run.
 fn judge_corpus(
     corpus_dir: &Path,
     gc_dir: &Path,
@@ -715,13 +719,45 @@ fn judge_corpus(
     literals: &[Literal],
 ) -> CorpusJudgement {
     let ids: Vec<String> = entries.iter().map(|entry| entry.id.clone()).collect();
+    judge_with_run(
+        load_corpus_run(corpus_dir, &ids),
+        corpus_dir,
+        gc_dir,
+        world_b,
+        entries,
+        literals,
+    )
+}
+
+/// Judges `entries` as [`judge_corpus`] does, against `run`, the recording
+/// run already read from `corpus_dir`. A case that fails to load, whose
+/// committed input differs from the model's, or that `run` does not vouch
+/// for ([`CorpusRun::confirm_case`]: a transcript present though the run
+/// was read as absent, or other than the bytes the run's verified
+/// `SHA256SUMS` listed for it, or one that listing names but the case no
+/// longer holds, or an input other than the one that listing names) fails
+/// its own integrity check: its cause names the file at fault, and the case
+/// is NOT COMPARED unless it is BOUNDARY, while every other case keeps its
+/// own verdict. So only a committed input equal to the model's, and to the
+/// input the verified run lists, is run, and only for a capture that run
+/// lists byte for byte, so with no recording none runs. The run line shows
+/// the first integrity failure, of the run or else of a case.
+fn judge_with_run(
+    run: Result<CorpusRun, String>,
+    corpus_dir: &Path,
+    gc_dir: &Path,
+    world_b: &Store,
+    entries: &[CorpusEntry],
+    literals: &[Literal],
+) -> CorpusJudgement {
     let mut integrity = Vec::new();
-    let (run_line, run_failed, quarantined) = match load_corpus_run(corpus_dir, &ids) {
-        Ok(CorpusRun::Absent) => (format!("{RUN_LINE}none"), false, Vec::new()),
+    let (run_line, run_failed, quarantined): (String, bool, &[String]) = match &run {
+        Ok(CorpusRun::Absent) => (format!("{RUN_LINE}none"), false, &[]),
         Ok(CorpusRun::Recorded {
             meta,
             quarantined,
             export_sha256,
+            ..
         }) => {
             let values: Vec<String> = CORPUS_META_KEYS
                 .iter()
@@ -731,19 +767,32 @@ fn judge_corpus(
                 "{RUN_LINE}{}; export_sha256={export_sha256}; exports=IDENTICAL runs=IDENTICAL",
                 values.join("; ")
             );
-            (line, false, quarantined)
+            (line, false, quarantined.as_slice())
         }
         Err(cause) => {
-            let cause = crate_relative(&cause);
-            let line = format!("{RUN_LINE}INTEGRITY FAIL: {}", one_line(&cause));
+            let cause = crate_relative(cause);
+            let line = integrity_line(&cause);
             integrity.push(cause);
-            (line, true, Vec::new())
+            (line, true, &[])
         }
     };
     let mut verdicts = Vec::with_capacity(entries.len());
     for entry in entries {
         let case = match load_corpus_case(corpus_dir, &entry.id) {
-            Ok(case) if case.inputs == entry.inputs => Some(case),
+            // Held to the run read above, never to the listing the case
+            // reader read just now. A failed run compares no case anyway.
+            Ok(case) if case.inputs == entry.inputs => {
+                match run
+                    .as_ref()
+                    .map_or(Ok(()), |run| run.confirm_case(corpus_dir, &case))
+                {
+                    Ok(()) => Some(case),
+                    Err(cause) => {
+                        integrity.push(crate_relative(&cause));
+                        None
+                    }
+                }
+            }
             Ok(_) => {
                 integrity.push(crate_relative(&format!(
                     "{}: committed input differs from the generated model",
@@ -759,7 +808,8 @@ fn judge_corpus(
         // The committed inputs and the capture a verdict may use, or why
         // there is none: precedence rules (b), (c) and (d), in that order.
         // `case` is `None` when the case failed its own integrity check: it
-        // did not load, or its committed input differs from the model's.
+        // did not load, its committed input differs from the model's, or
+        // the run does not vouch for its transcript or its input.
         let usable: Result<(&[String], &str), &'static str> = match &case {
             _ if run_failed => Err(RUN_INTEGRITY_FAILURE),
             None => Err(CASE_INTEGRITY_FAILURE),
@@ -800,7 +850,7 @@ fn judge_corpus(
     // first case integrity failure replaces the run's line, so that no
     // failure leaves the line reading healthy.
     let run_line = match integrity.first() {
-        Some(cause) if !run_failed => format!("{RUN_LINE}INTEGRITY FAIL: {}", one_line(cause)),
+        Some(cause) if !run_failed => integrity_line(cause),
         _ => run_line,
     };
     CorpusJudgement {
@@ -1016,7 +1066,8 @@ fn matched_line(matched: usize, in_scope: usize) -> String {
 /// The corpus verdicts over the loaded fixtures, or the reason they did not
 /// load, judged from the committed corpus folder against the GC captures.
 /// When the model or world B is missing, the block holds only its heading,
-/// the first cause as the recording run line and `MATCHED 0 OF 0`.
+/// the first cause in the recording run line, as [`integrity_line`]
+/// quotes it, and `MATCHED 0 OF 0`.
 fn corpus_results(world_a: &Result<Store, String>, literals: &[Literal]) -> CorpusReport {
     let built = match world_a {
         Err(cause) => Err(vec![format!("fixtures not loaded: {cause}")]),
@@ -1028,7 +1079,7 @@ fn corpus_results(world_a: &Result<Store, String>, literals: &[Literal]) -> Corp
             let first = integrity.first().map_or("", String::as_str);
             let block = [
                 CORPUS_HEADING.to_string(),
-                format!("{RUN_LINE}INTEGRITY FAIL: {}", one_line(first)),
+                integrity_line(first),
                 matched_line.clone(),
             ]
             .join("\n\n");
@@ -2410,11 +2461,7 @@ fn assert_run_fails(folder: &TempCorpus, file: &str, fragment: &str) {
         std::slice::from_ref(&cause),
         "integrity"
     );
-    assert_eq!(
-        judgement.run_line,
-        format!("Recording run: INTEGRITY FAIL: {}", one_line(&cause)),
-        "run line"
-    );
+    assert_eq!(judgement.run_line, integrity_line(&cause), "run line");
     let verdict = verdict_of(&judgement, "CP-001");
     assert_eq!(verdict.verdict, NOT_COMPARED, "CP-001 verdict: {cause}");
     assert_eq!(
@@ -2561,7 +2608,9 @@ fn world_of(verdict: &CorpusVerdict) -> &WorldLabel {
 /// BOUNDARY case stays BOUNDARY either way, recorded exactly when its
 /// transcript exists. Every reader refuses an id outside the series by
 /// name, whatever stands at the path it would lead to. A CR case with its
-/// input alone is NOT COMPARED, and so is its world label.
+/// input alone is NOT COMPARED, and so is its world label. A recording
+/// published after the run was read as absent fails each case it holds,
+/// judged against that absent run, although a fresh read verifies it.
 #[test]
 fn corpus_reader_no_capture_not_compared() {
     // Every reader test writes only into a folder its guard created
@@ -2755,9 +2804,7 @@ fn corpus_reader_no_capture_not_compared() {
         "each failing input is a case integrity failure"
     );
     assert_eq!(
-        input_failures
-            .first()
-            .map(|cause| format!("{RUN_LINE}INTEGRITY FAIL: {}", one_line(cause))),
+        input_failures.first().map(|cause| integrity_line(cause)),
         Some(judgement.run_line.clone()),
         "the run line names the first failing input"
     );
@@ -2864,10 +2911,7 @@ fn corpus_reader_no_capture_not_compared() {
     );
     assert_eq!(
         judgement.run_line,
-        format!(
-            "{RUN_LINE}INTEGRITY FAIL: {}",
-            one_line(&crate_relative(&run_cause))
-        ),
+        integrity_line(&crate_relative(&run_cause)),
         "the run line names the run's failure"
     );
     for row in &transcript_entries {
@@ -2963,6 +3007,129 @@ fn corpus_reader_no_capture_not_compared() {
         (0, 0),
         "MATCHED n OF m"
     );
+
+    // A recording published after the run was read as absent. The run read
+    // first stands for the whole judgement: each transcript that appeared
+    // since fails its own case, although a fresh run and the case reader
+    // now verify every file, CP-001's capture would MATCH and CR-01's
+    // equals its GC capture. No capture is compared, the BOUNDARY case
+    // stays BOUNDARY, and the CR world label is NOT COMPARED.
+    let mut late = TempCorpus::new("no-capture-late");
+    late.input("CP-001", &cp);
+    late.input("CE-17", &boundary);
+    late.input("CR-01", &replay);
+    let late_entries = [
+        entry("CP-001", CLASS_CP, &cp, None),
+        entry("CE-17", CLASS_BOUNDARY, &boundary, None),
+        entry("CR-01", CLASS_CR, &replay, Some(gc)),
+    ];
+    let late_ids: Vec<String> = late_entries.iter().map(|row| row.id.clone()).collect();
+    let stale = load_corpus_run(late.path(), &late_ids);
+    assert_eq!(
+        stale,
+        Ok(CorpusRun::Absent),
+        "inputs alone, read before the recording"
+    );
+    let rust = rust_transcript(&cp);
+    late.transcript("CP-001", &rust);
+    late.transcript("CE-17", "SYNTHETIC BOUNDARY CAPTURE\n");
+    late.transcript("CR-01", &gc_transcript(gc));
+    late.run(&[
+        ("CP-001", "RECORDED"),
+        ("CE-17", "RECORDED"),
+        ("CR-01", "RECORDED"),
+    ]);
+    assert!(
+        matches!(
+            load_corpus_run(late.path(), &late_ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "a fresh read verifies the recording"
+    );
+    let late_case = match load_corpus_case(late.path(), "CP-001") {
+        Ok(case) => case,
+        Err(cause) => panic!("CP-001 must load from the recording: {cause}"),
+    };
+    assert_eq!(
+        late_case.transcript.as_deref(),
+        Some(rust.as_str()),
+        "CP-001's capture, as the case reader returns it"
+    );
+    let fresh = judge(&late, &late_entries);
+    assert_eq!(
+        (
+            fresh.integrity.len(),
+            verdict_of(&fresh, "CP-001").verdict,
+            world_of(verdict_of(&fresh, "CR-01")).label
+        ),
+        (0, MATCH, WORLD_INDEPENDENT),
+        "judged against a fresh read, the recording verifies"
+    );
+    let appeared = |id: &str| {
+        format!(
+            "{}: present though the recording run was read as absent",
+            late.path().join(id).join("transcript.txt").display()
+        )
+    };
+    assert_eq!(
+        CorpusRun::Absent.confirm_case(late.path(), &late_case),
+        Err(appeared("CP-001")),
+        "an absent run vouches for no transcript"
+    );
+    let unrecorded = match load_corpus_case(folder.path(), "CP-001") {
+        Ok(case) => case,
+        Err(cause) => panic!("CP-001 must load from its input alone: {cause}"),
+    };
+    assert_eq!(unrecorded.transcript, None, "CP-001 is not recorded");
+    assert_eq!(
+        CorpusRun::Absent.confirm_case(folder.path(), &unrecorded),
+        Ok(()),
+        "an absent run accepts a case with no transcript"
+    );
+    let judgement = judge_with_run(
+        stale,
+        late.path(),
+        &default_dir(),
+        test_world_b(),
+        &late_entries,
+        &literal_rows(SPEC),
+    );
+    let causes: Vec<String> = late_ids
+        .iter()
+        .map(|id| crate_relative(&appeared(id)))
+        .collect();
+    assert_eq!(
+        judgement.integrity, causes,
+        "each transcript that appeared after the absent read, in case order"
+    );
+    assert_eq!(
+        causes.first().map(|cause| integrity_line(cause)),
+        Some(judgement.run_line.clone()),
+        "the run line names the first transcript that appeared"
+    );
+    for (id, verdict, detail) in [
+        ("CP-001", NOT_COMPARED, CASE_INTEGRITY_FAILURE),
+        ("CE-17", BOUNDARY, NO_DETAIL),
+        ("CR-01", NOT_COMPARED, CASE_INTEGRITY_FAILURE),
+    ] {
+        let judged = verdict_of(&judgement, id);
+        assert_eq!(
+            (judged.verdict, judged.detail.as_str(), judged.recorded),
+            (verdict, detail, true),
+            "{id} verdict, detail and recorded, against the absent run"
+        );
+    }
+    let world = world_of(verdict_of(&judgement, "CR-01"));
+    assert_eq!(
+        (world.label, world.detail.as_str()),
+        (NOT_COMPARED, CASE_INTEGRITY_FAILURE),
+        "CR-01 label against the absent run"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m against the absent run"
+    );
 }
 
 /// A capture equal to the Rust transcript, with valid run files, is MATCH;
@@ -3029,7 +3196,23 @@ fn corpus_reader_matching_capture() {
             meta,
             quarantined,
             export_sha256,
+            transcripts,
+            inputs: listed_inputs,
         }) => {
+            assert_eq!(
+                transcripts,
+                [(
+                    "CP-001".to_string(),
+                    sha256_hex(rust_transcript(&inputs).as_bytes())
+                )],
+                "the transcripts the verified listing names, with their digests"
+            );
+            let input_text: String = inputs.iter().map(|input| format!("{input}\n")).collect();
+            assert_eq!(
+                listed_inputs,
+                [("CP-001".to_string(), sha256_hex(input_text.as_bytes()))],
+                "the inputs the verified listing names, with their digests"
+            );
             for (key, value) in [
                 ("image_digest", "synthetic"),
                 ("snapshot_id", "synthetic"),
@@ -3134,11 +3317,7 @@ fn corpus_reader_matching_capture() {
         "integrity: {:?}",
         judgement.integrity
     );
-    assert_eq!(
-        judgement.run_line,
-        format!("Recording run: INTEGRITY FAIL: {}", one_line(&cause)),
-        "run line"
-    );
+    assert_eq!(judgement.run_line, integrity_line(&cause), "run line");
     let verdict = verdict_of(&judgement, "CP-001");
     assert_eq!(verdict.verdict, NOT_COMPARED, "detail: {}", verdict.detail);
     assert_eq!(verdict.detail, CASE_INTEGRITY_FAILURE, "CP-001 detail");
@@ -3259,7 +3438,7 @@ fn corpus_reader_matching_capture() {
         );
         assert_eq!(
             judgement.run_line,
-            format!("Recording run: INTEGRITY FAIL: {}", one_line(&judged)),
+            integrity_line(&judged),
             "run line: {reason}"
         );
         let verdict = verdict_of(&judgement, "CP-001");
@@ -3346,11 +3525,7 @@ fn corpus_reader_matching_capture() {
         ],
     );
     assert_eq!(judgement.integrity, [cause.as_str()], "integrity");
-    assert_eq!(
-        judgement.run_line,
-        format!("Recording run: INTEGRITY FAIL: {}", one_line(&cause)),
-        "run line"
-    );
+    assert_eq!(judgement.run_line, integrity_line(&cause), "run line");
     let healthy = verdict_of(&judgement, "CP-001");
     assert_eq!(healthy.verdict, MATCH, "CP-001 detail: {}", healthy.detail);
     assert_eq!(healthy.detail, NO_DETAIL, "CP-001 detail");
@@ -3803,8 +3978,10 @@ fn corpus_reader_mismatch_first_line() {
 /// over the quarantine, a BOUNDARY case stays BOUNDARY with or without one,
 /// and a quarantined CR case keeps its world label.
 /// Any status other than RECORDED or QUARANTINED fails the run. The exit
-/// statuses, and DIFF lines naming the export or a case, are evidence only
-/// and change nothing.
+/// statuses are evidence only and change nothing. A DIFF line naming the
+/// export or a case fails the run beside exports=IDENTICAL and
+/// runs=IDENTICAL, naming its line, and beside a DIFFERENT identity line,
+/// before or after it, the identity line fails the run.
 #[test]
 fn corpus_reader_quarantined() {
     let mut folder = TempCorpus::new("quarantined");
@@ -3861,11 +4038,7 @@ fn corpus_reader_quarantined() {
     let cause = format!("{named}: committed input differs from the generated model");
     let judgement = judge(&changed, &[entry("CP-001", CLASS_CP, &inputs, None)]);
     assert_eq!(judgement.integrity, [cause.as_str()], "integrity");
-    assert_eq!(
-        judgement.run_line,
-        format!("Recording run: INTEGRITY FAIL: {}", one_line(&cause)),
-        "run line"
-    );
+    assert_eq!(judgement.run_line, integrity_line(&cause), "run line");
     let verdict = verdict_of(&judgement, "CP-001");
     assert_eq!(verdict.verdict, NOT_COMPARED, "detail: {}", verdict.detail);
     assert_eq!(verdict.detail, CASE_INTEGRITY_FAILURE, "CP-001 detail");
@@ -3890,11 +4063,7 @@ fn corpus_reader_quarantined() {
         "integrity: {:?}",
         judgement.integrity
     );
-    assert_eq!(
-        judgement.run_line,
-        format!("Recording run: INTEGRITY FAIL: {}", one_line(&missing)),
-        "run line"
-    );
+    assert_eq!(judgement.run_line, integrity_line(&missing), "run line");
     let verdict = verdict_of(&judgement, "CP-001");
     assert_eq!(verdict.verdict, NOT_COMPARED, "detail: {}", verdict.detail);
     assert_eq!(verdict.detail, RUN_INTEGRITY_FAILURE, "CP-001 detail");
@@ -4008,9 +4177,8 @@ fn corpus_reader_quarantined() {
         let fragment = format!("line 4: status {status} is neither RECORDED nor QUARANTINED");
         assert_run_fails(&folder, "run-summary.txt", &fragment);
     }
-    // Nonzero, absent or odd exit statuses, and DIFF lines naming the
-    // export or a case under IDENTICAL identity lines, leave the run
-    // recorded and CP-001 QUARANTINED.
+    // Nonzero, absent or odd exit statuses leave the run recorded and
+    // CP-001 QUARANTINED.
     let evidence = [
         (
             "nonzero exit statuses",
@@ -4021,11 +4189,6 @@ fn corpus_reader_quarantined() {
             "odd exit statuses",
             "CP-001\tQUARANTINED\t-\tx\nCE-17\tRECORDED\t0\t0\n",
         ),
-        (
-            "DIFF lines",
-            "CP-001\tQUARANTINED\t0\t0\nCE-17\tRECORDED\t0\t0\n\
-             DIFF\texport\nDIFF\tCP-001\nDIFF\tCE-17\n",
-        ),
     ];
     for (index, (what, cases)) in evidence.into_iter().enumerate() {
         let folder = recorded_pair(
@@ -4034,6 +4197,50 @@ fn corpus_reader_quarantined() {
             Some(&format!("{head}{cases}")),
         );
         assert_cp_quarantined(&folder, what);
+    }
+    // record_corpus.sh writes a DIFF line only beside a DIFFERENT identity
+    // line, so one beside two IDENTICAL lines contradicts them and fails the
+    // run at the first DIFF line. Beside a DIFFERENT line, before or after
+    // it, the identity line fails the run instead.
+    let cases = "CP-001\tQUARANTINED\t0\t0\nCE-17\tRECORDED\t0\t0\n";
+    let contradiction = "DIFF contradicts exports=IDENTICAL and runs=IDENTICAL";
+    let diffs = [
+        (
+            format!("{head}{cases}DIFF\texport\n"),
+            format!("line 6: {contradiction}"),
+        ),
+        (
+            format!("{head}{cases}DIFF\tCP-001\n"),
+            format!("line 6: {contradiction}"),
+        ),
+        (
+            format!("{head}{cases}DIFF\texport\nDIFF\tCP-001\nDIFF\tCE-17\n"),
+            format!("line 6: {contradiction}"),
+        ),
+        (
+            format!("DIFF\tCE-17\n{head}{cases}"),
+            format!("line 1: {contradiction}"),
+        ),
+        (
+            format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\nruns=DIFFERENT\n{cases}DIFF\tCP-001\n"),
+            "runs=DIFFERENT".to_string(),
+        ),
+        (
+            format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\nDIFF\tCP-001\nruns=DIFFERENT\n{cases}"),
+            "runs=DIFFERENT".to_string(),
+        ),
+        (
+            format!("exports=DIFFERENT\n{SUMMARY_DIGEST}\nruns=IDENTICAL\n{cases}DIFF\texport\n"),
+            "exports=DIFFERENT".to_string(),
+        ),
+    ];
+    for (index, (summary, fragment)) in diffs.iter().enumerate() {
+        let folder = recorded_pair(
+            &format!("quarantined-diff-{index}"),
+            "run-summary.txt",
+            Some(summary),
+        );
+        assert_run_fails(&folder, "run-summary.txt", fragment);
     }
 }
 
@@ -4050,7 +4257,9 @@ fn corpus_reader_quarantined() {
 /// only, and a binary-mode line is accepted.
 /// A missing `meta.txt` or `run-summary.txt`, the other files present and
 /// hashed, fails the run the same way, naming that file, and so does a
-/// correctly hashed summary that breaks any of its rules.
+/// correctly hashed summary that breaks any of its rules. Markup that a
+/// rejected run file holds and its cause quotes, an image, an HTML element,
+/// a link or a backtick run, stays inside the run line's code span.
 #[test]
 fn corpus_reader_missing_sha256sums() {
     let mut folder = TempCorpus::new("missing-sums");
@@ -4392,6 +4601,67 @@ fn corpus_reader_missing_sha256sums() {
         );
         assert_run_fails(&folder, "run-summary.txt", fragment);
     }
+
+    // Hostile markup in a rejected run file, quoted by the cause, reaches
+    // the run line only inside its code span: an image, an HTML element
+    // with a handler, a link and a backtick run. Each run line is spelled
+    // out here, its fence one backtick longer than the longest run in the
+    // cause, so the payload can neither close the span nor render.
+    let hostile_meta = format!(
+        "image_digest=synthetic\nsnapshot_id=synthetic\nsource_revision=synthetic\n\
+         context={SYNTHETIC_CONTEXT}\nstart_command={SYNTHETIC_START}\n\
+         ![t](https://example.invalid/pixel)=synthetic\n"
+    );
+    let hostile = [
+        (
+            "image",
+            "meta.txt",
+            hostile_meta,
+            "meta line 6: unknown key ![t](https://example.invalid/pixel)",
+            "`",
+        ),
+        (
+            "html",
+            "run-summary.txt",
+            format!("{head}{cases}<img src=x onerror=alert(1)>\tRECORDED\t0\t0\n"),
+            "line 6: unexpected case <img src=x onerror=alert(1)>",
+            "`",
+        ),
+        (
+            "link",
+            "run-summary.txt",
+            format!(
+                "exports=[phish](https://example.invalid)\n{SUMMARY_DIGEST}\nruns=IDENTICAL\n{cases}"
+            ),
+            "exports=[phish](https://example.invalid)",
+            "`",
+        ),
+        (
+            "backticks",
+            "run-summary.txt",
+            format!("{head}CP-001\t``x``\t0\t0\nCE-17\tRECORDED\t0\t0\n"),
+            "line 4: status ``x`` is neither RECORDED nor QUARANTINED",
+            "```",
+        ),
+    ];
+    for (name, file, text, payload, fence) in hostile {
+        let folder = recorded_pair(&format!("missing-sums-hostile-{name}"), file, Some(&text));
+        assert_run_fails(&folder, file, payload);
+        let judgement = judge(&folder, &pair_entries());
+        let cause = judgement.integrity.first().cloned().unwrap_or_default();
+        assert!(
+            !cause.contains(['"', '\\'])
+                && !cause.contains(char::is_control)
+                && cause.matches('`').count() == payload.matches('`').count(),
+            "{name}: only the payload may hold a backtick, and nothing a code span escapes: \
+             {cause:?}"
+        );
+        assert_eq!(
+            judgement.run_line,
+            format!("Recording run: INTEGRITY FAIL: {fence}\"{cause}\"{fence}"),
+            "{name}: the payload stays inside the run line's code span"
+        );
+    }
 }
 
 /// A transcript changed by one byte after the digest list was written
@@ -4417,6 +4687,12 @@ fn corpus_reader_missing_sha256sums() {
 /// run too, which leaves CP-001 NOT COMPARED. The case reader binds the
 /// text it returns to the digest list on every call, so a case file
 /// replaced or deleted after the run verified fails it, naming that file.
+/// Judged against the run read first, a transcript replaced, added or
+/// removed with the listing rewritten to match fails its case, naming its
+/// transcript, although a fresh read verifies the new listing. So does an
+/// input relisted that way, even the model's own, naming its input, while
+/// an input the run lists without its final newline, or does not list,
+/// is accepted.
 #[test]
 fn corpus_reader_edited_transcript() {
     let mut folder = TempCorpus::new("edited");
@@ -4665,7 +4941,7 @@ fn corpus_reader_edited_transcript() {
         [corpus_failure.clone(), corpus_failure.clone()],
         "a failed run adds one failure per integrity cause"
     );
-    let failed = format!("{RUN_LINE}INTEGRITY FAIL: {}", one_line(&cause));
+    let failed = integrity_line(&cause);
     let not_compared = matched_line(judgement.matched, judgement.in_scope);
     assert_eq!(
         not_compared,
@@ -4839,7 +5115,7 @@ fn corpus_reader_edited_transcript() {
         let cause = crate_relative(&cause);
         assert_eq!(
             judgement.run_line,
-            format!("Recording run: INTEGRITY FAIL: {}", one_line(&cause)),
+            integrity_line(&cause),
             "{name}: run line"
         );
         assert_eq!(
@@ -4921,6 +5197,235 @@ fn corpus_reader_edited_transcript() {
         Err(missing),
         "run with a listed transcript deleted"
     );
+
+    // The listing rewritten after a run verified, so that a fresh run and
+    // the case reader verify the new bytes: judged against the run read
+    // first, each case whose transcript that run does not vouch for fails,
+    // naming its transcript, and none is compared. CP-001's transcript is
+    // replaced, CP-002, which held none, gains one that would MATCH, and
+    // CP-003's listed transcript is removed.
+    let mut relisted = TempCorpus::new("edited-relisted");
+    relisted.input("CP-001", &inputs);
+    relisted.transcript("CP-001", &rust);
+    relisted.input("CP-002", &other);
+    relisted.input("CP-003", &paging);
+    relisted.transcript("CP-003", "SYNTHETIC CAPTURE\n");
+    relisted.run(&[
+        ("CP-001", "RECORDED"),
+        ("CP-002", "RECORDED"),
+        ("CP-003", "RECORDED"),
+    ]);
+    let relisted_entries = [
+        entry("CP-001", CLASS_CP, &inputs, None),
+        entry("CP-002", CLASS_CP, &other, None),
+        entry("CP-003", CLASS_CP, &paging, None),
+    ];
+    let relisted_ids: Vec<String> = relisted_entries.iter().map(|row| row.id.clone()).collect();
+    let verified = load_corpus_run(relisted.path(), &relisted_ids);
+    match &verified {
+        Ok(CorpusRun::Recorded { transcripts, .. }) => assert_eq!(
+            transcripts,
+            &[
+                ("CP-001".to_string(), sha256_hex(rust.as_bytes())),
+                ("CP-003".to_string(), sha256_hex(b"SYNTHETIC CAPTURE\n")),
+            ],
+            "the transcripts the first listing names, in listing order"
+        ),
+        unverified => panic!("the first listing must verify: {unverified:?}"),
+    }
+    relisted.transcript("CP-001", &with_line(&rust, 2, "SYNTHETIC RELISTED LINE"));
+    relisted.transcript("CP-002", &rust_transcript(&other));
+    relisted.remove("CP-003/transcript.txt");
+    relisted.sums();
+    assert!(
+        matches!(
+            load_corpus_run(relisted.path(), &relisted_ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "a fresh read verifies the rewritten listing"
+    );
+    for id in &relisted_ids {
+        if let Err(cause) = load_corpus_case(relisted.path(), id) {
+            panic!("{id} must load under the rewritten listing: {cause}");
+        }
+    }
+    let held = |id: &str, cause: &str| {
+        crate_relative(&format!(
+            "{}: {cause}",
+            relisted.path().join(id).join("transcript.txt").display()
+        ))
+    };
+    let causes = [
+        held(
+            "CP-001",
+            "SHA-256 differs from the SHA256SUMS the recording run verified",
+        ),
+        held(
+            "CP-002",
+            "not listed in the SHA256SUMS the recording run verified",
+        ),
+        held(
+            "CP-003",
+            "listed in the SHA256SUMS the recording run verified but missing",
+        ),
+    ];
+    let judgement = judge_with_run(
+        verified,
+        relisted.path(),
+        &default_dir(),
+        test_world_b(),
+        &relisted_entries,
+        &literal_rows(SPEC),
+    );
+    assert_eq!(
+        judgement.integrity, causes,
+        "each case the first listing does not vouch for, in case order"
+    );
+    assert_eq!(
+        causes.first().map(|cause| integrity_line(cause)),
+        Some(judgement.run_line.clone()),
+        "the run line names CP-001's transcript"
+    );
+    for (id, recorded) in [("CP-001", true), ("CP-002", true), ("CP-003", false)] {
+        let judged = verdict_of(&judgement, id);
+        assert_eq!(
+            (judged.verdict, judged.detail.as_str(), judged.recorded),
+            (NOT_COMPARED, CASE_INTEGRITY_FAILURE, recorded),
+            "{id} verdict, detail and recorded, against the first listing"
+        );
+    }
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m against the first listing"
+    );
+
+    // An input relisted after a run verified: the run read first recorded
+    // CP-001 with CP-002's committed input beside the model's CP-001
+    // transcript, so the case is NOT COMPARED for its input. CP-001's model
+    // input is then written and the listing rewritten to match, which a
+    // fresh run and the case reader verify, but judged against the run read
+    // first the case fails, naming its input, and nothing is compared.
+    let mut relisted_input = TempCorpus::new("edited-relisted-input");
+    relisted_input.input("CP-001", &other);
+    relisted_input.transcript("CP-001", &rust);
+    relisted_input.run(&[("CP-001", "RECORDED")]);
+    let input_entries = [entry("CP-001", CLASS_CP, &inputs, None)];
+    let first = load_corpus_run(relisted_input.path(), &ids);
+    match &first {
+        Ok(CorpusRun::Recorded {
+            inputs: listed_inputs,
+            ..
+        }) => assert_eq!(
+            listed_inputs,
+            &[("CP-001".to_string(), sha256_hex(other_input.as_bytes()))],
+            "the input the first listing names, with its digest"
+        ),
+        unverified => panic!("the first listing must verify: {unverified:?}"),
+    }
+    let relisted_path = relisted_input.path().join("CP-001").join("input.txt");
+    let before = judge(&relisted_input, &input_entries);
+    assert_eq!(
+        before.integrity,
+        [crate_relative(&format!(
+            "{}: committed input differs from the generated model",
+            relisted_path.display()
+        ))],
+        "CP-001 recorded with another case's input"
+    );
+    relisted_input.input("CP-001", &inputs);
+    relisted_input.sums();
+    let fresh = load_corpus_run(relisted_input.path(), &ids);
+    assert!(
+        matches!(fresh, Ok(CorpusRun::Recorded { .. })),
+        "a fresh read verifies the relisted input: {fresh:?}"
+    );
+    let relisted_case = match load_corpus_case(relisted_input.path(), "CP-001") {
+        Ok(case) => case,
+        Err(cause) => panic!("CP-001 must load under the relisted input: {cause}"),
+    };
+    assert_eq!(
+        relisted_case.inputs, inputs,
+        "CP-001 loads the model's inputs under the rewritten listing"
+    );
+    assert_eq!(
+        fresh.map(|run| run.confirm_case(relisted_input.path(), &relisted_case)),
+        Ok(Ok(())),
+        "the fresh run vouches for the input it lists with its final newline"
+    );
+    let input_cause = crate_relative(&format!(
+        "{}: SHA-256 differs from the SHA256SUMS the recording run verified",
+        relisted_path.display()
+    ));
+    let judgement = judge_with_run(
+        first,
+        relisted_input.path(),
+        &default_dir(),
+        test_world_b(),
+        &input_entries,
+        &literal_rows(SPEC),
+    );
+    assert_eq!(
+        judgement.integrity,
+        [input_cause.as_str()],
+        "CP-001's relisted input, against the first listing"
+    );
+    assert_eq!(
+        judgement.run_line,
+        integrity_line(&input_cause),
+        "the run line names CP-001's input"
+    );
+    let judged = verdict_of(&judgement, "CP-001");
+    assert_eq!(
+        (judged.verdict, judged.detail.as_str()),
+        (NOT_COMPARED, CASE_INTEGRITY_FAILURE),
+        "CP-001 verdict and detail, its input relisted"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m, CP-001's input relisted"
+    );
+
+    // An input the run lists as written without its final newline, which
+    // splits into the same inputs, and an input the run does not list at
+    // all, written after the digest list: each run vouches for its case.
+    let mut unterminated = TempCorpus::new("edited-unterminated-input");
+    unterminated.write("CP-001/input.txt", &inputs.join("\n"));
+    unterminated.transcript("CP-001", &rust);
+    unterminated.run(&[("CP-001", "RECORDED")]);
+    let mut unlisted = TempCorpus::new("edited-unlisted-input");
+    unlisted.transcript("CP-001", &rust);
+    unlisted.run(&[("CP-001", "RECORDED")]);
+    unlisted.input("CP-001", &inputs);
+    let unterminated_digest = sha256_hex(inputs.join("\n").as_bytes());
+    for (name, folder, listed) in [
+        (
+            "unterminated",
+            &unterminated,
+            vec![("CP-001".to_string(), unterminated_digest)],
+        ),
+        ("unlisted", &unlisted, Vec::new()),
+    ] {
+        let run = load_corpus_run(folder.path(), &ids);
+        match &run {
+            Ok(CorpusRun::Recorded {
+                inputs: listed_inputs,
+                ..
+            }) => assert_eq!(listed_inputs, &listed, "{name}: the inputs listed"),
+            unverified => panic!("{name}: the run must verify: {unverified:?}"),
+        }
+        let case = match load_corpus_case(folder.path(), "CP-001") {
+            Ok(case) => case,
+            Err(cause) => panic!("{name}: CP-001 must load: {cause}"),
+        };
+        assert_eq!(case.inputs, inputs, "{name}: CP-001 inputs");
+        assert_eq!(
+            run.map(|run| run.confirm_case(folder.path(), &case)),
+            Ok(Ok(())),
+            "{name}: the run vouches for CP-001's input"
+        );
+    }
 }
 
 /// A CR capture equal to its GC capture is WORLD-INDEPENDENT, unless it was
@@ -5069,11 +5574,7 @@ fn corpus_cr_world_independent() {
             "(a) integrity: {:?}",
             judgement.integrity
         );
-        assert_eq!(
-            judgement.run_line,
-            format!("Recording run: INTEGRITY FAIL: {cause}"),
-            "(a) run line"
-        );
+        assert_eq!(judgement.run_line, integrity_line(&cause), "(a) run line");
         let verdict = verdict_of(&judgement, "CR-01");
         assert_eq!(
             verdict.verdict, NOT_COMPARED,

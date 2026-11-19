@@ -174,7 +174,7 @@ cargo run --offline --locked --bin corpus_gen -- --check
   ```
 
   - Each script changes to the crate folder itself, so it can be started from any directory.
-  - `load_corpus.sh` and `record_corpus.sh` take `NAME` (default `vehu`), `BASE_IMAGE` (default `worldvista/vehu:202609`) and `SOURCE_REVISION` (default `dd3fd0f3124c8178657d9fff4173c324da30f7ae`) from the environment.
+  - `load_corpus.sh` and `record_corpus.sh` take `NAME` (default `vehu`), `BASE_IMAGE` (default `worldvista/vehu:202609`) and `SOURCE_REVISION` (default `dd3fd0f3124c8178657d9fff4173c324da30f7ae`) from the environment. `NAME` names a container the scripts remove and replace, and they stop before removing one not started from `vehu-snap:gc-base` or `vehu-snap:corpus-base` (or an image made from one), as `tests/golden/ifcap/README.md` Part C (C5) describes.
   - `tests/golden/ifcap/README.md` Part C gives each script's steps, the files each writes (`BASE.txt`, the transcripts, `meta.txt`, `run-summary.txt` and `SHA256SUMS`) and the paging quarantine.
   - This branch holds no recording.
 - On macOS the serial-run advice of `SPEC.md` open item O-12 applies to `tests/corpus.rs` too: run `cargo test --offline --locked --no-fail-fast -- --test-threads=1`.

@@ -19,7 +19,14 @@
 #   4. cargo test --offline --locked
 #
 # Writes:  the throwaway container NAME, the image vehu-snap:corpus-base,
-#          tests/golden/ifcap/corpus/BASE.txt, and scratch files under captures-work/corpus/.
+#          tests/golden/ifcap/corpus/BASE.txt, and scratch files under captures-work/corpus/:
+#          base-export.zwr and base-export.err, and every other intermediate file in a private
+#          folder load.XXXXXX that mktemp -d makes there, removed at the end of a run that loads
+#          and kept after a FAIL. Before it copies anything or runs any Docker command, it stops
+#          with a FAIL when a file it reads or writes, or a folder above that file inside the crate
+#          folder, is a symbolic link or of the wrong kind: each folder must be a folder, a file it
+#          reads a regular file, and a file it writes absent or a regular file. BASE.txt is
+#          checked again just before it is written.
 # Never writes: the original image, vehu-snap:gc-base, or any committed file other than BASE.txt.
 #
 # One run at a time: a run holds the lock folder captures-work/corpus/load.lock until it ends,
@@ -36,13 +43,20 @@
 # docker rm -f; 600 s for each readiness wait (vc_wait_ready, whose own count leaves out the time
 # its docker exec takes); and 1800 s each for the presence check, the load, the read back,
 # docker commit and the base export. A FAIL or a signal stops an operation still running the
-# same way, within about 5 s, before the lock is removed.
+# same way, within about 5 s, before the lock is removed. Each docker ps -a of the container
+# checks (see NAME below) has the 120 s of a docker image inspect.
 #
 # Environment (each optional):
 #   NAME=vehu                                                    container name (a letter or digit, then
 #                                                                at least one letter, digit, _, . or -)
 #   BASE_IMAGE=worldvista/vehu:202609                            the original image (printed as context)
 #   SOURCE_REVISION=dd3fd0f3124c8178657d9fff4173c324da30f7ae     source revision (printed as context)
+# NAME is destructive: the run force-removes container NAME, replaces it with its own, and later
+# loads into, stops, commits, replaces and removes that one. Before the first removal it stops
+# with a FAIL unless no container has that name, or the one that has it was started from
+# vehu-snap:gc-base or vehu-snap:corpus-base (or an image made from one), as docker ps -a
+# --filter ancestor= shows. It keeps the id of each container it starts, and stops with a FAIL
+# rather than act on NAME once NAME no longer names that container.
 # Inherited: HOME, read only when docker is not on PATH, because vc_find_docker then also looks
 # for Docker Desktop's docker in $HOME/.docker/bin.
 
@@ -81,7 +95,91 @@ if [ -z "${HOME+set}" ] && ! command -v docker >/dev/null 2>&1; then
   fail "HOME is not set and docker is not on PATH: vc_find_docker also looks for Docker Desktop's docker in \$HOME/.docker/bin; set HOME or put docker on PATH."
 fi
 vc_find_docker || fail "docker not found: install Docker Desktop or the Docker CLI."
+
+# Path checks, the same text in load_corpus.sh and record_corpus.sh. Each path this script reads
+# or writes, and each folder on the way to it from the crate folder (where the cd above lands)
+# down, is checked before anything is read or written through it, so that a symbolic link or an
+# entry of the wrong kind left there cannot send a read or a write outside the crate: it stops
+# the run with a FAIL naming it. [ -d ] and [ -f ] follow a symbolic link, so [ -L ] is asked
+# first and no link is ever followed.
+
+# path_kind <path>: set KIND to what <path> is, never following a symbolic link: link (a symbolic
+# link, dangling or not), folder, file (a regular file), other (a FIFO, device or socket) or absent.
+path_kind() {
+  if [ -L "$1" ]; then
+    KIND=link
+  elif [ -d "$1" ]; then
+    KIND=folder
+  elif [ -f "$1" ]; then
+    KIND=file
+  elif [ -e "$1" ]; then
+    KIND=other
+  else
+    KIND=absent
+  fi
+}
+
+# require_folder <path> <remedy>: stop with a FAIL unless <path> is a folder that is not a
+# symbolic link. A missing <path> stops with "<path> not found: <remedy>", or passes when
+# <remedy> is empty, for a folder this run makes. Returns 0.
+require_folder() {
+  path_kind "$1"
+  case "$KIND" in
+    folder) ;;
+    link) fail "$1 is a symbolic link, which this script never follows: replace it with a real folder";;
+    absent) [ -z "$2" ] || fail "$1 not found: $2";;
+    *) fail "$1 is not a folder: move it away";;
+  esac
+  return 0
+}
+
+# require_folders <path> <remedy>: require_folder <folder> <remedy> on each folder of the
+# relative <path>, from its first part down to <path> itself, so that no folder is looked into
+# before the one that holds it has passed. Returns 0.
+require_folders() {
+  local rest="$1" folder=""
+  while [ -n "$rest" ]; do
+    folder="${folder:+$folder/}${rest%%/*}"
+    case "$rest" in
+      */*) rest="${rest#*/}";;
+      *) rest="";;
+    esac
+    require_folder "$folder" "$2"
+  done
+}
+
+# require_input <path> <remedy>: stop with a FAIL unless <path> is a regular file that is not a
+# symbolic link, each FAIL ending with <remedy>. Returns 0.
+require_input() {
+  path_kind "$1"
+  case "$KIND" in
+    file) ;;
+    link) fail "$1 is a symbolic link, which this script never reads through: remove it, then $2";;
+    absent) fail "$1 not found: $2";;
+    *) fail "$1 is not a regular file: move it away, then $2";;
+  esac
+  return 0
+}
+
+# require_output <path>: stop with a FAIL unless <path> is absent or a regular file that is not a
+# symbolic link, so that writing it creates or replaces that one file. A symbolic link, dangling
+# or not, a folder, a FIFO, a device or a socket stops the run. Returns 0.
+require_output() {
+  path_kind "$1"
+  case "$KIND" in
+    absent | file) ;;
+    link) fail "$1 is a symbolic link, which this script never writes through: remove it";;
+    *) fail "$1 is not a regular file, so it is not written: move it away";;
+  esac
+  return 0
+}
+# End of the path checks.
+
+# captures-work and captures-work/corpus may be missing, and mkdir -p makes them, but neither may
+# be a symbolic link or anything but a folder, before or after.
+require_folders "$W" ""
 mkdir -p "$W" || fail "cannot create $W"
+require_folders "$W" "mkdir -p $W made no folder"
 
 # One run at a time: two runs would share the scratch files below, the image tag and BASE.txt.
 # mkdir is atomic, so the folder is the lock. While the lock is being taken a signal is only
@@ -154,6 +252,19 @@ if [ "$LOCK_HELD" -ne 1 ]; then
   fail "cannot create the lock $LOCK"
 fi
 echo "$$" > "$LOCK/pid" || fail "cannot write $LOCK/pid"
+
+# P: this run's private scratch folder, made once the lock is held by mktemp -d, which gives a
+# new folder of mode 0700 under a fresh name, inside the checked W. Every intermediate file goes
+# there, so that none an earlier run, or anyone else, left in W is written through or read. The
+# base export and its standard error alone stay in W, as captures-work/corpus/base-export.zwr
+# and base-export.err. A FAIL or a signal keeps P, since a FAIL line may name a file in it; a
+# run that loads removes it before it reports RESULT, and a folder it cannot remove is a FAIL.
+P="$(mktemp -d "$W/load.XXXXXX")" || fail "cannot create a private scratch folder in $W (mktemp -d)"
+case "$P" in
+  "$W"/load.?*) ;;
+  *) fail "mktemp -d printed no folder name in $W: $P";;
+esac
+require_folder "$P" "mktemp -d printed it but made no folder"
 
 # restore_container <image>: replace container NAME with a fresh one started from <image>.
 restore_container() {
@@ -250,6 +361,148 @@ read_one_line() {
 }
 # End of the deadline supervision.
 
+# Container checks, the same text in load_corpus.sh and record_corpus.sh. restore_container
+# force-removes whatever container NAME names, and later steps act on it again, so NAME alone
+# never makes a container this script's to remove. Before the first restore, NAME may name no
+# container, or one started from vehu-snap:gc-base or vehu-snap:corpus-base, the snapshots the
+# corpus scripts and the kit's capture scripts start their disposable containers from; any
+# other container stops the run with a FAIL and is left as it is. After each restore the id of
+# the container now named NAME is kept in OWN_ID, and each later step that changes or removes
+# that container first checks that NAME still names it. Docker is asked by docker ps -a alone,
+# which lists stopped containers too and runs no M command, each call under the deadline of an
+# inspect; its output goes to files in P and is read only after its exit status is checked, so
+# a docker ps that fails or is stopped never passes for no container. These are checks, not
+# locks: a container that takes NAME between a check and the step after it is not caught.
+# FOUND_ID: the container the last container_lookup found, empty for none. OWN_ID: the container
+# this run started last, empty before its first restore. IMAGE_ID: set by optional_image_id.
+FOUND_ID=""
+OWN_ID=""
+IMAGE_ID=""
+
+# is_id_hex <text>: true when <text> is 64 lower-case hexadecimal digits, the form of a full
+# container id, and of an image id after its sha256: prefix.
+is_id_hex() {
+  case "$1" in *[!0123456789abcdef]*) return 1;; esac
+  [ "${#1}" -eq 64 ]
+}
+
+# container_lookup [<note>]: set FOUND_ID to the full id of the container named exactly NAME,
+# or to empty when no container has that name. docker ps -a --filter name= takes NAME as an
+# unanchored regular expression, in which a . matches any character, so it may list other names
+# too: the shell keeps only a line whose comma-separated names include NAME itself. Every line
+# must be a 64-digit id, one space and the names, at most 4095 characters, ended by a line feed.
+# A docker ps that fails or is stopped, a line of any other form, or two containers named NAME,
+# stops the run with a FAIL ending with <note>.
+container_lookup() {
+  local note="${1:-}" rc line="" id names matches=0
+  FOUND_ID=""
+  run_bounded "$DEADLINE_INSPECT" "docker ps -a for container $NAME" \
+    docker ps -a --no-trunc --filter "name=$NAME" --format '{{.ID}} {{.Names}}' > "$P/container-list.out" 2> "$P/container-list.err"
+  rc=$?
+  [ -z "$BOUNDED_EXPIRED" ] || fail "$BOUNDED_EXPIRED$note"
+  [ "$rc" -eq 0 ] || fail "cannot list the containers named $NAME (docker ps -a exited with status $rc; see $P/container-list.err)$note"
+  exec 7< "$P/container-list.out" || fail "cannot read $P/container-list.out$note"
+  while IFS= read -r -n 4096 -u 7 line; do
+    [ "${#line}" -lt 4096 ] || fail "docker ps -a printed a line longer than 4095 characters; see $P/container-list.out$note"
+    id="${line%% *}"
+    names="${line#* }"
+    if ! is_id_hex "$id" || [ "$names" = "$line" ] || [ -z "$names" ]; then
+      fail "docker ps -a printed a line that is not a 64-digit container id, one space and its names; see $P/container-list.out$note"
+    fi
+    case ",$names," in
+      *",$NAME,"*)
+        matches=$((matches + 1))
+        FOUND_ID="$id";;
+    esac
+  done
+  exec 7<&-
+  [ -z "$line" ] || fail "docker ps -a printed a last line with no line feed; see $P/container-list.out$note"
+  [ "$matches" -le 1 ] || fail "docker ps -a lists $matches containers named $NAME, where Docker allows one; see $P/container-list.out$note"
+  return 0
+}
+
+# container_from <id> <image id>: 0 when the container <id> was started from the image <image
+# id>, 1 when it was not. docker ps -a --filter ancestor= counts the image and every image made
+# from it, and matches nothing for an image that does not exist; filters of two keys must both
+# match, so the output is <id> or nothing. A docker ps that fails or is stopped, or that prints
+# anything else, stops the run with a FAIL.
+container_from() {
+  local rc
+  run_bounded "$DEADLINE_INSPECT" "docker ps -a for container $1 and image $2" \
+    docker ps -a --no-trunc --filter "id=$1" --filter "ancestor=$2" --format '{{.ID}}' > "$P/container-from.out" 2> "$P/container-from.err"
+  rc=$?
+  check_deadline
+  [ "$rc" -eq 0 ] || fail "cannot check the image of container $1 (docker ps -a exited with status $rc; see $P/container-from.err)"
+  [ -s "$P/container-from.out" ] || return 1
+  read_one_line "$P/container-from.out" && [ "$LINE" = "$1" ] && return 0
+  fail "docker ps -a for container $1 and image $2 printed something other than that id or nothing; see $P/container-from.out"
+}
+
+# container_preflight <image id>...: before the first restore, stop with a FAIL unless no
+# container is named NAME, or the one named NAME was started from one of the <image id>s, the
+# ids of vehu-snap:gc-base and vehu-snap:corpus-base this script could read; an empty one is
+# skipped. Only such a container is a disposable copy that restore_container may remove.
+container_preflight() {
+  local image
+  container_lookup
+  if [ -z "$FOUND_ID" ]; then
+    echo "container $NAME: no container has that name yet"
+    return 0
+  fi
+  for image in "$@"; do
+    [ -n "$image" ] || continue
+    if container_from "$FOUND_ID" "$image"; then
+      echo "container $NAME: $FOUND_ID, started from $image, which the restore replaces"
+      return 0
+    fi
+  done
+  fail "container $NAME exists (id $FOUND_ID) and was not started from vehu-snap:gc-base or vehu-snap:corpus-base, so this script will not remove it: if it is disposable, remove it by hand (docker rm -f $NAME), or set NAME to a name no container has"
+}
+
+# container_started <image id> <image>: straight after a restore from <image>, whose id is
+# <image id>, stop with a FAIL unless a container is named NAME and was started from <image
+# id>, then keep its id in OWN_ID and print it. restore_container sends the new id that docker
+# run prints to /dev/null, so it is read back this way.
+container_started() {
+  container_lookup
+  [ -n "$FOUND_ID" ] || fail "no container is named $NAME after the restore from $2"
+  container_from "$FOUND_ID" "$1" \
+    || fail "container $NAME (id $FOUND_ID) was not started from $2 ($1), so it is not the container the restore started"
+  OWN_ID="$FOUND_ID"
+  echo "container $NAME: id $OWN_ID, started from $2"
+}
+
+# require_own_container <operation> [<note>]: before <operation> changes or removes container
+# NAME, stop with a FAIL ending with <note> unless NAME still names OWN_ID, the container this
+# run started last.
+require_own_container() {
+  local note="${2:-}"
+  container_lookup "$note"
+  [ -n "$OWN_ID" ] && [ "$FOUND_ID" = "$OWN_ID" ] \
+    || fail "container $NAME is no longer the container this run started (id ${OWN_ID:-none}; $NAME now names ${FOUND_ID:-no container}): refusing to $1$note"
+}
+
+# optional_image_id <image> <file name>: set IMAGE_ID to the id of <image>, sha256: and 64
+# hexadecimal digits, which docker image inspect writes to P/<file name>.out, read after its
+# exit status is checked; or to empty when the inspect fails or prints no such id. The image need
+# not exist: a missing id only leaves its containers out of those container_preflight allows. An
+# inspect still running at its deadline stops the run with a FAIL.
+optional_image_id() {
+  local rc
+  IMAGE_ID=""
+  run_bounded "$DEADLINE_INSPECT" "docker image inspect $1" \
+    docker image inspect --format '{{.Id}}' "$1" > "$P/$2.out" 2> "$P/$2.err"
+  rc=$?
+  check_deadline
+  [ "$rc" -eq 0 ] && read_one_line "$P/$2.out" || return 0
+  case "$LINE" in
+    sha256:*) is_id_hex "${LINE#sha256:}" && IMAGE_ID="$LINE";;
+  esac
+  return 0
+}
+# End of the container checks.
+
+
 # count_data_lines <file>: set COUNT to the number of data lines (lines beginning ^) in <file>.
 # grep -c exits 1 when it counts none, so only a status of 2 or more is a failure.
 count_data_lines() {
@@ -303,29 +556,52 @@ sha256_file() {
 }
 
 step "1. Prerequisites"
-[ -f "$ZWR" ] || fail "$ZWR not found: run cargo run --offline --locked --bin corpus_gen first"
-[ -d "$C" ] || fail "$C not found: run cargo run --offline --locked --bin corpus_gen first"
+# The path checks, before anything is copied and before any Docker command: corpus.zwr, the
+# file read here, and the folders above it; the corpus folder and BASE.txt, written in step 8;
+# and the base export and its standard error, written in step 7.
+require_folders "${ZWR%/*}" "run cargo run --offline --locked --bin corpus_gen first"
+require_input "$ZWR" "run cargo run --offline --locked --bin corpus_gen first"
+require_folders "$C" "run cargo run --offline --locked --bin corpus_gen first"
+require_output "$C/BASE.txt"
+require_output "$W/base-export.zwr"
+require_output "$W/base-export.err"
 # Only the data lines: this skips the two header lines of corpus.zwr. The copy must succeed and
 # hold every data line, so that a stale or partial copy from an earlier run is never loaded.
 count_data_lines "$ZWR"
 ZWR_NODES="$COUNT"
 [ "$ZWR_NODES" -gt 0 ] || fail "$ZWR holds no data line"
-grep '^\^' "$ZWR" > "$W/corpus-data.zwr"
+grep '^\^' "$ZWR" > "$P/corpus-data.zwr"
 RC=$?
-[ "$RC" -eq 0 ] || fail "cannot copy the data lines of $ZWR to $W/corpus-data.zwr (grep status $RC)"
-count_data_lines "$W/corpus-data.zwr"
+[ "$RC" -eq 0 ] || fail "cannot copy the data lines of $ZWR to $P/corpus-data.zwr (grep status $RC)"
+count_data_lines "$P/corpus-data.zwr"
 NODES="$COUNT"
-[ "$NODES" = "$ZWR_NODES" ] || fail "$W/corpus-data.zwr holds $NODES data lines, but $ZWR holds $ZWR_NODES"
-run_bounded "$DEADLINE_INSPECT" "docker image inspect $GC_SNAP" docker image inspect "$GC_SNAP" >/dev/null 2>&1 \
+[ "$NODES" = "$ZWR_NODES" ] || fail "$P/corpus-data.zwr holds $NODES data lines, but $ZWR holds $ZWR_NODES"
+# The snapshot ids say which container named NAME step 2 may replace (container_preflight).
+# Each is read from a file, after the exit status is checked, so a failed or stopped inspect
+# never passes its output on, and the file must hold exactly one line. vehu-snap:gc-base must
+# exist; vehu-snap:corpus-base, made by an earlier run, need not.
+run_bounded "$DEADLINE_INSPECT" "docker image inspect $GC_SNAP" \
+  docker image inspect --format '{{.Id}}' "$GC_SNAP" > "$P/gc-base-id.out" 2> "$P/gc-base-id.err" \
   || { check_deadline; fail "image $GC_SNAP not found: make it with scripts/kit/load_orders.sh and scripts/kit/save_state.sh"; }
+read_one_line "$P/gc-base-id.out" \
+  || fail "docker image inspect did not print the id of $GC_SNAP as one line of at most 4095 characters; see $P/gc-base-id.out"
+GC_ID="$LINE"
+case "$GC_ID" in
+  sha256:*) is_hex64 "${GC_ID#sha256:}";;
+  *) false;;
+esac || fail "the id of $GC_SNAP is not sha256: followed by 64 hexadecimal digits: $GC_ID"
+optional_image_id "$CORPUS_SNAP" corpus-base-id
+CORPUS_BASE_ID="$IMAGE_ID"
 echo "container:       $NAME"
 echo "base image:      $BASE_IMAGE"
 echo "source revision: $SOURCE_REVISION"
 echo "corpus nodes:    $NODES (from $ZWR)"
+container_preflight "$GC_ID" "$CORPUS_BASE_ID"
 
 step "2. Throwaway container from $GC_SNAP"
 run_bounded "$DEADLINE_CONTAINER" "the restore of container $NAME from $GC_SNAP (docker rm -f, then docker run -d)" \
   restore_container "$GC_SNAP" || { check_deadline; fail "docker run failed"; }
+container_started "$GC_ID" "$GC_SNAP"
 # The kit's wait counts only its own pauses, not the time its docker exec takes, so run_bounded
 # holds it to its 600 s of wall-clock time.
 run_bounded "$DEADLINE_READY" "vc_wait_ready $NAME 600" vc_wait_ready "$NAME" 600
@@ -338,15 +614,15 @@ step "3. Corpus orders must be absent"
 # presence_check: the one $D loop over IENs 991001 to 991200, into present.out and present.err.
 # A FOR scopes to the end of the line, so the IF lets the WRITE run once, on the last IEN.
 presence_check() {
-  docker exec -i "$NAME" su - vehu -c "mumps -run %XCMD 'S N=0 F I=991001:1:991200 S:\$D(^PRC(442,I)) N=N+1 I I=991200 W \"CORPUS_PRESENT=\",N,!'" < /dev/null > "$W/present.out" 2> "$W/present.err"
+  docker exec -i "$NAME" su - vehu -c "mumps -run %XCMD 'S N=0 F I=991001:1:991200 S:\$D(^PRC(442,I)) N=N+1 I I=991200 W \"CORPUS_PRESENT=\",N,!'" < /dev/null > "$P/present.out" 2> "$P/present.err"
 }
 run_bounded "$DEADLINE_BULK" "the presence check of IENs 991001 to 991200" presence_check
 RC=$?
 check_deadline
-no_m_errors "the presence check printed an M error" "$W/present.out" "$W/present.err"
-[ "$RC" -eq 0 ] || fail "the presence check exited with status $RC; see $W/present.out and $W/present.err"
-grep -q '^CORPUS_PRESENT=' "$W/present.out" || fail "the presence check printed no CORPUS_PRESENT= line; see $W/present.out"
-PRESENT="$(grep '^CORPUS_PRESENT=' "$W/present.out" | cut -d= -f2 | tr -d '[:space:]')"
+no_m_errors "the presence check printed an M error" "$P/present.out" "$P/present.err"
+[ "$RC" -eq 0 ] || fail "the presence check exited with status $RC; see $P/present.out and $P/present.err"
+grep -q '^CORPUS_PRESENT=' "$P/present.out" || fail "the presence check printed no CORPUS_PRESENT= line; see $P/present.out"
+PRESENT="$(grep '^CORPUS_PRESENT=' "$P/present.out" | cut -d= -f2 | tr -d '[:space:]')"
 echo "corpus orders present in 991001 to 991200: $PRESENT"
 [ "$PRESENT" = "0" ] || fail "corpus orders already present: start again from $GC_SNAP"
 
@@ -355,38 +631,39 @@ step "4. Load $NODES corpus nodes"
 # exit statuses to <status file>, because run_bounded runs it in a subshell whose variables do not
 # come back. && makes a failed sed the status of the group, and then no halt is sent.
 load_nodes() {
-  { sed 's/^/set /' "$W/corpus-data.zwr" && echo "halt"; } | docker exec -i "$NAME" su - vehu -c 'mumps -dir' > "$W/load.out" 2>&1
+  { sed 's/^/set /' "$P/corpus-data.zwr" && echo "halt"; } | docker exec -i "$NAME" su - vehu -c 'mumps -dir' > "$P/load.out" 2>&1
   printf '%s\n' "${PIPESTATUS[*]}" > "$1"
 }
-rm -f "$W/load.status" || fail "cannot remove $W/load.status"
-run_bounded "$DEADLINE_BULK" "the load of $NODES corpus nodes" load_nodes "$W/load.status"
+rm -f "$P/load.status" || fail "cannot remove $P/load.status"
+require_own_container "load the corpus into $NAME"
+run_bounded "$DEADLINE_BULK" "the load of $NODES corpus nodes" load_nodes "$P/load.status"
 RC=$?
 check_deadline
-[ "$RC" -eq 0 ] || fail "cannot write the load pipeline's exit statuses to $W/load.status (status $RC)"
-read_one_line "$W/load.status" || fail "cannot read the load pipeline's exit statuses from $W/load.status"
+[ "$RC" -eq 0 ] || fail "cannot write the load pipeline's exit statuses to $P/load.status (status $RC)"
+read_one_line "$P/load.status" || fail "cannot read the load pipeline's exit statuses from $P/load.status"
 LOAD_STATUS="$LINE"
-no_m_errors "load had errors" "$W/load.out"
-[ "$LOAD_STATUS" = "0 0" ] || fail "load pipeline exited with status $LOAD_STATUS; see $W/load.out"
+no_m_errors "load had errors" "$P/load.out"
+[ "$LOAD_STATUS" = "0 0" ] || fail "load pipeline exited with status $LOAD_STATUS; see $P/load.out"
 echo "load finished with no M errors"
 
 step "5. Read back"
 # read_back: every node of ^PRC(442), into readback.zwr and readback.err.
 read_back() {
-  docker exec -i "$NAME" su - vehu -c "mumps -run %XCMD 'zwrite ^PRC(442,*)'" < /dev/null > "$W/readback.zwr" 2> "$W/readback.err"
+  docker exec -i "$NAME" su - vehu -c "mumps -run %XCMD 'zwrite ^PRC(442,*)'" < /dev/null > "$P/readback.zwr" 2> "$P/readback.err"
 }
 run_bounded "$DEADLINE_BULK" "the read back of ^PRC(442)" read_back
 RC=$?
 check_deadline
-no_m_errors "the read back printed an M error" "$W/readback.zwr" "$W/readback.err"
-[ "$RC" -eq 0 ] || fail "the read back exited with status $RC; see $W/readback.err"
+no_m_errors "the read back printed an M error" "$P/readback.zwr" "$P/readback.err"
+[ "$RC" -eq 0 ] || fail "the read back exited with status $RC; see $P/readback.err"
 # Every loaded line that did not come back exactly goes to MISSING, which stays on disk whole,
 # and a FAIL prints only its count and the first lines, each cut to PREVIEW_BYTES bytes. An
 # empty read back makes every line missing. With -v, grep exits 0 when it writes such a line, 1
 # when there is none, 2 or more on an error, a failed write included. A redirection that cannot
 # open its file gives status 1 too, so the file is opened, and checked, before grep runs.
-MISSING="$W/readback-missing.zwr"
+MISSING="$P/readback-missing.zwr"
 exec 3> "$MISSING" || fail "cannot write $MISSING"
-grep -Fxv -f "$W/readback.zwr" "$W/corpus-data.zwr" >&3
+grep -Fxv -f "$P/readback.zwr" "$P/corpus-data.zwr" >&3
 RC=$?
 exec 3>&-
 case "$RC" in
@@ -397,27 +674,29 @@ case "$RC" in
     LC_ALL=C cut -b "1-$PREVIEW_BYTES" "$MISSING" | sed -e 's/^/  MISSING OR DIFFERENT: /' -e 10q
     echo "full list: $MISSING"
     echo "first lines read back:"
-    LC_ALL=C cut -b "1-$PREVIEW_BYTES" "$W/readback.zwr" | sed 5q
+    LC_ALL=C cut -b "1-$PREVIEW_BYTES" "$P/readback.zwr" | sed 5q
     fail "the corpus did not read back byte for byte";;
   1) ;;
-  *) fail "cannot compare $W/readback.zwr with $W/corpus-data.zwr (grep status $RC)";;
+  *) fail "cannot compare $P/readback.zwr with $P/corpus-data.zwr (grep status $RC)";;
 esac
 echo "all $NODES loaded nodes read back identical"
 
 step "6. Freeze as $CORPUS_SNAP"
+require_own_container "stop $NAME"
 run_bounded "$DEADLINE_CONTAINER" "docker stop $NAME" docker stop "$NAME" >/dev/null \
   || { check_deadline; fail "docker stop failed"; }
+require_own_container "commit $NAME as $CORPUS_SNAP"
 run_bounded "$DEADLINE_BULK" "docker commit $NAME $CORPUS_SNAP" docker commit "$NAME" "$CORPUS_SNAP" >/dev/null \
   || { check_deadline; fail "docker commit failed"; }
 # The id is read from a file, after the exit status is checked, so a failed or stopped inspect
 # never passes its output on, and the file must hold exactly one line.
 run_bounded "$DEADLINE_INSPECT" "docker image inspect $CORPUS_SNAP" \
-  docker image inspect --format '{{.Id}}' "$CORPUS_SNAP" > "$W/snapshot-id.out" 2> "$W/snapshot-id.err"
+  docker image inspect --format '{{.Id}}' "$CORPUS_SNAP" > "$P/snapshot-id.out" 2> "$P/snapshot-id.err"
 RC=$?
 check_deadline
-[ "$RC" -eq 0 ] || fail "cannot read the id of $CORPUS_SNAP (docker image inspect exited with status $RC); see $W/snapshot-id.err"
-read_one_line "$W/snapshot-id.out" \
-  || fail "docker image inspect did not print the id of $CORPUS_SNAP as one line of at most 4095 characters; see $W/snapshot-id.out"
+[ "$RC" -eq 0 ] || fail "cannot read the id of $CORPUS_SNAP (docker image inspect exited with status $RC); see $P/snapshot-id.err"
+read_one_line "$P/snapshot-id.out" \
+  || fail "docker image inspect did not print the id of $CORPUS_SNAP as one line of at most 4095 characters; see $P/snapshot-id.out"
 SNAP_ID="$LINE"
 case "$SNAP_ID" in
   sha256:*) is_hex64 "${SNAP_ID#sha256:}";;
@@ -426,8 +705,10 @@ esac || fail "the id of $CORPUS_SNAP is not sha256: followed by 64 hexadecimal d
 echo "snapshot id: $SNAP_ID"
 
 step "7. Base export from a fresh container"
+require_own_container "replace $NAME with a fresh container from $CORPUS_SNAP"
 run_bounded "$DEADLINE_CONTAINER" "the restore of container $NAME from $CORPUS_SNAP (docker rm -f, then docker run -d)" \
   restore_container "$CORPUS_SNAP" || { check_deadline; fail "could not start a container from $CORPUS_SNAP"; }
+container_started "$SNAP_ID" "$CORPUS_SNAP"
 run_bounded "$DEADLINE_READY" "vc_wait_ready $NAME 600" vc_wait_ready "$NAME" 600
 RC=$?
 [ -z "$BOUNDED_EXPIRED" ] || fail "container from $CORPUS_SNAP not ready within $DEADLINE_READY s: $BOUNDED_EXPIRED"
@@ -456,6 +737,8 @@ echo "export: $W/base-export.zwr ($EXPORT_BYTES bytes, sha256 $EXPORT_SHA)"
 
 step "8. Write BASE.txt"
 MCMD="$(vc_mcmd "$VC_SCOPE_ROOTS")"
+# Checked again just before it is written, since the load and the export take a while.
+require_output "$C/BASE.txt"
 {
   printf 'snapshot_image=%s\n' "$CORPUS_SNAP"
   printf 'snapshot_id=%s\n' "$SNAP_ID"
@@ -466,12 +749,14 @@ MCMD="$(vc_mcmd "$VC_SCOPE_ROOTS")"
   printf 'export_bytes=%s\n' "$EXPORT_BYTES"
   printf 'corpus_zwr_sha256=%s\n' "$CORPUS_SHA"
 } > "$C/BASE.txt" || fail "cannot write $C/BASE.txt"
+require_own_container "remove $NAME"
 run_bounded "$DEADLINE_CONTAINER" "docker rm -f $NAME" docker rm -f "$NAME" >/dev/null
 RC=$?
 check_deadline
 [ "$RC" -eq 0 ] || fail "cannot remove container $NAME (docker rm -f exited with status $RC)"
 cat "$C/BASE.txt"
 echo
+rm -rf "$P" || fail "cannot remove the private scratch folder $P; remove that folder by hand"
 release_lock || fail "cannot remove the lock $LOCK; remove that folder by hand"
 echo "RESULT: LOADED. Next: tests/golden/ifcap/corpus/scripts/record_corpus.sh"
 exit 0
