@@ -26,7 +26,15 @@
 //! - With `--check`, nothing is written. Each generated file is compared
 //!   byte for byte with the committed one, read through
 //!   `golden::read_corpus_input` for a case input file and directly for
-//!   `corpus.zwr` and `manifest.tsv`. No other file is read.
+//!   `corpus.zwr` and `manifest.tsv`. No other file is read. Before either
+//!   of those two is opened, it is inspected without following links, from
+//!   the crate folder down as a destination is: a symbolic link, a
+//!   non-folder or nothing on the way to it, or a file that is a symbolic
+//!   link, is not a regular file or is not as long as the generated text,
+//!   is refused without being opened, and the read stops one byte past that
+//!   length. The inspection is not atomic with the open, so a link or FIFO
+//!   that a concurrent writer puts in place between the two is followed or
+//!   blocks the open.
 //!
 //! Both modes first print the seven lines of `Corpus::summary` to standard
 //! output, each filled from the generated model:
@@ -39,10 +47,10 @@
 //! - `largest item count: <k>; worst $Y: <y> (bound 45)`
 //!
 //! With `--check` they are followed by one `differs: <path>` line for each
-//! generated file that is missing, unreadable, rejected by the case input
-//! reader or unequal, then `check: 233 files equal` or
-//! `check: <k> of 233 files differ`. Paths are shown relative to the crate
-//! folder.
+//! generated file that is missing, refused by that inspection, unreadable,
+//! rejected by the case input reader or unequal, then
+//! `check: 233 files equal` or `check: <k> of 233 files differ`. Paths are
+//! shown relative to the crate folder.
 //!
 //! The exit status is 0 when the files were written or all compared equal.
 //! It is 1 when the fixtures or `SPEC.md` cannot be read, the generation
@@ -59,7 +67,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Display;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
@@ -264,7 +272,11 @@ fn write_file(path: &Path, text: &str) -> io::Result<()> {
 /// `differs:` line for each that is not equal, then the `check:` line. A
 /// case input file is read through `golden::read_corpus_input`, so one its
 /// integrity rules reject differs; `corpus.zwr` and the manifest are read
-/// whole. A file that cannot be read differs.
+/// through `read_committed`, which first inspects them without following
+/// links and refuses, unopened, a link or non-folder on the way, a file that
+/// is a link or not a regular file, or one whose length is not the generated
+/// text's. That inspection is not atomic with the open. A file that is
+/// refused or cannot be read differs.
 fn check_files(
     files: &[(PathBuf, String)],
     inputs: &BTreeMap<PathBuf, String>,
@@ -275,7 +287,7 @@ fn check_files(
     for (path, text) in files {
         let committed = match inputs.get(path) {
             Some(id) => golden::read_corpus_input(&folder, id).ok(),
-            None => fs::read_to_string(path).ok(),
+            None => read_committed(path, text.len()),
         };
         if committed.as_deref() != Some(text.as_str()) {
             differing += 1;
@@ -290,6 +302,50 @@ fn check_files(
         let _ = writeln!(out, "check: {differing} of {total} files differ");
         ExitCode::FAILURE
     }
+}
+
+/// The committed text of `corpus.zwr` or the manifest at `path`, read
+/// directly, or `None` when it is refused or cannot be read, so that it
+/// differs. Before anything is opened, each part from the crate folder down
+/// to the file is inspected through `fs::symlink_metadata`, which describes
+/// a symbolic link itself rather than what it points to. A path outside the
+/// crate folder, a symbolic link, a non-folder or nothing on the way, or a
+/// file that is a symbolic link, dangling or not, is not a regular file (a
+/// FIFO, socket, device or folder) or is not `length` bytes long is refused
+/// without being opened; `length` is the generated text's, the only length
+/// that can compare equal. The crate folder and its ancestors are trusted
+/// and not inspected, and a hard link is not refused, since a read changes
+/// nothing. The read stops one byte past `length`, so a file grown since its
+/// inspection is never read whole and still differs. The inspection is not
+/// atomic with the open, so a link or FIFO that a concurrent writer puts in
+/// place between the two is followed or blocks the open.
+fn read_committed(path: &Path, length: usize) -> Option<String> {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let relative = path.strip_prefix(crate_dir).ok()?;
+    if !relative
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
+    let mut folder = crate_dir.to_path_buf();
+    for part in relative.parent().into_iter().flat_map(Path::components) {
+        folder.push(part);
+        // A symbolic link's own metadata is never a folder's.
+        if !fs::symlink_metadata(&folder).ok()?.is_dir() {
+            return None;
+        }
+    }
+    let budget = u64::try_from(length).ok()?;
+    // Nor is it a regular file's, so a link at the file is refused here too.
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() != budget {
+        return None;
+    }
+    let mut text = String::with_capacity(length);
+    let mut file = fs::File::open(path).ok()?.take(budget.saturating_add(1));
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
 }
 
 /// `path` relative to the crate folder where it lies inside it, else as

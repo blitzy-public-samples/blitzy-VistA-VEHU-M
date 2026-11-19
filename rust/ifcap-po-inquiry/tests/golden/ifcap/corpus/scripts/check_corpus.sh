@@ -1168,16 +1168,21 @@ else
       rc=$?
       added=0
       # One output line per line handed over: <path>: OK, or a failure such as <path>: FAILED
-      # or <path>: FAILED open or read. Split on newlines only, with no glob expansion (set -f).
-      OLD_IFS="$IFS"
-      IFS="$NL"
-      for line in $out; do
+      # or <path>: FAILED open or read. One line at a time, cut from the front of what is left,
+      # with no word splitting; an empty line is skipped.
+      rest="$out"
+      while [ -n "$rest" ]; do
+        line="${rest%%"$NL"*}"
+        case "$rest" in
+          *"$NL"*) rest="${rest#*"$NL"}" ;;
+          *) rest="" ;;
+        esac
+        [ -n "$line" ] || continue
         case "$line" in
           *": OK") ok=$((ok + 1)) ;;
           *) add_problem "SHA256SUMS: $line"; added=$((added + 1)) ;;
         esac
       done
-      IFS="$OLD_IFS"
       # Without a failure line, both the exit status and the OK count must confirm every line
       # handed over, so that a line shasum skipped or a shasum that did not run cannot pass.
       if [ "$added" -eq 0 ] && { [ "$rc" -ne 0 ] || [ "$ok" -ne "$passed" ]; }; then

@@ -167,7 +167,7 @@ run_bounded() {
   JOB_PID=$!
   set +m
   while kill -0 "$JOB_PID" 2>/dev/null; do
-    if [ $((SECONDS - start)) -ge "$window" ]; then
+    if [ "$((SECONDS - start))" -ge "$window" ]; then
       if stop_owned "-$JOB_PID"; then
         { wait "$JOB_PID"; } 2>/dev/null
         JOB_PID=""
@@ -663,10 +663,18 @@ check_export() {
 # before reading: the run stops once they pass it, because the file grew, and at the end unless
 # they equal it, because a NUL byte (which bash drops), a failed read or a change cut them short.
 # Nothing is truncated: every stop is a FAIL naming <file> and ending with <remedy>.
+# The size is taken by wc -c with <file> as an argument, never on its standard input: the wc of
+# macOS, of GNU coreutils and of uutils coreutils then takes the count from the file's size and
+# reads at most its last block, whereas uutils coreutils wc (Ubuntu 25.10's) reads a standard
+# input to its end. Both callers pass a path in the corpus folder C, which begins with tests/,
+# never with -, so wc never takes it for an option.
 read_capped() {
   local LC_ALL=C file="$1" budget="$2" bound="$3" handler="$4" remedy="$5" size line="" n=0 total=0
-  size="$(wc -c < "$file")" || fail "cannot take the size of $file: $remedy"
-  size="${size// /}"
+  size="$(LC_ALL=C wc -c "$file")" || fail "cannot take the size of $file: $remedy"
+  # The count alone: wc prints <count> <file>, the count padded with leading spaces on macOS, so
+  # the spaces are dropped and the digits before the next byte kept, never one of <file>'s.
+  size="${size#"${size%%[! ]*}"}"
+  size="${size%%[!0123456789]*}"
   case "$size" in ''|*[!0123456789]*) fail "wc -c gave no byte count for $file: $size";; esac
   [ "$size" -le "$budget" ] || fail "$file holds $size bytes, more than its budget of $budget bytes: $remedy"
   exec 6< "$file" || fail "cannot read $file: $remedy"

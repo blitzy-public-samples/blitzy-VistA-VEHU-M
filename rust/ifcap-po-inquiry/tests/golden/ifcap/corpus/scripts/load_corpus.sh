@@ -328,7 +328,7 @@ run_bounded() {
   JOB_PID=$!
   set +m
   while kill -0 "$JOB_PID" 2>/dev/null; do
-    if [ $((SECONDS - start)) -ge "$window" ]; then
+    if [ "$((SECONDS - start))" -ge "$window" ]; then
       if stop_owned "-$JOB_PID"; then
         { wait "$JOB_PID"; } 2>/dev/null
         JOB_PID=""

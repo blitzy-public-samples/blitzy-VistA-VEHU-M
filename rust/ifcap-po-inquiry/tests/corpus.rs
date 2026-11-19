@@ -1566,8 +1566,10 @@ fn gate_c_values_and_miss_strings() {
 
 /// The minimum checks of the variation matrix, with the model's dropped
 /// variants: a dropped value has left its list, so no minimum counts it,
-/// and a minimum over distinct values falls by one per value dropped from
-/// its dimension.
+/// and a minimum over distinct values falls by one per distinct value
+/// dropped from its dimension that the distinct count includes, so a
+/// dropped empty service, which the count of named services excludes,
+/// relaxes nothing.
 struct Minimums<'a> {
     drops: &'a [corpus::DroppedVariant],
     failures: Vec<String>,
@@ -1602,15 +1604,29 @@ impl Minimums<'_> {
         }
     }
 
-    /// `found` distinct values of `dimension` are at least `minimum`, less
-    /// one per value dropped from it.
-    fn distinct(&mut self, dimension: &str, found: usize, minimum: usize) {
-        let dropped = self
+    /// The distinct values of `counts` that `keep` accepts are at least
+    /// `minimum`, less one per distinct value dropped from `dimension` that
+    /// `keep` also accepts (the tag form `empty` standing for the empty
+    /// value), as `corpus::Tally::distinct` counts them.
+    fn distinct(
+        &mut self,
+        dimension: &str,
+        counts: &BTreeMap<&str, usize>,
+        minimum: usize,
+        keep: impl Fn(&str) -> bool,
+    ) {
+        let found = counts.keys().filter(|value| keep(value)).count();
+        let exempt: BTreeSet<&str> = self
             .drops
             .iter()
             .filter(|drop| drop.dimension == dimension)
-            .count();
-        let needed = minimum.saturating_sub(dropped);
+            .map(|drop| match drop.value.as_str() {
+                "empty" => "",
+                value => value,
+            })
+            .filter(|value| keep(value))
+            .collect();
+        let needed = minimum.saturating_sub(exempt.len());
         if found < needed {
             self.failures.push(format!(
                 "{dimension}: {found} distinct values, minimum {needed}"
@@ -1921,7 +1937,9 @@ fn minimum_probes(first: &str, vendor: &str, delivery_date: &str) -> Vec<Minimum
 /// must report that minimum and only the violations the probe lists (the
 /// one-vendor copy also breaks the distinct-vendor minimum), and for the
 /// FOB and unit copies a dropped variant of the removed value must exempt
-/// that minimum.
+/// that minimum. Two synthetic drops check the gate's own distinct rule: a
+/// dropped empty service leaves four named services short of five, and a
+/// dropped named service lets them pass.
 #[test]
 fn gate_variation_minimums() {
     let gate = gate();
@@ -2007,21 +2025,45 @@ fn gate_variation_minimums() {
     let authorities = tally(authority_counts.iter().map(String::as_str));
     check.each("authority", &authorities, &["0", "1", "3"], 5, "orders");
 
+    let named = |value: &str| !value.is_empty();
     let vendors = tally(views().map(|order| order.vendor.as_str()));
-    let named_vendors = vendors.keys().filter(|vendor| !vendor.is_empty()).count();
-    check.distinct("vendor", named_vendors, 40);
+    check.distinct("vendor", &vendors, 40, named);
     let services = tally(views().map(|order| order.service.as_str()));
-    let named_services = services
-        .keys()
-        .filter(|service| !service.is_empty())
-        .count();
-    check.distinct("service", named_services, 5);
+    check.distinct("service", &services, 5, named);
     check.each("service", &services, &[""], 3, "orders");
+    // The distinct rule itself, on four named services against the minimum
+    // of five: a dropped empty service, which the count excludes, relaxes
+    // nothing, and a dropped named service lowers the minimum to four.
+    let four_named = tally(["3", "6", "9", "10"].into_iter());
+    let verdict = |pass: bool| if pass { "pass" } else { "fail" };
+    for (value, passes) in [("empty", false), ("2", true)] {
+        let drops = [corpus::DroppedVariant {
+            round: 1,
+            case: "CP-001".to_string(),
+            dimension: "service".to_string(),
+            value: value.to_string(),
+            branch: gate.not_implemented.first().cloned().unwrap_or_default(),
+        }];
+        let mut oracle = Minimums {
+            drops: &drops,
+            failures: Vec::new(),
+        };
+        oracle.distinct("service", &four_named, 5, named);
+        check.require(
+            oracle.failures.is_empty() == passes,
+            format!(
+                "service={value} dropped: 4 named services {} the distinct minimum of 5, expected to {}: {:?}",
+                verdict(oracle.failures.is_empty()),
+                verdict(passes),
+                oracle.failures
+            ),
+        );
+    }
     let totals = tally(views().map(|order| order.total.as_str()));
-    check.distinct("total", totals.len(), 12);
+    check.distinct("total", &totals, 12, |_| true);
 
     let dates = tally(views().map(|order| order.date.as_str()));
-    check.distinct("date", dates.len(), DATES.len());
+    check.distinct("date", &dates, DATES.len(), |_| true);
     check.each(
         "date",
         &dates,
