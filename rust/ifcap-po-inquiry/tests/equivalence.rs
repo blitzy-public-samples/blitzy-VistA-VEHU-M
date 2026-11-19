@@ -5468,7 +5468,10 @@ fn corpus_reader_edited_transcript() {
 /// transcript, the input, the case folder, `meta.txt` or the corpus folder
 /// itself, its target outside the folder under test) is refused as
 /// `<path>: symbolic link`, so the case and its label are NOT COMPARED, and
-/// a dangling transcript link counts as present.
+/// a dangling transcript link counts as present. On Linux, a case folder
+/// swapped for a link to an outside folder holding the only transcript the
+/// listing verifies, and back, again and again while the run and the case
+/// are read, never lets either reader accept.
 #[test]
 fn corpus_cr_world_independent() {
     let mut folder = TempCorpus::new("world-independent");
@@ -5747,6 +5750,106 @@ fn corpus_cr_world_independent() {
             Err(linked(folder.path(), "CR-01/transcript.txt")),
             "(f) case with a dangling transcript link"
         );
+
+        // (g) The case folder swapped for a link to an outside folder that
+        // holds the only transcript the listing verifies, and back, over
+        // and over while the run and the case are read. Each file is
+        // looked up through the folder found at the case path, never
+        // through a link there, so neither reader ever accepts, whether
+        // the link is swapped back before its last check or not. Linux
+        // only, where the reader holds each folder open while it reads.
+        #[cfg(target_os = "linux")]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            /// The reads of each reader made while the folder is swapped.
+            const SWAP_READS: usize = 12_000;
+            let mut outside = TempCorpus::new("world-independent-swap-outside");
+            outside.input("CR-01", &inputs);
+            outside.transcript("CR-01", &capture);
+            let mut folder = TempCorpus::new("world-independent-swap");
+            folder.input("CR-01", &inputs);
+            folder.transcript("CR-01", &capture);
+            folder.run(&[("CR-01", "RECORDED")]);
+            // Rewritten after the listing, so that only the outside
+            // transcript has the digest listed for CR-01's.
+            folder.transcript("CR-01", "ORDINARY\n");
+            let stale = format!(
+                "{}: SHA-256 differs from SHA256SUMS",
+                folder.path().join("CR-01/transcript.txt").display()
+            );
+            assert_eq!(
+                load_corpus_run(folder.path(), &ids),
+                Err(stale.clone()),
+                "(g) unswapped, the run fails on the folder's own transcript"
+            );
+            assert_eq!(
+                load_corpus_case(folder.path(), "CR-01"),
+                Err(stale),
+                "(g) unswapped, the case fails on the folder's own transcript"
+            );
+            let live = folder.path().join("CR-01");
+            let parked = folder.path().join("CR-01-parked");
+            let target = outside.path().join("CR-01");
+            let stop = AtomicBool::new(false);
+            // Only counted inside the scope, with no assertion, so that the
+            // swapper is always stopped and joined before anything fails.
+            let (runs, cases, swapper) = std::thread::scope(|scope| {
+                let swapper = scope.spawn(|| -> std::io::Result<u64> {
+                    // The link and the folder are each held for a time swept
+                    // from 0 to 40 microseconds, independently, so that some
+                    // cycles put the link between a read's first and last
+                    // check of the folder: a reader that looks the file up
+                    // through the case path accepts some of these reads.
+                    let hold = |micros: u64| {
+                        let held = std::time::Instant::now();
+                        let span = std::time::Duration::from_micros(micros);
+                        while held.elapsed() < span {
+                            std::hint::spin_loop();
+                        }
+                    };
+                    let mut cycles = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        fs::rename(&live, &parked)?;
+                        std::os::unix::fs::symlink(&target, &live)?;
+                        hold(cycles % 41);
+                        fs::remove_file(&live)?;
+                        fs::rename(&parked, &live)?;
+                        hold(cycles / 41 % 41);
+                        cycles = cycles.saturating_add(1);
+                    }
+                    Ok(cycles)
+                });
+                let mut runs = 0usize;
+                let mut cases = 0usize;
+                for _ in 0..SWAP_READS {
+                    runs += usize::from(load_corpus_run(folder.path(), &ids).is_ok());
+                    cases += usize::from(load_corpus_case(folder.path(), "CR-01").is_ok());
+                }
+                stop.store(true, Ordering::Relaxed);
+                (runs, cases, swapper.join())
+            });
+            let cycles = match swapper {
+                Ok(swapped) => swapped.map_err(|err| err.to_string()),
+                Err(_) => Err("the swapper panicked".to_string()),
+            };
+            assert!(
+                matches!(cycles, Ok(count) if count > 0),
+                "(g) the case folder must have been swapped without error: {cycles:?}"
+            );
+            assert_eq!(
+                (runs, cases),
+                (0, 0),
+                "(g) runs and cases accepted while {} was swapped for a link to {}",
+                live.display(),
+                target.display()
+            );
+            let restored = fs::symlink_metadata(&live).map(|meta| meta.is_dir());
+            assert!(
+                matches!(restored, Ok(true)),
+                "(g) {} must be a real folder again: {restored:?}",
+                live.display()
+            );
+        }
     }
 }
 

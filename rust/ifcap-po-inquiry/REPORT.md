@@ -1565,7 +1565,7 @@ The host's Docker daemon holds no image, so `worldvista/vehu:202609`, `vehu-snap
 - O-17: run `load_corpus.sh`, `record_corpus.sh`, `check_corpus.sh`, then `cargo test --offline --locked`, and commit the recording.
 - A later round corrects any MISMATCH the recording exposes and implements any BOUNDARY branch the team chooses; the corpus records no finding and no dropped variant to carry into it.
 
-**Final-tree re-run.** The record above observed commit `486398a59`, and the 21 later commits of the round up to `91a228d0f` changed `src/corpus.rs`, `src/bin/corpus_gen.rs`, `src/golden.rs`, `tests/corpus.rs`, `tests/equivalence.rs`, the three scripts, the golden README, `RUNNING.md`, this document and `REPORT.md` (`git diff --stat 486398a59 91a228d0f`, 12 files), so its values describe that commit and stay as history. Every command of that record ran again on the delivered tree on 2026-11-19 from 20:21:13Z to 20:26:23Z, on the same Linux build host (12 CPUs, 1-minute load average 21.47 to 23.62 from other work on the host), at commit `91a228d0f1ac0cdb8eb893ffc7f127d422fdbaf8`, the observed commit, on the work branch `blitzy-98f410cb-da9c-4258-aa61-effc9de33dba-w-051`, with no uncommitted change when they started. It holds every fix of the round's last review other than this record: `src/` (tree `f475033109b09fc03e902a780f5e2e7379edf1ce`), and `tests/` with the generated data, the three scripts and the golden README Part C (tree `739ac67bdf08a66b9aeefa0c907f6fc73b425330`). The delivered tree differs from the observed commit only in this document and `REPORT.md`, so its `src/` and `tests/` are the two trees above. The commands ran from `<crate>` with `RUSTUP_AUTO_INSTALL=0` set and the default target folder, except `git rev-parse HEAD`, the tree IDs, the A7 commands and the three byte-identity commands, which ran from the repository root. The re-run ran no Docker command and no script or block of one. `REPORT.md` is not edited by hand: criterion 1's run rewrote it byte for byte as committed (sha256 `f2d1261a1cedffbd8dfdceccc279b6bc3c647083b00e2b614270691ca10719db`, `git status --porcelain` empty afterwards), so no restore was needed, and the committed `REPORT.md` is the one the last `cargo test --offline --locked` writes after this record was added.
+**Final-tree re-run.** The record above observed commit `486398a59`, and the 21 later commits of the round up to `91a228d0f` changed `src/corpus.rs`, `src/bin/corpus_gen.rs`, `src/golden.rs`, `tests/corpus.rs`, `tests/equivalence.rs`, the three scripts, the golden README, `RUNNING.md`, this document and `REPORT.md` (`git diff --stat 486398a59 91a228d0f`, 12 files), so its values describe that commit and stay as history. Every command of that record ran again on the delivered tree on 2026-11-19 from 20:21:13Z to 20:26:23Z, on the same Linux build host (12 CPUs, 1-minute load average 21.47 to 23.62 from other work on the host), at commit `91a228d0f1ac0cdb8eb893ffc7f127d422fdbaf8`, the observed commit, on the work branch `blitzy-98f410cb-da9c-4258-aa61-effc9de33dba-w-051`, with no uncommitted change when they started. It holds every fix of the round's last review other than this record: `src/` (tree `f475033109b09fc03e902a780f5e2e7379edf1ce`), and `tests/` with the generated data, the three scripts and the golden README Part C (tree `739ac67bdf08a66b9aeefa0c907f6fc73b425330`). That tree, the delivered tree when this re-run was recorded, was later superseded by the reader fix for QAFIN-B1-F01, which changed `src/golden.rs`, `tests/equivalence.rs`, the symbolic-link bullet of the golden README Part C, C2, and the Integrity bullet of this document's "Corpus verdicts", so its `src/` and `tests/` are not the delivered trees; the second final-tree re-run below observes the delivered tree. The commands ran from `<crate>` with `RUSTUP_AUTO_INSTALL=0` set and the default target folder, except `git rev-parse HEAD`, the tree IDs, the A7 commands and the three byte-identity commands, which ran from the repository root. The re-run ran no Docker command and no script or block of one. `REPORT.md` is not edited by hand: criterion 1's run rewrote it byte for byte as committed (sha256 `f2d1261a1cedffbd8dfdceccc279b6bc3c647083b00e2b614270691ca10719db`, `git status --porcelain` empty afterwards), so no restore was needed, and the committed `REPORT.md` is the one the last `cargo test --offline --locked` writes after this record was added.
 
 **Re-run: observed commit.** At 2026-11-19T20:21:13Z, each exit status 0, `git status --porcelain` with no output:
 
@@ -1816,7 +1816,258 @@ $ grep -c docker $D/check_corpus.sh                                  # exit 1
 
 Line 117 is the body of `export_scope` (lines 116 to 118), so `%XCMD` appears only there; every `docker exec` that runs a case (lines 960 and 1008) or an export is `docker exec -i`, and the readiness probe's (line 605) takes no flag. At 20:26:23Z no `transcript.txt`, `returned.txt`, `meta.txt`, `SHA256SUMS`, `run-summary.txt` or `BASE.txt` exists under `tests/golden/ifcap/corpus/`, which holds the 235 committed files, and `git status --porcelain` printed nothing.
 
-**Result.** The corpus round is noncompliant. Two of its execution conditions fail: the condition that this run issue no Docker command, through the two read-only Docker queries recorded above, and the condition that it run none of the scripts, through the round's whole runs of `check_corpus.sh` and its runs of blocks cut from `load_corpus.sh` and `record_corpus.sh` against a stubbed `docker`. Its baseline prerequisite also failed: the baseline was taken after the first edit, its test check failed, and the stop it calls for was not taken (section "Corpus round: baseline before the first edit"). The round's outcome is stop and report, not a satisfied gate. The dated record's commands ran on the Linux build host at commit `486398a59`, and their results stay as history. The final-tree re-run ran every command again on the same host at commit `91a228d0f`, the delivered tree, and ran no Docker command and no script; its results are reported evidence, not a passed gate, and they change none of the failures above. On that tree the other completion conditions hold: `cargo test --offline --locked` exits 0 with 209 passed and 0 failed; `corpus_gen --check` exits 0, prints the `specified:` line `specified: 200 CP, 26 CE (16 IN, 10 BOUNDARY), 5 CR, 50 multi-item orders` and `check: 233 files equal`; `REPORT.md` part 3 carries `### Parity corpus`, `#### Dropped variants` and `#### BOUNDARY map` with `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES`, every CP, IN and CR case NOT COMPARED and every BOUNDARY case BOUNDARY, and part 2 still reads `Verdict: PASS` for GC-01 to GC-05; the equivalence, bridge and corpus targets pass, and `end_to_end_real_captures` gets `match` true for each READY case; no read outside `src/golden.rs` opens a capture file, and each criterion 4 hit has its reason; clean, build, clippy, format and documentation exit 0 with no warning; the audits S1 to S9, A7, the three byte-identity commands, the specification counts and coverage, and the K20 capture comparison hold; `corpus_gen` run twice leaves `git status --porcelain` empty; the runtime check shows the bridge unaffected; and the script static checks hold. This round records no acceptance (section "Acceptance record"). After review, the stop, no-Docker and no-script conclusions of the corpus round's two records were corrected to the above, and after the last review the final-tree re-run was added and this paragraph made to cite it; no command, exit status or output in either dated record changed.
+**Second final-tree re-run.** The re-run above observed commit `91a228d0f`. The two later commits on the destination branch, `8179b548d`, which carries that tree with the re-run above in this document and `REPORT.md`, and `39981c7cd`, which integrates the reader fix for QAFIN-B1-F01, changed `src/golden.rs`, `tests/equivalence.rs`, the golden README, this document and `REPORT.md` (`git diff --stat 91a228d0f 39981c7cd`, 5 files), so its values describe that commit and stay as history. Every command of that re-run ran again on the delivered tree on 2026-11-19 from 23:18:32Z to 23:23:15Z, on the same Linux build host (12 CPUs, 1-minute load average 5.14 to 6.55 where sampled), at commit `39981c7cd595208949e97341eb68ba775c6356b1`, the observed commit, on the destination branch `blitzy-98f410cb-da9c-4258-aa61-effc9de33dba`, with no uncommitted change when they started. It holds the reader fix and every earlier fix of the round: `src/` (tree `62848a55c9f9136aeaf535754e182b139fe80890`), and `tests/` with the generated data, the three scripts and the golden README Part C (tree `8ca99d32a5ad2181f302709fb36a5e1db5296d5e`). The observed commit's hash is local to this checkout and is not published. The delivered commit differs from it only in this document and `REPORT.md`, so its `src/` and `tests/` are the two trees named here. The commands ran from `<crate>` with `RUSTUP_AUTO_INSTALL=0` and `TMPDIR` set and the default target folder, except `git rev-parse HEAD`, `git status --porcelain`, the tree IDs, the A7 commands and the three byte-identity commands, which ran from the repository root. The re-run ran no Docker command and no script or block of one. `REPORT.md` is not edited by hand: criterion 1's run rewrote it byte for byte as committed at the observed commit (sha256 `89b2a76405400e9d0d09e4498343ad9bc701d2df562874f2851d421cfde92475`, `git status --porcelain` empty afterwards), so no restore was needed, and the delivered `REPORT.md` is the one the last `cargo test --offline --locked` wrote after this record was added.
+
+**Second re-run: observed commit.** At 2026-11-19T23:18:32Z, each exit status 0, `git status --porcelain` with no output:
+
+```text
+$ git rev-parse HEAD
+39981c7cd595208949e97341eb68ba775c6356b1
+$ git status --porcelain
+$ echo src $(git rev-parse HEAD:rust/ifcap-po-inquiry/src); echo tests $(git rev-parse HEAD:rust/ifcap-po-inquiry/tests)
+src 62848a55c9f9136aeaf535754e182b139fe80890
+tests 8ca99d32a5ad2181f302709fb36a5e1db5296d5e
+```
+
+**Second re-run: build, lint, format and documentation.** In sequence, before the tests, each exit status 0 with no warning. Output complete:
+
+| Command | Time | Exit status | Output |
+|---|---|---|---|
+| `cargo clean` | 23:18:37Z | 0 | `Removed 1905 files, 530.6MiB total` |
+| `cargo build --offline --locked` | 23:18:37Z | 0 | `Compiling ifcap-po-inquiry v0.1.0 (<crate>)`, then ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.35s`` |
+| `cargo clippy --offline --locked --all-targets` | 23:18:51Z | 0 | `Checking ifcap-po-inquiry v0.1.0 (<crate>)`, then ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.30s`` |
+| `cargo fmt --check` | 23:19:04Z | 0 | none |
+| `RUSTDOCFLAGS='-D warnings' cargo doc --offline --locked --no-deps --document-private-items` | 23:19:05Z | 0 | `Checking ifcap-po-inquiry v0.1.0 (<crate>)`, `Documenting ifcap-po-inquiry v0.1.0 (<crate>)`, ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.52s``, `Generated <crate>/target/doc/ifcap_po_inquiry/index.html and 2 other files` |
+
+**Second re-run: criterion 1, tests.** `cargo test --offline --locked`, started 2026-11-19T23:19:17Z at a 1-minute load average of 5.92, finished 23:20:15Z at 6.55, exit status 0, in one run. Output trimmed: the 209 lines `test <name> ... ok` are omitted; every other line, standard error included, is shown:
+
+```text
+   Compiling ifcap-po-inquiry v0.1.0 (<crate>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.44s
+     Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
+
+running 169 tests
+
+test result: ok. 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.38s
+
+     Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/corpus_gen.rs (target/debug/deps/corpus_gen-a1fbdc32ff510447)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bridge.rs (target/debug/deps/bridge-9beed9b1f5406b38)
+
+running 20 tests
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.06s
+
+     Running tests/corpus.rs (target/debug/deps/corpus-e0897437a71ec731)
+
+running 8 tests
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.63s
+
+     Running tests/equivalence.rs (target/debug/deps/equivalence-3c2b54028f880761)
+
+running 12 tests
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.01s
+
+   Doc-tests ifcap_po_inquiry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Total over the seven test targets: 209 passed (unit tests of `src/lib.rs` 169, `src/bin/bridge.rs` 0, `src/bin/corpus_gen.rs` 0, `tests/bridge.rs` 20, `tests/corpus.rs` 8, `tests/equivalence.rs` 12, doc-tests 0), 0 failed, 0 ignored, with the ten corpus tests of `tests/equivalence.rs` each `... ok`. `bridge::tests::live_admission_bounds_real_runs` passed, so no run failed and none was repeated.
+
+**Second re-run: criterion 2, generator check.** `cargo run --offline --locked --bin corpus_gen -- --check`, 2026-11-19T23:20:24Z, exit status 0. Output complete, standard error included: Cargo's two indented lines are standard error, and the eight lines after them standard output:
+
+```text
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running `target/debug/corpus_gen --check`
+specified: 200 CP, 26 CE (16 IN, 10 BOUNDARY), 5 CR, 50 multi-item orders
+generated: 200 CP, 26 CE (13 IN, 13 BOUNDARY), 5 CR, 50 multi-item orders
+moved: CE-04 IN->BOUNDARY PO-09.b11; CE-06 IN->BOUNDARY PO-09.b11; CE-08 IN->BOUNDARY PO-09.b11
+dropped variants: 0
+findings: 0
+regeneration rounds: 1
+largest item count: 8; worst $Y: 39 (bound 45)
+check: 233 files equal
+```
+
+**Second re-run: criterion 3, the report.** On the `REPORT.md` that criterion 1's run wrote, at 2026-11-19T23:20:29Z, `grep -n '^### Parity corpus\|^#### Dropped variants\|^#### BOUNDARY map\|^MATCHED ' REPORT.md`, exit status 0, then `grep -c '^- Verdict: PASS' REPORT.md`, exit status 0:
+
+```text
+1884:### Parity corpus
+1895:MATCHED 0 OF 0 IN-SCOPE CORPUS CASES
+2143:#### Dropped variants
+2147:#### BOUNDARY map
+5
+```
+
+The five `- Verdict: PASS` lines are the part 2 blocks of `GC-01` to `GC-05`, at lines 1832, 1839, 1846, 1853 and 1860. Under `### Parity corpus` the run line reads `Recording run: none`, and the count table, verbatim:
+
+```text
+| Class | MATCH | MISMATCH | NOT COMPARED | BOUNDARY | QUARANTINED | Total |
+|---|---|---|---|---|---|---|
+| CP | 0 | 0 | 200 | 0 | 0 | 200 |
+| IN | 0 | 0 | 13 | 0 | 0 | 13 |
+| BOUNDARY | 0 | 0 | 0 | 13 | 0 | 13 |
+| CR | 0 | 0 | 5 | 0 | 0 | 5 |
+```
+
+So every CP, IN and CR case is NOT COMPARED (200, 13 and 5) and every BOUNDARY case BOUNDARY (13), with no MATCH, MISMATCH or QUARANTINED. `#### Class moves` lists CE-04, CE-06 and CE-08, each IN to BOUNDARY at PO-09.b11; `#### Findings` and `#### Dropped variants` read `none`; `#### CR world labels` follows the BOUNDARY map. These line numbers belong to the file that run wrote, which is the `REPORT.md` of the observed commit and carries the re-run above but not this one, so the delivered `REPORT.md` has other line numbers.
+
+**Second re-run: the three test targets.** Each command is `cargo test --offline --locked` followed by the arguments shown. Each output is complete in its cell, one code span per line, blank lines left out:
+
+| Command | Time | Exit status | Output |
+|---|---|---|---|
+| `--test equivalence -- --nocapture --test-threads=1` | 23:20:36Z | 0 | ``Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s``, ``Running tests/equivalence.rs (target/debug/deps/equivalence-3c2b54028f880761)``, `running 12 tests`, nine lines `test <name> ... ok` (the nine corpus tests before `equivalence_report` in name order, as in the first record), `test equivalence_report ... GC-01 PASS`, `GC-02 PASS`, `GC-03 PASS`, `GC-04 PASS`, `GC-05 PASS`, `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES`, `ok`, `test sha256_known_answers ... ok`, `test spec_has_report_sections ... ok`, `test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.07s` |
+| `--test bridge end_to_end_real_captures -- --nocapture` | 23:20:50Z | 0 | ``Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s``, ``Running tests/bridge.rs (target/debug/deps/bridge-9beed9b1f5406b38)``, `running 1 test`, `GC-01 MATCH`, `GC-02 MATCH`, `GC-03 MATCH`, `GC-04 MATCH`, `GC-05 MATCH`, `test end_to_end_real_captures ... ok`, `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 1.54s` |
+| `--test corpus -- --test-threads=1` | 23:20:51Z | 0 | ``Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s``, ``Running tests/corpus.rs (target/debug/deps/corpus-e0897437a71ec731)``, `running 8 tests`, `test corpus_gen_check_exits_zero ... ok`, `test gate_c_values_and_miss_strings ... ok`, `test gate_every_case_meets_its_class ... ok`, `test gate_no_paging_by_computation ... ok`, `test gate_profile_and_references ... ok`, `test gate_variation_minimums ... ok`, `test generator_is_deterministic ... ok`, `test world_b_keeps_world_a_and_world_a_has_no_corpus ... ok`, `test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 38.23s` |
+
+**Second re-run: criterion 4, read reach.** At 2026-11-19T23:21:35Z, the two searches of the first record, both exit status 0. The first printed 330 hits:
+
+| File | Hits | Reason |
+|---|---|---|
+| `src/golden.rs` | 180 | The capture reader, the one module of `src/` that names capture files |
+| `tests/bridge.rs` | 27 | Byte-identical to the base (`git diff --quiet 7afbc4af9 -- tests/bridge.rs` exits 0), which held the same 27: the synthetic capture folders it writes under the temporary directory and its comments |
+| `tests/corpus.rs` | 2 | Lines 12 and 13, its module doc, which names the files the gate never reads |
+| `tests/equivalence.rs` | 121 | Lines 127, 128, 133, 139, 143 and 148, the readiness-check definitions printed into `REPORT.md` part 3, and line 526, the FAIL cause `meta.txt missing or unparsable`: the base's seven hits, the same text moved down. Lines 648, 649, 692, 735, 740 and 785, doc comments and a comment of the corpus verdict code. Line 1979, `SUMS_NAME`, the name the reader tests write and expect in a failure. Lines 2089, 2090, 2352, 2632, 2633, 2693, 2729, 2856, 3170, 3173, 3425, 3427, 3485, 4289, 4707, 4716, 5468 and 5668, comments of the reader tests and their helpers. Lines 2080, 2085, 2108, 2117, 2725, 2726, 2799, 2800, 2869, 2906, 2916, 2982, 2983, 3102, 3214, 3260, 3262, 3438, 3455, 3457, 3495, 3501, 4205, 4209, 4227, 4271, 4274, 4405, 4406, 4407, 4408, 4431, 4437, 4441, 4459, 4460, 4462, 4464, 4468, 4470, 4471, 4474, 4475, 4476, 4478, 4479, 4503, 4522, 4523, 4527, 4544, 4630, 4633, 4649, 4656, 4663, 4672, 4932, 5108, 5109, 5112, 5131, 5139, 5174, 5175, 5194, 5208, 5219, 5270, 5287, 5293, 5297, 5301, 5358, 5389, 5426, 5589, 5591, 5629, 5632, 5676, 5680, 5681, 5686, 5735, 5744, 5750, 5777 and 5778, the reader tests' synthetic corpus folders under `std::env::temp_dir()` (`TempCorpus` and the tests from line 2646 on): the files they write or link there, the paths and causes they expect in a failure, and their assertion messages. Against the re-run above, the reader fix rewrote the one doc line 5471 of `corpus_cr_world_independent` as four and added its scenario (g), lines 5753 to 5852, so every hit after line 5470 moved down 3, and lines 5777 and 5778, the cause and path scenario (g) expects, are the two new hits |
+
+The second printed 15 hits, the same as the re-run above at the same lines, none of them a read of a capture file:
+
+| Hit | What it reads |
+|---|---|
+| `src/bridge.rs:1237` | A static `frontend/` file the bridge serves |
+| `src/bridge.rs:3213`, `5410`, `5478` | `/dev/null` and the `frontend/` files, in its test module |
+| `src/bin/corpus_gen.rs:98` | `SPEC.md` |
+| `src/bin/corpus_gen.rs:346`, `347` | In `read_committed`, with `--check` only, the committed `corpus.zwr` and `manifest.tsv`, opened only after `fs::symlink_metadata` shows a regular file of the generated length under folders that are not links, and read to at most one byte past that length; each `input.txt` goes through `golden::read_corpus_input` (line 289) |
+| `src/store.rs:347`, `373` | `load_fixtures`, the `*.zwr` fixtures of one folder |
+| `src/store.rs:1118` | A fixture in its test module |
+| `tests/bridge.rs:1745` | The `frontend/` files |
+| `tests/corpus.rs:155`, `162` | `corpus.zwr` and `manifest.tsv` |
+| `tests/equivalence.rs:45` | A doc comment naming `fs::read_to_string` |
+| `tests/equivalence.rs:1004` | `corpus.zwr`, for world B |
+
+**Second re-run: criterion 5, byte identity.** From the repository root at 2026-11-19T23:22:01Z, with `BASE=7afbc4af999d9b2b70a3302ffbb72dcede2952d3` and `C=rust/ifcap-po-inquiry`:
+
+```text
+$ git diff --exit-code $BASE -- Packages $C/Cargo.lock $C/rust-toolchain.toml $C/Cargo.toml $C/frontend $C/src/mumps.rs $C/src/bridge.rs $C/src/bin/bridge.rs $C/src/store.rs $C/tests/bridge.rs $C/tests/golden/ifcap/GC-01 $C/tests/golden/ifcap/GC-02 $C/tests/golden/ifcap/GC-03 $C/tests/golden/ifcap/GC-04 $C/tests/golden/ifcap/GC-05 $C/tests/golden/ifcap/state $C/tests/fixtures/ifcap $C/scripts; echo "exit=$?"
+exit=0
+$ for f in src/inquiry.rs src/lib.rs src/golden.rs; do git diff -U0 $BASE -- $C/$f | grep -c '^-[^-]'; done
+0
+0
+0
+$ git diff --name-status $BASE | grep -v 'tests/golden/ifcap/corpus/C[PER]-[0-9]*/input.txt$'
+M	rust/ifcap-po-inquiry/REPORT.md
+M	rust/ifcap-po-inquiry/RUNNING.md
+M	rust/ifcap-po-inquiry/SPEC.md
+A	rust/ifcap-po-inquiry/src/bin/corpus_gen.rs
+A	rust/ifcap-po-inquiry/src/corpus.rs
+M	rust/ifcap-po-inquiry/src/golden.rs
+M	rust/ifcap-po-inquiry/src/inquiry.rs
+M	rust/ifcap-po-inquiry/src/lib.rs
+A	rust/ifcap-po-inquiry/tests/corpus.rs
+M	rust/ifcap-po-inquiry/tests/equivalence.rs
+A	rust/ifcap-po-inquiry/tests/fixtures/ifcap-corpus/corpus.zwr
+M	rust/ifcap-po-inquiry/tests/golden/ifcap/README.md
+A	rust/ifcap-po-inquiry/tests/golden/ifcap/corpus/manifest.tsv
+A	rust/ifcap-po-inquiry/tests/golden/ifcap/corpus/scripts/check_corpus.sh
+A	rust/ifcap-po-inquiry/tests/golden/ifcap/corpus/scripts/load_corpus.sh
+A	rust/ifcap-po-inquiry/tests/golden/ifcap/corpus/scripts/record_corpus.sh
+```
+
+`git diff --name-status $BASE` printed 247 lines, exit status 0: these 16 and 231 lines `A` for the case inputs `CP-001` to `CP-200`, `CE-01` to `CE-26` and `CR-01` to `CR-05`. Every path is in the corpus round's file list. The `REPORT.md` line is the committed file, which criterion 1's run rewrote byte for byte.
+
+**Second re-run: audits**, at 2026-11-19T23:22:10Z, each exit status as shown:
+
+```text
+$ grep -rnE 'unsafe|\.unwrap\(|\.expect\(|panic!' src/          # S1, exit 0
+src/lib.rs:9:#![forbid(unsafe_code)]
+$ grep -rnE '[A-Za-z_)]\[[^]]+\]' src/                          # S2, exit 0
+src/inquiry.rs:859:        // W:DIC(0)["E" ! ends the line before G ASK [DIC.m:63], whose W ! and
+$ grep -n 'golden' src/inquiry.rs src/store.rs src/mumps.rs     # S3, exit 1, no output
+$ grep -rlE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/   # S4, exit 0
+src/golden.rs
+$ grep -rnE '<same pattern>' src/ | wc -l
+127
+$ grep -rcE '<same pattern>' src/golden.rs
+127
+$ grep -rn '&mut Store' src/                                    # S5, exit 1, no output
+$ grep -n '&mut self' src/store.rs                              # S5, exit 1, no output
+$ grep -rn 'Command::new' src/                                  # S6, exit 0
+src/bridge.rs:2245:    let mut child = Command::new(program)
+src/bridge.rs:3526:        let spawned = Command::new("sleep")
+$ grep -rnE 'fs::write|File::create|OpenOptions|create_dir|remove_file|rename\(' src/ | wc -l   # S7, exit 0
+27
+$ grep -rnE '<same pattern>' src/ | grep '^src/bin/'                # S7, the generator's hits
+src/bin/corpus_gen.rs:266:        fs::create_dir_all(dir)?;
+src/bin/corpus_gen.rs:268:    fs::write(path, text)
+$ grep -rniE 'create|edit|cancel|delete' frontend/ | wc -l       # S8, exit 0
+8
+$ grep -rnE 'method: *"(PUT|PATCH|DELETE)"' frontend/           # S9, exit 1, no output
+```
+
+- S1 has the one allowlisted crate attribute, and the one S2 hit is the comment quoting the M code `DIC(0)["E"` [DIC.m:63], at line 859 as in the records above. S3 and S5 print nothing. All 127 S4 hits are in `src/golden.rs`.
+- S6 equals the records above. S7 has 27 hits, the reader fix adding no `OpenOptions` literal. 25 are the base's test-module hits: `src/bridge.rs` 6 and `src/store.rs` 6 at their base lines (both files byte-identical, `git diff --quiet 7afbc4af9` exit status 0, and their hit lists equal the base's, `diff` exit status 0), and `src/golden.rs` 13 with the same text as at the base (`diff` exit status 0, at 23:22:18Z), at lines 2872 to 4190, all inside its test module, which now starts at line 2861 (`#[cfg(test)]`). The other two are `src/bin/corpus_gen.rs:266` and `268`, the `fs::create_dir_all` and `fs::write` of its `write_file`, the generator's only outputs: the 233 generated files, written only after a successful generation and never with `--check`. S8 prints the 8 lines of section "Read-only enforcement results" unchanged, since `frontend/` is byte-identical.
+
+**Second re-run: A7, source unchanged.** From the repository root at 2026-11-19T23:22:26Z, with `blitzy/screenshots` and `blitzy/screen_recordings` empty, the two commands of the first record each exited 0 and printed nothing.
+
+**Second re-run: specification counts**, at 23:22:26Z: `grep -c '^| PO-[0-9]*\.b' SPEC.md` 108, `grep -c '^| PO-' SPEC.md` 108 and `grep -c '^### PO-' SPEC.md` 41, each exit status 0. The coverage of the "Branch inventory" rows, by the three `grep` commands of round two's fence verification, is 47 exercised (exit status 0), 0 exercised-not-implemented (exit status 1, as `grep -c` gives for a count of 0) and 61 not implemented (exit status 0). `### Branch inventory` equals the base's (`diff` exit status 0), so `corpus::ne_branches` reads the same 61 IDs. These counts are of the observed commit's document; this record adds no line that begins `| PO-` or `### PO-`.
+
+**Second re-run: capture hashes (K20).** At 2026-11-19T23:22:41Z the two listing lines of section "Capture hashes", each exit status 0, printed 275 lines, of which 235 are under `tests/golden/ifcap/corpus/` (`manifest.tsv`, the 231 `input.txt` files and the three scripts). With those removed by `grep -v '  tests/golden/ifcap/corpus/'` and the rest piped to `sort`, the 40 lines have sha256 `d30051be4ccae4ed8ae0d9032f4c97ce96e2783320d05ae3cce3896a2da8a6d5`, that of the corpus round's baseline saved before the first edit, and equal that baseline as rebuilt from the listing under "Round two, before the first edit" without its `200.zwr` line, piped to `sort`, which has the same sha256 (`diff` exit status 0). In round two's form, `sha256sum tests/fixtures/ifcap/200.zwr`, then `find tests/golden/ifcap -type f ! -name README.md -exec sha256sum {} + | grep -v '  tests/golden/ifcap/corpus/' | sort -k2`, then the `cases.zwr` line, the 41 lines equal the listing verbatim under "Round two, before the first edit" (`diff` exit status 0): every GC, `state/` and `cases.zwr` hash holds, and `200.zwr` is still `836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da`. `tests/fixtures/ifcap/` holds 13 files. The section `diff` of the first record against `7afbc4af9` printed nothing, exit status 0, so section "Capture hashes" is unchanged.
+
+**Second re-run: generator writes.** At 2026-11-19T23:22:46Z and 23:22:51Z, with `git status --porcelain` empty before, `cargo run --offline --locked --bin corpus_gen`, with no argument, ran twice, writing its 233 files into the checkout. Each run exited 0 and printed the seven summary lines of criterion 2, identical between the runs (`diff` exit status 0), and after each `git status --porcelain` printed nothing, exit status 0: the generator rewrote the committed files byte for byte.
+
+**Second re-run: runtime check.** The bridge ran inside this checkout's own network namespace, `pf-18144`, never in the host's, after the build above, with nothing listening on host port 18144 or on port 8080 in the namespace before (23:23:10Z) or after (23:23:12Z). The command of the first record, unchanged, output complete:
+
+```text
+2026-11-19T23:23:12Z
+{"mumps_mode":"replay","recorded":["GC-01","GC-02","GC-03","GC-04","GC-05"],"ready":["GC-01","GC-02","GC-03","GC-04","GC-05"],"incomplete":{}}
+curl-exit=0
+wait=143
+0
+nsenter-exit=0
+```
+
+The status call answered by 23:23:12Z (`curl-exit` is the status of the `echo` before it, as in the first record). The bridge's standard output was exactly the three lines `http://127.0.0.1:8080/`, `MUMPS MODE: REPLAY` and `RECORDED 5 OF 5 READY 5 OF 5`, and its standard error was empty (0 bytes). After `kill`, `wait` gave 143 (TERM), and no listener remained on port 8080.
+
+**Second re-run: recording scripts, without Docker.** At 2026-11-19T23:23:02Z, from `<crate>`, with `D=tests/golden/ifcap/corpus/scripts`:
+
+```text
+$ for s in load_corpus record_corpus check_corpus; do bash -n $D/$s.sh; echo "bash -n $s.sh exit=$?"; test -x $D/$s.sh; echo "test -x $s.sh exit=$?"; done
+bash -n load_corpus.sh exit=0
+test -x load_corpus.sh exit=0
+bash -n record_corpus.sh exit=0
+test -x record_corpus.sh exit=0
+bash -n check_corpus.sh exit=0
+test -x check_corpus.sh exit=0
+$ git ls-files -s $D                                                 # exit 0
+100755 e238f292ac1030234d7904ca9c4a10a5683ce24b 0	tests/golden/ifcap/corpus/scripts/check_corpus.sh
+100755 54217c33d6eaafe41be3e6ff1b6977f4eaa76275 0	tests/golden/ifcap/corpus/scripts/load_corpus.sh
+100755 a80bfd0bf4a2af3e373a910f62f0398101ad687b 0	tests/golden/ifcap/corpus/scripts/record_corpus.sh
+$ grep -c 'vc_wait_ready\|mumps -dir' $D/record_corpus.sh          # exit 1
+0
+$ grep -n '%XCMD' $D/record_corpus.sh                               # exit 0
+117:  docker exec -i "$NAME" su - vehu -c "mumps -run %XCMD '$(vc_mcmd "$VC_SCOPE_ROOTS")'" < /dev/null > "$1" 2> "$2"
+$ grep -n 'docker exec -t\|docker exec -it\|-ti ' $D/record_corpus.sh   # exit 1, no output
+$ grep -c docker $D/check_corpus.sh                                  # exit 1
+0
+```
+
+The three blob IDs equal the re-run above's, so the scripts are unchanged. Line 117 is the body of `export_scope` (lines 116 to 118), so `%XCMD` appears only there; every `docker exec` that runs a case (lines 960 and 1008) or an export is `docker exec -i`, and the readiness probe's (line 605) takes no flag. At 23:23:15Z no `transcript.txt`, `returned.txt`, `meta.txt`, `SHA256SUMS`, `run-summary.txt` or `BASE.txt` exists under `tests/golden/ifcap/corpus/`, which holds the 235 committed files, and `git status --porcelain` printed nothing.
+
+**Result.** The corpus round is noncompliant. Two of its execution conditions fail: the condition that this run issue no Docker command, through the two read-only Docker queries recorded above, and the condition that it run none of the scripts, through the round's whole runs of `check_corpus.sh` and its runs of blocks cut from `load_corpus.sh` and `record_corpus.sh` against a stubbed `docker`. Its baseline prerequisite also failed: the baseline was taken after the first edit, its test check failed, and the stop it calls for was not taken (section "Corpus round: baseline before the first edit"). The round's outcome is stop and report, not a satisfied gate. The dated record's commands ran on the Linux build host at commit `486398a59`, and the first final-tree re-run's at commit `91a228d0f`, whose tree the reader fix for QAFIN-B1-F01 later superseded; their results stay as history. The second final-tree re-run ran every command again on the same host at commit `39981c7cd`, the delivered tree (`src/` tree `62848a55c9f9136aeaf535754e182b139fe80890`, `tests/` tree `8ca99d32a5ad2181f302709fb36a5e1db5296d5e`), and ran no Docker command and no script; its results are reported evidence, not a passed gate, and they change none of the failures above. On that tree the other completion conditions hold: `cargo test --offline --locked` exits 0 with 209 passed and 0 failed; `corpus_gen --check` exits 0, prints the `specified:` line `specified: 200 CP, 26 CE (16 IN, 10 BOUNDARY), 5 CR, 50 multi-item orders` and `check: 233 files equal`; `REPORT.md` part 3 carries `### Parity corpus`, `#### Dropped variants` and `#### BOUNDARY map` with `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES`, every CP, IN and CR case NOT COMPARED and every BOUNDARY case BOUNDARY, and part 2 still reads `Verdict: PASS` for GC-01 to GC-05; the equivalence, bridge and corpus targets pass, and `end_to_end_real_captures` gets `match` true for each READY case; no read outside `src/golden.rs` opens a capture file, and each criterion 4 hit has its reason; clean, build, clippy, format and documentation exit 0 with no warning; the audits S1 to S9, A7, the three byte-identity commands, the specification counts and coverage, and the K20 capture comparison hold; `corpus_gen` run twice leaves `git status --porcelain` empty; the runtime check shows the bridge unaffected; and the script static checks hold. This round records no acceptance (section "Acceptance record"). After review, the stop, no-Docker and no-script conclusions of the corpus round's two records were corrected to the above, and after the last review the final-tree re-run was added and this paragraph made to cite it; after the reader fix for QAFIN-B1-F01, the second final-tree re-run was added, the first re-run's statement of the delivered trees corrected, and this paragraph made to cite the second; no command, exit status or output in any earlier dated record changed.
 
 ### Harness checks in this run
 

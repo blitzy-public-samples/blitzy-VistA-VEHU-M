@@ -1504,10 +1504,16 @@ pub fn default_dir() -> PathBuf {
 // reports them, and holding the same bytes, and against its folder as
 // first found: a difference is `<path>: changed while read`, so a link
 // swapped in at a file during its read never yields its target's bytes.
-// These checks assume a stable directory tree and trusted ancestors of the
-// corpus folder a reader is given. They are not atomic with the opens they
-// guard, so a folder swapped and restored between two checks goes unseen,
-// and no folder above the one given is inspected. The corpus generator,
+// On Linux every file is looked up through an open handle of its folder
+// as first found, a real folder and not a link, by that handle's
+// `/proc/self/fd` entry, so a folder swapped for a link during a read is
+// never followed, whether or not it is swapped back before the last
+// check. Elsewhere stable std looks a name up only through its path, so
+// there the checks are not atomic with the opens they guard, and a folder
+// swapped and restored between two checks goes unseen. Everywhere the
+// folders above the corpus folder a reader is given are trusted and not
+// inspected, and the probes that decide only whether a recording exists
+// judge paths and read no file. The corpus generator,
 // its gate and the equivalence harness read these case and run files only
 // through the items below, and nothing here writes.
 
@@ -1637,7 +1643,8 @@ fn object_id(entry: &fs::Metadata) -> (u64, u64) {
 /// one inspection, so a link there is never followed: `Err` as
 /// `<dir>: symbolic link` for a symbolic link, dangling or not, else the
 /// [`object_id`] of what stands there, or `None` when its metadata cannot
-/// be read, which the reader that follows reports, as for [`refuse_link`].
+/// be read. [`hold_folder`] records it where no handle holds the folder,
+/// and [`confirm_standing`] compares it with the folder first found.
 fn folder_found(dir: &Path) -> Result<Option<(u64, u64)>, String> {
     match fs::symlink_metadata(dir) {
         Ok(entry) if entry.file_type().is_symlink() => {
@@ -1648,29 +1655,135 @@ fn folder_found(dir: &Path) -> Result<Option<(u64, u64)>, String> {
     }
 }
 
+/// The folder `dir` as its own path names it, for judging whether it is a
+/// link and which object it is: [`corpus_root`] of it, or `.` for an empty
+/// path, which names the current folder when a file name is joined to it.
+fn folder_root(dir: &Path) -> &Path {
+    let root = corpus_root(dir);
+    if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    }
+}
+
+/// A corpus folder held as [`hold_folder`] first found it, for looking up
+/// the files it holds: each is reached as `through` joined with its name.
+struct HeldFolder {
+    /// The folder, open, kept until every lookup through `through` is
+    /// confirmed, so that its descriptor number is not reused meanwhile.
+    #[cfg(target_os = "linux")]
+    _handle: File,
+    /// What each file name of the folder is joined to: on Linux the open
+    /// handle's `/proc/self/fd/<n>` entry, which leads to the very folder
+    /// held whatever then stands at its path; elsewhere the folder's path.
+    through: PathBuf,
+    /// The [`object_id`] of the folder as first found ([`folder_found`]),
+    /// which its path must still name once a file is read.
+    id: Option<(u64, u64)>,
+}
+
+/// Holds the folder `dir` before its corpus file `name` is read, so that
+/// the file is looked up in the folder found at `dir` and nowhere else:
+/// `None` when nothing stands at `dir` ([`folder_root`]), so that the file
+/// is missing and nothing is opened. `dir` must be a real folder, judged
+/// without following a link, else it is `Err` as `<dir>: symbolic link`
+/// for a link there, dangling or not, and as `<path>: not a directory`,
+/// the path that of the file, for anything else. The folder is then opened
+/// without waiting ([`open_read_only`]), and the object opened must be that
+/// folder ([`object_id`]), else it is `Err` as `<path>: changed while
+/// read`, so a link swapped in at `dir` between the inspection and the
+/// open is never held. Its handle's `/proc/self/fd/<n>` entry must lead to
+/// that same folder, else it is `Err` as `<dir>: not confirmed through its
+/// open handle`. Metadata that cannot be read, or an open that fails, is
+/// `Err` as `<path>: <cause>`. No error names the `/proc` entry.
+#[cfg(target_os = "linux")]
+fn hold_folder(dir: &Path, name: &'static str) -> Result<Option<HeldFolder>, String> {
+    use std::os::fd::AsRawFd;
+    let root = folder_root(dir);
+    let shown = || dir.join(name).display().to_string();
+    let changed = || format!("{}: changed while read", shown());
+    let found = match fs::symlink_metadata(root) {
+        Ok(found) => found,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {}", shown(), io_cause(&e))),
+    };
+    if found.file_type().is_symlink() {
+        return Err(format!("{}: symbolic link", root.display()));
+    }
+    if !found.is_dir() {
+        return Err(format!("{}: not a directory", shown()));
+    }
+    let id = object_id(&found);
+    let handle = match open_read_only(root) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(changed()),
+        Err(e) => return Err(format!("{}: {}", shown(), io_cause(&e))),
+    };
+    if !handle
+        .metadata()
+        .is_ok_and(|opened| opened.is_dir() && object_id(&opened) == id)
+    {
+        return Err(changed());
+    }
+    let through = Path::new("/proc/self/fd").join(handle.as_raw_fd().to_string());
+    if !fs::metadata(&through).is_ok_and(|reached| reached.is_dir() && object_id(&reached) == id) {
+        return Err(format!(
+            "{}: not confirmed through its open handle",
+            root.display()
+        ));
+    }
+    Ok(Some(HeldFolder {
+        _handle: handle,
+        through,
+        id: Some(id),
+    }))
+}
+
+/// Holds the folder `dir` before its corpus file `name` is read, where
+/// stable std can look a name up only through a path: the file is reached
+/// through `dir` itself, and only the folder's identity as now found
+/// ([`folder_found`]) is kept for [`confirm_standing`], so a folder swapped
+/// and restored between the two inspections goes unseen. A link at `dir`
+/// is `Err` as `<dir>: symbolic link`; whatever else stands there, or
+/// nothing, is reported by the read that follows.
+#[cfg(not(target_os = "linux"))]
+fn hold_folder(dir: &Path, name: &'static str) -> Result<Option<HeldFolder>, String> {
+    let _ = name;
+    Ok(Some(HeldFolder {
+        through: dir.to_path_buf(),
+        id: folder_found(folder_root(dir))?,
+    }))
+}
+
 /// Confirms that `bytes`, what [`CaptureFile::read`] gave for the corpus
-/// file `name` of `dir`, are the bytes of the regular file standing at that
-/// path, and that `dir` is still what [`folder_found`] gave as `folder`.
-/// The path must hold a regular file, judged without following a link; the
-/// file then opened there ([`admit`]) must be that same object
-/// ([`object_id`]); and reading it again within its budget ([`read_kept`])
-/// must give the same bytes. So bytes read through a link swapped in at the
-/// path, whether or not it has been swapped out since, are never taken for
-/// the file's. A link found at the path is `Err` as
+/// file `name` of the folder `held`, found at `dir`, are the bytes of the
+/// regular file standing at that name in that folder, and that `dir` still
+/// names the folder held. The file is looked up through the folder held
+/// ([`HeldFolder::through`]), never through `dir`. It must be a regular
+/// file, judged without following a link; the file then opened there
+/// ([`admit`]) must be that same object ([`object_id`]); and reading it
+/// again within its budget ([`read_kept`]) must give the same bytes. So
+/// bytes read through a link swapped in at the file, whether or not it has
+/// been swapped out since, are never taken for the file's. Last, `dir`
+/// ([`folder_root`]) must still be the folder first found
+/// ([`folder_found`]). A link found at the file is `Err` as
 /// `<path>: symbolic link`, one found at `dir` as `<dir>: symbolic link`,
-/// and any other difference, or a path that can no longer be inspected,
-/// opened or read, as `<path>: changed while read`.
+/// and any other difference, or a file that can no longer be inspected,
+/// opened or read, as `<path>: changed while read`, the path always that
+/// of `name` under `dir`.
 fn confirm_standing(
+    held: &HeldFolder,
     dir: &Path,
     name: &'static str,
-    folder: Option<(u64, u64)>,
     bytes: &[u8],
 ) -> Result<(), String> {
-    let path = dir.join(name);
-    let changed = || format!("{}: changed while read", path.display());
+    let shown = dir.join(name);
+    let changed = || format!("{}: changed while read", shown.display());
+    let path = held.through.join(name);
     let entry = fs::symlink_metadata(&path).map_err(|_| changed())?;
     if entry.file_type().is_symlink() {
-        return Err(format!("{}: symbolic link", path.display()));
+        return Err(format!("{}: symbolic link", shown.display()));
     }
     if !entry.is_file() {
         return Err(changed());
@@ -1684,31 +1797,39 @@ fn confirm_standing(
     if !matches!(reread, Content::Bytes(same) if same == bytes) {
         return Err(changed());
     }
-    if folder_found(dir)? != folder {
+    if folder_found(folder_root(dir))? != held.id {
         return Err(changed());
     }
     Ok(())
 }
 
 /// The corpus file `name` of `dir`, read whole within its budget: `None`
-/// when nothing is at its path. A symbolic link at `dir` or at the file,
-/// dangling or not, is `Err` as `<path>: symbolic link` when these checks
-/// find it. They are made just before [`CaptureFile::read`] opens the file,
-/// and that open follows a link, so on their own they hold only for a
-/// folder that nothing changes while it is read. The bytes read are
-/// therefore confirmed before they are judged ([`confirm_standing`]): text
-/// that is not the regular file now standing at its path, or a `dir` that
-/// is no longer the folder first found, is `Err` as
-/// `<path>: changed while read`, so a link swapped in at the file during
-/// its read never yields its target's bytes. A file that is present but
-/// unreadable, over budget or not UTF-8 is `Err` as
-/// [`CaptureFile::failure`] gives it, and one holding a `\r` is `Err` with
-/// the cause `carriage return`.
+/// when nothing is at its path. The folder is held first ([`hold_folder`])
+/// and the file is looked up only through it, so on Linux a `dir` swapped
+/// for a link at any moment of the read is never followed: the file read
+/// is always one standing in the folder found at `dir`, a real folder and
+/// not a link. Elsewhere the file is reached through `dir` itself. A
+/// symbolic link at `dir` or at the file, dangling or not, is `Err` as
+/// `<path>: symbolic link` when these checks find it. They are made just
+/// before [`CaptureFile::read`] opens the file, and that open follows a
+/// link at the file, so the bytes read are confirmed before they are
+/// judged ([`confirm_standing`]): text that is not the regular file now
+/// standing at that name in the folder held, or a `dir` that no longer
+/// names that folder, is `Err` as `<path>: changed while read`, so a link
+/// swapped in at the file during its read never yields its target's bytes.
+/// A file that is present but unreadable or over budget is `Err` with the
+/// cause [`CaptureFile::read`] gives, one that is not UTF-8 with the cause
+/// `not UTF-8`, and one holding a `\r` with the cause `carriage return`.
+/// Every path shown is `name` under `dir`, never the handle's entry.
 fn read_corpus_text(dir: &Path, name: &'static str) -> Result<Option<String>, String> {
-    let folder = folder_found(dir)?;
-    refuse_link(&dir.join(name))?;
-    let file = CaptureFile::read(dir, name, true);
-    let path = file.path.display().to_string();
+    let Some(held) = hold_folder(dir, name)? else {
+        return Ok(None);
+    };
+    let path = dir.join(name).display().to_string();
+    if is_link(&held.through.join(name)) {
+        return Err(format!("{path}: symbolic link"));
+    }
+    let file = CaptureFile::read(&held.through, name, true);
     let bytes = match file.content {
         Content::Missing => return Ok(None),
         Content::Unreadable(cause) => return Err(format!("{path}: {cause}")),
@@ -1718,7 +1839,7 @@ fn read_corpus_text(dir: &Path, name: &'static str) -> Result<Option<String>, St
     };
     // Confirmed before they are judged, so that bytes read through a link
     // are refused as such whatever they hold.
-    confirm_standing(dir, name, folder, &bytes)?;
+    confirm_standing(&held, dir, name, &bytes)?;
     let text = String::from_utf8(bytes).map_err(|_| format!("{path}: not UTF-8"))?;
     if text.contains('\r') {
         return Err(format!("{path}: carriage return"));
@@ -1733,9 +1854,12 @@ fn read_corpus_text(dir: &Path, name: &'static str) -> Result<Option<String>, St
 /// symbolic link at the corpus folder, the case folder or the file,
 /// dangling or not, is `Err` as `<path>: symbolic link`, and text that is
 /// not the regular file standing at its path once read is `Err` as
-/// `<path>: changed while read`. Both checks assume a corpus tree that
-/// nothing replaces while it is read, as this module's Parity corpus notes
-/// state. It is `Err` as `<path>: <cause>`, naming the folder or file at
+/// `<path>: changed while read`. On Linux the file is looked up through an
+/// open handle of the case folder as found, so a case folder swapped for a
+/// link during the read is never followed;
+/// elsewhere both checks assume a corpus tree that nothing replaces while
+/// it is read, as this module's Parity corpus notes state. It is `Err` as
+/// `<path>: <cause>`, naming the folder or file at
 /// fault, when the case folder is missing or cannot be inspected, the file
 /// is missing, unreadable, over its 1 MiB budget, not UTF-8 or holds a
 /// `\r`, it is empty, or the last of its [`split_input_lines`] does not
@@ -1801,7 +1925,9 @@ pub struct CorpusCase {
 /// link at the corpus folder, the case folder, `transcript.txt` or
 /// `SHA256SUMS`, dangling or not, is `Err` as `<path>: symbolic link`, and
 /// a text that is not the regular file standing at its path once read is
-/// `Err` as `<path>: changed while read`.
+/// `Err` as `<path>: changed while read`. On Linux each file is looked up
+/// through an open handle of its folder as found, so a folder swapped for
+/// a link during the read is never followed.
 ///
 /// When recording evidence exists, a present `transcript.txt` or anything
 /// standing as `SHA256SUMS` in `corpus_dir`, a dangling link included, the
@@ -2154,6 +2280,9 @@ fn inputs_have_digest(inputs: &[String], digest: &str) -> bool {
 /// folder, at a case folder or at a file this function reads is `Err` as
 /// `<path>: symbolic link`, and a text that is not the regular file
 /// standing at its path once read is `Err` as `<path>: changed while read`.
+/// On Linux each file is looked up through an open handle of its folder as
+/// found, so a folder swapped for a link during the read is never followed
+/// and no file outside the folder given is hashed or vouched for.
 /// A missing corpus folder, or
 /// one holding no `transcript.txt` for any of `case_ids` and none of
 /// `meta.txt`, `SHA256SUMS` and `run-summary.txt`, is
