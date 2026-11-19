@@ -30,7 +30,9 @@
 //!
 //! Capture files are read only through `golden`: `load_case`, which also
 //! evaluates readiness, and `readiness` alone for an unreadable case, and for
-//! the corpus `load_corpus_case` and `load_corpus_run`. The fixtures are
+//! the corpus `load_corpus_case` and `load_corpus_run`, with
+//! `corpus_transcript_exists` telling from metadata alone whether a corpus
+//! transcript is present. The fixtures are
 //! loaded only through `store::load_fixtures`, and `corpus.zwr` with
 //! `fs::read_to_string`. `SPEC.md` is compiled in: the report copies its
 //! static sections, its literals table only labels a differing line, and the
@@ -54,8 +56,9 @@ use std::sync::OnceLock;
 use ifcap_po_inquiry::corpus;
 use ifcap_po_inquiry::golden::{
     CASE_IDS, CHECKS, CORPUS_META_KEYS, Case, CaseLoad, CorpusRun, Readiness, Rule,
-    corpus_case_ids, corpus_dir, default_dir, load_case, load_corpus_case, load_corpus_run,
-    normalise, readiness, sha256_hex, validate_context,
+    corpus_case_ids, corpus_dir, corpus_input_path, corpus_transcript_exists, default_dir,
+    load_case, load_corpus_case, load_corpus_run, normalise, readiness, sha256_hex,
+    validate_context,
 };
 use ifcap_po_inquiry::store::{Store, load_fixtures};
 use ifcap_po_inquiry::{InquiryError, inquire};
@@ -604,8 +607,8 @@ const WORLD_DEPENDENT: &str = "WORLD-DEPENDENT";
 
 /// Why a case with no transcript capture is NOT COMPARED.
 const NO_CAPTURE: &str = "no capture";
-/// Why every case is NOT COMPARED while the recording run fails an
-/// integrity check.
+/// Why every non-BOUNDARY case (CP, IN and CR) is NOT COMPARED while the
+/// recording run fails an integrity check.
 const RUN_INTEGRITY_FAILURE: &str = "recording run integrity failure";
 /// Why a case that fails an integrity check of its own is NOT COMPARED.
 const CASE_INTEGRITY_FAILURE: &str = "integrity failure";
@@ -655,7 +658,8 @@ struct CorpusVerdict {
     /// The first differing line of a MISMATCH, why a case is NOT COMPARED,
     /// or [`NO_DETAIL`].
     detail: String,
-    /// Whether the case loaded with a transcript capture.
+    /// Whether the case folder holds a transcript capture, valid or not:
+    /// the BOUNDARY map's recorded column.
     recorded: bool,
     /// The world label, for a CR case only.
     world: Option<WorldLabel>,
@@ -664,6 +668,9 @@ struct CorpusVerdict {
 /// The verdicts of a set of corpus cases, with the recording run line and
 /// the two numbers of the MATCHED line.
 struct CorpusJudgement {
+    /// The recording run line: `none`, the run's `meta.txt` values, or
+    /// `INTEGRITY FAIL: <cause>` with the first integrity failure, the
+    /// run's when the run failed, else the first case's.
     run_line: String,
     verdicts: Vec<CorpusVerdict>,
     /// Every integrity failure, of the recording run and of each case, in
@@ -680,10 +687,13 @@ struct CorpusJudgement {
 /// Judges `entries` from the corpus folder `corpus_dir` on `world_b`, and
 /// labels each CR case against its GC capture in `gc_dir`, by the
 /// precedence of the module doc (AAP 0.5.7). The recording run is verified
-/// once. A case that fails to load, and a committed input that differs from
-/// the model's, is an integrity failure; the committed input is the one
-/// run. A Rust session runs only for a usable capture, so with no recording
-/// none runs.
+/// once. A case that fails to load, or whose committed input differs from
+/// the model's, fails its own integrity check: its cause names the file at
+/// fault, and the case is NOT COMPARED unless it is BOUNDARY, while every
+/// other case keeps its own verdict. So only a committed input equal to the
+/// model's is run, and only for a usable capture, so with no recording none
+/// runs. The run line shows the first integrity failure, of the run or
+/// else of a case.
 fn judge_corpus(
     corpus_dir: &Path,
     gc_dir: &Path,
@@ -720,14 +730,13 @@ fn judge_corpus(
     let mut verdicts = Vec::with_capacity(entries.len());
     for entry in entries {
         let case = match load_corpus_case(corpus_dir, &entry.id) {
-            Ok(case) => {
-                if case.inputs != entry.inputs {
-                    integrity.push(format!(
-                        "{}: committed input differs from the generated model",
-                        entry.id
-                    ));
-                }
-                Some(case)
+            Ok(case) if case.inputs == entry.inputs => Some(case),
+            Ok(_) => {
+                integrity.push(crate_relative(&format!(
+                    "{}: committed input differs from the generated model",
+                    corpus_input_path(corpus_dir, &entry.id).display()
+                )));
+                None
             }
             Err(cause) => {
                 integrity.push(crate_relative(&cause));
@@ -736,6 +745,8 @@ fn judge_corpus(
         };
         // The committed inputs and the capture a verdict may use, or why
         // there is none: precedence rules (b), (c) and (d), in that order.
+        // `case` is `None` when the case failed its own integrity check: it
+        // did not load, or its committed input differs from the model's.
         let usable: Result<(&[String], &str), &'static str> = match &case {
             _ if run_failed => Err(RUN_INTEGRITY_FAILURE),
             None => Err(CASE_INTEGRITY_FAILURE),
@@ -757,7 +768,7 @@ fn judge_corpus(
             class: entry.class,
             verdict,
             detail,
-            recorded: case.as_ref().is_some_and(|case| case.transcript.is_some()),
+            recorded: corpus_transcript_exists(corpus_dir, &entry.id),
             world: entry
                 .gc
                 .map(|gc| world_label(gc_dir, gc, capture, literals)),
@@ -772,6 +783,13 @@ fn judge_corpus(
     };
     let matched = counted(&[MATCH]);
     let in_scope = counted(&[MATCH, MISMATCH]);
+    // A failed run already shows its own cause. When the run verified, the
+    // first case integrity failure replaces the run's line, so that no
+    // failure leaves the line reading healthy.
+    let run_line = match integrity.first() {
+        Some(cause) if !run_failed => format!("{RUN_LINE}INTEGRITY FAIL: {}", one_line(cause)),
+        _ => run_line,
+    };
     CorpusJudgement {
         run_line,
         verdicts,
@@ -1609,7 +1627,8 @@ fn corpus_reader_no_capture_not_compared() {
     );
 }
 
-/// A capture equal to the Rust transcript, with valid run files, is MATCH.
+/// A capture equal to the Rust transcript, with valid run files, is MATCH;
+/// one recorded with an input other than the model's is NOT COMPARED.
 #[test]
 fn corpus_reader_matching_capture() {
     let mut folder = TempCorpus::new("matching");
@@ -1637,6 +1656,43 @@ fn corpus_reader_matching_capture() {
     assert_eq!(
         (judgement.matched, judgement.in_scope),
         (1, 1),
+        "MATCHED n OF m"
+    );
+
+    // CP-001 recorded with CP-002's input, its capture equal to the Rust
+    // transcript of that input and every digest refreshed: the case fails
+    // its own integrity check, so it is never compared and stays outside m,
+    // and the run line names its committed input.
+    let mut changed = TempCorpus::new("matching-changed-input");
+    let other = committed_inputs("CP-002");
+    assert_ne!(other, inputs, "CP-002's input must differ from CP-001's");
+    changed.input("CP-001", &other);
+    changed.transcript("CP-001", &rust_transcript(&other));
+    changed.run(&[("CP-001", "RECORDED")]);
+    let named = crate_relative(
+        &corpus_input_path(changed.path(), "CP-001")
+            .display()
+            .to_string(),
+    );
+    let cause = format!("{named}: committed input differs from the generated model");
+    let judgement = judge(&changed, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+    assert!(
+        judgement.integrity.contains(&cause),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    assert_eq!(
+        judgement.run_line,
+        format!("Recording run: INTEGRITY FAIL: {}", one_line(&cause)),
+        "run line"
+    );
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(verdict.verdict, NOT_COMPARED, "detail: {}", verdict.detail);
+    assert_eq!(verdict.detail, CASE_INTEGRITY_FAILURE, "CP-001 detail");
+    assert!(verdict.recorded, "CP-001 is recorded");
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
         "MATCHED n OF m"
     );
 }
@@ -1707,20 +1763,41 @@ fn corpus_reader_quarantined() {
 }
 
 /// Transcripts without a digest list fail the recording run, which names
-/// the missing file, and leave every case NOT COMPARED.
+/// the missing file, and leave each non-BOUNDARY case NOT COMPARED. A
+/// BOUNDARY case stays BOUNDARY, and its transcript, present but unhashed,
+/// still shows as recorded although the case does not load.
 #[test]
 fn corpus_reader_missing_sha256sums() {
     let mut folder = TempCorpus::new("missing-sums");
     let inputs = committed_inputs("CP-001");
+    let boundary = committed_inputs("CE-17");
     folder.input("CP-001", &inputs);
     folder.transcript("CP-001", &rust_transcript(&inputs));
-    folder.run_files(&[("CP-001", "RECORDED")]);
-    let ids = ["CP-001".to_string()];
+    folder.input("CE-17", &boundary);
+    folder.transcript("CE-17", "SYNTHETIC BOUNDARY CAPTURE\n");
+    folder.run_files(&[("CP-001", "RECORDED"), ("CE-17", "RECORDED")]);
+    let ids = ["CP-001".to_string(), "CE-17".to_string()];
     match load_corpus_run(folder.path(), &ids) {
         Err(cause) => assert!(cause.contains(SUMS_NAME), "cause: {cause}"),
         Ok(run) => panic!("a run without its digest list loaded: {run:?}"),
     }
-    let judgement = judge(&folder, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+    assert!(
+        load_corpus_case(folder.path(), "CE-17").is_err(),
+        "an unhashed CE-17 transcript must not load"
+    );
+    let judgement = judge(
+        &folder,
+        &[
+            entry("CP-001", CLASS_CP, &inputs, None),
+            entry("CE-17", CLASS_BOUNDARY, &boundary, None),
+        ],
+    );
+    let boundary_verdict = verdict_of(&judgement, "CE-17");
+    assert_eq!(boundary_verdict.verdict, BOUNDARY, "CE-17 verdict");
+    assert!(
+        boundary_verdict.recorded,
+        "CE-17's transcript exists, so it is recorded although it does not load"
+    );
     assert!(
         judgement
             .integrity
@@ -1792,7 +1869,9 @@ fn corpus_reader_edited_transcript() {
     );
 }
 
-/// A CR capture equal to its GC capture is WORLD-INDEPENDENT.
+/// A CR capture equal to its GC capture is WORLD-INDEPENDENT, unless it was
+/// recorded with an input other than the model's, which makes the case and
+/// its label NOT COMPARED.
 #[test]
 fn corpus_cr_world_independent() {
     let mut folder = TempCorpus::new("world-independent");
@@ -1811,6 +1890,31 @@ fn corpus_cr_world_independent() {
             assert_eq!(world.gc, gc, "GC case");
             assert_eq!(world.label, WORLD_INDEPENDENT, "detail: {}", world.detail);
             assert_eq!(world.detail, NO_DETAIL, "WORLD-INDEPENDENT detail");
+        }
+        None => panic!("CR-01 has no world label"),
+    }
+
+    // The same capture recorded with CR-02's input and refreshed digests:
+    // the case fails its own integrity check, so its verdict and its world
+    // label are NOT COMPARED, not WORLD-INDEPENDENT.
+    let mut changed = TempCorpus::new("world-independent-changed-input");
+    let (_, other) = cr_case("CR-02");
+    assert_ne!(other, inputs, "CR-02's input must differ from CR-01's");
+    changed.input("CR-01", &other);
+    changed.transcript("CR-01", &gc_transcript(gc));
+    changed.run(&[("CR-01", "RECORDED")]);
+    let judgement = judge(&changed, &[entry("CR-01", CLASS_CR, &inputs, Some(gc))]);
+    assert!(
+        !judgement.integrity.is_empty(),
+        "a changed CR input must fail integrity"
+    );
+    let verdict = verdict_of(&judgement, "CR-01");
+    assert_eq!(verdict.verdict, NOT_COMPARED, "detail: {}", verdict.detail);
+    assert_eq!(verdict.detail, CASE_INTEGRITY_FAILURE, "CR-01 detail");
+    match &verdict.world {
+        Some(world) => {
+            assert_eq!(world.label, NOT_COMPARED, "detail: {}", world.detail);
+            assert_eq!(world.detail, CASE_INTEGRITY_FAILURE, "CR-01 label detail");
         }
         None => panic!("CR-01 has no world label"),
     }

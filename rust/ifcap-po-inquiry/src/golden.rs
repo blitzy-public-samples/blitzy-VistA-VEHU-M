@@ -1886,10 +1886,17 @@ pub fn load_corpus_run(corpus_dir: &Path, case_ids: &[String]) -> Result<CorpusR
     })
 }
 
-/// Whether corpus case `case_id` holds a `transcript.txt`, readable or
-/// not, by the rule [`is_recorded`] applies: a case folder whose metadata
-/// cannot be read is taken to hold one.
-fn corpus_transcript_exists(corpus_dir: &Path, case_id: &str) -> bool {
+/// Whether corpus case `case_id` under `corpus_dir` holds a
+/// `transcript.txt`, judged from file metadata alone, so no file content
+/// is read. It is `true` for a transcript whether or not it is readable or
+/// valid, and, by the rule [`is_recorded`] applies, for a case folder whose
+/// metadata cannot be read, since its transcript cannot be confirmed
+/// absent. It is `false` for an id outside [`corpus_case_ids`], so no id
+/// leads a path outside its case folder.
+pub fn corpus_transcript_exists(corpus_dir: &Path, case_id: &str) -> bool {
+    if !corpus_case_known(case_id) {
+        return false;
+    }
     let case_dir = corpus_dir.join(case_id);
     match probe_folder(&case_dir) {
         Folder::Absent => false,
