@@ -1,13 +1,29 @@
 #!/usr/bin/env bash
 # check_corpus.sh: offline file checks of a parity-corpus recording, the shell counterpart of the
 # integrity rules of golden::load_corpus_run in src/golden.rs. It checks what record_corpus.sh
-# wrote under tests/golden/ifcap/corpus/: every case in manifest.tsv has its input.txt and a
-# non-empty transcript.txt; no file anywhere under the corpus folder holds a carriage return, and
-# the folder holds only folders, each listed in full, and regular files; the run files meta.txt,
-# run-summary.txt and SHA256SUMS exist; every non-blank SHA256SUMS line is a SHA-256 digest and a
-# path the run may list (BASE.txt, meta.txt, run-summary.txt, or the input.txt or transcript.txt
-# of a manifest case), each path listed once, and matches its file's bytes; and every
-# transcript.txt anywhere under the corpus folder is listed in SHA256SUMS.
+# wrote under tests/golden/ifcap/corpus/, in nine steps:
+#   1. tests, tests/golden, tests/golden/ifcap and the corpus folder are each a folder and not a
+#      symbolic link, and the corpus folder can be listed; otherwise no later step reads anything;
+#   2. manifest.tsv, within 1048576 bytes, has its header, and each case id is a corpus id listed
+#      once;
+#   3. every case in manifest.tsv has its input.txt and a non-empty transcript.txt, and each of the
+#      two that is a regular file holds at most 1048576 bytes and is UTF-8;
+#   4. one walk of the corpus folder, within 4096 entries and 8 folder levels: it holds only
+#      folders, each listed in full, and regular files, and no file holds a carriage return;
+#   5. the run files meta.txt, run-summary.txt and SHA256SUMS exist as regular files;
+#   6. meta.txt, within 65536 bytes and UTF-8, holds each of its five keys once and no other key;
+#   7. run-summary.txt, within 65536 bytes and UTF-8, holds exports=IDENTICAL, runs=IDENTICAL and
+#      an export_sha256= of 64 lower-case hex digits, once each, and one RECORDED or QUARANTINED
+#      line for each manifest case and for no other id; a DIFF line, evidence only, names the
+#      export or a manifest case; any other line is a problem;
+#   8. SHA256SUMS, within 65536 bytes and UTF-8: every non-blank line is a SHA-256 digest and a
+#      path the run may list (BASE.txt, meta.txt, run-summary.txt, or the input.txt or
+#      transcript.txt of a manifest case), each path listed once, and matches its file's bytes; a
+#      listed BASE.txt holds at most 65536 bytes and is UTF-8;
+#   9. every transcript.txt the walk of step 4 found is listed in SHA256SUMS.
+# A PASS does not cover the corpus reader's input rules (input.txt is not empty, and its last line
+# begins with ^) or the equivalence harness's comparison of each committed input.txt with the
+# generated model; cargo test --offline --locked applies both.
 # It is offline: it uses no container and runs no M command.
 #
 # Usage (from anywhere; it changes to the crate folder rust/ifcap-po-inquiry/ itself and takes no
@@ -17,7 +33,7 @@
 # Prerequisites:
 #   - a recording by tests/golden/ifcap/corpus/scripts/record_corpus.sh;
 #   - for the whole sequence, the snapshot image vehu-snap:gc-base, which load_corpus.sh builds on;
-#   - bash (macOS /bin/bash 3.2 or later), dirname, wc, ls, grep and shasum.
+#   - bash (macOS /bin/bash 3.2 or later), dirname, wc, ls, grep, tr and shasum.
 #
 # The team's order:
 #   1. tests/golden/ifcap/corpus/scripts/load_corpus.sh
@@ -26,8 +42,12 @@
 #   4. cargo test --offline --locked
 #
 # It reads files only; writes nothing. It opens regular files only, never through a symbolic link
-# inside the corpus folder, so no listing can make it read outside that folder. Every check runs
-# and each problem is collected, never fatal: after the last check it prints one PROBLEM: line per
+# at or inside the corpus folder or in the three folders above it, so no listing can make it read
+# outside that folder. What it holds in the shell is bounded: manifest.tsv by 1048576 bytes,
+# meta.txt, run-summary.txt and SHA256SUMS by 65536 each, and the walk by its entry and depth
+# budgets; case files are only measured and searched, by wc and grep.
+# Every check runs, except those step 1 or a missing input leaves nothing to check, and each
+# problem is collected, never fatal: after the last check it prints one PROBLEM: line per
 # problem, then the result line.
 #
 # Exit status: 0 with CORPUS CHECK PASS <n> CASES when no problem was found; 1 with
@@ -72,56 +92,140 @@ step_result() { echo "problems in this step: $((K - STEP_K))"; }
 NL=$'\n'
 CR=$'\r'
 TAB=$'\t'
-# The characters a blank SHA256SUMS line may hold, which golden.rs skips as well.
+# The characters a blank line of meta.txt, run-summary.txt or SHA256SUMS may hold, which golden.rs
+# skips: str::trim removes each character char::is_whitespace accepts, the 25 of Unicode
+# White_Space. WS holds the ASCII ones a line can hold, and UNICODE_WS the UTF-8 form of each of
+# the other 19: U+0085, U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F and
+# U+3000. WS_LEADS holds their lead bytes. The bytes are made by $'\xNN' in plain assignments,
+# since $'...' is not expanded inside double quotes.
 WS=$' \t\v\f\r'
+UNICODE_WS=($'\xc2\x85' $'\xc2\xa0' $'\xe1\x9a\x80' $'\xe2\x80\x80' $'\xe2\x80\x81' $'\xe2\x80\x82'
+  $'\xe2\x80\x83' $'\xe2\x80\x84' $'\xe2\x80\x85' $'\xe2\x80\x86' $'\xe2\x80\x87' $'\xe2\x80\x88'
+  $'\xe2\x80\x89' $'\xe2\x80\x8a' $'\xe2\x80\xa8' $'\xe2\x80\xa9' $'\xe2\x80\xaf' $'\xe2\x81\x9f'
+  $'\xe3\x80\x80')
+WS_LEADS=$'\xc2\xe1\xe2\xe3'
 
-# read_lines FILE: puts the lines of FILE, each without its newline, into FILE_LINES, indexed from
-# 0, and their number into FILE_LINE_COUNT, and returns 0 when those lines hold every byte of
-# FILE. A last line with no newline is still a line, and a final newline adds none. Otherwise it
-# returns 1, FILE_LINES is not to be used, and READ_FAULT gives the cause: FILE cannot be opened,
-# wc fails or gives no count, or the bytes read, counted under LC_ALL=C, differ in number from the
-# byte count of wc. The builtin read drops each NUL byte, and ends at a read error as at the end
-# of the file, so without the count a file that holds a NUL, that could not be read in full, or
-# that changed between the two reads, would be checked as text other than its bytes. It reads in
-# this shell with the builtin read alone, with no subshell, pipe or scratch file, in time linear
-# in the length of FILE. bash's own message on a failed open or read is still shown, as is wc's.
+# Budgets. read_lines reads manifest.tsv within MANIFEST_LIMIT bytes (corpus_gen writes about
+# 105000), and meta.txt, run-summary.txt and SHA256SUMS within TEXT_LIMIT, the budget golden.rs
+# size_limit gives every run file and BASE.txt. CASE_FILE_LIMIT is the budget it gives each
+# input.txt and transcript.txt.
+MANIFEST_LIMIT=1048576
+TEXT_LIMIT=65536
+CASE_FILE_LIMIT=1048576
+# The walk lists at most ENTRY_BUDGET entries in all (a recording of the 231 cases holds about
+# 700) and no folder more than DEPTH_BUDGET levels below the corpus folder (the layout uses one).
+ENTRY_BUDGET=4096
+DEPTH_BUDGET=8
+
+# utf8_line_pattern: sets UTF8_LINE, an extended regular expression that a line, matched whole
+# under LC_ALL=C as bytes, matches exactly when it is UTF-8 as the corpus reader's
+# String::from_utf8 accepts it: ASCII bytes, NUL included, and two- to four-byte sequences in
+# their shortest form, with no surrogate (ED A0 to ED BF) and nothing above U+10FFFF. An overlong
+# form, a C0, C1 or F5 to FF lead byte, a lone continuation byte or a cut sequence does not
+# match. The bytes are made by $'\xNN' in plain assignments, since $'...' is not expanded inside
+# double quotes.
+utf8_line_pattern() {
+  local x80=$'\x80' x8f=$'\x8f' x90=$'\x90' x9f=$'\x9f' xa0=$'\xa0' xbf=$'\xbf' xc2=$'\xc2'
+  local xdf=$'\xdf' xe0=$'\xe0' xe1=$'\xe1' xec=$'\xec' xed=$'\xed' xee=$'\xee' xef=$'\xef'
+  local xf0=$'\xf0' xf1=$'\xf1' xf3=$'\xf3' xf4=$'\xf4' xff=$'\xff' t
+  t="[$x80-$xbf]"
+  UTF8_LINE="^([^$x80-$xff]|[$xc2-$xdf]$t|$xe0[$xa0-$xbf]$t|[$xe1-$xec$xee$xef]$t$t|$xed[$x80-$x9f]$t|$xf0[$x90-$xbf]$t$t|[$xf1-$xf3]$t$t$t|$xf4[$x80-$x8f]$t$t)*\$"
+}
+utf8_line_pattern
+
+# read_lines FILE LIMIT: puts the lines of FILE, each without its newline, into FILE_LINES,
+# indexed from 0, and their number into FILE_LINE_COUNT, and returns 0 when those lines hold every
+# byte of FILE and FILE holds at most LIMIT bytes. A last line with no newline is still a line, and
+# a final newline adds none. A shell variable cannot hold a NUL byte, so FILE is read through tr,
+# which turns each NUL into the byte \002 and keeps every other byte. Like NUL, \002 is not
+# White_Space, a tab, = or a newline, and fits no digest, id, key, status or path, so every line
+# rule decides on it as the corpus reader decides on the NUL, which it reads as an ordinary
+# character; \001 is not used, as bash quotes with it internally. A problem text shows a NUL as
+# the \002 it was read as. Otherwise it returns 1, FILE_LINES is not to be used, and READ_FAULT
+# gives the cause: wc fails or gives no count; FILE holds more than LIMIT bytes by that count, and
+# then nothing of it is read; the output of tr cannot be opened; it grew past LIMIT while it was
+# read; or the bytes read, counted under LC_ALL=C, differ in number from the byte count of wc,
+# taken again after the read. tr gives one byte for each byte, and its output just ends early, as
+# at the end of the file, when FILE cannot be opened or read in full, so without the second count
+# a file that could not be read in full, or that changed between the reads, would be checked as
+# text other than its bytes. Each read takes at most one byte more than the budget has left, so no
+# line, and no number of lines, can hold more than LIMIT bytes in this shell, whatever FILE holds
+# or becomes. The loop runs in this shell, fed by the one tr process through a process
+# substitution, with no scratch file, in time linear in the length of FILE, which is at most
+# LIMIT. The messages of bash on a failed open, of tr and of wc are still shown.
 read_lines() {
-  local line="" term=1 bytes=0 st size
+  local line="" term=1 bytes=0 st room
   READ_FAULT=""
   FILE_LINES=()
   FILE_LINE_COUNT=0
+  file_size "$1"
+  st=$?
+  if [ "$st" -ne 0 ]; then
+    READ_FAULT="$SIZE_FAULT"
+    return 1
+  fi
+  if [ "$SIZE" -gt "$2" ]; then
+    READ_FAULT="larger than $2 bytes (not read)"
+    return 1
+  fi
   while :; do
-    if IFS= read -r line; then
+    room=$(($2 - bytes + 1))
+    if IFS= read -r -n "$room" line; then
       term=1
     elif [ -n "$line" ]; then
       term=0
     else
       break
     fi
+    # A read that filled its bound stopped before any newline, so the line, and the file, hold
+    # more than the budget has left.
+    if [ "${#line}" -ge "$room" ]; then
+      bytes=$(($2 + 1))
+      break
+    fi
     FILE_LINES[FILE_LINE_COUNT]="$line"
     FILE_LINE_COUNT=$((FILE_LINE_COUNT + 1))
     bytes=$((bytes + ${#line} + term))
-    [ "$term" -eq 1 ] || break
-  done < "$1"
+    [ "$term" -eq 1 ] && [ "$bytes" -le "$2" ] || break
+  done < <(LC_ALL=C tr '\000' '\002' < "$1")
   st=$?
   if [ "$st" -ne 0 ]; then
-    READ_FAULT="cannot be read (it cannot be opened)"
+    READ_FAULT="cannot be read (the output of tr cannot be opened)"
     return 1
   fi
-  size="$(wc -c < "$1")"
+  if [ "$bytes" -gt "$2" ]; then
+    READ_FAULT="larger than $2 bytes (it grew while it was read)"
+    return 1
+  fi
+  file_size "$1"
   st=$?
   if [ "$st" -ne 0 ]; then
-    READ_FAULT="cannot be read (wc exited $st)"
+    READ_FAULT="$SIZE_FAULT"
+    return 1
+  fi
+  if [ "$bytes" != "$SIZE" ]; then
+    READ_FAULT="could not be read in full, or changed while it was read (not read)"
+    return 1
+  fi
+  return 0
+}
+
+# file_size FILE: puts the byte count wc -c gives for FILE into SIZE and returns 0, or returns 1
+# with the cause in SIZE_FAULT when wc fails or gives no count. wc reads FILE on its standard
+# input, so its message on a failed open is bash's.
+file_size() {
+  local st
+  SIZE_FAULT=""
+  SIZE="$(LC_ALL=C wc -c < "$1")"
+  st=$?
+  if [ "$st" -ne 0 ]; then
+    SIZE_FAULT="cannot be read (wc exited $st)"
     return 1
   fi
   # The count alone, without the spaces macOS wc pads it with.
-  size="${size//[!0123456789]/}"
-  if [ -z "$size" ]; then
-    READ_FAULT="cannot be read (wc gave no byte count)"
-    return 1
-  fi
-  if [ "$bytes" != "$size" ]; then
-    READ_FAULT="holds a NUL byte, could not be read in full, or changed while it was read (not read)"
+  SIZE="${SIZE//[!0123456789]/}"
+  if [ -z "$SIZE" ]; then
+    SIZE_FAULT="cannot be read (wc gave no byte count)"
     return 1
   fi
   return 0
@@ -155,36 +259,129 @@ allowed_path() {
   return 1
 }
 
+# is_run_file PATH: whether PATH is a regular file that is not a symbolic link, the only kind of
+# run file the later steps read.
+is_run_file() {
+  [ ! -L "$1" ] && [ -f "$1" ]
+}
+
+# in_manifest WORD: whether WORD, as a whole, is one of the manifest's valid case ids (VALID).
+in_manifest() {
+  is_case_id "$1" || return 1
+  case "$VALID " in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+# is_blank_line LINE: whether LINE holds only White_Space characters, or nothing, so that golden.rs
+# skips it as line.trim().is_empty(). A line of WS bytes alone is blank, and one holding any other
+# byte but no byte of WS_LEADS is not, so an ASCII line is decided by two matches. Otherwise the
+# line is blank when nothing but WS bytes is left once every UNICODE_WS sequence is removed. In
+# UTF-8 no character's bytes occur inside another's, so on a UTF-8 line each removal takes whole
+# characters only; a line that is not UTF-8 is reported by the file's UTF-8 check whatever this
+# decides.
+is_blank_line() {
+  local rest="$1" i=0
+  case "$rest" in
+    *[!"$WS"]*) ;;
+    *) return 0 ;;
+  esac
+  case "$rest" in
+    *["$WS_LEADS"]*) ;;
+    *) return 1 ;;
+  esac
+  while [ "$i" -lt "${#UNICODE_WS[@]}" ]; do
+    rest=${rest//"${UNICODE_WS[$i]}"/}
+    i=$((i + 1))
+  done
+  case "$rest" in
+    *[!"$WS"]*) return 1 ;;
+  esac
+  return 0
+}
+
+# utf8_status FILE: returns 0 when every line of FILE matches UTF8_LINE, 1 when one does not, and
+# 2 when grep cannot read FILE. UTF-8 never uses a newline byte inside a character, so a file is
+# UTF-8 exactly when each of its lines is.
+utf8_status() {
+  LC_ALL=C grep -a -q -v -x -E -e "$UTF8_LINE" "$1" 2>/dev/null
+  case "$?" in
+    0) return 1 ;;
+    1) return 0 ;;
+  esac
+  return 2
+}
+
+# check_text_budget FILE LIMIT: the corpus reader's rules for one file it reads whole, FILE being
+# a regular file reached through no symbolic link: it holds at most LIMIT bytes and, within
+# them, is UTF-8. A file over budget is not searched, as the reader stops at its budget.
+check_text_budget() {
+  if ! file_size "$1"; then
+    add_problem "$1: $SIZE_FAULT"
+    return 0
+  fi
+  if [ "$SIZE" -gt "$2" ]; then
+    add_problem "$1: larger than $2 bytes"
+    return 0
+  fi
+  utf8_status "$1"
+  case "$?" in
+    1) add_problem "$1: not UTF-8" ;;
+    2) add_problem "$1: cannot be read" ;;
+  esac
+}
+
 # walk VISITOR: runs VISITOR KIND PATH for every entry under the corpus folder C, depth first,
 # where KIND is file (a regular file), folder (a folder, walked next when it can be listed) or
 # other (a symbolic link, never followed, or a FIFO, device or socket, never opened). For each
 # folder, C included, whose entries cannot all be listed, it also runs VISITOR unlisted FOLDER
 # CAUSE, where CAUSE names the folder and why. It lists with bash globs in this shell, so a
 # visitor's add_problem counts, and checks each listing against ls -A, because a glob gives no
-# status when a folder cannot be read. It returns 1, visiting nothing, when C is not a folder it
+# status when a folder cannot be read. The walk is bounded: it lists at most ENTRY_BUDGET entries
+# in all and no folder more than DEPTH_BUDGET levels below C, and a folder past either bound is
+# reported as unlisted and not listed. It returns 1, visiting nothing, when C is not a folder it
 # can list.
 walk() {
   if [ -L "$C" ] || [ ! -d "$C" ] || [ ! -r "$C" ] || [ ! -x "$C" ]; then
     return 1
   fi
+  ENTRIES_LEFT=$ENTRY_BUDGET
   shopt -s nullglob dotglob
   shopt -u failglob
-  walk_folder "$1" "$C"
+  walk_folder "$1" "$C" 0
   shopt -u nullglob dotglob
   return 0
 }
 
-# walk_folder VISITOR DIR: the walk of one folder that can be listed. The glob gives the entries,
-# by their exact names, and is expanded once; pathname expansion is on only while the list of the
-# for loop is expanded. ls -A, run just before, prints each name followed by a newline, and the x
-# printed after it keeps every newline, so the newlines count the names exactly. A failed ls, or a
-# count other than the number of entries the glob gave, means the glob may have missed entries,
-# and the folder is reported as unlisted; its entries the glob gave are still visited. A name that
-# holds a newline counts more than once, so its folder is reported too.
+# walk_folder VISITOR DIR DEPTH: the walk of one folder that can be listed, DEPTH levels below C.
+# ls -A first counts its entries: it prints each name followed by a newline, and wc -l counts the
+# newlines, so no listing is held in this shell. A folder deeper than DEPTH_BUDGET, a failed ls,
+# or more entries than are left of ENTRY_BUDGET, is reported as unlisted and not globbed.
+# Otherwise the glob gives the entries, by their exact names, and is expanded once; pathname
+# expansion is on only while the list of the for loop is expanded. A glob count other than the ls
+# count means the glob may have missed entries, or the folder changed, and the folder is reported
+# as unlisted; of its entries no more than ls counted are visited. A name that holds a newline
+# counts more than once, so its folder is reported too.
 walk_folder() {
-  local visitor="$1" dir="$2" entry listing st names globbed=0
-  listing="$(LC_ALL=C ls -A "$dir" 2>/dev/null && printf x)"
+  local visitor="$1" dir="$2" depth="$3" entry count st globbed=0
+  if [ "$depth" -gt "$DEPTH_BUDGET" ]; then
+    "$visitor" unlisted "$dir" "$dir: folder not listed (more than $DEPTH_BUDGET folder levels below $C, the depth budget)"
+    return 0
+  fi
+  count="$(set -o pipefail; LC_ALL=C ls -A "$dir" 2>/dev/null | LC_ALL=C wc -l)"
   st=$?
+  # The count alone, without the spaces macOS wc pads it with.
+  count="${count//[!0123456789]/}"
+  if [ "$st" -ne 0 ] || [ -z "$count" ]; then
+    "$visitor" unlisted "$dir" "$dir: folder cannot be listed (ls exited $st)"
+    return 0
+  fi
+  if [ "$count" -gt "$ENTRIES_LEFT" ]; then
+    "$visitor" unlisted "$dir" "$dir: folder not listed (its $count entries exceed the $ENTRIES_LEFT left of the $ENTRY_BUDGET-entry budget)"
+    return 0
+  fi
+  ENTRIES_LEFT=$((ENTRIES_LEFT - count))
   set +f
   for entry in "$dir"/*; do
     set -f
@@ -192,12 +389,13 @@ walk_folder() {
       */. | */..) continue ;;
     esac
     globbed=$((globbed + 1))
+    [ "$globbed" -le "$count" ] || break
     if [ -L "$entry" ]; then
       "$visitor" other "$entry"
     elif [ -d "$entry" ]; then
       "$visitor" folder "$entry"
       if [ -r "$entry" ] && [ -x "$entry" ]; then
-        walk_folder "$visitor" "$entry"
+        walk_folder "$visitor" "$entry" "$((depth + 1))"
       else
         "$visitor" unlisted "$entry" "$entry: folder cannot be listed"
       fi
@@ -208,15 +406,310 @@ walk_folder() {
     fi
   done
   set -f
-  if [ "$st" -ne 0 ]; then
-    "$visitor" unlisted "$dir" "$dir: folder cannot be listed (ls exited $st)"
+  if [ "$globbed" -gt "$count" ]; then
+    "$visitor" unlisted "$dir" "$dir: folder listing incomplete (more entries by glob than the $count by ls)"
+  elif [ "$globbed" -ne "$count" ]; then
+    "$visitor" unlisted "$dir" "$dir: folder listing incomplete ($globbed entries by glob, $count by ls)"
+  fi
+}
+
+# check_root: step 1, run before anything under the corpus folder is read. Each of tests,
+# tests/golden, tests/golden/ifcap and the corpus folder C, in that order, must be a folder that
+# is not a symbolic link, and C must be readable and searchable. The first that is not is
+# reported, and none beneath it is looked at: a symbolic link is never followed, so no later step
+# can read outside the crate's corpus folder. ROOT_OK becomes 1 when all hold and 0 otherwise.
+check_root() {
+  local folder
+  ROOT_OK=0
+  for folder in tests tests/golden tests/golden/ifcap "$C"; do
+    if [ -L "$folder" ]; then
+      add_problem "$folder: a symbolic link, not a folder (never followed)"
+      return 0
+    elif [ ! -e "$folder" ]; then
+      add_problem "$folder: missing"
+      return 0
+    elif [ ! -d "$folder" ]; then
+      add_problem "$folder: not a folder (not read)"
+      return 0
+    fi
+  done
+  if [ ! -r "$C" ] || [ ! -x "$C" ]; then
+    add_problem "$C: folder cannot be listed"
     return 0
   fi
-  listing="${listing%x}"
-  names="${listing//[!$NL]/}"
-  if [ "${#names}" -ne "$globbed" ]; then
-    "$visitor" unlisted "$dir" "$dir: folder listing incomplete ($globbed entries by glob, ${#names} by ls)"
+  ROOT_OK=1
+}
+
+# check_transcripts_listed: step 9, from what the walk of step 4 recorded, with no second walk.
+# Every entry named transcript.txt under the corpus folder, of any kind and in any folder, a
+# manifest case's or not, must have its path relative to the corpus folder among the paths of
+# the SHA256SUMS lines that passed the line rules of step 8 (LISTED). A folder whose entries
+# could not all be listed may hide one, so each is reported here as well.
+check_transcripts_listed() {
+  local i=0 path rel
+  while [ "$i" -lt "$TRANSCRIPT_COUNT" ]; do
+    path="${TRANSCRIPT_PATHS[$i]}"
+    i=$((i + 1))
+    rel="${path#"$C/"}"
+    # A path that holds a newline is never listed, whatever lines its parts match.
+    case "$rel" in
+      *"$NL"*) ;;
+      *)
+        case "$LISTED" in
+          *"$NL$rel$NL"*) continue ;;
+        esac
+        ;;
+    esac
+    add_problem "$path: not listed in SHA256SUMS"
+  done
+  i=0
+  while [ "$i" -lt "$UNLISTED_COUNT" ]; do
+    add_problem "${UNLISTED_CAUSES[$i]}, so not every transcript in it could be checked"
+    i=$((i + 1))
+  done
+}
+
+# check_case_budgets: step 3's budget and UTF-8 rules of the corpus reader, for each manifest
+# case's input.txt and transcript.txt that is a regular file reached through no symbolic link
+# (its case folder and itself both not links); any other is reported by the presence checks of
+# step 3 or by step 4, and never opened. Each must hold at most CASE_FILE_LIMIT bytes, and each
+# within budget must be UTF-8. One wc -c over all of them gives the sizes, and one grep over those
+# within budget names each that holds a line that is not UTF-8, so the step starts two processes
+# whatever the number of cases. The paths are built from ids that passed is_case_id, so they hold
+# no space, newline or pattern character, and wc prints <count> <path> for each, in order, then a
+# total line. When wc or grep fails, or wc's lines are not those, each file is checked on its own,
+# so that a failure is put on the file that caused it. CASE_FILES_CHECKED gives the number of
+# files checked.
+check_case_budgets() {
+  local id name path line count out rest st i=0 j=0 n=0 m=0
+  CASE_PATHS=()
+  CASE_SIZES=()
+  BUDGET_PATHS=()
+  while [ "$i" -lt "$N" ]; do
+    id="${VALID_IDS[$i]}"
+    i=$((i + 1))
+    [ ! -L "$C/$id" ] && [ -d "$C/$id" ] || continue
+    for name in input.txt transcript.txt; do
+      path="$C/$id/$name"
+      [ ! -L "$path" ] && [ -f "$path" ] || continue
+      CASE_PATHS[n]="$path"
+      n=$((n + 1))
+    done
+  done
+  CASE_FILES_CHECKED=$n
+  # The arrays are expanded whole only when they hold a path, since bash 3.2 under set -u rejects
+  # the expansion of an empty array.
+  [ "$n" -gt 0 ] || return 0
+  out="$(LC_ALL=C wc -c "${CASE_PATHS[@]}" 2>/dev/null)"
+  st=$?
+  if [ "$st" -eq 0 ]; then
+    # One line at a time, cut from the front of what is left, with no word splitting.
+    rest="$out"
+    while [ -n "$rest" ]; do
+      line="${rest%%"$NL"*}"
+      case "$rest" in
+        *"$NL"*) rest="${rest#*"$NL"}" ;;
+        *) rest="" ;;
+      esac
+      # <count> <path>, the count padded with leading spaces.
+      line="${line#"${line%%[! ]*}"}"
+      count="${line%% *}"
+      path="${line#* }"
+      path="${path#"${path%%[! ]*}"}"
+      if [ "$j" -lt "$n" ] && [ "$path" = "${CASE_PATHS[$j]}" ]; then
+        case "$count" in
+          "" | *[!0123456789]*) st=1; break ;;
+        esac
+        CASE_SIZES[j]="$count"
+        j=$((j + 1))
+      elif [ "$j" -ne "$n" ] || [ "$path" != total ]; then
+        st=1
+        break
+      fi
+    done
+    [ "$j" -eq "$n" ] || st=1
   fi
+  i=0
+  if [ "$st" -ne 0 ]; then
+    while [ "$i" -lt "$n" ]; do
+      check_text_budget "${CASE_PATHS[$i]}" "$CASE_FILE_LIMIT"
+      i=$((i + 1))
+    done
+    return 0
+  fi
+  while [ "$i" -lt "$n" ]; do
+    if [ "${CASE_SIZES[$i]}" -gt "$CASE_FILE_LIMIT" ]; then
+      add_problem "${CASE_PATHS[$i]}: larger than $CASE_FILE_LIMIT bytes"
+    else
+      BUDGET_PATHS[m]="${CASE_PATHS[$i]}"
+      m=$((m + 1))
+    fi
+    i=$((i + 1))
+  done
+  [ "$m" -gt 0 ] || return 0
+  # -v -x -l: the name of each file holding a line that UTF8_LINE does not match as a whole.
+  out="$(LC_ALL=C grep -a -l -v -x -E -e "$UTF8_LINE" "${BUDGET_PATHS[@]}" 2>/dev/null)"
+  st=$?
+  if [ "$st" -le 1 ]; then
+    rest="$out"
+    while [ -n "$rest" ]; do
+      line="${rest%%"$NL"*}"
+      case "$rest" in
+        *"$NL"*) rest="${rest#*"$NL"}" ;;
+        *) rest="" ;;
+      esac
+      [ -z "$line" ] || add_problem "$line: not UTF-8"
+    done
+    return 0
+  fi
+  i=0
+  while [ "$i" -lt "$m" ]; do
+    utf8_status "${BUDGET_PATHS[$i]}"
+    case "$?" in
+      1) add_problem "${BUDGET_PATHS[$i]}: not UTF-8" ;;
+      2) add_problem "${BUDGET_PATHS[$i]}: cannot be read" ;;
+    esac
+    i=$((i + 1))
+  done
+}
+
+# check_meta FILE: step 6, the rules of golden.rs parse_corpus_meta for meta.txt, each breach
+# collected rather than the first only. FILE is read within TEXT_LIMIT and must be UTF-8. A line
+# is_blank_line finds blank is skipped. Any other must hold =, and its key, the text before the
+# first =, must be one of the five corpus meta keys, appearing once. Each of the five must
+# appear. Values are not checked, as golden.rs keeps them exactly as written.
+check_meta() {
+  local file="$1" n=0 line key seen=" "
+  if ! read_lines "$file" "$TEXT_LIMIT"; then
+    add_problem "$file: $READ_FAULT"
+    return 0
+  fi
+  utf8_status "$file"
+  case "$?" in
+    1) add_problem "$file: not UTF-8" ;;
+    2) add_problem "$file: cannot be read" ;;
+  esac
+  while [ "$n" -lt "$FILE_LINE_COUNT" ]; do
+    line="${FILE_LINES[$n]}"
+    n=$((n + 1))
+    is_blank_line "$line" && continue
+    case "$line" in
+      *=*) key="${line%%=*}" ;;
+      *) add_problem "$file: line $n: no '='"; continue ;;
+    esac
+    case "$key" in
+      image_digest | snapshot_id | source_revision | context | start_command) ;;
+      *) add_problem "$file: line $n: unknown key $key"; continue ;;
+    esac
+    case "$seen" in
+      *" $key "*) add_problem "$file: line $n: repeated key $key"; continue ;;
+    esac
+    seen="$seen$key "
+  done
+  for key in image_digest snapshot_id source_revision context start_command; do
+    case "$seen" in
+      *" $key "*) ;;
+      *) add_problem "$file: missing key $key" ;;
+    esac
+  done
+}
+
+# check_run_summary FILE: step 7, the rules of golden.rs parse_run_summary for run-summary.txt,
+# with the manifest's valid ids (VALID) as the cases, each breach collected rather than the first
+# only. FILE is read within TEXT_LIMIT and must be UTF-8. A line is_blank_line finds blank is
+# skipped. Every other line is tested in golden.rs's order:
+#   - exports= and runs=: each once, its value exactly IDENTICAL;
+#   - export_sha256=: once, its value 64 lower-case hex digits;
+#   - DIFF<TAB><subject>: a difference record_corpus.sh collected, evidence only, since the two
+#     identity lines decide the run; its subject must be exactly export or a manifest case;
+#   - any other line holding a tab: <id><TAB><status>, then the two exit statuses, which are
+#     evidence only and never read; the id is a manifest case listed once, and the status is
+#     exactly RECORDED or QUARANTINED;
+#   - anything else is not recognised.
+# Each of the three identity lines, and a case line for each manifest case, must appear.
+check_run_summary() {
+  local file="$1" n=0 i=0 line value id status exports=0 runs=0 export_sha=0 cases=" "
+  if ! read_lines "$file" "$TEXT_LIMIT"; then
+    add_problem "$file: $READ_FAULT"
+    return 0
+  fi
+  utf8_status "$file"
+  case "$?" in
+    1) add_problem "$file: not UTF-8" ;;
+    2) add_problem "$file: cannot be read" ;;
+  esac
+  while [ "$n" -lt "$FILE_LINE_COUNT" ]; do
+    line="${FILE_LINES[$n]}"
+    n=$((n + 1))
+    is_blank_line "$line" && continue
+    case "$line" in
+      exports=*)
+        value="${line#exports=}"
+        if [ "$exports" -eq 1 ]; then
+          add_problem "$file: line $n: repeated exports="
+        else
+          exports=1
+          [ "$value" = IDENTICAL ] || add_problem "$file: exports=$value"
+        fi
+        ;;
+      runs=*)
+        value="${line#runs=}"
+        if [ "$runs" -eq 1 ]; then
+          add_problem "$file: line $n: repeated runs="
+        else
+          runs=1
+          [ "$value" = IDENTICAL ] || add_problem "$file: runs=$value"
+        fi
+        ;;
+      export_sha256=*)
+        value="${line#export_sha256=}"
+        if [ "$export_sha" -eq 1 ]; then
+          add_problem "$file: line $n: repeated export_sha256="
+        else
+          export_sha=1
+          case "$value" in
+            *[!0123456789abcdef]*) value="" ;;
+          esac
+          [ "${#value}" -eq 64 ] || add_problem "$file: line $n: export_sha256 is not 64 lower-case hex digits"
+        fi
+        ;;
+      "DIFF$TAB"*)
+        value="${line#"DIFF$TAB"}"
+        if [ "$value" != export ] && ! in_manifest "$value"; then
+          add_problem "$file: line $n: DIFF names neither the export nor a case: $value"
+        fi
+        ;;
+      *"$TAB"*)
+        id="${line%%"$TAB"*}"
+        status="${line#*"$TAB"}"
+        status="${status%%"$TAB"*}"
+        if ! in_manifest "$id"; then
+          add_problem "$file: line $n: unexpected case $id"
+          continue
+        fi
+        case "$cases" in
+          *" $id "*) add_problem "$file: line $n: repeated case $id"; continue ;;
+        esac
+        cases="$cases$id "
+        case "$status" in
+          RECORDED | QUARANTINED) ;;
+          *) add_problem "$file: line $n: status $status is neither RECORDED nor QUARANTINED" ;;
+        esac
+        ;;
+      *) add_problem "$file: line $n: not recognised" ;;
+    esac
+  done
+  [ "$exports" -eq 1 ] || add_problem "$file: missing exports= line"
+  [ "$runs" -eq 1 ] || add_problem "$file: missing runs= line"
+  [ "$export_sha" -eq 1 ] || add_problem "$file: missing export_sha256= line"
+  while [ "$i" -lt "$N" ]; do
+    id="${VALID_IDS[$i]}"
+    i=$((i + 1))
+    case "$cases" in
+      *" $id "*) ;;
+      *) add_problem "$file: missing case $id" ;;
+    esac
+  done
 }
 
 cd "$(dirname "$0")/../../../../.." || { echo "FAIL: cannot change to the crate folder five levels above $(dirname "$0")"; exit 1; }
@@ -224,18 +717,29 @@ cd "$(dirname "$0")/../../../../.." || { echo "FAIL: cannot change to the crate 
 
 C=tests/golden/ifcap/corpus
 MANIFEST="$C/manifest.tsv"
+# The line every later step prints instead of its checks when step 1 failed.
+ROOT_SKIP="skipped: the corpus folder failed its checks (counted in step 1)"
 
-step "1. Manifest"
+step "1. Corpus folder"
+STEP_K=$K
+check_root
+step_result
+
+step "2. Manifest"
 STEP_K=$K
 # VALID holds the valid case ids, space separated, in manifest order; later steps walk it.
+# VALID_IDS holds the same ids indexed from 0, N of them.
 VALID=""
+VALID_IDS=()
 N=0
-if [ -L "$MANIFEST" ] || { [ -e "$MANIFEST" ] && [ ! -f "$MANIFEST" ]; }; then
+if [ "$ROOT_OK" -ne 1 ]; then
+  echo "$ROOT_SKIP"
+elif [ -L "$MANIFEST" ] || { [ -e "$MANIFEST" ] && [ ! -f "$MANIFEST" ]; }; then
   add_problem "$MANIFEST: not a regular file (not read)"
 elif [ ! -e "$MANIFEST" ]; then
   add_problem "$MANIFEST: missing"
 else
-  read_lines "$MANIFEST"
+  read_lines "$MANIFEST" "$MANIFEST_LIMIT"
   st=$?
   if [ "$st" -ne 0 ]; then
     # No row of a failed read, or of lines that are not the file's bytes, is checked, so a partial
@@ -273,6 +777,7 @@ else
         *" $id "*) add_problem "$MANIFEST: line $n: $id: listed more than once"; continue ;;
       esac
       VALID="$VALID $id"
+      VALID_IDS[N]="$id"
       N=$((N + 1))
     done
     # An empty file has no header line either.
@@ -284,21 +789,51 @@ fi
 echo "cases: $N (corpus_gen writes 231)"
 step_result
 
-step "2. Case files"
+step "3. Case files"
 STEP_K=$K
-for id in $VALID; do
-  [ -f "$C/$id/input.txt" ] || add_problem "$C/$id/input.txt: missing"
-  test -s "$C/$id/transcript.txt" || add_problem "$C/$id/transcript.txt: missing or empty"
-done
+if [ "$ROOT_OK" -ne 1 ]; then
+  echo "$ROOT_SKIP"
+else
+  i=0
+  while [ "$i" -lt "$N" ]; do
+    id="${VALID_IDS[$i]}"
+    i=$((i + 1))
+    [ -f "$C/$id/input.txt" ] || add_problem "$C/$id/input.txt: missing"
+    test -s "$C/$id/transcript.txt" || add_problem "$C/$id/transcript.txt: missing or empty"
+  done
+  check_case_budgets
+  echo "case files checked against the $CASE_FILE_LIMIT-byte budget: $CASE_FILES_CHECKED"
+fi
 step_result
 
-step "3. Carriage returns"
+step "4. Inventory"
 STEP_K=$K
-# Every entry under the corpus folder is visited, whatever the manifest lists: each regular file
-# is searched, and anything but a folder or a regular file is reported, never followed or opened,
-# as is a folder whose entries cannot all be listed.
+# The one walk of the corpus folder. Every entry under it is visited, whatever the manifest lists:
+# each regular file is searched for a carriage return, and anything but a folder or a regular file
+# is reported, never followed or opened, as is a folder whose entries cannot all be listed. Step 9
+# reuses what the walk records, so the folder is walked once: TRANSCRIPT_PATHS holds the path of
+# every entry named transcript.txt, of any kind and in any folder, and UNLISTED_CAUSES the cause
+# of every folder not listed in full, TRANSCRIPT_COUNT and UNLISTED_COUNT entries each. Both are
+# bounded by the entry budget of the walk.
 FILES=0
-cr_visit() {
+TRANSCRIPT_PATHS=()
+TRANSCRIPT_COUNT=0
+UNLISTED_CAUSES=()
+UNLISTED_COUNT=0
+WALKED=0
+inventory_visit() {
+  if [ "$1" = unlisted ]; then
+    add_problem "$3"
+    UNLISTED_CAUSES[UNLISTED_COUNT]="$3"
+    UNLISTED_COUNT=$((UNLISTED_COUNT + 1))
+    return 0
+  fi
+  case "$2" in
+    */transcript.txt)
+      TRANSCRIPT_PATHS[TRANSCRIPT_COUNT]="$2"
+      TRANSCRIPT_COUNT=$((TRANSCRIPT_COUNT + 1))
+      ;;
+  esac
   case "$1" in
     file)
       FILES=$((FILES + 1))
@@ -309,46 +844,83 @@ cr_visit() {
         *) add_problem "$2: cannot be read" ;;
       esac
       ;;
-    unlisted) add_problem "$3" ;;
     other) add_problem "$2: not a regular file or folder (never followed or read)" ;;
   esac
 }
-if walk cr_visit; then
+if [ "$ROOT_OK" -ne 1 ]; then
+  echo "$ROOT_SKIP"
+elif walk inventory_visit; then
+  WALKED=1
   echo "files searched: $FILES"
-elif [ -L "$C" ]; then
-  add_problem "$C: not a regular file or folder (never followed or read)"
-elif [ -d "$C" ]; then
-  add_problem "$C: folder cannot be listed"
+  echo "entries counted: $((ENTRY_BUDGET - ENTRIES_LEFT)) of the $ENTRY_BUDGET-entry budget"
 else
-  echo "skipped: no corpus folder (counted in steps 1 and 4)"
+  # Step 1 found the folder listable, so it changed since.
+  add_problem "$C: folder cannot be listed"
 fi
 step_result
 
-step "4. Run files"
+step "5. Run files"
 STEP_K=$K
-for name in meta.txt run-summary.txt SHA256SUMS; do
-  [ -f "$C/$name" ] || add_problem "$C/$name: missing"
-done
+if [ "$ROOT_OK" -ne 1 ]; then
+  echo "$ROOT_SKIP"
+else
+  for name in meta.txt run-summary.txt SHA256SUMS; do
+    if [ -L "$C/$name" ]; then
+      add_problem "$C/$name: a symbolic link, not a regular file (never followed or read)"
+    elif [ ! -e "$C/$name" ]; then
+      add_problem "$C/$name: missing"
+    elif [ ! -f "$C/$name" ]; then
+      add_problem "$C/$name: not a regular file (not read)"
+    fi
+  done
+fi
 step_result
 
-step "5. SHA256SUMS verification"
+step "6. meta.txt"
+STEP_K=$K
+if [ "$ROOT_OK" -ne 1 ]; then
+  echo "$ROOT_SKIP"
+elif ! is_run_file "$C/meta.txt"; then
+  echo "skipped: meta.txt is not a regular file (counted in step 5)"
+else
+  check_meta "$C/meta.txt"
+fi
+step_result
+
+step "7. run-summary.txt"
+STEP_K=$K
+if [ "$ROOT_OK" -ne 1 ]; then
+  echo "$ROOT_SKIP"
+elif ! is_run_file "$C/run-summary.txt"; then
+  echo "skipped: run-summary.txt is not a regular file (counted in step 5)"
+else
+  check_run_summary "$C/run-summary.txt"
+fi
+step_result
+
+step "8. SHA256SUMS verification"
 STEP_K=$K
 SUMS="$C/SHA256SUMS"
-# SUMS_READ becomes 1 once SHA256SUMS is read in full. LISTED then holds, for step 6, the path of
+# SUMS_READ becomes 1 once SHA256SUMS is read in full. LISTED then holds, for step 9, the path of
 # every line that passed the line rules, each path between newlines.
 SUMS_READ=0
 LISTED="$NL"
-if [ -L "$SUMS" ]; then
-  add_problem "$SUMS: not a regular file (not read)"
-elif [ ! -f "$SUMS" ]; then
-  echo "skipped: no SHA256SUMS (counted in step 4)"
+if [ "$ROOT_OK" -ne 1 ]; then
+  echo "$ROOT_SKIP"
+elif ! is_run_file "$SUMS"; then
+  echo "skipped: SHA256SUMS is not a regular file (counted in step 5)"
 else
-  read_lines "$SUMS"
+  read_lines "$SUMS" "$TEXT_LIMIT"
   st=$?
   if [ "$st" -ne 0 ]; then
     add_problem "$SUMS: $READ_FAULT"
   else
     SUMS_READ=1
+    utf8_status "$SUMS"
+    case "$?" in
+      1) add_problem "$SUMS: not UTF-8" ;;
+      2) add_problem "$SUMS: cannot be read" ;;
+    esac
     # The line rules of golden.rs walk_sha256sums, each line checked here and none left to
     # shasum: a blank line is skipped, and any other is 64 lower-case hex digits, two spaces or
     # a space and *, and a path allowed_path accepts, listed once. Only a line that passes them
@@ -362,10 +934,7 @@ else
     while [ "$n" -lt "$FILE_LINE_COUNT" ]; do
       line="${FILE_LINES[$n]}"
       n=$((n + 1))
-      case "$line" in
-        *[!"$WS"]*) ;;
-        *) continue ;;
-      esac
+      is_blank_line "$line" && continue
       lines=$((lines + 1))
       digest="${line:0:64}"
       sep="${line:64:2}"
@@ -404,6 +973,9 @@ else
       else
         OK_LINES="$OK_LINES$line$NL"
         passed=$((passed + 1))
+        # The corpus reader reads every listed file within its budget. Step 3 checks the case
+        # files and steps 6 and 7 the run files, so BASE.txt alone is left.
+        [ "$path" != BASE.txt ] || check_text_budget "$C/BASE.txt" "$TEXT_LIMIT"
       fi
     done
     # A listing with no line would otherwise pass with nothing verified.
@@ -435,46 +1007,21 @@ else
 fi
 step_result
 
-step "6. Every transcript listed"
+step "9. Every transcript listed"
 STEP_K=$K
-# Every entry named transcript.txt under the corpus folder, of any kind and in any folder, a
-# manifest case's or not, must have its path relative to the corpus folder among the paths of
-# the SHA256SUMS lines that passed the line rules of step 5. A folder whose entries cannot all be
-# listed may hide one, so it is reported here as well, even when step 3 could list it.
-TRANSCRIPTS=0
-listed_visit() {
-  local rel
-  if [ "$1" = unlisted ]; then
-    add_problem "$3, so not every transcript in it could be checked"
-    return 0
-  fi
-  case "$2" in
-    */transcript.txt) ;;
-    *) return 0 ;;
-  esac
-  TRANSCRIPTS=$((TRANSCRIPTS + 1))
-  rel="${2#"$C/"}"
-  # A path that holds a newline is never listed, whatever lines its parts match.
-  case "$rel" in
-    *"$NL"*) ;;
-    *)
-      case "$LISTED" in
-        *"$NL$rel$NL"*) return 0 ;;
-      esac
-      ;;
-  esac
-  add_problem "$2: not listed in SHA256SUMS"
-}
-if [ "$SUMS_READ" -ne 1 ]; then
-  if [ -L "$SUMS" ] || [ -f "$SUMS" ]; then
-    echo "skipped: SHA256SUMS was not read (counted in step 5)"
+if [ "$ROOT_OK" -ne 1 ]; then
+  echo "$ROOT_SKIP"
+elif [ "$SUMS_READ" -ne 1 ]; then
+  if is_run_file "$SUMS"; then
+    echo "skipped: SHA256SUMS was not read (counted in step 8)"
   else
-    echo "skipped: no SHA256SUMS (counted in step 4)"
+    echo "skipped: SHA256SUMS is not a regular file (counted in step 5)"
   fi
-elif walk listed_visit; then
-  echo "transcripts found: $TRANSCRIPTS"
+elif [ "$WALKED" -ne 1 ]; then
+  echo "skipped: the corpus folder cannot be listed (counted in step 4)"
 else
-  echo "skipped: the corpus folder cannot be listed (counted in step 3)"
+  check_transcripts_listed
+  echo "transcripts found: $TRANSCRIPT_COUNT"
 fi
 step_result
 

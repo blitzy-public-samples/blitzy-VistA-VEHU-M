@@ -443,7 +443,7 @@ Paths in the table are relative to this folder, except `tests/fixtures/ifcap-cor
   - Lines `exports=IDENTICAL|DIFFERENT`, `export_sha256=<hex>` and `runs=IDENTICAL|DIFFERENT`.
   - Then one `<id><TAB><RECORDED|QUARANTINED><TAB><run 1 exit status><TAB><run 2 exit status>` line per case, in manifest order.
   - Then one `DIFF<TAB><id or export>` line per collected difference.
-  - The exit statuses are evidence only, and no verdict reads them.
+  - The exit statuses and the `DIFF` lines are evidence only, and no verdict reads them: `exports=` and `runs=` decide the run.
 - **`SHA256SUMS`** holds `shasum -a 256` lines, `<64 hex>` then two spaces then the path relative to `corpus/`, sorted under `LC_ALL=C`. It covers `BASE.txt`, `meta.txt`, `run-summary.txt` and every `<id>/input.txt` and `<id>/transcript.txt`.
 - **Readers.** Only `src/golden.rs` reads the corpus capture files, through `golden::read_corpus_input`, `load_corpus_case` and `load_corpus_run`, under these integrity rules:
   - each present file is UTF-8 and within its size limit: 1 MiB for `input.txt` and `transcript.txt`, 64 KiB for each run file;
@@ -451,7 +451,7 @@ Paths in the table are relative to this folder, except `tests/fixtures/ifcap-cor
   - a present `transcript.txt` is not empty;
   - `input.txt` is not empty, and its last input begins with `^`;
   - no symbolic link is followed: a link at the corpus folder, a case folder or any corpus file, dangling or not, fails as `<path>: symbolic link`, so nothing outside the corpus folder is read, as `check_corpus.sh` never follows a link either;
-  - once any transcript exists, `meta.txt`, `SHA256SUMS` and `run-summary.txt` must all exist, every `SHA256SUMS` line must match its file, every transcript must be listed, and `run-summary.txt` must read `exports=IDENTICAL` and `runs=IDENTICAL` and hold no `DIFF` line. A `BASE.txt` alone, written before any recording, leaves the corpus unrecorded.
+  - once any transcript exists, `meta.txt`, `SHA256SUMS` and `run-summary.txt` must all exist, every `SHA256SUMS` line must match its file, every transcript must be listed, and `run-summary.txt` must read `exports=IDENTICAL` and `runs=IDENTICAL`. A `DIFF` line is accepted as evidence when it names `export` or one of the cases, and is rejected when it names anything else. A `BASE.txt` alone, written before any recording, leaves the corpus unrecorded.
 
   A failed run check shows in `REPORT.md` part 3 as `Recording run: INTEGRITY FAIL: <cause>`, and a failed case check makes that case NOT COMPARED. Either fails `cargo test` after the report is written. `manifest.tsv` and `corpus.zwr` are generated data, not captures.
 - **What ignores `corpus/`.** None of the five-case readers looks inside it:
@@ -545,16 +545,19 @@ Each script prints each step as `== <n>. <name>`, numbered as below. Paths are a
 
 One export pair serves the whole run: per-case exports of 231 cases would add over 500 MB.
 
-**`check_corpus.sh`** makes offline file checks, with no container and no M command. It writes nothing, and every check runs:
+**`check_corpus.sh`** makes offline file checks, with no container and no M command, by the integrity rules of the corpus reader (C2). It writes nothing, never reads through a symbolic link, and collects every problem:
 
-1. **Manifest.** `manifest.tsv` has its header, and each case id is a corpus id listed once.
-2. **Case files.** Each manifest case has `input.txt` and a non-empty (`test -s`) `transcript.txt`.
-3. **Carriage returns.** No corpus file holds `\r`.
-4. **Run files.** `meta.txt`, `run-summary.txt` and `SHA256SUMS` exist.
-5. **`SHA256SUMS` verification.** `shasum -a 256 -c SHA256SUMS` passes inside `corpus/`.
-6. **Every transcript listed.** Each present transcript is listed in `SHA256SUMS`.
+1. **Corpus folder.** `tests`, `tests/golden`, `tests/golden/ifcap` and `corpus/` are each a folder and not a symbolic link, and `corpus/` can be listed. This runs before anything is read; if it fails, every later step prints `skipped: … (counted in step 1)` and reads nothing.
+2. **Manifest.** `manifest.tsv`, within 1,048,576 bytes, has its header, and each case id is a corpus id listed once.
+3. **Case files.** Each manifest case has `input.txt` and a non-empty (`test -s`) `transcript.txt`. Each of the two that is a regular file holds at most 1,048,576 bytes and is UTF-8, checked by one `wc -c` and one `grep` over all of them.
+4. **Inventory.** One walk of `corpus/`, within 4,096 entries and 8 folder levels: it holds only folders, each listed in full, and regular files, and no file holds `\r`. A folder past either budget is reported and not listed.
+5. **Run files.** `meta.txt`, `run-summary.txt` and `SHA256SUMS` exist as regular files.
+6. **`meta.txt`.** Within 65,536 bytes and UTF-8. Each of its five keys appears once, and no other key appears. Each non-blank line must hold `=`, and the key is the text before the first `=`.
+7. **`run-summary.txt`.** Within 65,536 bytes and UTF-8. It holds `exports=IDENTICAL`, `runs=IDENTICAL` and an `export_sha256=` of 64 lower-case hex digits, once each, and one `<id><TAB><RECORDED|QUARANTINED>` line for each manifest case and for no other id; the exit-status fields are not read. A `DIFF<TAB><subject>` line is evidence only and passes when it names `export` or a manifest case. Any other line is a problem.
+8. **`SHA256SUMS` verification.** Within 65,536 bytes and UTF-8. Every non-blank line is 64 lower-case hex digits, then two spaces or a space and `*`, then a path, listed once. The path is `BASE.txt`, `meta.txt`, `run-summary.txt`, or a manifest case's `input.txt` or `transcript.txt`. The lines that name a regular file reached through no symbolic link go to `shasum -a 256 -c` inside `corpus/`, which must confirm each one. A listed `BASE.txt` holds at most 65,536 bytes and is UTF-8.
+9. **Every transcript listed.** Each `transcript.txt` the step 4 walk found, in any folder, is listed in `SHA256SUMS`, and each folder step 4 could not list is reported again. No second walk is made.
 
-It then prints one `PROBLEM: <cause>` line per problem, then `CORPUS CHECK PASS <n> CASES` (exit 0) or `CORPUS CHECK FAIL <k> PROBLEMS` (exit 1). It does not read the content of `run-summary.txt`: `cargo test` does, through the corpus reader.
+It then prints one `PROBLEM: <cause>` line per problem, then `CORPUS CHECK PASS <n> CASES` (exit 0) or `CORPUS CHECK FAIL <k> PROBLEMS` (exit 1). A PASS does not cover the corpus reader's input rules (`input.txt` is not empty, and its last input begins with `^`), or the equivalence harness's comparison of each committed `input.txt` with the generated model. `cargo test` applies both.
 
 ### C7. Paging detector
 

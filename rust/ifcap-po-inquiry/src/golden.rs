@@ -1886,8 +1886,11 @@ pub enum CorpusRun {
 ///   for each of `case_ids` and none for any other id, its status
 ///   `RECORDED` or `QUARANTINED`. A summary missing a case line is `Err`
 ///   naming the first such id in `case_ids` order. The exit statuses are
-///   evidence only and are not read. A `DIFF\t` line, a difference the run
-///   collected, and any other line are `Err`;
+///   evidence only and are not read. Each `DIFF\t<subject>` line, a
+///   difference the run collected, is evidence for people too, while the
+///   identity lines decide the run: it is accepted when its subject is
+///   exactly `export` or one of `case_ids`, and is `Err` otherwise. Any
+///   other line is `Err`;
 /// - each `SHA256SUMS` line is 64 lower-case hex digits, two spaces or a
 ///   space and `*`, and a path relative to the corpus folder that is
 ///   exactly `BASE.txt`, `meta.txt`, `run-summary.txt`,
@@ -2032,8 +2035,15 @@ fn parse_run_summary(path: &Path, text: &str, case_ids: &[String]) -> Result<Run
                     "{path}: line {number}: export_sha256 is not 64 lower-case hex digits"
                 ));
             }
-        } else if let Some(rest) = line.strip_prefix("DIFF\t") {
-            return Err(format!("{path}: difference recorded: {rest}"));
+        } else if let Some(subject) = line.strip_prefix("DIFF\t") {
+            // A DIFF line is evidence for people, as the exit statuses are:
+            // the identity lines decide the run. Its subject must still be
+            // the export or one of the cases.
+            if subject != "export" && !known.contains(subject) {
+                return Err(format!(
+                    "{path}: line {number}: DIFF names neither the export nor a case: {subject}"
+                ));
+            }
         } else if let Some((id, rest)) = line.split_once('\t') {
             // Only the id and the status are read: the two exit statuses
             // after them are evidence for people, never for a verdict.

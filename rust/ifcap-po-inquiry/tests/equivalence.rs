@@ -1785,6 +1785,16 @@ impl TempCorpus {
             .push((relative.to_string(), sha256_hex(text.as_bytes())));
     }
 
+    /// Removes the written file `relative` and its record, so a later
+    /// digest list leaves it out.
+    fn remove(&mut self, relative: &str) {
+        let path = self.dir.join(relative);
+        if let Err(err) = fs::remove_file(&path) {
+            panic!("cannot remove {}: {err}", path.display());
+        }
+        self.written.retain(|(listed, _)| listed != relative);
+    }
+
     /// Writes `bytes`, which need not be UTF-8, to `relative`, creating its
     /// folder, and records it, as [`TempCorpus::write`] does for text.
     fn write_bytes(&mut self, relative: &str, bytes: &[u8]) {
@@ -2003,6 +2013,121 @@ fn with_line(text: &str, number: usize, line: &str) -> String {
         .join("\n");
     assert_ne!(changed, text, "line {number} was not replaced");
     changed
+}
+
+/// A valid `export_sha256=` line of a synthetic run summary, written out
+/// rather than computed, as is every summary built on it.
+const SUMMARY_DIGEST: &str =
+    "export_sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// The cases of a [`recorded_pair`]: CP-001 of class CP and CE-17 of class
+/// BOUNDARY, with their committed inputs.
+fn pair_entries() -> [CorpusEntry; 2] {
+    [
+        entry("CP-001", CLASS_CP, &committed_inputs("CP-001"), None),
+        entry("CE-17", CLASS_BOUNDARY, &committed_inputs("CE-17"), None),
+    ]
+}
+
+/// The folder for the test `name`, recording CP-001, its capture the Rust
+/// transcript, and CE-17 with valid run files, in which the run file `file`
+/// is then rewritten as `text`, or removed for `None`. The digest list is
+/// written last, so each digest it lists matches the bytes on disk and a
+/// failure comes from the rule under test alone.
+fn recorded_pair(name: &str, file: &str, text: Option<&str>) -> TempCorpus {
+    let mut folder = TempCorpus::new(name);
+    let [cp, boundary] = pair_entries();
+    folder.input(&cp.id, &cp.inputs);
+    folder.transcript(&cp.id, &rust_transcript(&cp.inputs));
+    folder.input(&boundary.id, &boundary.inputs);
+    folder.transcript(&boundary.id, "SYNTHETIC BOUNDARY CAPTURE\n");
+    folder.run_files(&[("CP-001", "RECORDED"), ("CE-17", "RECORDED")]);
+    match text {
+        Some(text) => folder.write(file, text),
+        None => folder.remove(file),
+    }
+    folder.sums();
+    folder
+}
+
+/// Asserts that the recording run of the [`recorded_pair`] `folder` fails
+/// with a cause that names its run file `file` and holds `fragment`, and
+/// that judging the pair shows that cause alone: in the run line, CP-001
+/// NOT COMPARED for the run, CE-17 still BOUNDARY, and nothing in m.
+fn assert_run_fails(folder: &TempCorpus, file: &str, fragment: &str) {
+    let named = format!("{}: ", folder.path().join(file).display());
+    let ids = ["CP-001".to_string(), "CE-17".to_string()];
+    let cause = match load_corpus_run(folder.path(), &ids) {
+        Err(cause) => cause,
+        Ok(run) => panic!("{file} with {fragment:?} loaded: {run:?}"),
+    };
+    assert!(
+        cause.starts_with(&named) && cause.contains(fragment),
+        "expected {named}…{fragment}, cause: {cause}"
+    );
+    let judgement = judge(folder, &pair_entries());
+    let cause = crate_relative(&cause);
+    assert_eq!(
+        judgement.integrity,
+        std::slice::from_ref(&cause),
+        "integrity"
+    );
+    assert_eq!(
+        judgement.run_line,
+        format!("Recording run: INTEGRITY FAIL: {}", one_line(&cause)),
+        "run line"
+    );
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(verdict.verdict, NOT_COMPARED, "CP-001 verdict: {cause}");
+    assert_eq!(
+        verdict.detail, RUN_INTEGRITY_FAILURE,
+        "CP-001 detail: {cause}"
+    );
+    assert_eq!(
+        verdict_of(&judgement, "CE-17").verdict,
+        BOUNDARY,
+        "CE-17 verdict: {cause}"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m: {cause}"
+    );
+}
+
+/// Asserts that the recording run of the [`recorded_pair`] `folder`, whose
+/// summary `what` describes, loads with CP-001 alone quarantined, and that
+/// judging the pair finds no integrity failure: CP-001 QUARANTINED, CE-17
+/// BOUNDARY, and nothing in m.
+fn assert_cp_quarantined(folder: &TempCorpus, what: &str) {
+    let ids = ["CP-001".to_string(), "CE-17".to_string()];
+    match load_corpus_run(folder.path(), &ids) {
+        Ok(CorpusRun::Recorded { quarantined, .. }) => {
+            assert_eq!(quarantined, ["CP-001"], "{what}: quarantined")
+        }
+        other => panic!("{what}: the run must load as recorded: {other:?}"),
+    }
+    let judgement = judge(folder, &pair_entries());
+    assert!(
+        judgement.integrity.is_empty(),
+        "{what}: integrity: {:?}",
+        judgement.integrity
+    );
+    assert_eq!(
+        verdict_of(&judgement, "CP-001").verdict,
+        QUARANTINED,
+        "{what}: CP-001 verdict"
+    );
+    assert_eq!(
+        verdict_of(&judgement, "CE-17").verdict,
+        BOUNDARY,
+        "{what}: CE-17 verdict"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "{what}: MATCHED n OF m"
+    );
 }
 
 /// A synthetic model case `id` of `class`, specified as such, with `inputs`
@@ -3066,6 +3191,9 @@ fn corpus_reader_mismatch_first_line() {
 /// A failed case or run integrity check and a missing transcript each win
 /// over the quarantine, a BOUNDARY case stays BOUNDARY with or without one,
 /// and a quarantined CR case keeps its world label.
+/// Any status other than RECORDED or QUARANTINED fails the run. The exit
+/// statuses, and DIFF lines naming the export or a case, are evidence only
+/// and change nothing.
 #[test]
 fn corpus_reader_quarantined() {
     let mut folder = TempCorpus::new("quarantined");
@@ -3249,6 +3377,53 @@ fn corpus_reader_quarantined() {
         (1, 1),
         "MATCHED n OF m counts CP-001 only"
     );
+
+    // Every digest matches in each folder below, so only the summary's own
+    // rules decide. A status other than exactly RECORDED or QUARANTINED, a
+    // lower-case spelling included, fails the run and names the status.
+    let head = format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\nruns=IDENTICAL\n");
+    let statuses = [
+        ("skipped", "SKIPPED"),
+        ("lower-case", "quarantined"),
+        ("empty", ""),
+    ];
+    for (name, status) in statuses {
+        let summary = format!("{head}CP-001\t{status}\t0\t0\nCE-17\tRECORDED\t0\t0\n");
+        let folder = recorded_pair(
+            &format!("quarantined-status-{name}"),
+            "run-summary.txt",
+            Some(&summary),
+        );
+        let fragment = format!("line 4: status {status} is neither RECORDED nor QUARANTINED");
+        assert_run_fails(&folder, "run-summary.txt", &fragment);
+    }
+    // Nonzero, absent or odd exit statuses, and DIFF lines naming the
+    // export or a case under IDENTICAL identity lines, leave the run
+    // recorded and CP-001 QUARANTINED.
+    let evidence = [
+        (
+            "nonzero exit statuses",
+            "CP-001\tQUARANTINED\t255\t1\nCE-17\tRECORDED\t0\t0\n",
+        ),
+        ("no exit statuses", "CP-001\tQUARANTINED\nCE-17\tRECORDED\n"),
+        (
+            "odd exit statuses",
+            "CP-001\tQUARANTINED\t-\tx\nCE-17\tRECORDED\t0\t0\n",
+        ),
+        (
+            "DIFF lines",
+            "CP-001\tQUARANTINED\t0\t0\nCE-17\tRECORDED\t0\t0\n\
+             DIFF\texport\nDIFF\tCP-001\nDIFF\tCE-17\n",
+        ),
+    ];
+    for (index, (what, cases)) in evidence.into_iter().enumerate() {
+        let folder = recorded_pair(
+            &format!("quarantined-evidence-{index}"),
+            "run-summary.txt",
+            Some(&format!("{head}{cases}")),
+        );
+        assert_cp_quarantined(&folder, what);
+    }
 }
 
 /// Transcripts without a digest list fail the recording run, which names
@@ -3262,6 +3437,9 @@ fn corpus_reader_quarantined() {
 /// bare id), holds a line that is not a digest and a path, or lists a path
 /// twice. A line for a corpus case outside the run's cases fails the run
 /// only, and a binary-mode line is accepted.
+/// A missing `meta.txt` or `run-summary.txt`, the other files present and
+/// hashed, fails the run the same way, naming that file, and so does a
+/// correctly hashed summary that breaks any of its rules.
 #[test]
 fn corpus_reader_missing_sha256sums() {
     let mut folder = TempCorpus::new("missing-sums");
@@ -3511,6 +3689,98 @@ fn corpus_reader_missing_sha256sums() {
         ),
         "CP-001 must load beside a binary-mode line"
     );
+
+    for file in ["meta.txt", "run-summary.txt"] {
+        let folder = recorded_pair(&format!("missing-sums-no-{file}"), file, None);
+        assert_run_fails(&folder, file, "missing");
+    }
+    // Each summary below breaks one rule, and its digest is listed afresh.
+    let head = format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\nruns=IDENTICAL\n");
+    let cases = "CP-001\tRECORDED\t0\t0\nCE-17\tRECORDED\t0\t0\n";
+    let summaries = [
+        (
+            format!("exports=DIFFERENT\n{SUMMARY_DIGEST}\nruns=IDENTICAL\n{cases}"),
+            "exports=DIFFERENT",
+        ),
+        (
+            format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\nruns=DIFFERENT\n{cases}"),
+            "runs=DIFFERENT",
+        ),
+        (
+            format!("{SUMMARY_DIGEST}\nruns=IDENTICAL\n{cases}"),
+            "missing exports= line",
+        ),
+        (
+            format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\n{cases}"),
+            "missing runs= line",
+        ),
+        (
+            format!("exports=IDENTICAL\nruns=IDENTICAL\n{cases}"),
+            "missing export_sha256= line",
+        ),
+        (
+            format!("{head}exports=IDENTICAL\n{cases}"),
+            "line 4: repeated exports=",
+        ),
+        (
+            format!("{head}runs=IDENTICAL\n{cases}"),
+            "line 4: repeated runs=",
+        ),
+        (
+            format!("{head}{SUMMARY_DIGEST}\n{cases}"),
+            "line 4: repeated export_sha256=",
+        ),
+        (
+            format!(
+                "exports=IDENTICAL\n{}\nruns=IDENTICAL\n{cases}",
+                "export_sha256=0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+            ),
+            "line 2: export_sha256 is not 64 lower-case hex digits",
+        ),
+        (
+            format!(
+                "exports=IDENTICAL\n{}\nruns=IDENTICAL\n{cases}",
+                "export_sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"
+            ),
+            "line 2: export_sha256 is not 64 lower-case hex digits",
+        ),
+        (
+            format!("{head}CE-17\tRECORDED\t0\t0\n"),
+            "missing case CP-001",
+        ),
+        (
+            format!("{head}{cases}CP-001\tRECORDED\t0\t0\n"),
+            "line 6: repeated case CP-001",
+        ),
+        (
+            format!("{head}{cases}CP-002\tRECORDED\t0\t0\n"),
+            "line 6: unexpected case CP-002",
+        ),
+        (
+            format!("{head}{cases}SYNTHETIC LINE\n"),
+            "line 6: not recognised",
+        ),
+        (
+            format!("{head}{cases}DIFF\tCP-999\n"),
+            "line 6: DIFF names neither the export nor a case: CP-999",
+        ),
+        (
+            format!("{head}{cases}DIFF\tCP-002\n"),
+            "line 6: DIFF names neither the export nor a case: CP-002",
+        ),
+        (
+            format!("{head}{cases}DIFF\tnothing\n"),
+            "line 6: DIFF names neither the export nor a case: nothing",
+        ),
+    ];
+    for (index, (summary, fragment)) in summaries.iter().enumerate() {
+        let folder = recorded_pair(
+            &format!("missing-sums-summary-{index}"),
+            "run-summary.txt",
+            Some(summary),
+        );
+        assert_run_fails(&folder, "run-summary.txt", fragment);
+    }
 }
 
 /// A transcript changed by one byte after the digest list was written
