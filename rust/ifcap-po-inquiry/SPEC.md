@@ -1272,10 +1272,228 @@ Parity covers OPTION `PRCH DISPLAY PO` (IEN 1901, `EN3^PRCHRPT`), the five cases
 - **Read-only:** the port has no write path. `PRCHQ1` (OPTION 10295, New RFQ, `EN2^PRCHQ2`) was named in the request but creates RFQs, so `PRCH DISPLAY PO` was substituted. The original's own non-business writes (`^DISV`, the device handler's scratch under `^XUTL` and the DEVICE file's open count, word-wrap and delivery scratch under `^UTILITY` and `^TMP`) are documented and not reproduced.
 - **Out of scope:** every write path (creating, editing, receiving, amending or cancelling orders); every other IFCAP function and option; VistA GUI clients, terminal devices and terminal emulators; a Java port; every other VistA package; the earlier GMV vitals slice; and the request's "must not be built" list: a write-guard framework, a CLI or exit-code scheme, git or provenance modules, deterministic-report machinery, Windows or macOS branches, an async runtime, any network service other than the loopback bridge, FFI or C bindings, procedural macros, a second crate or workspace, more than two integration test files, a front-end framework or build tooling, authentication or TLS.
 - **Unexercised branches:** every branch marked "not exercised, not implemented" is outside equivalence; a session that reaches one ends after the last prompt written and invents no output. Before this refine round so were the four exercised branches marked "not implemented (O-01)", which are now implemented.
+- **Parity corpus:** the 231 sessions of section "Parity corpus", run on world B, extend the evidence of the five cases only as far as a recording shows. Until the team records the corpus (O-17), every CP, IN and CR case is NOT COMPARED and every BOUNDARY case is BOUNDARY, so the corpus adds no equivalence claim to the first line of this section. The corpus request names `corpus_gen` with its `--check` mode and its exit statuses 0, 1 and 2, the deterministic generator `src/corpus.rs`, and `tests/corpus.rs`, a third integration test file, although the "must not be built" list above excludes a CLI or exit-code scheme, deterministic-report machinery and more than two integration test files; for the files it names, that request governs (K19).
 
 ## Exit input
 
 The exit input is `^`. At the order prompt it ends the lookup with no output [DIC11.m:23] [DIC.m:45]; `EN3^PRCHPAT` then quits on `+Y<0` [PRCHPAT.m:83] and `EN30` quits because `PRCHPO` is undefined [PRCHRPT.m:72], so `EN3^PRCHRPT` returns. Any other value beginning with `^` does the same [DIC11.m:33]. `inquire` has no special case for it: `ix_dic` follows PO-09.b3. At the station prompt `^` is the n/e PO-05.b2 instead, and the Rust session ends there, so every case answers the station prompt with an empty line. The value has two copies, because the front-end cannot import Rust: `golden::EXIT_INPUT` in `src/golden.rs`, which the readiness check `input_ends_with_exit` uses, and the constant `EXIT_INPUT = "^"` in `frontend/app.js`, which the EXIT button sends as an ordinary input. The `tests/bridge.rs` static-path test `static_paths_exact_match` asserts that the served `app.js` contains `const EXIT_INPUT = "^";`. `tests/golden/ifcap/README.md` states it.
+
+## Parity corpus
+
+The parity corpus widens the evidence of the five GC captures to a stated range of data and input, inside the branches the port already implements, and marks where that evidence stops. It adds no MUMPS branch and changes none: a session that halts where this document says the branch is implemented is recorded as a finding and never patched. The parts:
+
+- **Code.** `src/corpus.rs`, the corpus model, generation, classification, rendering and world B, with no file I/O; `src/bin/corpus_gen.rs`, the command line that reads, writes and checks; the corpus reader in `src/golden.rs`; `inquiry::inquire_traced` (section "Source corrections and interface departures", K16).
+- **Generated data.** `tests/fixtures/ifcap-corpus/corpus.zwr`, `tests/golden/ifcap/corpus/manifest.tsv` and one `tests/golden/ifcap/corpus/<case id>/input.txt` per case, 233 files, written only by `corpus_gen` and never edited by hand.
+- **Tests.** The offline gate `tests/corpus.rs`, and the corpus verdicts of `tests/equivalence.rs`, written into `REPORT.md` part 3 by its single writer `equivalence_report` (K18).
+- **Recording.** `tests/golden/ifcap/corpus/scripts/load_corpus.sh`, `record_corpus.sh` and `check_corpus.sh`, run by the team on its Docker host in that order, then `cargo test --offline --locked` (`tests/golden/ifcap/README.md` Part C, `RUNNING.md` step 8). The corpus round ran none of them (O-16, O-17).
+
+### Corpus classes and case ids
+
+| Class | Cases | Input lines | Purpose |
+|---|---|---|---|
+| CP | CP-001 to CP-200 | `""`, the order's `C` value, `""`, `""`, `^` | 200 generated orders, 150 with one item and 50 with two to eight (341 items), varying data inside the implemented branches |
+| CE | CE-01 to CE-26 | the sequences of "Edge sequences" below | Edge inputs, specified as 16 class IN and 10 class BOUNDARY |
+| CR | CR-01 to CR-05 | the C9 sequences of GC-01 to GC-05 | The five GC sequences replayed on world B |
+
+`golden::corpus_case_ids()` computes the 231 ids in report order, CP-001 to CP-200, CE-01 to CE-26, then CR-01 to CR-05, so no folder is walked. After the generator's gate each case has one final class in `manifest.tsv`: a CP, IN or CR case must run to its end, and a BOUNDARY case halts at a not-implemented branch, its expected branch, and is outside equivalence. A case recorded as a finding is judged by its finding instead ("Offline gate").
+
+### Data worlds
+
+- **World A** is `store::load_fixtures` of `tests/fixtures/ifcap/`, the 13 fixtures, 29,874 nodes. It alone judges GC-01 to GC-05, which still PASS, and it alone feeds the bridge. It is also the generator's only source of reference values and the base of world B.
+- **World B** is `corpus::world_b(world A, corpus.zwr)`: the two corpus header lines, every world A node written as `<Store::format_ref(key)>="<value with each " doubled>"`, then the data lines of `corpus.zwr` (its own header lines skipped), parsed once by `Store::from_zwr`. It adds the 3,526 data lines of `corpus.zwr` to world A and changes no world A node. Every corpus case runs on it, the CR cases included.
+- **Isolation.** `corpus.zwr` lives in `tests/fixtures/ifcap-corpus/` and never in `tests/fixtures/ifcap/`. `load_fixtures` reads only the `*.zwr` files directly in its folder, and the bridge reaches data only through it, so neither sees the corpus. The generator refuses a corpus key that exists in world A, so a corpus line never replaces a world A node, and the gate checks that world A holds no node under `^PRC(442,991001)` to `^PRC(442,991200)`, no `^PRC(442,"C")` subscript beginning `CP` and no `^PRC(442,"B")` subscript beginning `500-CP`.
+- **What `corpus.zwr` writes.** Only the orders 991001 to 991200 of `^PRC(442)` with their `B` and `C` index nodes: no `^PRC(442,0)` change, no vendor and no other reference entry. Every reference resolves in world A.
+
+### Generator rules
+
+- **Seed and stream.** `corpus::SEED` is `0x9E37_79B9_7F4A_7C15`, `11400714819323198485` in decimal, which every `manifest.tsv` row carries in its `seed` column. One `corpus::Xorshift64` stream (`x ^= x << 13; x ^= x >> 7; x ^= x << 17`, wrapping `u64` operations) restarts from `SEED` at the start of each generation round. It decides only free text and amounts, drawn in a fixed order: the orders in case order; per order the delivery location, proposal, APP, fund control point and cost center; then per item the description, quantity, unit cost, extended cost, STK#, NSN, FOOD GROUP, Items per and BOC, each only where the rotation gives it a value to draw. Free text is words of one to eight characters from `A` to `Z` and `0` to `9`, joined by single spaces, with no other character.
+- **Rotation.** Every dimension value comes from a fixed list, never from the stream: CP-n takes the value at position `n mod L` of its list of length L, and an item the value at `g mod L`, where g is the item's 1-based position over all items in case order.
+- **Identity.** CP-n is IEN `991000 + n`, with `.01` `500-CPnnn` and `C` value `CPnnn`, n in three digits [DD.zwr:514318-514320]. The 200 `C` values are distinct and five characters long, so none is a prefix of another. The generator also checks, by string comparison, that none is a prefix of `GC1001`, `GC2002` or `GC5005`, or of any `^PRC(442,"C")` or later-index subscript of world A, or the reverse.
+- **Item counts.** One item, except at the 50 positions n = 4k + (k mod 4) + 1, k = 0 to 49, whose counts are drawn round-robin from 2 (14 orders), 3 (12), 4 (9), 5 (6), 6 (4), 7 (3) and 8 (2), so the multi-item orders fall under all four order types. Item counts are exact and never dropped.
+- **Nodes written** for each order, after the GC records of `cases.zwr`:
+  - node 0: pieces 1 `.01`, 2 method of processing, 3 fund control point (three digits and a word), 4 APP, 5 cost center (four digits), 10 delivery date, 13 estimated shipping, 15 total;
+  - node 1: pieces 1 vendor, 2 service, 3 ship-to, 4 verbal, 5 confirmation, 6 FOB, 7 source code, 8 proposal, 10 agent, 11 delivery location, 15 date, with pieces 12 and 14 empty;
+  - node 7: piece 1 status, every other piece empty;
+  - node 14: authorities, header `^442.12PA^k^k` and entries `,14,j,0)=<442.4 IEN>` [DD.zwr:514677, 517623], only when k > 0;
+  - node 23: only for order type `P`, `S` or `D`, that letter in piece 11 and piece 7 empty;
+  - node 2: the items, header `^442.01^n^n` [DD.zwr:514888]; item j has node 0 (pieces 1 item number, 2 quantity, 3 unit, 4 BOC, 6 STK#, 9 unit cost, 12 items per, 13 NSN), the description header `,2,j,1,0)` and its one line `,2,j,1,1,0)`, node 2 piece 1 extended cost, node 4 piece 12 FOOD GROUP when present, and the item index `,2,"B",j,j)=""`;
+  - the order indexes `^PRC(442,"B","500-CPnnn",ien)=""` and `^PRC(442,"C","CPnnn",ien)=""`.
+- **Fixture profile.** Every record meets the exercised-path fixture profile of section "Source corrections and interface departures" (README Part B step 1): `^PRC(442,0)` piece 2 `442I`, read from world A; method of processing below 10; nodes 0 and 1 present and none of nodes 3, 4, 5, 6, 11, 13, 15 or 24; fields 5.3 (node 1 piece 12), 46 (node 23 piece 8) and 61 (node 23 piece 22) empty, with no `^PRC(442,"M")`, `"MCH"` or `"G"` entry; a vendor that is not EDI (440 node 3 piece 2 not `Y`); node 23 piece 7 empty; `.08` (node 7 piece 3) empty; each item description one line of 1 to 32 characters with no pipe character; no item contract number (item node 2 piece 2), partial receipt (piece 8), EDI status code (pieces 9 and 11), item node 3 or item `AC` index; no `^PRC(442.8,"B")` entry. Every reference resolves at its zero node in world A: vendor (440, with its state in file 5 or empty), service (49), ship-to (`^PRC(411,500,1,k,0)`), unit (420.5), source code (420.8), authority (442.4), method of processing (442.5) and status (442.3). The only `^VA(200)` value an order holds is `.5`, in node 1 piece 10, or empty. `corpus::profile_violations` makes these checks; the generator refuses to write on any violation and the gate repeats them.
+- **Vendors.** A vendor is eligible when it has a zero node, is not EDI, has an empty or resolving state, and holds no node 2 or node 3 with only descendants, which the display reads after a bare `$D` [PRCHDP1.m:29-30]. The 40 vendors are, first, for each of the 16 properties in turn (node 0 pieces 3, 4, 5, 6, 7, 8 and 10, and ACCT # at node 2 piece 1, each present and then absent) the lowest eligible IEN not yet chosen that has it, then the lowest remaining eligible IENs.
+- **ZWR form** (README Part B "ZWR form"). Line 1 is `OSEHRA ZGO Export: IFCAP PO INQUIRY PARITY CORPUS` and line 2 `ZWR`. Then one `<key>=<value>` line per node in the collation order of the store's keys, each key written by `Store::format_ref`, each value bare when `mumps::is_canonical` holds and otherwise quoted with `"` doubled. The text uses `\n` line ends with one final `\n`, printable ASCII only, and no `$C()` or `_`. The generator re-parses its own text and requires exactly the generated nodes back.
+- **`manifest.tsv`.** A header row naming the eight tab-separated columns `case`, `class`, `seed`, `order_ien`, `c_value`, `item_count`, `tags` and `expected_branch`, then 231 rows in `golden::corpus_case_ids()` order, each line ending `\n`. `class` is `CP`, `IN`, `BOUNDARY` or `CR`, after any move. `order_ien` and `c_value` give a CP row's order; for a CE or CR row they list the orders its sequence opens, comma-separated in first-use order, or are empty. `item_count` is empty for CE and CR rows. `tags` is a comma-separated list: on a CP row one `dimension=value` pair per matrix row (`status`, `type`, `source`, `mop`, `vendor`, `service`, `shipto`, `delivery`, `verbal`, `fob`, `proposal`, `authority`, `date`, `app`, `agent`, `total`, `shipping`, `items`) and per item `item<j>.<field>` pairs; `moved=IN>BOUNDARY` or `moved=BOUNDARY>IN` on a moved CE row; `gc=GC-0N` on a CR row; `finding=<id>` on a row recorded as a finding. `expected_branch` is `none` for a session expected to run to its end, else the branch ID it is expected to halt at.
+- **`input.txt`** is each input line followed by `\n`.
+- **`corpus_gen`.** `cargo run --offline --locked --bin corpus_gen` loads world A, reads `SPEC.md` beside `Cargo.toml`, generates in memory and, only after the whole generation succeeds, writes the 233 files, creating folders as needed; it prints the summary and exits 0. With `-- --check` it writes nothing, compares the 233 generated files byte for byte with the committed ones, each `input.txt` read through `golden::read_corpus_input`, and after the summary prints `check: 233 files equal` (exit status 0) or one `differs: <path>` line per differing or missing file and then `check: <k> of 233 files differ` (exit status 1). A failed generation writes nothing, prints `corpus_gen: <cause>` on standard error and exits 1; any other argument prints `usage: corpus_gen [--check]` on standard error and exits 2. It reads only the world A fixtures and `SPEC.md`, and with `--check` the committed generated files, never a capture.
+- **Summary lines**, printed by both modes and filled from the generated model: `specified:` counts the classes as the corpus request specifies them, `generated:` counts them after the gate, then `moved:`, `dropped variants:`, `findings:`, `regeneration rounds:` and `largest item count: <k>; worst $Y: <y> (bound 45)`. The values of this corpus are under "Generation outcomes".
+
+The variation matrix. Minimums are orders per value, or items per value for the item rows, counted by the gate over the final corpus; a dropped value leaves its list, is not counted against a minimum and is listed instead:
+
+| Dimension, read at | Rotation list | Minimum |
+|---|---|---|
+| `status`, node 7 piece 1 [PRCHDP1.m:15] [PRCHRPT.m:73] | The 56 442.3 IENs ascending, then again the 9 whose piece 2 is below 10 or empty, IENs 1, 4, 5, 8, 9, 11, 12, 81 and 82 (L = 65) | Every entry once, each of the 9 twice, and at least 3 of the 13 names over 34 characters |
+| `type`, node 23 piece 11 [PRCHDP1.m:13-15] [PRCHDP2.m:45, 49, 51] | Empty, `P`, `S`, `D` | 10 each |
+| `source`, node 1 piece 7 [PRCHDP1.m:57, 71] | 420.8 IENs 1 to 10, empty (L = 11) | 1 each |
+| `mop`, node 0 piece 2 [PRCHDP1.m:16] | 442.5 IENs 1, 2, 3, 4, 7, 8, 9 | 5 each |
+| `vendor`, node 1 piece 1 [PRCHDP1.m:18-44] | The 40 vendors of "Vendors" above | 40 distinct vendors, and each of the 16 properties held by at least one order's vendor |
+| `service`, node 1 piece 2 [PRCHDP1.m:17] | 49 IENs 2, 3, 6, 9, 10, empty | 5 distinct entries, empty at least 3 |
+| `shipto`, node 1 piece 3 [PRCHDP1.m:10, 21, 36-38] | `^PRC(411,500,1)` entries 1 `WAREHOUSE` and 2 `FISCAL`, empty | 8 each |
+| `delivery`, node 1 piece 11 [PRCHDP1.m:43] | Stream text of 1 to 20 characters, absent | 8 each |
+| `verbal`, node 1 pieces 4 and 5 [PRCHDP1.m:31] | `Y` and empty, `Y` and `Y`, both empty | 6 each |
+| `fob`, node 1 piece 6 [PRCHDP1.m:53] | `O`, `D`, empty (no point printed) | 1 each |
+| `proposal`, node 1 piece 8 [PRCHDP1.m:53-57] | Stream text of length 0, 1, 15, 16, 17, 31, 32, 33, 47, 48, 49 or 100 (wrap width 16, three lines printed) | 1 each |
+| `authority`, node 14 [PRCHDP1.m:55-56] | 0, 1 or 3 entries; entry j of CP-n is the 442.4 IEN at position `(n + j) mod 13` of the 13 IENs | 5 each |
+| `date`, node 0 piece 10 and node 1 piece 15 [PRCHDP1.m:58, 66, 69] | `2990101`, `2991231`, `3000229`, `3111109`, `3240229`, `3260101`, `3260115`, `3260630`, `3261001`, `3261015`, `3261231`, empty, both fields alike | 12 distinct values |
+| `app`, node 0 pieces 3, 4 and 5 [PRCHDP1.m:55, 65] | APP of 1, 4, 7 or 10 stream digits | 4 distinct APP lengths |
+| `agent`, node 1 piece 10 [PRCHDP1.m:57-59] | `.5`, empty | 5 each |
+| `total`, node 0 piece 15 [PRCHDP1.m:67] | `0`, `1`, `251`, `1000`, `.005`, `1.995`, `.5`, `99.99`, `12345.678`, `123456789.5`, `-5.25`, `-1000` | 12 distinct values |
+| `shipping`, node 0 piece 13 [PRCHDP2.m:13] | Empty, `.5`, `12.345`, `1000` | 10 orders with a value above 0 |
+| `items`, node 2 [PRCHDP2.m:11] | "Item counts" above | Exactly 150 × 1, 14 × 2, 12 × 3, 9 × 4, 6 × 5, 4 × 6, 3 × 7, 2 × 8 |
+| `item.desc`, item node 1 [PRCHDP2.m:47-50] | Stream text of length 1 to 32 (L = 32) | 1 each |
+| `item.qty`, item piece 2 [PRCHDP2.m:51] | Whole (1 to 999), one decimal place | 1 each |
+| `item.unit`, item piece 3 [PRCHDP2.m:51, 59] | 420.5 IENs 1 to 10, empty | 10 distinct units, empty at least 1 |
+| `item.cost`, item piece 9 [PRCHDP2.m:52] | `N/C`, whole, 2, 3, 4 and 5 decimal places: whole and 2 places print through `$J(,7,2)`, 3 through `$J(,6,3)`, 4 and 5 through `$J(,5,4)`, `N/C` through `"    N/C"` | 1 item each on an order whose type is not `S`, which omits the cost column |
+| `item.ext`, item node 2 piece 1 [PRCHDP2.m:53] | Up to 7 characters, more than 7 characters | 1 each |
+| `item.stk`, `item.nsn`, `item.food`, `item.per` [PRCHDP2.m:56, 59] | Present when g mod 2 = 1, g mod 3 = 1, g mod 5 = 1 and g mod 4 = 2 respectively, else absent; Items per prints only when the type is not `S`; then thinned ("Paging formula") | Each line printed at least once and absent at least once |
+| `item.boc`, item piece 4 [PRCHDP2.m:62] | One word (4 digits), several words (4 digits and two words) | 1 each |
+
+Every minimum is reachable from the fixture counts recorded in section "Run evidence", "Corpus round: baseline before the first edit".
+
+### Edge sequences
+
+`""` is an empty line. Every sequence starts with the station default `""`, except CE-22. The tail is `CP002`, `""`, `""`, `^`, `^`, `^`. `CPnnn` in a sequence is the lowest-numbered CP order with the property the sequence needs: a one-item order for the tails and every single-order use, which is CP002 because CP-001 has two items; for CE-12 the lowest one-item order, the lowest multi-item order and the lowest status-45 (`Cancelled Order`) order distinct from them, CP002, CP001 and CP022; for CE-13 the lowest one-item and the lowest multi-item order; for CE-15 the lowest window of five consecutive CP numbers whose shapes, each the pair (item count, order type), are pairwise distinct, CP001 to CP005. A found order is followed by `""`, `""`, which answer `ENTER '^' TO HALT: ` and `END OF DISPLAY…` (C9), except where a row answers a pause with `^` on purpose: CE-16 at `END OF DISPLAY…` and CE-25 at `ENTER '^' TO HALT: `.
+
+| Case | Exact input lines | Class, specified → after the gate | Expected branch after the gate | Source |
+|---|---|---|---|---|
+| CE-01 | `""`, `^` | IN → IN | none | PO-09.b3 [DIC11.m:23] |
+| CE-02 | `""`, `^FOO` | IN → IN | none | PO-09.b3 [DIC11.m:33] |
+| CE-03 | `""`, `ZZ9`, `^` | IN → IN | none | PO-09.b14, R5 step 6 |
+| CE-04 | `""`, `12345`, `^` | IN → BOUNDARY | PO-09.b11 | R5 step 6(d): a canonical number (K17) |
+| CE-05 | `""`, `NO-SUCH.ORDER`, `^` | IN → IN | none | PO-09.b14 |
+| CE-06 | `""`, `gc9999`, `^` | IN → BOUNDARY | PO-09.b11 | R5 step 6(d): a lowercase letter, and no candidate for its uppercase form (K17) |
+| CE-07 | `""`, thirty `Q`, `^` | IN → IN | none | PO-09.b14; 30 characters, the lookup length [DIC3.m:13] |
+| CE-08 | `""`, `991001`, `^` | IN → BOUNDARY | PO-09.b11 | R5 steps 4 and 6(d): CP-001's IEN, typed as a canonical number (K17) |
+| CE-09 | `""`, `ZZ9`, `CP002`, `""`, `""`, `^` | IN → IN | none | PO-09.b14, then PO-09.b8 |
+| CE-10 | `""`, `CP002`, `""`, `""`, `ZZ9`, `^` | IN → IN | none | PO-09.b8, then PO-09.b14 |
+| CE-11 | `""`, `CP002`, `""`, `""`, `CP002`, `""`, `""`, `^` | IN → IN | none | The same order twice [PRCHRPT.m:75] |
+| CE-12 | `""`, `CP002`, `""`, `""`, `CP001`, `""`, `""`, `CP022`, `""`, `""`, `^` | IN → IN | none | One-item, multi-item and status-45 orders [PRCHRPT.m:73-75] |
+| CE-13 | `""`, `CP002`, `""`, `""`, `ZZ9`, `CP001`, `""`, `""`, `NO-SUCH.ORDER`, `^` | IN → IN | none | Hits and misses interleaved, C9 sequences |
+| CE-14 | `""`, `ZZ9`, `NO-SUCH.ORDER`, `^` | IN → IN | none | PO-09.b14 twice |
+| CE-15 | `""`, then `CP001` to `CP005`, each followed by `""`, `""`, then `^` | IN → IN | none | Five consecutive orders of distinct shape [PRCHRPT.m:75] |
+| CE-16 | `""`, `CP002`, `""`, `^`, `^` | IN → IN | none | PO-38.b3: the `END OF DISPLAY` answer is not used [PRCHDP2.m:41] |
+| CE-17 | `""`, `""`, then the tail | BOUNDARY → BOUNDARY | PO-09.b6 | Empty answer at the order prompt |
+| CE-18 | `""`, `?`, then the tail | BOUNDARY → BOUNDARY | PO-09.b4 | Help |
+| CE-19 | `""`, `cp002`, then the tail | BOUNDARY → BOUNDARY | PO-09.b13 | R5 step 6: the uppercase retry finds CP002 |
+| CE-20 | `""`, `CP01`, then the tail | BOUNDARY → BOUNDARY | PO-09.b10 | Ten partial candidates, CP010 to CP019 (R5 step 5) |
+| CE-21 | `""`, `CP20`, then the tail | BOUNDARY → BOUNDARY | PO-09.b9 | One partial candidate, CP200 (R5 step 5) |
+| CE-22 | `500`, then the tail | BOUNDARY → BOUNDARY | PO-05.b2 | A non-empty station answer |
+| CE-23 | `""`, a backtick, then the tail | BOUNDARY → BOUNDARY | PO-09.b5 | Backtick value (R5 step 3) |
+| CE-24 | `""`, a single space, then the tail | BOUNDARY → BOUNDARY | PO-09.b5 | Single-space value (R5 step 3) |
+| CE-25 | `""`, `CP002`, `^`, then the tail | BOUNDARY → BOUNDARY | PO-25.b1 | `^` at `ENTER '^' TO HALT: ` [PRCHDP2.m:10] |
+| CE-26 | `""`, 251 `Z` characters, then the tail | BOUNDARY → BOUNDARY | PO-09.b2 | Over 250 characters (R5 step 3) |
+
+- **Miss strings.** `ZZ9`, `NO-SUCH.ORDER`, the thirty `Q`, `12345`, `gc9999` and `991001` (`corpus::MISS_STRINGS`). No `C` value of world B begins with one of them, compared as written and in upper case. The CE-26 answer is exactly 251 characters long.
+- **Moves change classes, never inputs.** CE-04, CE-06 and CE-08 keep their IN inputs, which end with `^` at the order prompt, so the original finishes them; only the Rust session halts, at the not-implemented PO-09.b11 (K17).
+- **CR inputs** (`corpus::CR_INPUTS`), each expected to run to its end: CR-01 `""`, `GC1001`, `""`, `""`, `^`; CR-02 `""`, `GC2002`, `""`, `""`, `^`; CR-03 `""`, `GC3003`, `^`; CR-04 `""`, `INVALID!`, `^`; CR-05 `""`, `GC5005`, `""`, `""`, `^`. They equal the `input.txt` lines of GC-01 to GC-05 (`cr_inputs_equal_gc_inputs`).
+
+### Offline gate
+
+Each case's session runs once on world B. `corpus::run_case` runs it through `inquire_traced` and returns the raw transcript, halting branch and error. `corpus::classify` then judges that result against the not-implemented set that `corpus::ne_branches` reads from "Branch inventory": the IDs of the rows whose last cell begins `not exercised, not implemented`. Its checks run in this order:
+
+| Outcome | Condition |
+|---|---|
+| Failure(cause) | An `InquiryError`; or a transcript of 1,048,576 bytes or more, the session output limit (K15) |
+| Unimplemented(id) | No error, and a branch ID that is in the not-implemented set |
+| Implemented(id) | No error, and a branch ID absent from that set: a halt where this document says the branch is implemented |
+| End | No error, no branch ID, and a transcript ending `P.O./REQ.NO.: ` followed by the K14 `\n` |
+| Failure(cause) | Otherwise: no branch ID and no exit `\n`, so the input ran out or the output limit cut the session |
+
+The generator resolves the outcomes before it writes anything:
+
+| Class | End | Unimplemented(id) | Implemented(id) | Failure |
+|---|---|---|---|---|
+| CP | Kept | The variant is dropped and the corpus regenerated (below) | Kept unchanged and recorded as a finding | Stop |
+| Specified IN | Kept | Moved to BOUNDARY with `id` | Kept as IN and recorded as a finding | Stop |
+| Specified BOUNDARY | Moved to IN | Kept; a different `id` replaces the expected branch and is listed with the moves | Kept as BOUNDARY and recorded as a finding | Stop |
+| CR | Kept | Stop: the corpus would have changed a GC path, which no class describes | Kept and recorded as a finding | Stop |
+
+- **Dropping.** A CP case whose outcome is Unimplemented has its variant attributed by single-dimension reversion. In the order of the matrix rows, then the item rows, the generator sets one dimension at a time back to its list's first value, or to the second when the order already holds the first, rebuilds only that dimension from the order's own stream state, reruns the case, and takes the first reversion that gives End. That (dimension, value) leaves its list. An attribution that changes more than the reverted dimension, that finds none, or that leaves only the item count, which is never dropped, is a stop.
+- **Regeneration.** The whole generation repeats from `SEED` with the reduced lists, up to five rounds. A CP case still Unimplemented after the fifth stops the generation: `corpus_gen` writes nothing, prints the case with its branch and exits 1.
+- **Findings.** An Implemented(id) case keeps its record and inputs in every later round, so its evidence stays in the corpus, and `src/inquiry.rs` is not patched. Its `manifest.tsv` row carries `finding=<id>`, with `id` as its expected branch, and it is counted in the `findings:` line, listed below under "Generation outcomes" and in `REPORT.md` part 3 "Findings".
+- **Stop.** Failure is never accepted, for any class or under any label: `corpus_gen` writes nothing, prints the case and the cause and exits 1, and the gate fails on the committed files.
+
+The gate, `tests/corpus.rs`, makes the same checks on the committed files, with world A, world B, the not-implemented set (from `SPEC.md` compiled in) and the model computed once and shared by its eight tests:
+
+| Test | What it proves |
+|---|---|
+| `gate_every_case_meets_its_class` | Through `inquire_traced`, which must agree with `run_case`, and `classify`: every CP, IN and CR case is End and every BOUNDARY case Unimplemented at its expected branch; a case tagged `finding=<id>` passes only as Implemented at exactly that `id`; an error, exhausted input or output-limit cut fails under any tag; the specified counts are 16 IN and 10 BOUNDARY |
+| `gate_profile_and_references` | Every record meets the fixture profile, by `corpus::profile_violations` and node by node; every reference resolves in world A, whose `^VA(200,.5,0)` is the only file 200 entry an order names |
+| `gate_c_values_and_miss_strings` | No `C` value is a prefix of another or of `GC1001`, `GC2002` or `GC5005`, and none begins with a miss string |
+| `gate_variation_minimums` | Every minimum of the variation matrix holds, recounted from the world B nodes, and the item counts are exact |
+| `gate_no_paging_by_computation` | `max(Y_ask, Y_end) <= 45` for every order ("Paging formula") |
+| `generator_is_deterministic` | Two `generate` calls give byte-identical `files()`, equal to the committed files |
+| `corpus_gen_check_exits_zero` | The binary with `--check` exits 0, prints exactly the model's summary, its `specified:` line first, then `check: 233 files equal`, and writes nothing to standard error |
+| `world_b_keeps_world_a_and_world_a_has_no_corpus` | World B holds every world A node unchanged plus exactly the corpus nodes, and world A holds no corpus node |
+
+A recorded finding therefore leaves `cargo test` passing, as the corpus request's "record it… and do not patch it" requires, while any other deviation fails it.
+
+### Paging formula
+
+No corpus order may reach the paging prompt of `ASK^PRCHDP2`, the not-implemented PO-30.b2, which fires on `$Y+5>IOSL` [PRCHDP2.m:31], at `$Y` 56 with `IOSL` 60. `HDR` writes a form feed and three newlines, leaving `$Y` at 4 before the first item [PRCHDP2.m:42]. For item k, the row adds one line [PRCHDP2.m:49]; `d_k` counts its present lines among STK#, NSN and FOOD GROUP [PRCHDP2.m:56] and QTY PREV RCVD [PRCHDP2.m:57], which the profile keeps absent; `ip_k` is 1 when its Items per line prints [PRCHDP2.m:59], which writes a newline before and after its text, so the `W:$X>1 !` of [PRCHDP2.m:61] adds nothing; `D ASK` follows [PRCHDP2.m:60], and the BOC line ends with `W !` [PRCHDP2.m:65]. With e equal to 1 when node 0 piece 13 is above 0 [PRCHDP2.m:13]:
+
+```text
+Y_ask(k) = 4 + sum over j<k of (3 + d_j + ip_j) + 1 + d_k + 2*ip_k
+Y_end    = 4 + sum over all items of (3 + d_j + ip_j) + e
+```
+
+- **Bound.** For every order, `max(Y_ask(k) for every k, Y_end) <= 45`, `corpus::PAGING_BOUND`, well below the trigger at `$Y` 56. The estimated-shipping line follows the last `ASK`, and on the profile path no `ASK` follows it, so counting it in `Y_end` errs on the safe side. Descriptions of at most 32 characters keep the continuation loop of [PRCHDP2.m:54] from running.
+- **Thinning**, for orders of five or more items only: while the bound fails, the generator removes one optional line at a time, from the last item back, Items per, then FOOD GROUP, then NSN, then STK#, never changing the item count; Items per is skipped on a type `S` order, where it does not print. A four-item order cannot fail: its worst case is 4 + 4 × 7 + 1 = 33. No corpus order needed thinning: no `manifest.tsv` tag reads `thinned`.
+- **Largest counts.** With no optional line the bound allows **13** items (4 + 3 × 13 + 1 = 44), and with every optional line 5 (4 + 7 × 5 + 1 = 40). The largest corpus order has **8** items, and the worst `$Y` that `corpus_gen` printed is **39**: `largest item count: 8; worst $Y: 39 (bound 45)`.
+
+### Corpus verdicts
+
+`tests/equivalence.rs` judges every case on world B with `corpus::run_case` and the committed inputs, comparing raw bytes with no normalisation:
+
+| Verdict | Applies to | Definition |
+|---|---|---|
+| NOT COMPARED | CP, IN, CR | No usable capture (precedence below) |
+| QUARANTINED | CP, IN, CR | `run-summary.txt` marks the case `QUARANTINED` (paging detector below) |
+| MATCH | CP, IN, CR | The capture equals the Rust transcript byte for byte |
+| MISMATCH | CP, IN, CR | They differ. The first differing line is given by `transcript_cause`, attributed as in `REPORT.md` part 2. A capture line beginning `%YDB-E-` is a MISMATCH like any other |
+| BOUNDARY | BOUNDARY | Outside equivalence; the recorded output stays on file for a later round |
+
+**Precedence.** The first rule that applies wins: (1) a BOUNDARY-class case is `BOUNDARY`; (2) a failed integrity check of the recording run or of the case itself makes it `NOT COMPARED`; (3) no `transcript.txt` makes it `NOT COMPARED`; (4) a case `run-summary.txt` marks `QUARANTINED` is `QUARANTINED`; (5) otherwise it is `MATCH` or `MISMATCH`. With no recording, rules 1 and 3 make every CP, IN and CR case NOT COMPARED and every BOUNDARY case BOUNDARY.
+
+- **`MATCHED n OF m IN-SCOPE CORPUS CASES`.** m counts the CP and IN cases that have a capture and are not quarantined, and n those that are MATCH. With no recording it reads `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES`.
+- **CR world labels.** Each CR capture is compared byte for byte with the raw `GC-0N/transcript.txt` of the case it replays: equal gives `WORLD-INDEPENDENT`, different gives `WORLD-DEPENDENT` with the first differing line, and a failed integrity check, no CR transcript or a GC capture that does not load gives `NOT COMPARED`.
+- **Paging detector** (`record_corpus.sh`), for the cases of class IN, CP and CR only: with a the count of `ENTER '^' TO HALT: ` in the transcript and b the count of `END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: `, a > 2b shows a paging prompt and the case is `QUARANTINED`. BOUNDARY cases are exempt, because CE-25's `^` at the first pause legitimately skips the second.
+- **Integrity.** The corpus reader of `src/golden.rs` applies the integrity rules of README Part C, C2: UTF-8 within budget, no `\r`, a non-empty transcript, an input whose last line begins with `^`, and, once any transcript exists, `meta.txt` (the five `golden::CORPUS_META_KEYS`), `SHA256SUMS` matching every file it lists and listing every transcript, and a `run-summary.txt` reading `exports=IDENTICAL` and `runs=IDENTICAL`. An integrity failure fails `cargo test` after `REPORT.md` is written; no verdict does, because correcting mismatches is a later round.
+- **Report.** `REPORT.md` part 3 carries `### Parity corpus` after the capture-readiness tables: the recording-run line (`none`, the `meta.txt` values, or `INTEGRITY FAIL: <cause>`), the count table (rows CP, IN, BOUNDARY, CR; columns MATCH, MISMATCH, NOT COMPARED, BOUNDARY, QUARANTINED, Total), the `MATCHED` line, the table of all 231 cases, then `#### Class moves`, `#### Findings`, `#### Dropped variants`, `#### BOUNDARY map` and `#### CR world labels`.
+
+### Generation outcomes
+
+`cargo run --offline --locked --bin corpus_gen -- --check` printed this summary, then `check: 233 files equal`, with exit status 0 (section "Run evidence", "Corpus round: completion evidence"):
+
+```text
+specified: 200 CP, 26 CE (16 IN, 10 BOUNDARY), 5 CR, 50 multi-item orders
+generated: 200 CP, 26 CE (13 IN, 13 BOUNDARY), 5 CR, 50 multi-item orders
+moved: CE-04 IN->BOUNDARY PO-09.b11; CE-06 IN->BOUNDARY PO-09.b11; CE-08 IN->BOUNDARY PO-09.b11
+dropped variants: 0
+findings: 0
+regeneration rounds: 1
+largest item count: 8; worst $Y: 39 (bound 45)
+```
+
+The `specified:` line is the corpus request's count, and the `generated:` line the classes after the gate: 13 IN and 13 BOUNDARY.
+
+| Class move | Specified class | Final class | Branch |
+|---|---|---|---|
+| CE-04 | IN | BOUNDARY | PO-09.b11 |
+| CE-06 | IN | BOUNDARY | PO-09.b11 |
+| CE-08 | IN | BOUNDARY | PO-09.b11 |
+
+- **Findings:** none. No session halted at a branch this document calls implemented, so nothing was recorded against `src/inquiry.rs`.
+- **Dropped variants:** none. Every CP case ran to its end in the first round, so no value left its list and one round sufficed.
+- **Final classes:** 200 CP, 13 IN, 13 BOUNDARY and 5 CR. Until the team records the corpus (O-17), the 200 CP, 13 IN and 5 CR cases are NOT COMPARED and the 13 BOUNDARY cases BOUNDARY.
 
 ## Source corrections and interface departures
 
@@ -1313,6 +1531,8 @@ Each is reflected identically in this document, the implementation and the tests
   - No delivery schedule under the order number in `^PRC(442.8,"B")` (PO-36.b3).
   - Added for O-03 (R4, R5 step 6; each keeps a GC-03 or GC-04 value off the n/e PO-09.b11): fields 46 PURCHASE CARD NUMBER [DD.zwr:514943] and 61 PURCHASE CARD HOLDER [DD.zwr:515047] are empty, and no item carries 442.14 field 11 INVENTORY/DISTRIBUTION POINT [DD.zwr:517723], so indexes `M`, `MCH` and `G` hold no entry; no subscript of any index of 440, 442.5 or 442.3 equals or begins with `GC3003` or `INVALID!` (the repository fixtures hold none).
   - Values the profile leaves free are implemented: the MOP-4 and direct-delivery ship-to, the order-type labels, the `SIMPLIFIED` vendor, a verbal or confirmation copy, the status-order message, the estimated-shipping line, and purchase-card item columns.
+- **`inquire_traced` (K16).** `inquiry::inquire_traced(store, inputs)` returns the session of `inquire` together with the branch ID of the not-implemented branch that ended it, both from the private `run`: `pub fn inquire_traced(store: &Store, inputs: &[String]) -> (Result<InquiryOutput, InquiryError>, Option<&'static str>)`. The ID is `None` when the session ran to its end, ran out of input or reached the session output limit, and whenever the result is `Err`. It is the one way the ID leaves the crate, reached by path because the `src/lib.rs` re-export line is unchanged, and the parity corpus uses it to classify each session (`corpus::run_case`, `tests/corpus.rs`). `inquire` is unchanged. The doc line of `run`, "the ID never leaves the crate", and the module doc's "the only public operation" are frozen by the add-only rule for `src/inquiry.rs`, so they stay as written.
+- **CE-04, CE-06 and CE-08 class (K17).** The corpus request specifies the three as class IN, with the inputs `""`, `12345`, `^`; `""`, `gc9999`, `^`; and `""`, `991001`, `^`. Each value is absent, and R5 step 6(d) fails the O-03 guard for all three: `12345` and `991001` are canonical numbers, and `gc9999` has a lowercase letter, whose uppercase form `GC9999` finds no candidate. So each Rust session ends at the n/e PO-09.b11 after `P.O./REQ.NO.: `, as `RUNNING.md` step 4 states for `123456` and `gc3003`. The request's own move rule applies: each case becomes BOUNDARY with expected branch PO-09.b11, its inputs unchanged, tagged `moved=IN>BOUNDARY` in `manifest.tsv` and listed under "Class moves" in `REPORT.md` part 3 and section "Parity corpus". `corpus_gen` still prints the request's count line, `specified: 200 CP, 26 CE (16 IN, 10 BOUNDARY), 5 CR, 50 multi-item orders`, and then the generated classes, 13 IN and 13 BOUNDARY.
 
 ## Open items
 
@@ -1333,6 +1553,8 @@ Each is reflected identically in this document, the implementation and the tests
 | O-13 | `testingMethods.md` sentences that are now false | [testingMethods.md:48]: "O-01 (HOME device `IOF`/`IOSL`) is open, so GC-01, GC-02 and GC-05 FAIL once captured, until it is answered." Against the code and the run: O-01 is closed (this table); `STUB_CONTEXT` holds `IOF` `#` and `IOSL` `60` [src/inquiry.rs:117-122]; PO-10.b4, PO-12.b1, PO-26.b1 and PO-30.b1 are implemented; `cargo test --offline --locked --test equivalence -- --nocapture` prints `GC-01 PASS` to `GC-05 PASS`, and `REPORT.md` part 2 reads PASS for all five cases. The file's other sentences agree with the code and the five-PASS state; the 158 tests of its line 41 are the crate's earlier tests, stated as history | **OPEN.** `testingMethods.md` is frozen in round two and is not edited, so the sentence stands. **Action for the team, in a later round:** replace it with the closed O-01 and the five PASS |
 | O-14 | `tests/golden/ifcap/README.md` sentences that are now false | Line 5: "The folder holds only this README: no case folder, no `.gitkeep` and no placeholder. Every case is ABSENT, and therefore NOT COMPARED." The folder holds `GC-01/` to `GC-05/`, seven files each and all READY, and `state/`. Line 117: "`STUB_CONTEXT` is `[("DUZ", Some(".5")), ("IOF", None), ("IOSL", None), ("STATION", Some("500"))]`." It holds `("IOF", Some("#"))` and `("IOSL", Some("60"))` [src/inquiry.rs:117-122]. Line 119: "`IOF` and `IOSL` are unresolved (`None`, open item O-01). Any value is accepted, but both keys must be present;" O-01 is closed, and `validate_context` accepts only `IOF` `#` and `IOSL` `60`. Line 120: "Examples: `CONTEXT MISMATCH DUZ: expected .5, actual 1`, `CONTEXT MISMATCH IOF: expected UNRESOLVED (O-01), actual ABSENT`, `CONTEXT MISMATCH IOM: expected ABSENT, actual 80`." A missing `IOF` gives `CONTEXT MISMATCH IOF: expected #, actual ABSENT` [src/golden.rs:1885]. Line 172: "**While O-01 is open.** With `cases.zwr` loaded, the Rust sessions of GC-01, GC-02 and GC-05 end after `P.O./REQ.NO.: ` (with its one trailing space), because the display's `W:$Y>0 @IOF` depends on the unresolved HOME device [Packages/IFCAP/Routines/PRCHDP1.m:12]. Those cases FAIL once captured, until O-01 is answered." The three sessions run the whole display, and all five cases PASS. Line 186: "`tests/fixtures/ifcap/*.zwr` are the 11 supporting fixtures, unchanged copies of repository exports: `411.zwr`, `411.2.zwr`, `420.5.zwr`, `420.8.zwr`, `440.zwr`, `442.3.zwr`, `442.4.zwr`, `442.5.zwr`, `442.8.zwr`, `5.zwr` and `49.zwr`." The folder holds 12 supporting fixtures, these 11 and `200.zwr`, plus `cases.zwr`. Line 260: "If paging under the unresolved `IOSL` inserts an `ENTER '^' TO HALT: ` pause [Packages/IFCAP/Routines/PRCHDP2.m:31], the first capture shows it." `IOSL` is resolved, 60, and the GC-01, GC-02 and GC-05 transcripts show only the two display pauses. Line 278: "Include every global root of the supporting fixtures: `^PRC(411)`, `^PRC(411.2)`, `^PRCD(420.5)`, `^PRCD(420.8)`, `^PRC(440)`, `^PRCD(442.3)`, `^PRC(442.4)`, `^PRCD(442.5)`, `^PRC(442.8)`, `^DIC(5)` and `^DIC(49)`." The list lacks `200.zwr`'s root `^VA(200)`; that fixture's one node lies inside line 279's `^VA(200,.5)`, which every `db-before.zwr` holds, so the export scope as captured covers it | **OPEN.** The README's existing lines are frozen in round two: it gains only the step 6 paragraph on `200.zwr`, which passes the command-identity check and stays. **Action for the team, in a later round:** correct these lines to the closed O-01, the five PASS and the 12 supporting fixtures |
 | O-15 | One Rust session's work when it repeats an absent value: the session output limit (K15, O-11) bounds the work only through the output, and a lookup that finds nothing writes 20 bytes, so one request can still cost up to 52,425 lookups, about 44 to 49 s of CPU on the debug build (CWE-400, residual) | Each pass of the `ix_dic` loop [src/inquiry.rs:770-851] READs a value and, for one that no index holds, runs `search`, `pointer_candidate`, the `$ORDER` of file 442 after the index names and `no_match_guard` before it writes the no-match sequence `<BEL> ??\n\nP.O./REQ.NO.: ` (PO-09.b14, R3), 20 bytes. The first 80 bytes end at the first order prompt, so 52,424 sequences fit within 1,048,576 bytes and the order prompt after the 52,425th lookup is refused, which cuts the transcript at 1,048,560 bytes. Measured on 2026-11-17 from 16:50Z to 17:00Z on the debug replay bridge built from `d09596d44`, on the Linux build host (4 CPUs) under a 1-minute load average of 12.96 to 24.73 from other work on the host: `curl -s --max-time 300 -o out.json -w '%{http_code} %{time_total}' -H 'Content-Type: application/json' --data-binary @body.json http://127.0.0.1:<port>/api/rust/session`, the transcript length by `jq -j .transcript out.json \| wc -c`, and the bridge's CPU time from fields 14 and 15 of `/proc/<pid>/stat` before and after. Each body is `{"inputs":["",`, N values, then `"^"]}`, and each answer was 200 with `returned` null. `GC3003`: N = 1,000 (9,019-byte body), 20,081 bytes ending `P.O./REQ.NO.: \n`, 0.77 s wall, 0.77 s CPU; N = 10,000 (90,019), 200,081 bytes, 8.52 s, 8.27 s CPU; N = 52,424 (471,835), 1,048,561 bytes ending `P.O./REQ.NO.: \n`, 58.11 s, 48.46 s CPU; N = 52,425 (471,844), 1,048,560 bytes ending `P.O./REQ.NO.: ` with no `\n`, 49.90 s, 48.71 s CPU; N = 60,000 (540,019), 1,048,560 bytes, 43.94 s, 43.97 s CPU. `INVALID!`: N = 1,000 (11,019), 20,081 bytes, 0.84 s, 0.83 s CPU; N = 10,000 (110,019), 200,081 bytes, 8.66 s, 8.68 s CPU; N = 60,000 (660,019), 1,048,560 bytes, 51.93 s, 44.64 s CPU. The found order repeated, `""`, 60,000 × `"GC1001","",""`, `"^"` (900,019 bytes), took 1.41 s wall and 1.41 s CPU for 1,048,026 bytes. A lookup that finds nothing costs about 0.8 to 0.9 ms of CPU. Admission, from the constants and not run: a session of `""` and 52,425 values with its `"^"` holds 52,427 decoded inputs, so `MAX_HELD_INPUTS`, 524,288 [src/bridge.rs:109], admits 10 such sessions at once and an 11th waits for a charge to be released [src/bridge.rs:1509-1530]; a session of at most `FREE_INPUTS`, 1,024 inputs, is not charged [src/bridge.rs:102] and runs at most 1,023 lookups, under 1 s, within `MAX_CONNECTIONS`, 64 [src/bridge.rs:82]; `rust_session` runs `inquire` to its end with no deadline or cancellation [src/bridge.rs:1933-1941]. The bridge answers only on the loopback address it binds, and a session request only when it names a loopback host and comes from the bridge's own page [src/bridge.rs:18-30] | **OPEN, not blocking.** The five cases run at most one lookup each, and every session's output is bounded (O-11, closed). Round two adds no work bound: it fixes the mechanism to the output limit and requires every session under the limit to write the same bytes, so a READ or lookup budget that ended a session before the limit would change those bytes, and minimal change keeps the lookup's logic as it is. **Question for the team, for a later round:** bound one request's work at the bridge, for example by a cap on a RUST session's inputs or a deadline for `rust_session`, or make the no-match pass cheaper without changing its logic or bytes; `src/bridge.rs` is outside round two's file list |
+| O-16 | Container readiness in a corpus recording run: `record_corpus.sh` probes it from the shell only | The kit's `vc_wait_ready` polls with the M command `mumps -run %XCMD "write 1,!"` [scripts/kit/vehu_common.sh:35-43], and a recording run may run no M command other than the start command and the export command. After each restore from `vehu-snap:corpus-base`, `record_corpus.sh` therefore polls `docker exec NAME su - vehu -c 'test -f /home/vehu/etc/env'` every 5 s for up to 600 s, and stops with `FAIL:` when it times out. `load_corpus.sh` is not a recording run and uses `vc_wait_ready` | **OPEN until the team's first recording.** The probe proves the shell and the environment file the start command sources, not the database. The guards are the export-before hash check against `BASE.txt` `export_sha256` and the two-run identity check, `exports=IDENTICAL` and `runs=IDENTICAL` in `run-summary.txt`, without which the corpus reader rejects the recording. **Question for the team:** confirm on `worldvista/vehu:202609` that a container that passes the probe answers the start command and the export command |
+| O-17 | The parity corpus is unrecorded | The corpus round had no Docker and no VEHU image, and ran no recording script and no Docker command (section "Run evidence", "Corpus round: completion evidence"). `tests/golden/ifcap/corpus/` holds `manifest.tsv`, the 231 `input.txt` files and the three scripts, and no `BASE.txt`, `transcript.txt`, `meta.txt`, `run-summary.txt` or `SHA256SUMS`. `REPORT.md` part 3 "Parity corpus" reads `Recording run: none` and `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES` | **OPEN.** Until the team's run, every CP, IN and CR case is NOT COMPARED and every BOUNDARY case BOUNDARY. **Action for the team:** from `rust/ifcap-po-inquiry/`, with the snapshot `vehu-snap:gc-base`, run `load_corpus.sh`, `record_corpus.sh` and `check_corpus.sh`, then `cargo test --offline --locked`, and commit `BASE.txt`, the transcripts, `meta.txt`, `run-summary.txt` and `SHA256SUMS` (`tests/golden/ifcap/README.md` Part C). Correcting any MISMATCH the recording exposes, and implementing any BOUNDARY branch, is a later round |
 
 ## Conflict register
 
@@ -1371,6 +1593,11 @@ Each is reflected identically in this document, the implementation and the tests
 | K13 | Every selector change resends the current sequence, the empty one included, versus MUMPS and RUST idle screenshots pixel-identical with the selector and status line masked | The screen keeps the resend, and the idle-screen identity is checked in two forms. With zero captures, the MUMPS screen as loaded and the RUST screen after selecting RUST are pixel-identical with the backend selector, the status line and the transcript box masked, and the transcript box's computed styles are equal except `grid-template-rows`, which lists the row tracks its content creates, because RUST answers the empty sequence with the station prompt while MUMPS has sent nothing. With a READY case whose two raw transcripts are equal, sending its inputs with `SEND` in MUMPS and then selecting RUST shows the same transcript in both, and the screens are pixel-identical with only the selector and the status line masked. The check exists to show that no RUST style applies at rest; the transcript content is the backend's answer, not style |
 | K14 | The Rust transcript must equal the capture (the plan's first goal) versus "implemented output is unchanged": every capture ends with one `\n` after the final `P.O./REQ.NO.: `, which the implemented session end did not write | Decided by the refine round's instruction: when the session ends by the original's normal completion (`^` at the final order prompt, so `EN3` returns), `run` appends `\n` if `$X>0`; a session cut at `Halt::InputExhausted` or `Halt::Unexercised` keeps the cut at the last prompt and gets no `\n`. The rule keys on `$X`, never on transcript text; `Halt` and `into_transcript_at_prompt` are unchanged. YottaDB documents the completion only for CLOSE, so O-10 asks the team to confirm it for process exit |
 | K15 | "Behaviour that must not change" and "rules come from source only" versus a bounded Rust session: the original has no output limit, since `G EN30` [PRCHRPT.m:75] asks for the next order after every display for as long as orders are entered, while one Rust session must not consume unbounded memory and time for one request (CWE-400, Uncontrolled Resource Consumption; O-11) | Decided by refine round two: `SESSION_OUTPUT_LIMIT` in `src/mumps.rs`, 1,048,576 bytes, the size of `LIVE_OUTPUT_LIMIT` in `src/bridge.rs`, bounds one session's transcript. When a write would take the transcript past it, the write appends nothing, the next READ returns `Halt::OutputLimit` (or `process_exit` does, when `EN3` returns), `run` keeps `Halt::OutputLimit` even when an unimplemented branch or a corrupt node is reached after that write and before that READ, and the session ends as an exhausted input does: the transcript is cut by `Session::into_transcript_at_prompt` after the last prompt written before that write, `returned` is `None`, and no exit `\n` is appended, so the transcript is never longer than the limit. The limit bounds the session's output and, only through it, its work: a repeated found order stops in its 663rd display, but a repeated absent value, whose no-match sequence writes 20 bytes, only at its 52,425th lookup (O-11, O-15). The limit has no MUMPS counterpart and is not a branch of the original: the branch inventory and the coverage 47/0/61 are unchanged, and a session under the limit, each of the five cases included, writes the same bytes as without it |
+| K16 | "The ID never leaves the crate", the doc of the private `run` in `src/inquiry.rs` (line 162 at the corpus round's base commit `7afbc4af9`), versus the corpus request's `pub fn inquire_traced(store: &Store, inputs: &[String]) -> (Result<InquiryOutput, InquiryError>, Option<&'static str>) { run(store, inputs) }` | Decided by the corpus request: the branch ID leaves the crate through `inquire_traced` only, added directly after `inquire` with no existing line of `src/inquiry.rs` changed. The add-only rule freezes the doc line of `run`, and the module doc's "the only public operation", so both stay as written and this row records that they are now partly stale (section "Source corrections and interface departures") |
+| K17 | The corpus request lists CE-04 `12345`, CE-06 `gc9999` and CE-08 `991001` as class IN, versus R5 step 6(d) and `RUNNING.md` step 4, which send a canonical number, or a value with a lowercase letter and no candidate, to the not-implemented PO-09.b11 | The request's move rule governs: the three become BOUNDARY with expected branch PO-09.b11 and their inputs unchanged, tagged `moved=IN>BOUNDARY` and listed under "Class moves" in `REPORT.md` part 3. `corpus_gen` prints the request's count line `specified: … (16 IN, 10 BOUNDARY)` as specified, and the generated counts, 13 IN and 13 BOUNDARY, on the next line (section "Parity corpus", "Generation outcomes") |
+| K18 | The request puts the corpus results in "`REPORT.md` part 3", versus the existing part 3, "Capture readiness", which `tests/golden/ifcap/README.md` Part B step 7 and `RUNNING.md` describe as capture readiness | The corpus results are the subsection `### Parity corpus` inside part 3, after its readiness and definitions tables and before the static sections. The part 3 heading and its two tables stay as they are, so both existing descriptions stay true, and `equivalence_report` stays the single writer of `REPORT.md` |
+| K19 | Section "Scope statement": "the five cases GC-01 to GC-05 … only" and the "must not be built" list (a CLI or exit-code scheme, deterministic-report machinery, more than two integration test files), versus the corpus request, which names `corpus_gen` with `--check` and its exit statuses, the deterministic generator `src/corpus.rs` and a third integration test file, `tests/corpus.rs` | The corpus request governs for the files it names. The first line of "Scope statement" and its existing bullets are unchanged, and its "Parity corpus" bullet records the exception. The corpus makes no equivalence claim until a recording shows one (O-17) |
+| K20 | Section "Capture hashes": its equality rule names a run-built `cases.zwr` as "the one permitted addition", versus the corpus round, whose listing command `find tests/golden/ifcap -type f ! -name README.md -exec sha256sum {} +` now also lists the corpus files the request names under `tests/golden/ifcap/corpus/`: `manifest.tsv`, the 231 `input.txt` files and the three scripts | Section "Capture hashes" stays unchanged, its text and its hashes. The corpus round compares the listing with its `tests/golden/ifcap/corpus/` lines removed, by `grep -v '  tests/golden/ifcap/corpus/'`, against the round-two listing, so every GC, `state/` and `cases.zwr` hash must still hold (section "Run evidence", "Corpus round: completion evidence") |
 
 ## Source-unchanged verification
 
@@ -1780,6 +2007,8 @@ This listing is identical to round two's before listing above, line for line: `d
 ## Run evidence
 
 Each command below ran on 2026-11-15 in this checkout from `rust/ifcap-po-inquiry/` unless its entry says otherwise (the subsections headed "Round one" ran on 2026-11-17, in round one), with `RUSTUP_AUTO_INSTALL=0` set so that a missing toolchain fails instead of downloading. Each entry gives the command, its exit status and its output, standard error included. An output is complete unless its entry says it is trimmed. Round one's records are history. Each "Round one" heading names the commit its record was observed on, or, for a record taken over uncommitted edits, the commit that committed them; when recorded, these subsections were headed "Refine round", and their own cross-references use that name. Round two's baseline and completion records close this section; its fixture-to-source check is in subsection "Fixture-to-source equality". The read-only searches S5 to S9 are in `SPEC.md` section "Read-only enforcement results", the A7 commands in each round's completion evidence below and in section "Source-unchanged verification", and the capture listings in section "Capture hashes".
+
+The corpus round's two records follow round two's and close this section: "Corpus round: baseline before the first edit", taken at the round's base commit before its first edit of this document, and "Corpus round: completion evidence". The corpus round's capture listing is compared there with its `tests/golden/ifcap/corpus/` lines removed (K20).
 
 ### Round one: baseline before the first edit (commit `0b123807c`)
 
@@ -2899,6 +3128,157 @@ On the destination branch the same command lists the commit that delivers this r
 **Document limits.** At 19:42:54Z, `wc -l -w testingMethods.md` gives `52  600 testingMethods.md`, and `wc -l runPlaybook.md` gives `116 runPlaybook.md`, each exit status 0 (at most 60 lines and 600 words, and at most 150 lines).
 
 **Result.** Every completion condition of round two holds on the Linux build host at commit `7c7959357`, on the destination branch, whose `src/` and `tests/` trees are `ab0e513a…17dd` and `c50b5978…52dd`, and at its parent `a774d2770`: `cargo test --offline --locked` exits 0 with 191 passed and 0 failed; `REPORT.md` part 2 reads `Verdict: PASS` for all five cases; `end_to_end_real_captures` gets `match` true for each READY case; build, clippy, format and documentation exit 0 with no warning; S1 has one hit, S3 and S5 none, and S4 hits only `src/golden.rs`; A7 holds; every stated hash holds. This round records no acceptance (section "Acceptance record"). These runs left `REPORT.md` unchanged, sha256 `917e70c7…ab66` before and after, and `git status --porcelain` printed nothing after them, so no restore was needed. The committed `REPORT.md` is the one `cargo test --offline --locked` wrote after this document's final edit; a second run left its sha256 unchanged, which shows it current.
+
+### Corpus round: baseline before the first edit
+
+These commands ran on 2026-11-19 from 07:29:44Z to 07:34:03Z on the Linux build host (12 CPUs, 1-minute load average 29.88 to 34.26 from other work on the host), at the corpus round's base commit `7afbc4af999d9b2b70a3302ffbb72dcede2952d3`, the merge of pull request #3. When this record was taken the checkout already held the corpus round's other edits (its `HEAD` was `56cde196a`, carrying the corpus code, generated data, scripts, `tests/golden/ifcap/README.md` Part C and `RUNNING.md` step 8, while this document was still byte-identical to the base), so they ran in a scratch `git worktree` of the base commit outside the checkout, created at 07:29:44Z by `git worktree add --detach <scratch>/wt 7afbc4af999d9b2b70a3302ffbb72dcede2952d3`, exit status 0. They ran from the worktree's `rust/ifcap-po-inquiry/`, shown as `<base>`, with `RUSTUP_AUTO_INSTALL=0` set, except `git rev-parse HEAD`, which ran from the worktree root. Every file the corpus round adds was absent there.
+
+`git rev-parse HEAD`, 2026-11-19T07:30:42Z, exit status 0, then `git status --porcelain`, exit status 0 with no output:
+
+```text
+7afbc4af999d9b2b70a3302ffbb72dcede2952d3
+```
+
+**Toolchain**, 2026-11-19T07:30:47Z. `rustc -Vv`, `cargo -V` and `cc --version`, each exit status 0. Output complete:
+
+```text
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+binary: rustc
+commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67
+commit-date: 2026-10-13
+host: x86_64-unknown-linux-gnu
+release: 1.99.1
+LLVM version: 23.1.1
+cargo 1.99.1 (5f94df478 2026-08-27)
+cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+Copyright (C) 2025 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+```
+
+The pinned `rustc 1.99.1` and a C linker are present, so environment blocker C1 does not apply.
+
+**Tests.** `cargo test --offline --locked` ran four times. The first three, started at 07:30:54Z, 07:31:16Z and 07:32:08Z, each exited 101 with one failure, the unit test `bridge::tests::live_admission_bounds_real_runs` of `src/bridge.rs`, and with every other `src/lib.rs` test passing (`168 passed; 1 failed`); Cargo stopped after the failing target, so the later targets did not run. The first run's output, trimmed of its 168 lines `test <name> ... ok`, every other line, standard error included, shown:
+
+```text
+   Compiling ifcap-po-inquiry v0.1.0 (<base>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.36s
+     Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
+
+running 169 tests
+test bridge::tests::live_admission_bounds_real_runs ... FAILED
+
+failures:
+
+---- bridge::tests::live_admission_bounds_real_runs stdout ----
+
+thread 'bridge::tests::live_admission_bounds_real_runs' (984283) panicked at src/bridge.rs:3829:9:
+assertion `left == right` failed
+  left: [Ok(""), Ok(""), Ok(""), Err(Timeout), Ok(""), Ok("")]
+ right: [Ok(""), Ok(""), Ok(""), Ok(""), Ok(""), Ok("")]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    bridge::tests::live_admission_bounds_real_runs
+
+test result: FAILED. 168 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.00s
+
+error: test failed, to rerun pass `--lib`
+```
+
+The second and third runs failed the same assertion, with `left` `[Ok(""), Ok(""), Ok(""), Err(Timeout), Err(Timeout), Ok("")]` and `[Ok(""), Ok(""), Ok(""), Err(Timeout), Ok(""), Err(Timeout)]`. The test starts six 0.3 s `sleep` runs through two admission slots under the 10 s `LIVE_TIMEOUT`; between the second and third runs, `cargo test --offline --locked --lib live_admission_bounds_real_runs`, run three times from 07:31:55Z to 07:31:57Z, passed each time (`1 passed; 0 failed; … 168 filtered out; finished in 0.97s`). It is a host-load timing failure of a test in `src/bridge.rs`, which the corpus round leaves byte-identical, not a state of the base. The fourth run, started 2026-11-19T07:32:33Z at a 1-minute load average of 34.26 and finished 07:33:11Z, exit status 0. Output trimmed: the 191 lines `test <name> ... ok` are omitted; every other line, standard error included, is shown:
+
+```text
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
+
+running 169 tests
+
+test result: ok. 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.46s
+
+     Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
+
+running 20 tests
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.68s
+
+     Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
+
+running 2 tests
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.90s
+
+   Doc-tests ifcap_po_inquiry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Total over the five test targets: 191 passed (unit tests of `src/lib.rs` 169, `src/bin/bridge.rs` 0, `tests/bridge.rs` 20, `tests/equivalence.rs` 2, doc-tests 0), 0 failed, 0 ignored: the request's 191.
+
+`grep -c '^- Verdict: PASS' REPORT.md`, 2026-11-19T07:33:16Z, on the `REPORT.md` the fourth run wrote, printed `5`, exit status 0; `grep -n '^- Verdict' REPORT.md` printed the five part 2 lines `1141:- Verdict: PASS`, `1148:- Verdict: PASS`, `1155:- Verdict: PASS`, `1162:- Verdict: PASS` and `1169:- Verdict: PASS`, for `GC-01` to `GC-05`; and `git diff --exit-code -- REPORT.md` printed nothing, exit status 0, so the regenerated file is byte-identical to the committed one, sha256 `624f0094a9b14b7005b2fc37086a428878af5b4d1f7272939102e6769d0f8478`. Its part 1 harness checks read `fixtures loaded: PASS — 29874 nodes`, `per-case readiness evaluated: PASS — 5 of 5 cases`, `store equal to its pre-call clone: PASS — sessions run: 5` and `SPEC.md sections found: PASS — 10 of 10`.
+
+`cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, 2026-11-19T07:33:41Z, exit status 0, after which `git diff --exit-code -- REPORT.md` still exited 0. Output complete:
+
+```text
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
+
+running 2 tests
+test equivalence_report ... GC-01 PASS
+GC-02 PASS
+GC-03 PASS
+GC-04 PASS
+GC-05 PASS
+ok
+test spec_has_report_sections ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.78s
+```
+
+**Capture listing**, 2026-11-19T07:33:52Z. The three commands of section "Capture hashes", "Round two, before the first edit", each exit status 0:
+
+```sh
+sha256sum tests/fixtures/ifcap/200.zwr
+find tests/golden/ifcap -type f ! -name README.md -exec sha256sum {} + | sort -k2
+if [ -f tests/fixtures/ifcap/cases.zwr ]; then sha256sum tests/fixtures/ifcap/cases.zwr; else echo "ABSENT tests/fixtures/ifcap/cases.zwr"; fi
+```
+
+They printed 41 lines, identical line for line to the listing verbatim in section "Capture hashes" under "Round two, before the first edit" (`diff` exit status 0), and to the one under "Round two, after the last edit" (`diff` exit status 0). The first line is `836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da  tests/fixtures/ifcap/200.zwr` and the last `9dd56f96bf29c5bb8e0e373cbaf2fb3f912daab4b41bf65fec1df76485da32a0  tests/fixtures/ifcap/cases.zwr`. The two "Capture hashes" listing lines, `find tests/golden/ifcap -type f ! -name README.md -exec sha256sum {} +` and the `cases.zwr` line, were then run again with their output piped to `sort` and saved outside the checkout as the corpus round's baseline: 40 lines, sha256 `d30051be4ccae4ed8ae0d9032f4c97ce96e2783320d05ae3cce3896a2da8a6d5`. `tests/fixtures/ifcap/` holds 13 files.
+
+**Fixture counts**, 2026-11-19T07:34:03Z, from `<base>/tests/fixtures/ifcap/`, each exit status 0, against the corpus minimums of section "Parity corpus":
+
+```text
+$ grep -c '^\^PRC(440,[0-9.]*,0)=' 440.zwr
+2627
+$ grep -E '^\^PRC\(440,[0-9.]+,3\)=' 440.zwr | awk -F'"' '{split($2,p,"^"); if (p[2]=="Y") c++} END{print c+0}'
+0
+$ grep -E '^\^PRCD\(442\.3,[0-9.]+,0\)=' 442.3.zwr | awk -F'"' '{split($2,p,"^"); if (p[2]=="" || p[2]+0<10) c++} END{print c}'
+9
+$ grep -E '^\^PRCD\(442\.5,[0-9.]+,0\)=' 442.5.zwr | sed 's/^\^PRCD(442\.5,\([0-9.]*\),0).*/\1/' | awk '$1<10{c++} END{print c}'
+7
+$ grep -cE '^\^PRC\(411,500,1,[0-9]+,0\)=' 411.zwr
+2
+$ grep -cE '^\^PRC\(411,[0-9]+,1,[0-9]+,0\)=' 411.zwr
+3
+```
+
+| Count | Value | Corpus minimum |
+|---|---|---|
+| File 440 vendors (zero nodes), of which EDI (node 3 piece 2 `Y`) | 2,627, of which 0 | 40 non-EDI vendors: 2,627 are non-EDI |
+| 442.3 statuses whose piece 2 is below 10 or empty | 9 | At least 1, each used twice |
+| 442.5 methods of processing below 10 | 7 | At least 1, each used 5 times |
+| 411 ship-to entries of station 500, and in the whole file | 2, and 3 | At least 1, each used 8 times |
+
+No count falls short of a minimum, so the stop condition does not apply. The baseline is the one the request expects: 191 passed and 0 failed, `Verdict: PASS` for all five cases, `REPORT.md` regenerated byte-identical, and every hash of the round-two listing unchanged.
 
 
 ## Acceptance record
