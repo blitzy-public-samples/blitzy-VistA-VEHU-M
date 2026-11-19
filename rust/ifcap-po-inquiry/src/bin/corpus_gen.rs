@@ -13,7 +13,16 @@
 //! input file in each case's folder of the corpus folder.
 //! - With no argument, those files are written, their folders created as
 //!   needed, and only once the whole generation has succeeded. Nothing else
-//!   is written and nothing is deleted.
+//!   is written and nothing is deleted. Before the first file is written,
+//!   every destination is inspected without following links, from the crate
+//!   folder down; the crate folder and its ancestors are trusted and not
+//!   inspected. A destination outside the crate folder, a symbolic link or a
+//!   non-folder on the way to a file, or a file that is a symbolic link, is
+//!   not a regular file or, on Unix, has another hard link is refused, and
+//!   then nothing is written. Each file is inspected again just before it is
+//!   written. The inspections are not atomic with the writes, so a link that
+//!   a concurrent writer puts in place between an inspection and its write
+//!   is followed.
 //! - With `--check`, nothing is written. Each generated file is compared
 //!   byte for byte with the committed one, read through
 //!   `golden::read_corpus_input` for a case input file and directly for
@@ -37,18 +46,21 @@
 //!
 //! The exit status is 0 when the files were written or all compared equal.
 //! It is 1 when the fixtures or `SPEC.md` cannot be read, the generation
-//! fails, the generated file list is not the 233 corpus files, a file cannot
-//! be written, or a compared file differs; each failure but the last prints
-//! `corpus_gen: <cause>` to standard error, and a failed generation writes
-//! nothing. It is 2, after `usage: corpus_gen [--check]` on standard error,
-//! for any other argument.
+//! fails, the generated file list is not the 233 corpus files, a destination
+//! is refused, a file cannot be written, or a compared file differs; each
+//! failure but the last prints `corpus_gen: <cause>` to standard error, for
+//! a refused or unwritable file `corpus_gen: <path>: <cause>`. A failed
+//! generation, and a destination refused before the first write, write
+//! nothing; a refusal or write failure during the writes stops them at that
+//! file, the files before it already written. It is 2, after
+//! `usage: corpus_gen [--check]` on standard error, for any other argument.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Display;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use ifcap_po_inquiry::{corpus, golden, store};
@@ -56,7 +68,6 @@ use ifcap_po_inquiry::{corpus, golden, store};
 /// The manifest's file name in the corpus folder.
 const MANIFEST_NAME: &str = "manifest.tsv";
 
-/// What the command line asks for.
 enum Mode {
     /// Generate and write the corpus files.
     Write,
@@ -150,19 +161,98 @@ fn case_inputs(files: &[(PathBuf, String)]) -> Option<BTreeMap<PathBuf, String>>
     complete.then_some(inputs)
 }
 
-/// Writes every generated file, creating its folder first, and stops at the
-/// first file that cannot be written. Unchanged files are written too.
+/// Writes every generated file, creating its folder first. Every
+/// destination passes `check_destination` before the first file is written,
+/// so a refused one stops the run with nothing written. Each is checked
+/// again just before its own write, and the run stops at the first file that
+/// is refused then or cannot be written, the files before it already
+/// written. The checks are not atomic with the writes: a link that a
+/// concurrent writer puts in place between a check and its write is
+/// followed. Unchanged files are written too.
 fn write_files(files: &[(PathBuf, String)]) -> ExitCode {
+    for (path, _) in files {
+        if let Err(cause) = check_destination(path) {
+            return fail(format_args!("{}: {cause}", shown(path)));
+        }
+    }
     for (path, text) in files {
-        if let Err(error) = write_file(path, text) {
-            return fail(format_args!("{}: {error}", shown(path)));
+        let written = check_destination(path)
+            .and_then(|()| write_file(path, text).map_err(|error| error.to_string()));
+        if let Err(cause) = written {
+            return fail(format_args!("{}: {cause}", shown(path)));
         }
     }
     ExitCode::SUCCESS
 }
 
+/// Whether `path` may be written. It must lie inside the crate folder, each
+/// folder between the crate folder and the file must be a folder or not
+/// exist yet, and the file must not exist yet or be a regular file with no
+/// other hard link. Each part is inspected through `fs::symlink_metadata`,
+/// which describes a symbolic link itself rather than what it points to, so
+/// a link anywhere on the way is refused, a dangling one included. The crate
+/// folder and its ancestors are trusted and not inspected. `Err` gives the
+/// cause.
+fn check_destination(path: &Path) -> Result<(), String> {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let relative = path.strip_prefix(crate_dir).ok().filter(|relative| {
+        relative.file_name().is_some()
+            && relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+    });
+    let Some(relative) = relative else {
+        return Err("destination is not a file inside the crate folder".to_string());
+    };
+    let mut folder = crate_dir.to_path_buf();
+    for part in relative.parent().into_iter().flat_map(Path::components) {
+        folder.push(part);
+        match fs::symlink_metadata(&folder) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!("folder {} is a symbolic link", shown(&folder)));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(format!("{} is not a folder", shown(&folder)));
+            }
+            Ok(_) => {}
+            // A missing folder is created by the write, and nothing can lie
+            // below it yet.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("{}: {error}", shown(&folder))),
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err("destination is a symbolic link".to_string())
+        }
+        Ok(meta) if !meta.is_file() => Err("destination is not a regular file".to_string()),
+        Ok(meta) => match hard_links(&meta) {
+            Some(links) => Err(format!("destination has {links} hard links")),
+            None => Ok(()),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// The hard-link count of the file `meta` describes, when it is more than
+/// one, so that a write cannot reach another name of the same file.
+#[cfg(unix)]
+fn hard_links(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.nlink()).filter(|&links| links > 1)
+}
+
+/// Off Unix the standard library gives no hard-link count, so no hard link
+/// is reported and none is refused.
+#[cfg(not(unix))]
+fn hard_links(_meta: &fs::Metadata) -> Option<u64> {
+    None
+}
+
 /// Writes `text` to `path`, creating the folders above it as needed. These
-/// are the generator's only two file-system writes.
+/// are the generator's only two file-system writes, and both follow links,
+/// so `write_files` calls `check_destination` first.
 fn write_file(path: &Path, text: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;

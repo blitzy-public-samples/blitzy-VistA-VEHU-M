@@ -163,7 +163,7 @@ cargo run --offline --locked --bin corpus_gen -- --check
 - **`REPORT.md` part 3** now also carries the subsection `### Parity corpus`, after the capture-readiness tables. It holds the recording-run line, the count table, the line `MATCHED n OF m IN-SCOPE CORPUS CASES`, the per-case table, and `#### Class moves`, `#### Findings`, `#### Dropped variants`, `#### BOUNDARY map` and `#### CR world labels`.
   - With no recording, as on this branch, it reads `Recording run: none` and `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES`, every CP, IN and CR case is NOT COMPARED, and every BOUNDARY case is BOUNDARY.
   - `cargo test --offline --locked --test equivalence -- --nocapture` prints the MATCHED line after the `GC-0N <verdict>` lines.
-  - A corpus verdict never fails `cargo test`. A corpus integrity failure does, and only after `REPORT.md` is written: a recording run or a corpus case that fails its integrity checks, a committed input that differs from the generated one, or a corpus model or world B that cannot be built.
+  - A corpus verdict never fails `cargo test`. A corpus integrity failure does, and only after `REPORT.md` is written: a recording run or a corpus case that fails its integrity checks, a committed input or `corpus.zwr` that differs from the generated one, or a corpus model or world B that cannot be built.
 - **Recording** is the team's, on its Docker host only. The prerequisite is the snapshot `vehu-snap:gc-base` of the pinned `worldvista/vehu:202609`, made by `scripts/kit/load_orders.sh` and `scripts/kit/save_state.sh`. The order is:
 
   ```text

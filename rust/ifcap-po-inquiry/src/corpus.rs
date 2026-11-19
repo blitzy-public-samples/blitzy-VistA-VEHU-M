@@ -85,9 +85,9 @@ pub const CR_INPUTS: [(&str, &str, &[&str]); 5] = [
     ("CR-05", "GC-05", &["", "GC5005", "", "", "^"]),
 ];
 
-/// The end of a session that `EN3^PRCHRPT` completes: the order prompt, the
-/// `^` that selects nothing, and the `\n` of the process exit (`SPEC.md`
-/// K14).
+/// The transcript suffix after a caret-prefixed exit from EN3^PRCHRPT:
+/// the order prompt followed by the process-exit newline (SPEC.md K14).
+/// The exit answer is not echoed.
 const EXIT_TAIL: &str = "P.O./REQ.NO.: \n";
 
 /// The two header lines of the corpus ZWR text, and of the text world B is
@@ -103,7 +103,6 @@ const MAX_ROUNDS: usize = 5;
 /// `I +$P(^(0),U,1)=PRC("SITE")` [PRCHPAT.m:81].
 const STATION: &str = "500";
 
-/// The number of CP cases.
 const CP_COUNT: usize = 200;
 
 /// CP-n is order IEN `IEN_BASE + n`.
@@ -362,16 +361,65 @@ pub fn ne_branches(spec: &str) -> Vec<String> {
 /// header lines, each world A node as `<reference>="<value>"` with every `"`
 /// doubled, and the corpus lines from its first line beginning `^`. The
 /// corpus text's own header lines are skipped, because a header line after
-/// the first data line does not parse. A corpus key equal to a world A key
-/// would replace it; [`generate`] refuses such a key.
+/// the first data line does not parse.
 ///
-/// A malformed line gives the [`StoreError::Parse`] of [`Store::from_zwr`],
-/// with its `message` and with `file` `None`. A line of `corpus_zwr` carries
-/// its own 1-based number in `corpus_zwr`, counted as [`Store::from_zwr`]
-/// counts lines, its skipped header lines included, so a broken corpus file
-/// is located from the error. A world A node's line keeps its number in the
-/// merged text.
+/// A text that is not a corpus text, or that would change world A, is
+/// refused, so a corpus line can never overwrite a world A node:
+///
+/// - lines 1 and 2 must be the two corpus header lines [`generate`] writes,
+///   and line 3 must be a data line, beginning `^`, so a text without that
+///   header or with no data line is refused;
+/// - no data line may name a key world A already holds as a node or above
+///   one (`$D` not 0), the rule [`generate`] applies before it writes. Keys
+///   are compared as parsed, so a quoted alias such as `^VA(200,".5",0)`
+///   of `^VA(200,.5,0)` is refused too.
+///
+/// A refusal or a malformed line is a [`StoreError::Parse`] with `file`
+/// `None` and a fixed `message` that quotes nothing from the text, a
+/// malformed line's being the one [`Store::from_zwr`] gives. A line of
+/// `corpus_zwr` carries its own 1-based number in `corpus_zwr`, counted as
+/// [`Store::from_zwr`] counts lines, its header lines included, so a broken
+/// corpus file is located from the error: a missing or different header
+/// line gives its own number, 1 or 2; a third line that is missing or is no
+/// data line gives 3; and keys world A holds give the first data line that
+/// names one. Malformed lines are reported before keys world A holds. A
+/// world A node's line keeps its number in the merged text.
 pub fn world_b(world_a: &Store, corpus_zwr: &str) -> Result<Store, StoreError> {
+    let refused = |line: usize, message: &str| StoreError::Parse {
+        file: None,
+        line,
+        message: message.to_string(),
+    };
+    let mut corpus_lines = corpus_zwr.lines();
+    for (index, header) in ZWR_HEADER.into_iter().enumerate() {
+        if corpus_lines.next() != Some(header) {
+            return Err(refused(index + 1, "expected the corpus header line"));
+        }
+    }
+    if !corpus_lines
+        .next()
+        .is_some_and(|line| line.starts_with('^'))
+    {
+        return Err(refused(
+            ZWR_HEADER.len() + 1,
+            "expected a data line after the corpus header",
+        ));
+    }
+    Store::from_zwr(corpus_zwr)?;
+    let held = corpus_zwr
+        .split('\n')
+        .enumerate()
+        .skip(ZWR_HEADER.len())
+        .find(|(_, line)| {
+            Store::from_zwr(line)
+                .is_ok_and(|node| node.iter().any(|(key, _)| world_a.data(key) != 0))
+        });
+    if let Some((index, _)) = held {
+        return Err(refused(
+            index.saturating_add(1),
+            "the key already exists in world A",
+        ));
+    }
     let mut text = String::new();
     for header in ZWR_HEADER {
         text.push_str(header);
@@ -455,7 +503,8 @@ pub struct CaseEntry {
     pub specified: Class,
     /// The input lines, each typed without its terminator.
     pub inputs: Vec<String>,
-    /// The order IENs the case opens, without repeats, in first-use order.
+    /// The order IENs referenced by exact C-value input lines, without repeats,
+    /// in first-use order, including unused tails after a boundary halt.
     pub orders: Vec<String>,
     /// The `C` values of those orders, in the same order.
     pub c_values: Vec<String>,
@@ -760,7 +809,6 @@ struct References {
     vendors: Vec<String>,
 }
 
-/// The number of vendors the corpus uses.
 const VENDOR_COUNT: usize = 40;
 
 impl References {
@@ -1095,12 +1143,10 @@ struct Lists {
     rows: BTreeMap<String, Vec<String>>,
 }
 
-/// `values` as owned strings.
 fn owned(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| value.to_string()).collect()
 }
 
-/// `values` followed by the empty label.
 fn with_empty(values: &[String]) -> Vec<String> {
     let mut out = values.to_vec();
     out.push(String::new());
@@ -1406,7 +1452,7 @@ struct ItemDraft {
 impl ItemDraft {
     /// The item's paging shape: its printed detail lines among STK#, NSN
     /// and FOOD GROUP [PRCHDP2.m:56], and whether its Items per line prints,
-    /// which it does only off a purchase-card order [PRCHDP2.m:59].
+    /// which it does only when the order type is not `S` [PRCHDP2.m:59].
     fn shape(&self, purchase_card: bool) -> (usize, usize) {
         let details = [&self.stk, &self.nsn, &self.food]
             .iter()
@@ -2818,7 +2864,7 @@ struct ItemFacts {
     stk: bool,
     nsn: bool,
     food: bool,
-    /// The Items per line prints: not a purchase-card order, and piece 12
+    /// The Items per line prints: the order type is not `S`, and piece 12
     /// is not zero [PRCHDP2.m:59].
     per: bool,
     boc: String,
@@ -3218,8 +3264,9 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
 /// [PRCHDP2.m:56] and `ip_j` is 1 when its Items per line prints
 /// [PRCHDP2.m:59]; `Y_end = 4 + sum over all items of (3 + d_j + ip_j) + e`,
 /// with `e` 1 when the estimated shipping is above 0 [PRCHDP2.m:13]. The
-/// result is `max(Y_ask(k) for all k, Y_end)`: 44 for 13 items with no
-/// optional line, 40 for 5 items with every one.
+/// result is `max(Y_ask(k) for all k, Y_end)`. With positive estimated
+/// shipping, it is 44 for 13 items with no optional line and 40 for 5
+/// items with all optional lines on a non-S order.
 pub fn order_worst_y(world_b: &Store, ien: &str) -> usize {
     let facts = order_facts(world_b, ien);
     let shapes: Vec<(usize, usize)> = facts
@@ -3345,7 +3392,6 @@ fn cost_form(cost: &str) -> String {
     }
 }
 
-/// `present` or `absent`.
 fn presence(present: bool) -> String {
     if present { "present" } else { "absent" }.to_string()
 }
@@ -3700,7 +3746,6 @@ fn minimum_violations_with_refs(
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// The manifest's header row.
 const MANIFEST_HEADER: &str =
     "case\tclass\tseed\torder_ien\tc_value\titem_count\ttags\texpected_branch";
 
@@ -3716,9 +3761,10 @@ impl Corpus {
 
     /// The manifest: the header row, then one tab-separated row per case in
     /// case order, each line ending `\n`. A CP row gives its order's IEN,
-    /// `C` value and item count; a CE or CR row the orders it opens,
-    /// comma-separated, and no item count. Tags are comma-separated, and
-    /// the expected branch is `none` or a branch ID.
+    /// `C` value and item count. A CE or CR row lists the order references
+    /// in its inputs, including unused boundary tails, comma-separated, and
+    /// has no item count. Tags are comma-separated, and the expected branch
+    /// is `none` or a branch ID.
     pub fn render_manifest(&self) -> String {
         let seed = SEED.to_string();
         let mut text = String::from(MANIFEST_HEADER);

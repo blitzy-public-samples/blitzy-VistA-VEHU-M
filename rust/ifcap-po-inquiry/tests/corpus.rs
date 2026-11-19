@@ -802,9 +802,9 @@ fn inventory_lists(id: &str) -> bool {
         .any(|(first, _)| first.trim() == id)
 }
 
-/// The in-memory sessions that `gate_every_case_meets_its_class` runs
-/// through the real `corpus::classify` and `judge`, for the outcomes no
-/// committed case gives (`SPEC.md` "Parity corpus", offline gate): a session
+/// In-memory sessions for `gate_every_case_meets_its_class`, covering normal
+/// completion and outcomes absent from committed cases (`SPEC.md`
+/// "Parity corpus", offline gate): a session
 /// that ends; halts at a not-implemented and at an implemented branch; an
 /// error, alone and with either kind of branch; a transcript without the
 /// K14 exit newline; transcripts one byte under, at and one byte over the
@@ -2362,7 +2362,10 @@ fn corpus_key_violation(node: &[Sub], value: &str) -> Option<String> {
 
 /// `corpus.zwr` has its header, line ends and characters, and only corpus
 /// order and index nodes; world B is world A unchanged plus exactly the
-/// corpus nodes; and world A holds no corpus node.
+/// corpus nodes; `corpus::world_b` refuses, at the line and with the fixed
+/// text it documents, a text that names a key world A holds (quoted
+/// aliases included), lacks the corpus header or has no data line; and
+/// world A holds no corpus node.
 #[test]
 fn world_b_keeps_world_a_and_world_a_has_no_corpus() {
     let gate = gate();
@@ -2440,6 +2443,135 @@ fn world_b_keeps_world_a_and_world_a_has_no_corpus() {
             changed.len(),
             changed.first()
         ));
+    }
+
+    for node in [
+        key("VA", &["200", ".5", "0"]),
+        key("PRC", &["442", "0"]),
+        key("PRC", &["442", "990001", "0"]),
+    ] {
+        if world_a.get(&node).is_none() {
+            failures.push(format!(
+                "world A lacks {}, which the world B probes name",
+                Store::format_ref(&node)
+            ));
+        }
+    }
+    const HELD: &str = "the key already exists in world A";
+    const NO_HEADER: &str = "expected the corpus header line";
+    const NO_DATA: &str = "expected a data line after the corpus header";
+    let [first_header, _] = ZWR_HEADER;
+    let header: String = ZWR_HEADER.iter().map(|line| format!("{line}\n")).collect();
+    let data: String = text
+        .lines()
+        .skip(ZWR_HEADER.len())
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let appended = text.lines().count() + 1;
+    let refused: [(&str, String, usize, &str); 17] = [
+        (
+            "the POSTMASTER node",
+            format!("{header}^VA(200,.5,0)=\"EVIL\"\n"),
+            3,
+            HELD,
+        ),
+        (
+            "the POSTMASTER alias with a quoted IEN",
+            format!("{header}^VA(200,\".5\",0)=\"EVIL\"\n"),
+            3,
+            HELD,
+        ),
+        (
+            "the POSTMASTER alias with every subscript quoted",
+            format!("{header}^VA(\"200\",\".5\",\"0\")=\"EVIL\"\n"),
+            3,
+            HELD,
+        ),
+        (
+            "the file 442 header node",
+            format!("{header}^PRC(442,0)=\"EVIL^442I^1^1\"\n"),
+            3,
+            HELD,
+        ),
+        (
+            "the GC-01 order node",
+            format!("{header}^PRC(442,990001,0)=\"500-GC1001^1^EVIL\"\n"),
+            3,
+            HELD,
+        ),
+        (
+            "the GC-01 order alias with a quoted IEN",
+            format!("{header}^PRC(442,\"990001\",0)=\"500-GC1001^1^EVIL\"\n"),
+            3,
+            HELD,
+        ),
+        (
+            "a key above world A nodes",
+            format!("{header}^PRC(442)=\"EVIL\"\n"),
+            3,
+            HELD,
+        ),
+        (
+            "the committed corpus with the POSTMASTER node appended",
+            format!("{text}^VA(200,.5,0)=\"EVIL\"\n"),
+            appended,
+            HELD,
+        ),
+        (
+            "the committed corpus with the GC-01 order alias appended",
+            format!("{text}^PRC(442,\"990001\",0)=\"500-GC1001^1^EVIL\"\n"),
+            appended,
+            HELD,
+        ),
+        ("an empty text", String::new(), 1, NO_HEADER),
+        (
+            "a text with no line beginning ^",
+            "EVIL GARBAGE\nMORE EVIL\n".to_string(),
+            1,
+            NO_HEADER,
+        ),
+        (
+            "the corpus lines without the header",
+            data.clone(),
+            1,
+            NO_HEADER,
+        ),
+        (
+            "another first header line",
+            format!("OSEHRA ZGO Export: EVIL\nZWR\n{data}"),
+            1,
+            NO_HEADER,
+        ),
+        (
+            "another second header line",
+            format!("{first_header}\nEVIL\n{data}"),
+            2,
+            NO_HEADER,
+        ),
+        (
+            "the first header line alone before the data",
+            format!("{first_header}\n{data}"),
+            2,
+            NO_HEADER,
+        ),
+        ("the header alone", header.clone(), 3, NO_DATA),
+        (
+            "a third header line",
+            format!("{header}EVIL\n{data}"),
+            3,
+            NO_DATA,
+        ),
+    ];
+    for (what, probe, line, message) in &refused {
+        let expected = format!("MALFORMED ZWR LINE {line}: {message}");
+        match corpus::world_b(world_a, probe) {
+            Ok(_) => failures.push(format!("world B accepts {what}")),
+            Err(error) if error.to_string() != expected => failures.push(format!(
+                "world B refuses {what} with {:?}, not {expected:?}",
+                error.to_string()
+            )),
+            Err(_) => {}
+        }
     }
 
     for ien in corpus_iens() {

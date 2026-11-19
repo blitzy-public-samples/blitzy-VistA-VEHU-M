@@ -948,19 +948,23 @@ struct CorpusReport {
     integrity: Vec<String>,
 }
 
-/// World B: `world_a` plus the committed `corpus.zwr`, which is a fixture,
-/// not a capture. Each error is crate-relative text naming the file.
-fn corpus_world(world_a: &Store) -> Result<Store, String> {
+/// The text of the committed `corpus.zwr`, which is a fixture, not a
+/// capture, and world B, `world_a` plus that text. Each error is
+/// crate-relative text naming the file.
+fn corpus_world(world_a: &Store) -> Result<(String, Store), String> {
     let path = corpus::corpus_zwr_path();
     let text = fs::read_to_string(&path)
         .map_err(|err| crate_relative(&format!("{}: {err}", path.display())))?;
-    corpus::world_b(world_a, &text)
-        .map_err(|err| crate_relative(&format!("{}: {err}", path.display())))
+    let world_b = corpus::world_b(world_a, &text)
+        .map_err(|err| crate_relative(&format!("{}: {err}", path.display())))?;
+    Ok((text, world_b))
 }
 
 /// The corpus model generated from `world_a` and `SPEC.md`, and world B, or
 /// every reason either is missing. A model whose case ids are not
-/// `golden::corpus_case_ids()` in order is missing too.
+/// `golden::corpus_case_ids()` in order is missing too, and so is world B
+/// when the committed `corpus.zwr` is not the model's ZWR text, so no case
+/// is judged on a world B other than the generated one.
 fn corpus_model(world_a: &Store) -> Result<(corpus::Corpus, Store), Vec<String>> {
     let ids = corpus_case_ids();
     let model = corpus::generate(world_a, SPEC)
@@ -978,7 +982,11 @@ fn corpus_model(world_a: &Store) -> Result<(corpus::Corpus, Store), Vec<String>>
             }
         });
     match (model, corpus_world(world_a)) {
-        (Ok(model), Ok(world_b)) => Ok((model, world_b)),
+        (Ok(model), Ok((text, world_b))) if text == model.render_zwr() => Ok((model, world_b)),
+        (Ok(_), Ok(_)) => Err(vec![crate_relative(&format!(
+            "{}: differs from the generated corpus",
+            corpus::corpus_zwr_path().display()
+        ))]),
         (model, world_b) => Err(model.err().into_iter().chain(world_b.err()).collect()),
     }
 }
@@ -2250,7 +2258,7 @@ fn test_world_b() -> &'static Store {
     let built = WORLD_B.get_or_init(|| {
         load_fixtures(&corpus::world_a_dir())
             .map_err(|err| crate_relative(&err.to_string()))
-            .and_then(|world_a| corpus_world(&world_a))
+            .and_then(|world_a| corpus_world(&world_a).map(|(_, world_b)| world_b))
     });
     match built {
         Ok(store) => store,
