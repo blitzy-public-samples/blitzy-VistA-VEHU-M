@@ -364,6 +364,13 @@ pub fn ne_branches(spec: &str) -> Vec<String> {
 /// corpus text's own header lines are skipped, because a header line after
 /// the first data line does not parse. A corpus key equal to a world A key
 /// would replace it; [`generate`] refuses such a key.
+///
+/// A malformed line gives the [`StoreError::Parse`] of [`Store::from_zwr`],
+/// with its `message` and with `file` `None`. A line of `corpus_zwr` carries
+/// its own 1-based number in `corpus_zwr`, counted as [`Store::from_zwr`]
+/// counts lines, its skipped header lines included, so a broken corpus file
+/// is located from the error. A world A node's line keeps its number in the
+/// merged text.
 pub fn world_b(world_a: &Store, corpus_zwr: &str) -> Result<Store, StoreError> {
     let mut text = String::new();
     for header in ZWR_HEADER {
@@ -376,11 +383,33 @@ pub fn world_b(world_a: &Store, corpus_zwr: &str) -> Result<Store, StoreError> {
         text.push_str(&value.replace('"', "\"\""));
         text.push_str("\"\n");
     }
-    for line in corpus_zwr.lines().skip_while(|line| !line.starts_with('^')) {
+    let merged_before_corpus = text.bytes().filter(|byte| *byte == b'\n').count();
+    let skipped = corpus_zwr
+        .lines()
+        .take_while(|line| !line.starts_with('^'))
+        .count();
+    for line in corpus_zwr.lines().skip(skipped) {
         text.push_str(line);
         text.push('\n');
     }
-    Store::from_zwr(&text)
+    Store::from_zwr(&text).map_err(|error| {
+        let StoreError::Parse {
+            file,
+            line,
+            message,
+        } = error;
+        let line = if line > merged_before_corpus {
+            line.saturating_sub(merged_before_corpus)
+                .saturating_add(skipped)
+        } else {
+            line
+        };
+        StoreError::Parse {
+            file,
+            line,
+            message,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -627,20 +656,41 @@ fn resolves(store: &Store, global: &str, file: &str, ien: &str) -> bool {
     !ien.is_empty() && store.get(&key(global, &[file, ien, "0"])).is_some()
 }
 
-/// The node 0 pieces of a vendor that the order display prints when present
-/// [PRCHDP1.m:26-28]: address lines 3 to 5, city, state, zip and phone.
-const VENDOR_PIECES: [usize; 7] = [3, 4, 5, 6, 7, 8, 10];
+/// The violation of world A's file 442 header `^PRC(442,0)` when its piece
+/// 2 does not hold the file attributes `442I`, which the GC fixture
+/// `cases.zwr` writes and the corpus never does, or `None` when it holds
+/// them. The generator and the fixture profile both test it.
+fn file_header_violation(world_a: &Store) -> Option<&'static str> {
+    let header = world_a.get_or_empty(&key("PRC", &["442", "0"]));
+    (crate::mumps::piece(&header, "^", 2) != "442I")
+        .then_some("the world A file 442 header piece 2 is not 442I")
+}
+
+/// The vendor fields of node 0 that the order display prints when present
+/// [PRCHDP1.m:26-28], in piece order: ORDERING ADDRESS2 to ADDRESS4, city,
+/// state, zip and phone, at pieces 3 to 8 and 10.
+const VENDOR_PIECES: [Field; 7] = [
+    VENDOR_ADDRESS_2,
+    VENDOR_ADDRESS_3,
+    VENDOR_ADDRESS_4,
+    VENDOR_CITY,
+    VENDOR_STATE,
+    VENDOR_ZIP,
+    VENDOR_PHONE,
+];
 
 /// The names of the 16 vendor properties of the variation matrix, in order:
-/// each of [`VENDOR_PIECES`] present then absent, then ACCT # (node 2 piece 1
-/// [PRCHDP1.m:29]) present then absent.
+/// each of [`VENDOR_PIECES`], named by its piece, present then absent, then
+/// ACCT #, the field [`VENDOR_ACCOUNT`] the display prints after them
+/// [PRCHDP1.m:29], present then absent.
 fn vendor_property_names() -> Vec<String> {
     let mut names: Vec<String> = VENDOR_PIECES
         .iter()
-        .flat_map(|field| {
+        .map(|field| field.piece)
+        .flat_map(|piece| {
             [
-                format!("piece {field} present"),
-                format!("piece {field} absent"),
+                format!("piece {piece} present"),
+                format!("piece {piece} absent"),
             ]
         })
         .collect();
@@ -650,19 +700,17 @@ fn vendor_property_names() -> Vec<String> {
 }
 
 /// Whether vendor `ien` has each of the 16 properties of
-/// [`vendor_property_names`], in the same order.
+/// [`vendor_property_names`], in the same order: each field of
+/// [`VENDOR_PIECES`], then [`VENDOR_ACCOUNT`], read on the vendor record
+/// `^PRC(440,ien)` and present when its piece is not empty.
 fn vendor_properties(store: &Store, ien: &str) -> Vec<bool> {
-    let node0 = store.get_or_empty(&key("PRC", &["440", ien, "0"]));
-    let node2 = store.get_or_empty(&key("PRC", &["440", ien, "2"]));
+    let vendor = key("PRC", &["440", ien]);
     let mut out = Vec::with_capacity(16);
-    for field in VENDOR_PIECES {
-        let present = !crate::mumps::piece(&node0, "^", field).is_empty();
+    for field in VENDOR_PIECES.into_iter().chain([VENDOR_ACCOUNT]) {
+        let present = !field_value(store, &vendor, field).is_empty();
         out.push(present);
         out.push(!present);
     }
-    let present = !crate::mumps::piece(&node2, "^", 1).is_empty();
-    out.push(present);
-    out.push(!present);
     out
 }
 
@@ -672,12 +720,12 @@ fn vendor_properties(store: &Store, ien: &str) -> Vec<bool> {
 /// neither node 2 nor node 3 holds only descendants, which the display reads
 /// after a bare `$D` [PRCHDP1.m:29-30].
 fn vendor_eligible(store: &Store, ien: &str) -> bool {
-    let Some(node0) = store.get(&key("PRC", &["440", ien, "0"])) else {
+    let vendor = key("PRC", &["440", ien]);
+    if store.get(&under(&vendor, &["0"])).is_none() {
         return false;
-    };
-    let node3 = store.get_or_empty(&key("PRC", &["440", ien, "3"]));
-    let state = crate::mumps::piece(node0, "^", 7);
-    crate::mumps::piece(&node3, "^", 2) != "Y"
+    }
+    let state = field_value(store, &vendor, VENDOR_STATE);
+    field_value(store, &vendor, VENDOR_EDI) != "Y"
         && (state.is_empty() || resolves(store, "DIC", "5", &crate::mumps::num(state)))
         && ["2", "3"]
             .iter()
@@ -851,6 +899,187 @@ fn choose_vendors(world_a: &Store) -> Vec<String> {
         }
     }
     chosen
+}
+
+// ---------------------------------------------------------------------------
+// Where the order and item fields are stored
+// ---------------------------------------------------------------------------
+
+/// Where a field of a file 442 order, of one of its 442.01 items, or of a
+/// file 440 vendor is stored below its record, `^PRC(442,ien)`,
+/// `^PRC(442,ien,2,j)` or `^PRC(440,ien)`: the node subscript and the
+/// 1-based `^`-piece of the field's `node;piece` in its `^DD` zero node.
+/// [`assemble`] writes every order and item field at its location,
+/// [`reach`] takes each dimension's attribution footprint from the
+/// locations, and the shared checks read every field at its location, so
+/// the writer, the attribution guard and the checks place a field alike.
+/// The vendor fields, which the corpus never writes, are read at their
+/// locations alike by the vendor selection and the checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Field {
+    /// The node subscript below the record.
+    node: &'static str,
+    /// The 1-based `^`-piece of the node.
+    piece: usize,
+}
+
+impl Field {
+    /// The field stored at `^`-piece `piece` of node `node`.
+    const fn at(node: &'static str, piece: usize) -> Field {
+        Field { node, piece }
+    }
+}
+
+/// Order field `.01` PURCHASE ORDER NUMBER, `0;1` [DD.zwr:514312].
+const ORDER_NUMBER: Field = Field::at("0", 1);
+/// Order field `.02` METHOD OF PROCESSING, `0;2` [DD.zwr:514331].
+const ORDER_MOP: Field = Field::at("0", 2);
+/// Order field `1` FCP, the fund control point, `0;3` [DD.zwr:514505].
+const ORDER_FCP: Field = Field::at("0", 3);
+/// Order field `1.4` APPROPRIATION, `0;4` [DD.zwr:514551].
+const ORDER_APP: Field = Field::at("0", 4);
+/// Order field `2` COST CENTER, `0;5` [DD.zwr:514557].
+const ORDER_COST_CENTER: Field = Field::at("0", 5);
+/// Order field `7` DELIVERY DATE, `0;10` [DD.zwr:514650].
+const ORDER_DELIVERY_DATE: Field = Field::at("0", 10);
+/// Order field `13` EST. SHIPPING AND/OR HANDLING, `0;13` [DD.zwr:514683].
+const ORDER_SHIPPING: Field = Field::at("0", 13);
+/// Order field `91` TOTAL AMOUNT, `0;15` [DD.zwr:515190].
+const ORDER_TOTAL: Field = Field::at("0", 15);
+/// Order field `5` VENDOR, `1;1` [DD.zwr:514589].
+const ORDER_VENDOR: Field = Field::at("1", 1);
+/// Order field `5.2` REQUESTING SERVICE, `1;2` [DD.zwr:514606].
+const ORDER_SERVICE: Field = Field::at("1", 2);
+/// Order field `5.4` SHIP TO, `1;3` [DD.zwr:514615].
+const ORDER_SHIP_TO: Field = Field::at("1", 3);
+/// Order field `6` VERBAL PURCHASE ORDER (Y/N), `1;4` [DD.zwr:514632].
+const ORDER_VERBAL: Field = Field::at("1", 4);
+/// Order field `6.2` CONFIRMATION COPY (Y/N), `1;5` [DD.zwr:514636].
+const ORDER_CONFIRMATION: Field = Field::at("1", 5);
+/// Order field `6.4` F.O.B. POINT, `1;6` [DD.zwr:514639].
+const ORDER_FOB: Field = Field::at("1", 6);
+/// Order field `8` SOURCE CODE, `1;7` [DD.zwr:514659].
+const ORDER_SOURCE: Field = Field::at("1", 7);
+/// Order field `8.2` PROPOSAL, `1;8` [DD.zwr:514672].
+const ORDER_PROPOSAL: Field = Field::at("1", 8);
+/// Order field `16` PA/PPM/AUTHORIZED BUYER, the agent, `1;10`
+/// [DD.zwr:514742].
+const ORDER_AGENT: Field = Field::at("1", 10);
+/// Order field `5.6` DELIVERY LOCATION, `1;11` [DD.zwr:514624].
+const ORDER_DELIVERY_LOCATION: Field = Field::at("1", 11);
+/// Order field `5.3` DIRECT DELIVERY PATIENT, `1;12` [DD.zwr:514610], which
+/// the profile keeps empty.
+const ORDER_DIRECT_PATIENT: Field = Field::at("1", 12);
+/// Order field `.1` P.O. DATE, `1;15` [DD.zwr:514394].
+const ORDER_DATE: Field = Field::at("1", 15);
+/// Order field `.5` SUPPLY STATUS, `7;1` [DD.zwr:514433].
+const ORDER_STATUS: Field = Field::at("7", 1);
+/// Order field `.08` ESTIMATED ORDER?, `7;3` [DD.zwr:514379], which the
+/// profile keeps empty.
+const ORDER_ESTIMATED_ORDER: Field = Field::at("7", 3);
+/// Order field `31` SUBSTATION, `23;7` [DD.zwr:514881], which the profile
+/// keeps empty.
+const ORDER_SUBSTATION: Field = Field::at("23", 7);
+/// Order field `46` PURCHASE CARD NUMBER, `23;8` [DD.zwr:514943], which the
+/// profile keeps empty.
+const ORDER_CARD_NUMBER: Field = Field::at("23", 8);
+/// Order field `48` TYPE OF ORDER, `23;11` [DD.zwr:514968].
+const ORDER_TYPE: Field = Field::at("23", 11);
+/// Order field `61` PURCHASE CARD HOLDER, `23;22` [DD.zwr:515047], which
+/// the profile keeps empty.
+const ORDER_CARD_HOLDER: Field = Field::at("23", 22);
+/// The node of order field `40` ITEM, the 442.01 item multiple `2;0`
+/// [DD.zwr:514888]: its header at `2,0`, item j at `2,j` and the item index
+/// `B` at `2,"B"`.
+const ORDER_ITEMS: &str = "2";
+/// The node of order field `8.3` PURCHASE METHOD, the 442.12 authority
+/// multiple `14;0` [DD.zwr:514677]: its header at `14,0` and entry j at
+/// `14,j,0`.
+const ORDER_AUTHORITIES: &str = "14";
+/// Item field `.01` LINE ITEM NUMBER, `0;1` [DD.zwr:515986].
+const ITEM_NUMBER: Field = Field::at("0", 1);
+/// Item field `2` QUANTITY, `0;2` [DD.zwr:516079].
+const ITEM_QUANTITY: Field = Field::at("0", 2);
+/// Item field `3` UNIT OF PURCHASE, `0;3` [DD.zwr:516096].
+const ITEM_UNIT: Field = Field::at("0", 3);
+/// Item field `3.5` BOC, `0;4` [DD.zwr:516110].
+const ITEM_BOC: Field = Field::at("0", 4);
+/// Item field `9` VENDOR STOCK NUMBER, the STK#, `0;6` [DD.zwr:516187].
+const ITEM_STK: Field = Field::at("0", 6);
+/// Item field `5` ACTUAL UNIT COST, `0;9` [DD.zwr:516145].
+const ITEM_UNIT_COST: Field = Field::at("0", 9);
+/// Item field `3.1` PACKAGING MULTIPLE, the Items per line, `0;12`
+/// [DD.zwr:516100].
+const ITEM_PER: Field = Field::at("0", 12);
+/// Item field `9.5` NSN, `0;13` [DD.zwr:516208].
+const ITEM_NSN: Field = Field::at("0", 13);
+/// Item field `15` TOTAL COST, the extended cost, `2;1` [DD.zwr:516287].
+const ITEM_EXTENDED_COST: Field = Field::at("2", 1);
+/// Item field `4` CONTRACT/BOA #, `2;2` [DD.zwr:516132], which the profile
+/// keeps empty.
+const ITEM_CONTRACT: Field = Field::at("2", 2);
+/// Item field `11` QUANTITY PREVIOUSLY RECEIVED, `2;8` [DD.zwr:516239],
+/// which the profile keeps empty.
+const ITEM_RECEIVED: Field = Field::at("2", 8);
+/// Item field `12` EDI STATUS CODE 1, `2;9` [DD.zwr:516265], which the
+/// profile keeps empty.
+const ITEM_EDI_STATUS_1: Field = Field::at("2", 9);
+/// Item field `13` EDI STATUS CODE 2, `2;11` [DD.zwr:516276], which the
+/// profile keeps empty.
+const ITEM_EDI_STATUS_2: Field = Field::at("2", 11);
+/// Item field `41` FOOD GROUP, `4;12` [DD.zwr:516400].
+const ITEM_FOOD_GROUP: Field = Field::at("4", 12);
+/// The node of item field `1` DESCRIPTION, the 442.05 word-processing
+/// multiple `1;0` [DD.zwr:516024]: its header at `1,0` and line n at
+/// `1,n,0`.
+const ITEM_DESCRIPTION: &str = "1";
+/// Vendor field `2` ORDERING ADDRESS2, `0;3` [DD.zwr:510123].
+const VENDOR_ADDRESS_2: Field = Field::at("0", 3);
+/// Vendor field `3` ORDERING ADDRESS3, `0;4` [DD.zwr:510128].
+const VENDOR_ADDRESS_3: Field = Field::at("0", 4);
+/// Vendor field `4` ORDERING ADDRESS4, `0;5` [DD.zwr:510133].
+const VENDOR_ADDRESS_4: Field = Field::at("0", 5);
+/// Vendor field `4.2` ORDERING CITY, `0;6` [DD.zwr:510138].
+const VENDOR_CITY: Field = Field::at("0", 6);
+/// Vendor field `4.4` ORDERING STATE, a file 5 pointer, `0;7`
+/// [DD.zwr:510143].
+const VENDOR_STATE: Field = Field::at("0", 7);
+/// Vendor field `4.6` ORDERING ZIP CODE, `0;8` [DD.zwr:510148].
+const VENDOR_ZIP: Field = Field::at("0", 8);
+/// Vendor field `5` VENDOR PHONE NUMBER, `0;10` [DD.zwr:510172].
+const VENDOR_PHONE: Field = Field::at("0", 10);
+/// Vendor field `5.1` ACCOUNT NO., the ACCT # line, `2;1` [DD.zwr:510177].
+const VENDOR_ACCOUNT: Field = Field::at("2", 1);
+/// Vendor field `.2` EDI VENDOR?, `3;2` [DD.zwr:510094].
+const VENDOR_EDI: Field = Field::at("3", 2);
+
+/// The value of `field` of the record `record` in `store`: the field's
+/// piece of its node, empty when the node holds no value.
+fn field_value<'s>(store: &'s Store, record: &[Sub], field: Field) -> &'s str {
+    store
+        .get(&under(record, &[field.node]))
+        .map_or("", |node| crate::mumps::piece(node, "^", field.piece))
+}
+
+/// The nodes below `record` that `values` write, each value at its field's
+/// piece: a node holds every piece up to the highest one a value is placed
+/// at, and a piece no value is placed at is empty, as
+/// `S $P(node,U,piece)=value` leaves them.
+fn field_nodes(record: &[Sub], values: &[(Field, &str)]) -> BTreeMap<Vec<Sub>, String> {
+    let mut nodes: BTreeMap<&'static str, Vec<&str>> = BTreeMap::new();
+    for &(field, value) in values {
+        let pieces = nodes.entry(field.node).or_default();
+        if pieces.len() < field.piece {
+            pieces.resize(field.piece, "");
+        }
+        if let Some(slot) = field.piece.checked_sub(1).and_then(|at| pieces.get_mut(at)) {
+            *slot = value;
+        }
+    }
+    nodes
+        .into_iter()
+        .map(|(node, pieces)| (under(record, &[node]), pieces.join("^")))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,9 +1620,10 @@ fn build_record(
 }
 
 /// CP-n of `plan` with the drawn and thinned values `draft`, its draws
-/// started from `start`: its nodes, written from the plan's rotation values
-/// and the draft's drawn ones, the authority entries from `refs`, and its
-/// tags, where a thinned optional line is tagged `thinned`.
+/// started from `start`: its nodes, each field written at its [`Field`]
+/// location from the plan's rotation values and the draft's drawn ones, the
+/// authority entries from `refs`, and its tags, where a thinned optional
+/// line is tagged `thinned`.
 fn assemble(
     plan: &Plan,
     refs: &References,
@@ -1425,90 +1655,70 @@ fn assemble(
     let drafts = &draft.items;
 
     let date = plan.value("date");
-    let node0 = [
-        format!("{STATION}-{c_value}").as_str(),
-        plan.value("mop"),
-        &draft.fund_control_point,
-        &draft.app,
-        &draft.cost_center,
-        "",
-        "",
-        "",
-        "",
-        date,
-        "",
-        "",
-        plan.value("shipping"),
-        "",
-        plan.value("total"),
-    ]
-    .join("^");
-    let node1 = [
-        plan.value("vendor"),
-        plan.value("service"),
-        plan.value("shipto"),
-        verbal,
-        confirmation,
-        plan.value("fob"),
-        plan.value("source"),
-        &draft.proposal,
-        "",
-        plan.value("agent"),
-        &draft.delivery,
-        "",
-        "",
-        "",
-        date,
-    ]
-    .join("^");
-
     let order = key("PRC", &["442", &ien]);
-    let mut nodes: BTreeMap<Vec<Sub>, String> = BTreeMap::new();
-    nodes.insert(under(&order, &["0"]), node0);
-    nodes.insert(under(&order, &["1"]), node1);
-    let count = drafts.len().to_string();
-    nodes.insert(
-        under(&order, &["2", "0"]),
-        format!("^442.01^{count}^{count}"),
+    // Nodes 0, 1 and 7. The P.O. date takes the delivery date's value, and
+    // `.08` is placed empty so node 7 keeps its three pieces.
+    let mut nodes: BTreeMap<Vec<Sub>, String> = field_nodes(
+        &order,
+        &[
+            (ORDER_NUMBER, format!("{STATION}-{c_value}").as_str()),
+            (ORDER_MOP, plan.value("mop")),
+            (ORDER_FCP, &draft.fund_control_point),
+            (ORDER_APP, &draft.app),
+            (ORDER_COST_CENTER, &draft.cost_center),
+            (ORDER_DELIVERY_DATE, date),
+            (ORDER_SHIPPING, plan.value("shipping")),
+            (ORDER_TOTAL, plan.value("total")),
+            (ORDER_VENDOR, plan.value("vendor")),
+            (ORDER_SERVICE, plan.value("service")),
+            (ORDER_SHIP_TO, plan.value("shipto")),
+            (ORDER_VERBAL, verbal),
+            (ORDER_CONFIRMATION, confirmation),
+            (ORDER_FOB, plan.value("fob")),
+            (ORDER_SOURCE, plan.value("source")),
+            (ORDER_PROPOSAL, &draft.proposal),
+            (ORDER_AGENT, plan.value("agent")),
+            (ORDER_DELIVERY_LOCATION, &draft.delivery),
+            (ORDER_DATE, date),
+            (ORDER_STATUS, plan.value("status")),
+            (ORDER_ESTIMATED_ORDER, ""),
+        ],
     );
+    let items = under(&order, &[ORDER_ITEMS]);
+    let count = drafts.len().to_string();
+    nodes.insert(under(&items, &["0"]), format!("^442.01^{count}^{count}"));
     for (index, (planned, draft)) in plan.items.iter().zip(drafts).enumerate() {
         let j = (index + 1).to_string();
-        let item0 = [
-            j.as_str(),
-            &draft.qty,
-            Plan::item_value(planned, "item.unit"),
-            &draft.boc,
-            "",
-            draft.stk.as_deref().unwrap_or(""),
-            "",
-            "",
-            &draft.cost,
-            "",
-            "",
-            draft.per.as_deref().unwrap_or(""),
-            draft.nsn.as_deref().unwrap_or(""),
-        ]
-        .join("^");
-        nodes.insert(under(&order, &["2", &j, "0"]), item0);
+        let item = under(&items, &[&j]);
+        let mut values = vec![
+            (ITEM_NUMBER, j.as_str()),
+            (ITEM_QUANTITY, &draft.qty),
+            (ITEM_UNIT, Plan::item_value(planned, "item.unit")),
+            (ITEM_BOC, &draft.boc),
+            (ITEM_STK, draft.stk.as_deref().unwrap_or("")),
+            (ITEM_UNIT_COST, &draft.cost),
+            (ITEM_PER, draft.per.as_deref().unwrap_or("")),
+            (ITEM_NSN, draft.nsn.as_deref().unwrap_or("")),
+            (ITEM_EXTENDED_COST, &draft.ext),
+        ];
+        if let Some(food) = &draft.food {
+            values.push((ITEM_FOOD_GROUP, food));
+        }
+        nodes.extend(field_nodes(&item, &values));
         nodes.insert(
-            under(&order, &["2", &j, "1", "0"]),
+            under(&item, &[ITEM_DESCRIPTION, "0"]),
             DESCRIPTION_HEADER.to_string(),
         );
-        nodes.insert(under(&order, &["2", &j, "1", "1", "0"]), draft.desc.clone());
-        nodes.insert(under(&order, &["2", &j, "2"]), draft.ext.clone());
-        if let Some(food) = &draft.food {
-            nodes.insert(
-                under(&order, &["2", &j, "4"]),
-                format!("{}{food}", "^".repeat(11)),
-            );
-        }
-        nodes.insert(under(&order, &["2", "B", &j, &j]), String::new());
+        nodes.insert(
+            under(&item, &[ITEM_DESCRIPTION, "1", "0"]),
+            draft.desc.clone(),
+        );
+        nodes.insert(under(&items, &["B", &j, &j]), String::new());
     }
-    nodes.insert(under(&order, &["7"]), format!("{}^^", plan.value("status")));
     if authorities > 0 {
         let size = refs.authorities.len();
         nodes.insert(
-            under(&order, &["14", "0"]),
+            under(&order, &[ORDER_AUTHORITIES, "0"]),
             format!("^442.12PA^{authorities}^{authorities}"),
         );
         for j in 1..=authorities {
@@ -1519,16 +1729,13 @@ fn assemble(
                     CorpusError::new(Some(&case_id), "unresolved reference", "no 442.4 authority")
                 })?;
             nodes.insert(
-                under(&order, &["14", &j.to_string(), "0"]),
+                under(&order, &[ORDER_AUTHORITIES, &j.to_string(), "0"]),
                 authority.clone(),
             );
         }
     }
     if !order_type.is_empty() {
-        nodes.insert(
-            under(&order, &["23"]),
-            format!("{}{order_type}", "^".repeat(10)),
-        );
+        nodes.extend(field_nodes(&order, &[(ORDER_TYPE, order_type.as_str())]));
     }
     nodes.insert(
         key("PRC", &["442", "B", &format!("{STATION}-{c_value}"), &ien]),
@@ -1677,7 +1884,9 @@ fn run_round(
     Ok((built, world))
 }
 
-/// One single-dimension reversion of an order.
+/// One single-dimension reversion of an order: which value it reverts and
+/// the value it puts in its place. It holds no plan; [`Reversion::apply`]
+/// builds the reverted plan when the reversion's candidate is about to run.
 struct Reversion {
     /// The dimension: an order row such as `status`, or `item.` and an item
     /// field such as `item.cost`.
@@ -1687,8 +1896,8 @@ struct Reversion {
     item: Option<usize>,
     /// The value the reversion replaces.
     current: String,
-    /// The order's plan with that one value reverted.
-    plan: Plan,
+    /// The value the reversion puts in place of `current`.
+    value: String,
 }
 
 impl Reversion {
@@ -1700,14 +1909,38 @@ impl Reversion {
             _ => self.dimension.clone(),
         }
     }
+
+    /// A copy of `plan` with this reversion's one value, the order row
+    /// `dimension` or that field of item `item`, set to `value`. The order
+    /// rows are distinct, so the row's name finds its slot.
+    fn apply(&self, plan: &Plan) -> Plan {
+        let mut reverted = plan.clone();
+        let slot = match self.item {
+            None => reverted
+                .order
+                .iter_mut()
+                .find(|(name, _)| *name == self.dimension),
+            Some(at) => reverted
+                .items
+                .get_mut(at)
+                .and_then(|item| item.iter_mut().find(|(name, _)| *name == self.dimension)),
+        };
+        if let Some(slot) = slot {
+            slot.1.clone_from(&self.value);
+        }
+        reverted
+    }
 }
 
-/// Every single-dimension reversion of `plan` under `lists`: the order rows
-/// in matrix order, then the item rows, each over the items in order. A
-/// value reverts to its list's first value, or to the second when it is the
-/// first. The item count is not a dimension and never reverts.
-fn reversions(plan: &Plan, lists: &Lists) -> Vec<Reversion> {
-    let target = |dimension: &str, current: &str| -> Option<String> {
+/// Every single-dimension reversion of `plan` under `lists`, produced one
+/// at a time as the caller takes them, so that no reversion is prepared
+/// before its turn: the order rows in matrix order, then the item rows,
+/// each over the items in order. A value reverts to its list's first value,
+/// or to the second when it is the first, and a value whose list offers
+/// neither has no reversion. The item count is not a dimension and never
+/// reverts.
+fn reversions<'a>(plan: &'a Plan, lists: &'a Lists) -> impl Iterator<Item = Reversion> + 'a {
+    let target = move |dimension: &str, current: &str| -> Option<String> {
         let list = lists.list(dimension);
         let first = list.first()?;
         if first != current {
@@ -1716,57 +1949,43 @@ fn reversions(plan: &Plan, lists: &Lists) -> Vec<Reversion> {
             list.get(1).filter(|second| *second != current).cloned()
         }
     };
-    let mut out = Vec::new();
-    for (at, (dimension, current)) in plan.order.iter().enumerate() {
-        if let Some(value) = target(dimension, current) {
-            let mut reverted = plan.clone();
-            if let Some(slot) = reverted.order.get_mut(at) {
-                slot.1 = value;
-            }
-            out.push(Reversion {
-                dimension: dimension.clone(),
-                item: None,
-                current: current.clone(),
-                plan: reverted,
-            });
-        }
-    }
-    for field in ITEM_ROWS {
+    let rows = plan.order.iter().filter_map(move |(dimension, current)| {
+        Some(Reversion {
+            value: target(dimension, current)?,
+            dimension: dimension.clone(),
+            item: None,
+            current: current.clone(),
+        })
+    });
+    let items = ITEM_ROWS.into_iter().flat_map(move |field| {
         let dimension = format!("item.{field}");
-        for (at, item) in plan.items.iter().enumerate() {
+        plan.items.iter().enumerate().filter_map(move |(at, item)| {
             let current = Plan::item_value(item, &dimension);
-            if let Some(value) = target(&dimension, current) {
-                let mut reverted = plan.clone();
-                let slot = reverted
-                    .items
-                    .get_mut(at)
-                    .and_then(|item| item.iter_mut().find(|(name, _)| *name == dimension));
-                if let Some(slot) = slot {
-                    slot.1 = value;
-                }
-                out.push(Reversion {
-                    dimension: dimension.clone(),
-                    item: Some(at),
-                    current: current.to_string(),
-                    plan: reverted,
-                });
-            }
-        }
-    }
-    out
+            Some(Reversion {
+                value: target(&dimension, current)?,
+                dimension: dimension.clone(),
+                item: Some(at),
+                current: current.to_string(),
+            })
+        })
+    });
+    rows.chain(items)
 }
 
 /// The candidate order of `reversion` for `target`: `target`'s own draft
-/// with only the reverted dimension changed. A rotation-only dimension,
-/// every order row but `delivery`, `proposal` and `app`, and `item.unit`,
-/// changes through the reverted plan alone. A drawn one takes its new
-/// values from a fresh draw of the reverted plan started at
-/// [`Built::start`], and a reverted optional line is no longer marked
+/// with only the reverted dimension changed. The reverted plan is built
+/// here, once, from `target`'s plan by [`Reversion::apply`], serves both
+/// the fresh draw and the assembly, and is gone when the call returns. A
+/// rotation-only dimension, every order row but `delivery`, `proposal` and
+/// `app`, and `item.unit`, changes through the reverted plan alone. A drawn
+/// one takes its new values from a fresh draw of the reverted plan started
+/// at [`Built::start`], and a reverted optional line is no longer marked
 /// thinned. Every other drawn value is the target's, and nothing is thinned
 /// again.
 fn revert(target: &Built, refs: &References, reversion: &Reversion) -> Result<Built, CorpusError> {
     let case = target.record.case_id.as_str();
-    let fresh = draw_order(&reversion.plan, case, &mut target.start.clone())?;
+    let plan = reversion.apply(&target.plan);
+    let fresh = draw_order(&plan, case, &mut target.start.clone())?;
     let mut draft = target.draft.clone();
     match reversion.item {
         None => match reversion.dimension.as_str() {
@@ -1804,55 +2023,66 @@ fn revert(target: &Built, refs: &References, reversion: &Reversion) -> Result<Bu
             item.thinned.retain(|thinned| *thinned != field);
         }
     }
-    assemble(&reversion.plan, refs, target.start.clone(), draft)
+    assemble(&plan, refs, target.start.clone(), draft)
 }
 
 /// A node one dimension writes, below its order: the node's key, and the
 /// `^`-pieces the dimension sets, or `None` when it sets the whole node and
 /// every node below it.
-type Reach = (Vec<Sub>, Option<&'static [usize]>);
+type Reach = (Vec<Sub>, Option<Vec<usize>>);
 
 /// The nodes and pieces [`assemble`] writes from the dimension of
 /// `reversion` below `order`, the key of its order, for an item row in the
-/// reverted item only. An unknown dimension writes nothing.
+/// reverted item only, taken from the dimension's [`Field`] locations: the
+/// pieces one dimension sets in a node form that node's one entry. The
+/// type, the authority, the description, the extended cost and the FOOD
+/// GROUP each own a node no other dimension writes, so each reaches that
+/// whole node. An unknown dimension writes nothing.
 fn reach(reversion: &Reversion, order: &[Sub]) -> Vec<Reach> {
-    let node =
-        |subs: &[&str], pieces: Option<&'static [usize]>| -> Reach { (under(order, subs), pieces) };
     let j = reversion
         .item
         .map(|at| (at + 1).to_string())
         .unwrap_or_default();
-    let item = |subs: &[&str], pieces: Option<&'static [usize]>| -> Reach {
-        (under(&under(order, &["2", &j]), subs), pieces)
+    let item = under(order, &[ORDER_ITEMS, &j]);
+    let pieces = |record: &[Sub], fields: &[Field]| -> Vec<Reach> {
+        let mut nodes: BTreeMap<&'static str, Vec<usize>> = BTreeMap::new();
+        for field in fields {
+            nodes.entry(field.node).or_default().push(field.piece);
+        }
+        nodes
+            .into_iter()
+            .map(|(node, set)| (under(record, &[node]), Some(set)))
+            .collect()
     };
+    let whole = |record: &[Sub], subs: &[&str]| -> Vec<Reach> { vec![(under(record, subs), None)] };
     match reversion.dimension.as_str() {
-        "status" => vec![node(&["7"], Some(&[1]))],
-        "type" => vec![node(&["23"], None)],
-        "source" => vec![node(&["1"], Some(&[7]))],
-        "mop" => vec![node(&["0"], Some(&[2]))],
-        "vendor" => vec![node(&["1"], Some(&[1]))],
-        "service" => vec![node(&["1"], Some(&[2]))],
-        "shipto" => vec![node(&["1"], Some(&[3]))],
-        "delivery" => vec![node(&["1"], Some(&[11]))],
-        "verbal" => vec![node(&["1"], Some(&[4, 5]))],
-        "fob" => vec![node(&["1"], Some(&[6]))],
-        "proposal" => vec![node(&["1"], Some(&[8]))],
-        "authority" => vec![node(&["14"], None)],
-        "date" => vec![node(&["0"], Some(&[10])), node(&["1"], Some(&[15]))],
-        "app" => vec![node(&["0"], Some(&[4]))],
-        "agent" => vec![node(&["1"], Some(&[10]))],
-        "total" => vec![node(&["0"], Some(&[15]))],
-        "shipping" => vec![node(&["0"], Some(&[13]))],
-        "item.desc" => vec![item(&["1", "1", "0"], None)],
-        "item.qty" => vec![item(&["0"], Some(&[2]))],
-        "item.unit" => vec![item(&["0"], Some(&[3]))],
-        "item.cost" => vec![item(&["0"], Some(&[9]))],
-        "item.ext" => vec![item(&["2"], None)],
-        "item.stk" => vec![item(&["0"], Some(&[6]))],
-        "item.nsn" => vec![item(&["0"], Some(&[13]))],
-        "item.food" => vec![item(&["4"], None)],
-        "item.per" => vec![item(&["0"], Some(&[12]))],
-        "item.boc" => vec![item(&["0"], Some(&[4]))],
+        "status" => pieces(order, &[ORDER_STATUS]),
+        "type" => whole(order, &[ORDER_TYPE.node]),
+        "source" => pieces(order, &[ORDER_SOURCE]),
+        "mop" => pieces(order, &[ORDER_MOP]),
+        "vendor" => pieces(order, &[ORDER_VENDOR]),
+        "service" => pieces(order, &[ORDER_SERVICE]),
+        "shipto" => pieces(order, &[ORDER_SHIP_TO]),
+        "delivery" => pieces(order, &[ORDER_DELIVERY_LOCATION]),
+        "verbal" => pieces(order, &[ORDER_VERBAL, ORDER_CONFIRMATION]),
+        "fob" => pieces(order, &[ORDER_FOB]),
+        "proposal" => pieces(order, &[ORDER_PROPOSAL]),
+        "authority" => whole(order, &[ORDER_AUTHORITIES]),
+        "date" => pieces(order, &[ORDER_DELIVERY_DATE, ORDER_DATE]),
+        "app" => pieces(order, &[ORDER_APP]),
+        "agent" => pieces(order, &[ORDER_AGENT]),
+        "total" => pieces(order, &[ORDER_TOTAL]),
+        "shipping" => pieces(order, &[ORDER_SHIPPING]),
+        "item.desc" => whole(&item, &[ITEM_DESCRIPTION, "1", "0"]),
+        "item.qty" => pieces(&item, &[ITEM_QUANTITY]),
+        "item.unit" => pieces(&item, &[ITEM_UNIT]),
+        "item.cost" => pieces(&item, &[ITEM_UNIT_COST]),
+        "item.ext" => whole(&item, &[ITEM_EXTENDED_COST.node]),
+        "item.stk" => pieces(&item, &[ITEM_STK]),
+        "item.nsn" => pieces(&item, &[ITEM_NSN]),
+        "item.food" => whole(&item, &[ITEM_FOOD_GROUP.node]),
+        "item.per" => pieces(&item, &[ITEM_PER]),
+        "item.boc" => pieces(&item, &[ITEM_BOC]),
         _ => Vec::new(),
     }
 }
@@ -1938,7 +2168,9 @@ fn isolation_breach(original: &Built, candidate: &Built, reversion: &Reversion) 
 
 /// The dimension and value that make CP order `index` of `built` halt at a
 /// not-implemented branch: the first of its [`reversions`] after which its
-/// session runs to its end.
+/// session runs to its end. The reversions are taken one at a time, and
+/// each candidate is built only when its turn comes and dropped before the
+/// next, so no later reversion is prepared once one has decided.
 ///
 /// Each candidate is [`revert`]'s: the order's own draft with only the
 /// reverted dimension changed, its new drawn values from a fresh draw
@@ -2450,13 +2682,8 @@ pub fn generate(world_a: &Store, spec: &str) -> Result<Corpus, CorpusError> {
     }
     // Without these file attributes every lookup ends at PO-09.b15 before
     // any order is read, which no reversion could attribute.
-    let header = world_a.get_or_empty(&key("PRC", &["442", "0"]));
-    if crate::mumps::piece(&header, "^", 2) != "442I" {
-        return Err(CorpusError::new(
-            None,
-            "profile violation",
-            "the world A file 442 header piece 2 is not 442I",
-        ));
+    if let Some(violation) = file_header_violation(world_a) {
+        return Err(CorpusError::new(None, "profile violation", violation));
     }
     let refs = References::read(world_a)?;
     let Settled {
@@ -2566,7 +2793,7 @@ pub fn generate(world_a: &Store, spec: &str) -> Result<Corpus, CorpusError> {
         rounds,
         worst_y: worst,
     };
-    let violations = minimum_violations(world_a, &world, &corpus);
+    let violations = minimum_violations_with_refs(&refs, world_a, &world, &corpus);
     if !violations.is_empty() {
         return Err(CorpusError::new(
             None,
@@ -2600,48 +2827,59 @@ struct ItemFacts {
 
 /// What the display reads of one world B order.
 struct OrderFacts {
-    node0: String,
-    node1: String,
-    node7: String,
+    /// The order's nodes that hold a value, by node subscript.
+    nodes: BTreeMap<String, String>,
     order_type: String,
     authorities: usize,
     items: Vec<ItemFacts>,
 }
 
+impl OrderFacts {
+    /// The value of order field `field`, empty when its node holds none.
+    fn field(&self, field: Field) -> &str {
+        self.nodes
+            .get(field.node)
+            .map_or("", |node| crate::mumps::piece(node, "^", field.piece))
+    }
+}
+
 /// Reads order `ien` of `store`.
 fn order_facts(store: &Store, ien: &str) -> OrderFacts {
     let order = key("PRC", &["442", ien]);
-    let read = |subs: &[&str]| store.get_or_empty(&under(&order, subs));
-    let order_type = crate::mumps::piece(&read(&["23"]), "^", 11).to_string();
+    let order_type = field_value(store, &order, ORDER_TYPE).to_string();
     let purchase_card = order_type == "S";
-    let items = numeric_children(store, &under(&order, &["2"]))
+    let item_root = under(&order, &[ORDER_ITEMS]);
+    let items = numeric_children(store, &item_root)
         .iter()
         .map(|j| {
-            let item0 = read(&["2", j, "0"]);
-            let node2 = read(&["2", j, "2"]);
-            let node4 = read(&["2", j, "4"]);
+            let item = under(&item_root, &[j]);
+            let value = |field: Field| field_value(store, &item, field);
             let present = |text: &str| !text.is_empty();
             ItemFacts {
-                desc: read(&["2", j, "1", "1", "0"]),
-                qty: crate::mumps::piece(&item0, "^", 2).to_string(),
-                unit: crate::mumps::piece(&item0, "^", 3).to_string(),
-                cost: crate::mumps::piece(&item0, "^", 9).to_string(),
-                ext: crate::mumps::piece(&node2, "^", 1).to_string(),
-                stk: present(crate::mumps::piece(&item0, "^", 6)),
-                nsn: present(crate::mumps::piece(&item0, "^", 13)),
-                food: present(crate::mumps::piece(&node4, "^", 12)),
-                per: !purchase_card
-                    && crate::mumps::num(crate::mumps::piece(&item0, "^", 12)) != "0",
-                boc: crate::mumps::piece(&item0, "^", 4).to_string(),
+                desc: store.get_or_empty(&under(&item, &[ITEM_DESCRIPTION, "1", "0"])),
+                qty: value(ITEM_QUANTITY).to_string(),
+                unit: value(ITEM_UNIT).to_string(),
+                cost: value(ITEM_UNIT_COST).to_string(),
+                ext: value(ITEM_EXTENDED_COST).to_string(),
+                stk: present(value(ITEM_STK)),
+                nsn: present(value(ITEM_NSN)),
+                food: present(value(ITEM_FOOD_GROUP)),
+                per: !purchase_card && crate::mumps::num(value(ITEM_PER)) != "0",
+                boc: value(ITEM_BOC).to_string(),
                 purchase_card,
             }
         })
         .collect();
+    let nodes = child_texts(store, &order)
+        .into_iter()
+        .filter_map(|node| {
+            let value = store.get(&under(&order, &[&node]))?.to_string();
+            Some((node, value))
+        })
+        .collect();
     OrderFacts {
-        node0: read(&["0"]),
-        node1: read(&["1"]),
-        node7: read(&["7"]),
-        authorities: numeric_children(store, &under(&order, &["14"])).len(),
+        nodes,
+        authorities: numeric_children(store, &under(&order, &[ORDER_AUTHORITIES])).len(),
         order_type,
         items,
     }
@@ -2681,13 +2919,91 @@ fn is_food_group(value: &str) -> bool {
     (1..=FOOD_GROUPS).any(|code| code.to_string() == value)
 }
 
+/// The IENs `iens` as a comma-separated list, or `no IEN` when there are
+/// none.
+fn ien_list(iens: &[String]) -> String {
+    if iens.is_empty() {
+        "no IEN".to_string()
+    } else {
+        iens.join(", ")
+    }
+}
+
+/// What the file 442 index entry `^PRC(442,index,value,ien)` of `store`
+/// holds when it is present but not exactly `=""`, the node the `.01`
+/// cross-references set [DD.zwr:514316, 514319], or `None` when it has that
+/// shape or is absent. The entry must hold a value, the value must be
+/// empty, and it must have no descendants, so its `$D` is 1. An absent
+/// entry is left to the IEN rules of the callers, which report it. One `$D`
+/// and one read are made.
+fn index_leaf_violation(store: &Store, index: &str, value: &str, ien: &str) -> Option<String> {
+    let entry = key("PRC", &["442", index, value, ien]);
+    let data = store.data(&entry);
+    let held = store.get(&entry);
+    if data == 0 || (data == 1 && held == Some("")) {
+        return None;
+    }
+    let found = match held {
+        None => "no value".to_string(),
+        Some("") => "the empty value".to_string(),
+        Some(text) => format!("the value {text}"),
+    };
+    Some(format!(
+        "entry {ien} has $D {data} and {found} instead of $D 1 and the empty value"
+    ))
+}
+
+/// The violations of the file 442 index `index` of `world_b` for order
+/// `ien`, whose field `.01` `number` gives its value `own` there: an empty
+/// `own`, which files the order under no value; an `own` whose IENs are not
+/// `ien` alone; and an entry `^PRC(442,index,own,ien)` that is present but
+/// not exactly `=""`, the empty value with no descendants that the `.01`
+/// cross-references set [DD.zwr:514316, 514319]. Only the IENs below `own`
+/// and that one entry are read, so the cost does not grow with the number
+/// of index values. A value other than `own` that holds `ien` is not looked
+/// for here; [`c_value_violations`] reports one in index `C`. Each
+/// violation names the index and the value, with the IENs found or with the
+/// entry's IEN, `$D` and value.
+fn index_entry_violations(
+    world_b: &Store,
+    index: &str,
+    number: &str,
+    own: &str,
+    ien: &str,
+) -> Vec<String> {
+    let root = key("PRC", &["442", index]);
+    let mut out = Vec::new();
+    if own.is_empty() {
+        out.push(format!(
+            "field .01 {} gives no index {index} value",
+            tag_value(number)
+        ));
+    } else {
+        let iens = child_texts(world_b, &under(&root, &[own]));
+        if iens != [ien] {
+            out.push(format!(
+                "the file 442 index {index} value {own} holds {} instead of {ien} alone",
+                ien_list(&iens)
+            ));
+        }
+        if let Some(found) = index_leaf_violation(world_b, index, own, ien) {
+            out.push(format!("the file 442 index {index} value {own} {found}"));
+        }
+    }
+    out
+}
+
 /// The fixture profile of `SPEC.md` "Parity corpus" for order `ien` of
 /// `world_b`, every reference resolved in `world_a`: each violation names
 /// the order and the rule, and an order on the profile gives none. It
 /// checks the `^PRC(442,0)` attributes `442I`, nodes 0 and 1, a method of
 /// processing below 10, no node 11, 5, 3, 15, 4, 13, 6 or 24, field 5.3
 /// empty, node 23 pieces 7, 8 and 22 empty and piece 11 `P`, `S` or `D`, no
-/// `M`, `MCH` or `G` index, a non-EDI vendor, a status that resolves in
+/// `M`, `MCH` or `G` index, the order filed under its `.01` in index `B`
+/// and under the second `-` piece of its `.01` in index `C`, each by an
+/// entry `^PRC(442,index,value,ien)` that is exactly `=""` and each of those
+/// two values holding this order alone (another value that holds the order
+/// is not looked for), a non-EDI vendor, a status that resolves in
 /// 442.3, `.08` ESTIMATED ORDER? (node 7 piece 3) empty, at least one item,
 /// each with one description line of at most 32 characters and no `|`, a
 /// node 2 with pieces 2, 8, 9 and 11 empty and no node 3, an NSN (node 0
@@ -2695,26 +3011,22 @@ fn is_food_group(value: &str) -> bool {
 /// (node 4 piece 12) empty or a code of field 442.01/41, no item `AC`
 /// index, no 442.8 `B` index, every vendor, state, service, ship-to, unit,
 /// source code, authority, method and status pointer resolved, and an agent
-/// of `.5` or empty.
+/// that is empty or `.5` resolved in file 200.
 pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut fail = |rule: String| out.push(format!("order {ien}: {rule}"));
-    let header = world_a.get_or_empty(&key("PRC", &["442", "0"]));
-    if crate::mumps::piece(&header, "^", 2) != "442I" {
-        fail("the world A file 442 header piece 2 is not 442I".to_string());
+    if let Some(violation) = file_header_violation(world_a) {
+        fail(violation.to_string());
     }
     let order = key("PRC", &["442", ien]);
-    let node0 = world_b.get(&under(&order, &["0"]));
-    let node1 = world_b.get(&under(&order, &["1"]));
-    if node0.is_none() {
+    let value = |field: Field| field_value(world_b, &order, field);
+    if world_b.get(&under(&order, &["0"])).is_none() {
         fail("node 0 is absent".to_string());
     }
-    if node1.is_none() {
+    if world_b.get(&under(&order, &["1"])).is_none() {
         fail("node 1 is absent".to_string());
     }
-    let node0 = node0.unwrap_or("");
-    let node1 = node1.unwrap_or("");
-    let mop = crate::mumps::piece(node0, "^", 2);
+    let mop = value(ORDER_MOP);
     if !resolves(world_a, "PRCD", "442.5", mop)
         || crate::mumps::num_cmp(mop, "10") != Ordering::Less
     {
@@ -2728,19 +3040,26 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
             fail(format!("node {sub} is present"));
         }
     }
-    if !crate::mumps::piece(node1, "^", 12).is_empty() {
-        fail("field 5.3, node 1 piece 12, is not empty".to_string());
+    if !value(ORDER_DIRECT_PATIENT).is_empty() {
+        fail(format!(
+            "field 5.3, node {} piece {}, is not empty",
+            ORDER_DIRECT_PATIENT.node, ORDER_DIRECT_PATIENT.piece
+        ));
     }
-    let node23 = under(&order, &["23"]);
-    if world_b.data(&node23) != 0 {
-        let node23 = world_b.get_or_empty(&node23);
-        for field in [7, 8, 22] {
-            if !crate::mumps::piece(&node23, "^", field).is_empty() {
-                fail(format!("node 23 piece {field} is not empty"));
+    if world_b.data(&under(&order, &[ORDER_TYPE.node])) != 0 {
+        for field in [ORDER_SUBSTATION, ORDER_CARD_NUMBER, ORDER_CARD_HOLDER] {
+            if !value(field).is_empty() {
+                fail(format!(
+                    "node {} piece {} is not empty",
+                    field.node, field.piece
+                ));
             }
         }
-        if !["P", "S", "D"].contains(&crate::mumps::piece(&node23, "^", 11)) {
-            fail("node 23 piece 11 is not P, S or D".to_string());
+        if !["P", "S", "D"].contains(&value(ORDER_TYPE)) {
+            fail(format!(
+                "node {} piece {} is not P, S or D",
+                ORDER_TYPE.node, ORDER_TYPE.piece
+            ));
         }
     }
     for index in ["M", "MCH", "G"] {
@@ -2748,37 +3067,47 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
             fail(format!("the file 442 index {index} holds entries"));
         }
     }
-    let vendor = crate::mumps::piece(node1, "^", 1);
-    match world_a.get(&key("PRC", &["440", vendor, "0"])) {
-        None => fail(format!(
-            "vendor {} does not resolve in file 440",
-            tag_value(vendor)
-        )),
-        Some(vendor0) => {
-            let node3 = world_a.get_or_empty(&key("PRC", &["440", vendor, "3"]));
-            if crate::mumps::piece(&node3, "^", 2) == "Y" {
-                fail(format!("vendor {vendor} is an EDI vendor"));
-            }
-            let state = crate::mumps::piece(vendor0, "^", 7);
-            if !state.is_empty() && !resolves(world_a, "DIC", "5", &crate::mumps::num(state)) {
-                fail(format!(
-                    "vendor {vendor} state {state} does not resolve in file 5"
-                ));
-            }
+    // The `.01` cross-references file the number itself in `B` and its
+    // second `-` piece in `C`, each under the order's IEN [DD.zwr:514316,
+    // 514319].
+    let number = value(ORDER_NUMBER);
+    for (index, own) in [("B", number), ("C", crate::mumps::piece(number, "-", 2))] {
+        for violation in index_entry_violations(world_b, index, number, own, ien) {
+            fail(violation);
         }
     }
-    let node7 = world_b.get_or_empty(&under(&order, &["7"]));
-    let status = crate::mumps::piece(&node7, "^", 1);
+    let vendor = value(ORDER_VENDOR);
+    let vendor_record = key("PRC", &["440", vendor]);
+    if world_a.get(&under(&vendor_record, &["0"])).is_none() {
+        fail(format!(
+            "vendor {} does not resolve in file 440",
+            tag_value(vendor)
+        ));
+    } else {
+        if field_value(world_a, &vendor_record, VENDOR_EDI) == "Y" {
+            fail(format!("vendor {vendor} is an EDI vendor"));
+        }
+        let state = field_value(world_a, &vendor_record, VENDOR_STATE);
+        if !state.is_empty() && !resolves(world_a, "DIC", "5", &crate::mumps::num(state)) {
+            fail(format!(
+                "vendor {vendor} state {state} does not resolve in file 5"
+            ));
+        }
+    }
+    let status = value(ORDER_STATUS);
     if !resolves(world_a, "PRCD", "442.3", status) {
         fail(format!(
             "status {} does not resolve in file 442.3",
             tag_value(status)
         ));
     }
-    if !crate::mumps::piece(&node7, "^", 3).is_empty() {
-        fail("field .08, node 7 piece 3, is not empty".to_string());
+    if !value(ORDER_ESTIMATED_ORDER).is_empty() {
+        fail(format!(
+            "field .08, node {} piece {}, is not empty",
+            ORDER_ESTIMATED_ORDER.node, ORDER_ESTIMATED_ORDER.piece
+        ));
     }
-    let items = under(&order, &["2"]);
+    let items = under(&order, &[ORDER_ITEMS]);
     let entries = numeric_children(world_b, &items);
     if entries.is_empty() {
         fail("the order has no item".to_string());
@@ -2788,45 +3117,53 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
     }
     for j in &entries {
         let item = under(&items, &[j]);
-        let Some(item0) = world_b.get(&under(&item, &["0"])) else {
+        if world_b.get(&under(&item, &["0"])).is_none() {
             fail(format!("item {j} has no zero node"));
             continue;
-        };
-        let lines = numeric_children(world_b, &under(&item, &["1"]));
-        let desc = world_b.get_or_empty(&under(&item, &["1", "1", "0"]));
-        let header_present = world_b.get(&under(&item, &["1", "0"])).is_some();
+        }
+        let lines = numeric_children(world_b, &under(&item, &[ITEM_DESCRIPTION]));
+        let desc = world_b.get_or_empty(&under(&item, &[ITEM_DESCRIPTION, "1", "0"]));
+        let header_present = world_b
+            .get(&under(&item, &[ITEM_DESCRIPTION, "0"]))
+            .is_some();
         if !header_present || lines != ["1"] || desc.chars().count() > 32 || desc.contains('|') {
             fail(format!(
                 "item {j} description is not one line of at most 32 characters without |"
             ));
         }
-        match world_b.get(&under(&item, &["2"])) {
-            None => fail(format!("item {j} node 2 is absent")),
-            Some(node2) => {
-                for field in [2, 8, 9, 11] {
-                    if !crate::mumps::piece(node2, "^", field).is_empty() {
-                        fail(format!("item {j} node 2 piece {field} is not empty"));
-                    }
+        if world_b.get(&under(&item, &["2"])).is_none() {
+            fail(format!("item {j} node 2 is absent"));
+        } else {
+            for field in [
+                ITEM_CONTRACT,
+                ITEM_RECEIVED,
+                ITEM_EDI_STATUS_1,
+                ITEM_EDI_STATUS_2,
+            ] {
+                if !field_value(world_b, &item, field).is_empty() {
+                    fail(format!(
+                        "item {j} node {} piece {} is not empty",
+                        field.node, field.piece
+                    ));
                 }
             }
         }
         if world_b.data(&under(&item, &["3"])) != 0 {
             fail(format!("item {j} node 3 is present"));
         }
-        let unit = crate::mumps::piece(item0, "^", 3);
+        let unit = field_value(world_b, &item, ITEM_UNIT);
         if !unit.is_empty() && !resolves(world_a, "PRCD", "420.5", unit) {
             fail(format!(
                 "item {j} unit {unit} does not resolve in file 420.5"
             ));
         }
-        let nsn = crate::mumps::piece(item0, "^", 13);
+        let nsn = field_value(world_b, &item, ITEM_NSN);
         if !nsn.is_empty() && !is_nsn(nsn) {
             fail(format!(
                 "item {j} NSN {nsn} is not 4N-2UN-3UN-4N with at most one more UN character"
             ));
         }
-        let node4 = world_b.get_or_empty(&under(&item, &["4"]));
-        let food = crate::mumps::piece(&node4, "^", 12);
+        let food = field_value(world_b, &item, ITEM_FOOD_GROUP);
         if !food.is_empty() && !is_food_group(food) {
             fail(format!(
                 "item {j} FOOD GROUP {food} is not a code 1 to {FOOD_GROUPS}"
@@ -2836,11 +3173,11 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
     if world_b.data(&key("PRC", &["442.8", "B"])) != 0 {
         fail("the file 442.8 index B holds entries".to_string());
     }
-    let service = crate::mumps::piece(node1, "^", 2);
+    let service = value(ORDER_SERVICE);
     if !service.is_empty() && !resolves(world_a, "DIC", "49", service) {
         fail(format!("service {service} does not resolve in file 49"));
     }
-    let ship_to = crate::mumps::piece(node1, "^", 3);
+    let ship_to = value(ORDER_SHIP_TO);
     if !ship_to.is_empty()
         && world_a
             .get(&key("PRC", &["411", STATION, "1", ship_to, "0"]))
@@ -2850,22 +3187,26 @@ pub fn profile_violations(world_a: &Store, world_b: &Store, ien: &str) -> Vec<St
             "ship-to {ship_to} does not resolve under station {STATION}"
         ));
     }
-    let source = crate::mumps::piece(node1, "^", 7);
+    let source = value(ORDER_SOURCE);
     if !source.is_empty() && !resolves(world_a, "PRCD", "420.8", source) {
         fail(format!(
             "source code {source} does not resolve in file 420.8"
         ));
     }
-    let authorities = under(&order, &["14"]);
+    let authorities = under(&order, &[ORDER_AUTHORITIES]);
     for j in numeric_children(world_b, &authorities) {
         let authority = world_b.get_or_empty(&under(&authorities, &[&j, "0"]));
         if !resolves(world_a, "PRC", "442.4", &authority) {
             fail(format!("authority {j} does not resolve in file 442.4"));
         }
     }
-    let agent = crate::mumps::piece(node1, "^", 10);
-    if !(agent.is_empty() || (agent == ".5" && resolves(world_a, "VA", "200", ".5"))) {
-        fail(format!("agent {agent} is not .5 or empty"));
+    let agent = value(ORDER_AGENT);
+    if !agent.is_empty() {
+        if agent != ".5" {
+            fail(format!("agent {agent} is not .5 or empty"));
+        } else if !resolves(world_a, "VA", "200", agent) {
+            fail(format!("agent {agent} does not resolve in file 200"));
+        }
     }
     out
 }
@@ -2892,8 +3233,7 @@ pub fn order_worst_y(world_b: &Store, ien: &str) -> usize {
             (details, usize::from(item.per))
         })
         .collect();
-    let shipping =
-        crate::mumps::num_cmp(crate::mumps::piece(&facts.node0, "^", 13), "0") == Ordering::Greater;
+    let shipping = crate::mumps::num_cmp(facts.field(ORDER_SHIPPING), "0") == Ordering::Greater;
     worst_y(&shapes, shipping)
 }
 
@@ -2911,18 +3251,46 @@ fn string_children(store: &Store, parent: &[Sub]) -> Vec<String> {
 }
 
 /// The non-prefix rule over the `C` values of `world_b`, the GC values
-/// included: all are distinct and none is a prefix of another. Each corpus
-/// value, one world A's `C` index does not hold, must also be neither a
-/// prefix nor an extension of, nor equal to, any subscript of a world A
-/// file 442 index whose name collates at or after `C`. No `C` value may
-/// begin with one of [`MISS_STRINGS`], as written or in upper case.
+/// included: each indexes exactly one order, an IEN with a zero node in
+/// file 442 whose `.01` files it under that value, the second `-` piece of
+/// the `.01` being the value [DD.zwr:514319], through an entry
+/// `^PRC(442,"C",value,ien)` that is exactly `=""`, the empty value with no
+/// descendants, so no two orders share a value and no order is filed under
+/// a value other than its own; and none is a prefix of another. The
+/// one-order rule reads each value once, with the `.01` of its order and
+/// its one entry, so its cost grows linearly with the values.
+/// Each corpus value, one world A's `C` index does not hold, must also be
+/// neither a prefix nor an extension of, nor equal to, any subscript of a
+/// world A file 442 index whose name collates at or after `C`. No `C` value
+/// may begin with one of [`MISS_STRINGS`], as written or in upper case.
 pub fn c_value_violations(world_a: &Store, world_b: &Store) -> Vec<String> {
     let mut out = Vec::new();
-    let c_values = child_texts(world_b, &key("PRC", &["442", "C"]));
-    let mut seen = BTreeSet::new();
+    let c_index = key("PRC", &["442", "C"]);
+    let c_values = child_texts(world_b, &c_index);
     for value in &c_values {
-        if !seen.insert(value.as_str()) {
-            out.push(format!("C value {value} appears twice"));
+        let iens = child_texts(world_b, &under(&c_index, &[value]));
+        let orders = iens
+            .iter()
+            .filter(|ien| world_b.get(&key("PRC", &["442", ien, "0"])).is_some())
+            .count();
+        if iens.len() != 1 || orders != 1 {
+            out.push(format!(
+                "C value {value} holds {}, not exactly one file 442 order",
+                ien_list(&iens)
+            ));
+        } else if let Some(ien) = iens.first() {
+            let number = field_value(world_b, &key("PRC", &["442", ien]), ORDER_NUMBER);
+            let own = crate::mumps::piece(number, "-", 2);
+            if own != value.as_str() {
+                out.push(format!(
+                    "C value {value} holds {ien}, whose field .01 {} gives C value {}",
+                    tag_value(number),
+                    tag_value(own)
+                ));
+            }
+            if let Some(found) = index_leaf_violation(world_b, "C", value, ien) {
+                out.push(format!("C value {value} {found}"));
+            }
         }
     }
     for (at, first) in c_values.iter().enumerate() {
@@ -2985,35 +3353,37 @@ fn presence(present: bool) -> String {
 /// The order row labels of one world B order, as the rotation lists name
 /// them.
 fn order_labels(facts: &OrderFacts) -> Vec<(&'static str, String)> {
-    let p0 = |field: usize| crate::mumps::piece(&facts.node0, "^", field).to_string();
-    let p1 = |field: usize| crate::mumps::piece(&facts.node1, "^", field).to_string();
-    let verbal = match (p1(4).as_str(), p1(5).as_str()) {
+    let value = |field: Field| facts.field(field).to_string();
+    let verbal = match (facts.field(ORDER_VERBAL), facts.field(ORDER_CONFIRMATION)) {
         ("Y", "") => "verbal",
         ("Y", "Y") => "confirmation",
         ("", "") => "",
         _ => "other",
     };
     vec![
-        (
-            "status",
-            crate::mumps::piece(&facts.node7, "^", 1).to_string(),
-        ),
+        ("status", value(ORDER_STATUS)),
         ("type", facts.order_type.clone()),
-        ("source", p1(7)),
-        ("mop", p0(2)),
-        ("vendor", p1(1)),
-        ("service", p1(2)),
-        ("shipto", p1(3)),
-        ("delivery", presence(!p1(11).is_empty())),
+        ("source", value(ORDER_SOURCE)),
+        ("mop", value(ORDER_MOP)),
+        ("vendor", value(ORDER_VENDOR)),
+        ("service", value(ORDER_SERVICE)),
+        ("shipto", value(ORDER_SHIP_TO)),
+        (
+            "delivery",
+            presence(!facts.field(ORDER_DELIVERY_LOCATION).is_empty()),
+        ),
         ("verbal", verbal.to_string()),
-        ("fob", p1(6)),
-        ("proposal", p1(8).chars().count().to_string()),
+        ("fob", value(ORDER_FOB)),
+        (
+            "proposal",
+            facts.field(ORDER_PROPOSAL).chars().count().to_string(),
+        ),
         ("authority", facts.authorities.to_string()),
-        ("date", p0(10)),
-        ("app", p0(4).chars().count().to_string()),
-        ("agent", p1(10)),
-        ("total", p0(15)),
-        ("shipping", p0(13)),
+        ("date", value(ORDER_DELIVERY_DATE)),
+        ("app", facts.field(ORDER_APP).chars().count().to_string()),
+        ("agent", value(ORDER_AGENT)),
+        ("total", value(ORDER_TOTAL)),
+        ("shipping", value(ORDER_SHIPPING)),
     ]
 }
 
@@ -3131,12 +3501,27 @@ impl Tally<'_> {
 /// exempt from its minimum, and a minimum over distinct values falls by one
 /// per dropped value of its dimension that the distinct count includes: the
 /// empty service and unit, which their distinct counts exclude, relax only
-/// their own minimums. The item counts must be exact.
+/// their own minimums. The item counts must be exact. The date minimums
+/// count the delivery date, node 0 piece 10. Both date fields take the same
+/// date, so every order's P.O. date, node 1 piece 15, must equal its
+/// delivery date, and the date minimums then hold for both fields: a P.O.
+/// date that differs, an empty one included, is a violation naming the
+/// order, both fields and both values.
 pub fn minimum_violations(world_a: &Store, world_b: &Store, corpus: &Corpus) -> Vec<String> {
-    let refs = match References::read(world_a) {
-        Ok(refs) => refs,
-        Err(error) => return vec![error.to_string()],
-    };
+    match References::read(world_a) {
+        Ok(refs) => minimum_violations_with_refs(&refs, world_a, world_b, corpus),
+        Err(error) => vec![error.to_string()],
+    }
+}
+
+/// The checks of [`minimum_violations`], with the reference lists `refs`
+/// already read from `world_a`, so that [`generate`] reads them once.
+fn minimum_violations_with_refs(
+    refs: &References,
+    world_a: &Store,
+    world_b: &Store,
+    corpus: &Corpus,
+) -> Vec<String> {
     let facts: Vec<OrderFacts> = corpus
         .records
         .iter()
@@ -3197,7 +3582,7 @@ pub fn minimum_violations(world_a: &Store, world_b: &Store, corpus: &Corpus) -> 
     if tally.drops_in("vendor") == 0 {
         let held: Vec<Vec<bool>> = facts
             .iter()
-            .map(|order| vendor_properties(world_a, crate::mumps::piece(&order.node1, "^", 1)))
+            .map(|order| vendor_properties(world_a, order.field(ORDER_VENDOR)))
             .collect();
         for (index, property) in vendor_property_names().into_iter().enumerate() {
             let found = held
@@ -3240,6 +3625,24 @@ pub fn minimum_violations(world_a: &Store, world_b: &Store, corpus: &Corpus) -> 
             .any(|date| matches(date) && tally.count("date", date) > 0);
         if listed && !used {
             tally.out.push(format!("date: no order has {shape}"));
+        }
+    }
+    // Both date fields take the plan's one date, so the tally of the
+    // delivery date holds for the P.O. date once every order's two agree.
+    for (record, order) in corpus.records.iter().zip(&facts) {
+        let po_date = order.field(ORDER_DATE);
+        let delivery_date = order.field(ORDER_DELIVERY_DATE);
+        if po_date != delivery_date {
+            tally.out.push(format!(
+                "date: order {} P.O. date {};{} {} differs from its delivery date {};{} {}",
+                record.ien,
+                ORDER_DATE.node,
+                ORDER_DATE.piece,
+                tag_value(po_date),
+                ORDER_DELIVERY_DATE.node,
+                ORDER_DELIVERY_DATE.piece,
+                tag_value(delivery_date)
+            ));
         }
     }
     tally.distinct("app", 4, |_| true);
