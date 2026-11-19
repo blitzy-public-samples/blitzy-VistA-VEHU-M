@@ -1593,12 +1593,14 @@ fn read_corpus_text(dir: &Path, name: &'static str) -> Result<Option<String>, St
 }
 
 /// The text of corpus case `case_id`'s `input.txt` under `corpus_dir`,
-/// exactly as stored, never touching its `transcript.txt`. It is `Err`, as
-/// `<path>: <cause>`, when the id is not one of [`corpus_case_ids`], the
-/// case folder or the file is missing, the file is unreadable, over its
-/// 1 MiB budget, not UTF-8 or holds a `\r`, it is empty, or the last of
-/// its [`split_input_lines`] does not begin with `^`: every corpus session
-/// ends with a caret-prefixed exit, `SPEC.md` "Exit input" (PO-09.b3). The
+/// exactly as stored, never touching its `transcript.txt`. It is `Err` as
+/// `<id>: not a corpus case id` when the id is not one of
+/// [`corpus_case_ids`]. It is `Err` as `<path>: <cause>`, naming the folder
+/// or file at fault, when the case folder is missing or cannot be
+/// inspected, the file is missing, unreadable, over its 1 MiB budget, not
+/// UTF-8 or holds a `\r`, it is empty, or the last of its
+/// [`split_input_lines`] does not begin with `^`: every corpus session ends
+/// with a caret-prefixed exit, `SPEC.md` "Exit input" (PO-09.b3). The
 /// five-case check that the last input is exactly [`EXIT_INPUT`] does not
 /// apply, since an edge case may exit with `^FOO`.
 pub fn read_corpus_input(corpus_dir: &Path, case_id: &str) -> Result<String, String> {
@@ -1651,18 +1653,81 @@ pub struct CorpusCase {
 /// with its errors. A missing `transcript.txt` leaves the case unrecorded;
 /// a present one must be readable within its 1 MiB budget, UTF-8, free of
 /// `\r` and not empty, else the case is `Err` as `<path>: <cause>`.
+///
+/// When recording evidence exists, a present `transcript.txt` or a
+/// `SHA256SUMS` in `corpus_dir`, the very text returned is bound to that
+/// listing, so that a file replaced after [`load_corpus_run`] verified the
+/// run never reaches a verdict unhashed. `SHA256SUMS` is read once, within
+/// its 64 KiB budget, UTF-8 and free of `\r`, and each of its lines must
+/// pass the line rules of [`load_corpus_run`], with every id of
+/// [`corpus_case_ids`] allowed; a line that fails is the same `Err` that
+/// function gives. Then, each `Err` as `<path>: <cause>`:
+///
+/// - a missing `SHA256SUMS` has the cause `missing`;
+/// - a present transcript not listed as `<id>/transcript.txt` has the
+///   cause `not listed in SHA256SUMS`, and a listed one that is absent
+///   `listed in SHA256SUMS but missing`;
+/// - the returned transcript, and the returned input text when
+///   `<id>/input.txt` is listed, must have the listed SHA-256
+///   ([`sha256_hex`]) of their raw bytes, else the cause is
+///   `SHA-256 differs from SHA256SUMS`. An unlisted input is accepted, as
+///   [`load_corpus_run`] verifies only the files listed.
+///
+/// With neither, `SHA256SUMS` is not read and the case is unrecorded.
 pub fn load_corpus_case(corpus_dir: &Path, case_id: &str) -> Result<CorpusCase, String> {
-    let inputs = split_input_lines(&read_corpus_input(corpus_dir, case_id)?);
+    let input = read_corpus_input(corpus_dir, case_id)?;
     let case_dir = corpus_dir.join(case_id);
     let transcript = read_corpus_text(&case_dir, TRANSCRIPT)?;
     if transcript.as_deref() == Some("") {
         return Err(format!("{}: empty", case_dir.join(TRANSCRIPT).display()));
     }
+    if transcript.is_some() || exists(&corpus_dir.join(SHA256SUMS)) {
+        bind_case_to_sums(corpus_dir, case_id, &input, transcript.as_deref())?;
+    }
     Ok(CorpusCase {
         id: case_id.to_string(),
-        inputs,
+        inputs: split_input_lines(&input),
         transcript,
     })
+}
+
+/// Binds corpus case `case_id`'s `input` text and `transcript`, the very
+/// text [`load_corpus_case`] returns, to the `SHA256SUMS` of `corpus_dir`
+/// by the rules that function states. The listing is read once here and
+/// walked by [`walk_sha256sums`] with every corpus id allowed. Only the
+/// case's own `input.txt` and `transcript.txt` lines are compared, each
+/// with the digest of the text in hand, so no case file is read again.
+fn bind_case_to_sums(
+    corpus_dir: &Path,
+    case_id: &str,
+    input: &str,
+    transcript: Option<&str>,
+) -> Result<(), String> {
+    let sums_text = read_run_file(corpus_dir, SHA256SUMS)?;
+    let mut transcript_listed = false;
+    walk_sha256sums(corpus_dir, &sums_text, corpus_case_known, |line| {
+        let file_path = || line.member.dir.join(line.member.name).display().to_string();
+        let held = match line.listed.split_once('/') {
+            Some((id, INPUT)) if id == case_id => input,
+            Some((id, TRANSCRIPT)) if id == case_id => {
+                transcript_listed = true;
+                transcript
+                    .ok_or_else(|| format!("{}: listed in SHA256SUMS but missing", file_path()))?
+            }
+            _ => return Ok(()),
+        };
+        if sha256_hex(held.as_bytes()) != line.digest {
+            return Err(format!("{}: SHA-256 differs from SHA256SUMS", file_path()));
+        }
+        Ok(())
+    })?;
+    if transcript.is_some() && !transcript_listed {
+        return Err(format!(
+            "{}: not listed in SHA256SUMS",
+            corpus_dir.join(case_id).join(TRANSCRIPT).display()
+        ));
+    }
+    Ok(())
 }
 
 /// One parsed corpus `meta.txt`: each of the [`CORPUS_META_KEYS`] exactly
@@ -1960,13 +2025,13 @@ struct RunMember<'a> {
 
 /// The file the `SHA256SUMS` path `listed` names, when it is one the run
 /// may list: `BASE.txt`, `meta.txt` or `run-summary.txt` in `corpus_dir`,
-/// or `input.txt` or `transcript.txt` in the folder of an id of
-/// `case_ids`. Any other path, such as an absolute one, one through `..`
-/// or one starting `./`, is `None`.
+/// or `input.txt` or `transcript.txt` in the folder of an id `known`
+/// accepts. Any other path, such as an absolute one, one through `..` or
+/// one starting `./`, is `None`.
 fn run_member<'a>(
     corpus_dir: &Path,
     listed: &'a str,
-    case_ids: &HashSet<&str>,
+    known: impl Fn(&str) -> bool,
 ) -> Option<RunMember<'a>> {
     let run_file = |name: &'static str| RunMember {
         dir: corpus_dir.to_path_buf(),
@@ -1980,7 +2045,7 @@ fn run_member<'a>(
         _ => {}
     }
     let (id, file) = listed.split_once('/')?;
-    if !case_ids.contains(id) {
+    if !known(id) {
         return None;
     }
     let dir = corpus_dir.join(id);
@@ -1999,22 +2064,32 @@ fn run_member<'a>(
     }
 }
 
-/// Verifies `text`, the `SHA256SUMS` of `corpus_dir`, by the rules of
-/// [`load_corpus_run`] for the cases `case_ids`, and gives the ids whose
-/// transcript it lists. `retained` pairs each run file the caller has
-/// already read and parsed with that text: a listed path equal to one of
-/// those names is hashed from that very text and never read again, so the
-/// digest covers the bytes the caller parsed. Every other listed file is
-/// read here. Blank lines are ignored, and line numbers are 1-based.
-fn verify_sha256sums<'a>(
+/// One `SHA256SUMS` line that passed the line rules of [`walk_sha256sums`].
+struct SumsLine<'a> {
+    /// The listed SHA-256: 64 lower-case hex digits.
+    digest: &'a str,
+    /// The path exactly as listed, relative to the corpus folder.
+    listed: &'a str,
+    /// The file that path names.
+    member: RunMember<'a>,
+}
+
+/// Walks `text`, the `SHA256SUMS` of `corpus_dir`, and hands each line that
+/// passes the line rules to `visit`, in file order, stopping at the first
+/// `Err`, its own or `visit`'s. This is the one home of the line rules that
+/// [`load_corpus_run`] and [`load_corpus_case`] both apply: blank lines are
+/// ignored, and every other line is 64 lower-case hex digits, two spaces or
+/// a space and `*`, and a path [`run_member`] allows, `known` judging its
+/// case id, listed once. A line that breaks a rule is `Err` as
+/// `<SHA256SUMS path>: line <n>: <cause>`, with `n` 1-based.
+fn walk_sha256sums<'a>(
     corpus_dir: &Path,
     text: &'a str,
-    case_ids: &HashSet<&str>,
-    retained: &[(&str, &str)],
-) -> Result<HashSet<&'a str>, String> {
+    known: impl Fn(&str) -> bool,
+    mut visit: impl FnMut(SumsLine<'a>) -> Result<(), String>,
+) -> Result<(), String> {
     let sums_path = corpus_dir.join(SHA256SUMS).display().to_string();
     let mut listed: HashSet<&str> = HashSet::new();
-    let mut transcripts: HashSet<&str> = HashSet::new();
     for (index, line) in text.split('\n').enumerate() {
         let number = index.saturating_add(1);
         if line.trim().is_empty() {
@@ -2031,28 +2106,60 @@ fn verify_sha256sums<'a>(
                 "{sums_path}: line {number}: not a SHA-256 digest and path"
             ));
         };
-        let Some(member) = run_member(corpus_dir, listed_path, case_ids) else {
+        let Some(member) = run_member(corpus_dir, listed_path, &known) else {
             return Err(format!("{sums_path}: line {number}: path not allowed"));
         };
         if !listed.insert(listed_path) {
             return Err(format!("{sums_path}: line {number}: path listed twice"));
         }
-        let file_path = member.dir.join(member.name).display().to_string();
-        let content = match retained.iter().find(|(name, _)| *name == listed_path) {
-            Some(&(_, kept)) => std::borrow::Cow::Borrowed(kept),
-            None => match read_corpus_text(&member.dir, member.name)? {
-                Some(read) => std::borrow::Cow::Owned(read),
-                None => return Err(format!("{file_path}: listed in SHA256SUMS but missing")),
-            },
-        };
-        if member.transcript_of.is_some() && content.is_empty() {
-            return Err(format!("{file_path}: empty"));
-        }
-        if sha256_hex(content.as_bytes()) != digest {
-            return Err(format!("{file_path}: SHA-256 differs from SHA256SUMS"));
-        }
-        transcripts.extend(member.transcript_of);
+        visit(SumsLine {
+            digest,
+            listed: listed_path,
+            member,
+        })?;
     }
+    Ok(())
+}
+
+/// Verifies `text`, the `SHA256SUMS` of `corpus_dir`, by the rules of
+/// [`load_corpus_run`] for the cases `case_ids`, and gives the ids whose
+/// transcript it lists. Its lines are walked by [`walk_sha256sums`] with
+/// the ids of `case_ids` allowed. `retained` pairs each run file the caller
+/// has already read and parsed with that text: a listed path equal to one
+/// of those names is hashed from that very text and never read again, so
+/// the digest covers the bytes the caller parsed. Every other listed file
+/// is read here.
+fn verify_sha256sums<'a>(
+    corpus_dir: &Path,
+    text: &'a str,
+    case_ids: &HashSet<&str>,
+    retained: &[(&str, &str)],
+) -> Result<HashSet<&'a str>, String> {
+    let mut transcripts: HashSet<&str> = HashSet::new();
+    walk_sha256sums(
+        corpus_dir,
+        text,
+        |id| case_ids.contains(id),
+        |line| {
+            let member = line.member;
+            let file_path = member.dir.join(member.name).display().to_string();
+            let content = match retained.iter().find(|(name, _)| *name == line.listed) {
+                Some(&(_, kept)) => std::borrow::Cow::Borrowed(kept),
+                None => match read_corpus_text(&member.dir, member.name)? {
+                    Some(read) => std::borrow::Cow::Owned(read),
+                    None => return Err(format!("{file_path}: listed in SHA256SUMS but missing")),
+                },
+            };
+            if member.transcript_of.is_some() && content.is_empty() {
+                return Err(format!("{file_path}: empty"));
+            }
+            if sha256_hex(content.as_bytes()) != line.digest {
+                return Err(format!("{file_path}: SHA-256 differs from SHA256SUMS"));
+            }
+            transcripts.extend(member.transcript_of);
+            Ok(())
+        },
+    )?;
     Ok(transcripts)
 }
 
@@ -2075,71 +2182,90 @@ const SHA256_H0: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
+/// One SHA-256 compression of `block` into `state`, FIPS 180-4 section
+/// 6.2.2: the 64-word message schedule, the 64 rounds over [`SHA256_K`],
+/// then the working variables added back into `state`. The schedule is a
+/// fixed array on the stack, so compressing a block allocates nothing.
+fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    let mut schedule = [0u32; 64];
+    for (slot, word) in schedule.iter_mut().zip(block.as_chunks::<4>().0) {
+        *slot = u32::from_be_bytes(*word);
+    }
+    for t in 16usize..64 {
+        let back = |distance: usize| {
+            schedule
+                .get(t.wrapping_sub(distance))
+                .copied()
+                .unwrap_or_default()
+        };
+        let (w2, w7, w15, w16) = (back(2), back(7), back(15), back(16));
+        let sigma0 = w15.rotate_right(7) ^ w15.rotate_right(18) ^ (w15 >> 3);
+        let sigma1 = w2.rotate_right(17) ^ w2.rotate_right(19) ^ (w2 >> 10);
+        if let Some(slot) = schedule.get_mut(t) {
+            *slot = w16
+                .wrapping_add(sigma0)
+                .wrapping_add(w7)
+                .wrapping_add(sigma1);
+        }
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    for (constant, word) in SHA256_K.iter().zip(&schedule) {
+        let big_sigma1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let choose = (e & f) ^ (!e & g);
+        let temp1 = h
+            .wrapping_add(big_sigma1)
+            .wrapping_add(choose)
+            .wrapping_add(*constant)
+            .wrapping_add(*word);
+        let big_sigma0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let majority = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = big_sigma0.wrapping_add(majority);
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+    for (word, add) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+        *word = word.wrapping_add(add);
+    }
+}
+
 /// The SHA-256 digest of `bytes`, FIPS 180-4, as 64 lower-case hex digits:
 /// the digest `shasum -a 256` prints, with which [`load_corpus_run`]
 /// verifies a `SHA256SUMS` listing.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    // Padding: one 1 bit, zeros up to 56 bytes past a block boundary, then
-    // the message length in bits as a big-endian 64-bit number.
-    let mut message = bytes.to_vec();
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&(bytes.len() as u64).wrapping_mul(8).to_be_bytes());
     let mut state = SHA256_H0;
     // Fixed-size `as_chunks` rather than `chunks_exact`, which clippy's
-    // `chunks_exact_to_as_chunks` rejects for a constant size. The padding
-    // leaves no remainder, and the words need neither indexing nor a fallible
-    // conversion.
-    for block in message.as_chunks::<64>().0 {
-        let mut schedule: Vec<u32> = block
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|word| u32::from_be_bytes(*word))
-            .collect();
-        while schedule.len() < 64 {
-            let t = schedule.len();
-            let back = |distance: usize| {
-                schedule
-                    .get(t.wrapping_sub(distance))
-                    .copied()
-                    .unwrap_or_default()
-            };
-            let (w2, w7, w15, w16) = (back(2), back(7), back(15), back(16));
-            let sigma0 = w15.rotate_right(7) ^ w15.rotate_right(18) ^ (w15 >> 3);
-            let sigma1 = w2.rotate_right(17) ^ w2.rotate_right(19) ^ (w2 >> 10);
-            schedule.push(
-                w16.wrapping_add(sigma0)
-                    .wrapping_add(w7)
-                    .wrapping_add(sigma1),
-            );
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
-        for (constant, word) in SHA256_K.iter().zip(&schedule) {
-            let big_sigma1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let choose = (e & f) ^ (!e & g);
-            let temp1 = h
-                .wrapping_add(big_sigma1)
-                .wrapping_add(choose)
-                .wrapping_add(*constant)
-                .wrapping_add(*word);
-            let big_sigma0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let majority = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = big_sigma0.wrapping_add(majority);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        for (word, add) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *word = word.wrapping_add(add);
-        }
+    // `chunks_exact_to_as_chunks` rejects for a constant size. The complete
+    // blocks are compressed straight from the borrowed `bytes`, so the
+    // message is never copied, and the words need neither indexing nor a
+    // fallible conversion.
+    let (blocks, rest) = bytes.as_chunks::<64>();
+    for block in blocks {
+        sha256_compress(&mut state, block);
+    }
+    // Padding, of the remainder of fewer than 64 bytes only: the remainder,
+    // one 1 bit, zeros up to 56 bytes past a block boundary, then the
+    // message length in bits as a big-endian 64-bit number. That fills one
+    // tail block when the remainder is shorter than 56 bytes and two
+    // otherwise, so the zeroed scratch holds two blocks.
+    let tail_blocks = if rest.len() < 56 { 1 } else { 2 };
+    let mut tail = [0u8; 128];
+    let padded = rest.iter().copied().chain(std::iter::once(0x80));
+    for (slot, byte) in tail.iter_mut().zip(padded) {
+        *slot = byte;
+    }
+    let bit_length = (bytes.len() as u64).wrapping_mul(8).to_be_bytes();
+    let length_at = tail_blocks * 64 - 8;
+    for (slot, byte) in tail.iter_mut().skip(length_at).zip(bit_length) {
+        *slot = byte;
+    }
+    for block in tail.as_chunks::<64>().0.iter().take(tail_blocks) {
+        sha256_compress(&mut state, block);
     }
     let mut hex = String::with_capacity(64);
     for word in state {
