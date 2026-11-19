@@ -17,10 +17,14 @@
 //! that `ifcap_po_inquiry::corpus` shares with the generator. The profile,
 //! `C` value, variation and paging tests also recheck selected rules on
 //! their own from the world B nodes. The variation test recounts only some
-//! dimensions; the others (source, delivery location, verbal or
+//! dimensions; for the others (source, delivery location, verbal or
 //! confirmation, FOB, proposal, APP, the vendor properties, the P.O. date
-//! and most item dimensions) rest on `corpus::minimum_violations` alone. A
-//! test reports every violation it finds, not only the first.
+//! and every item dimension but the unit cost) it builds malformed copies
+//! of the corpus in memory, each breaking one of those minimums, and
+//! requires `corpus::minimum_violations` to report that minimum and only
+//! the violations listed for that copy; the one-vendor copy also breaks,
+//! and lists, the distinct-vendor minimum. A test reports every violation
+//! it finds, not only the first.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -621,7 +625,10 @@ fn row_differences(row: &Row, case: &corpus::CaseEntry) -> Vec<String> {
 /// itself returned, which the End and BOUNDARY rules check again. A row
 /// tagged `finding=<id>` passes only as `Implemented(id)` at its expected
 /// branch; otherwise CP, IN and CR rows must end and BOUNDARY rows must halt
-/// at their expected not-implemented branch.
+/// at their expected not-implemented branch. Besides the committed rows, it
+/// judges the synthetic rows of `classifier_probes` against their in-memory
+/// sessions, which reach the finding and failure rules no committed case
+/// reaches.
 fn judge(
     row: &Row,
     outcome: &corpus::Outcome,
@@ -700,10 +707,255 @@ fn judge(
     }
 }
 
+/// A branch that `SPEC.md` "Branch inventory" lists as exercised, so
+/// implemented: the halt of the in-memory finding probes.
+const IMPLEMENTED_BRANCH: &str = "PO-09.b8";
+
+/// A second exercised branch, whose finding tag must not accept a halt at
+/// `IMPLEMENTED_BRANCH`.
+const OTHER_IMPLEMENTED_BRANCH: &str = "PO-09.b3";
+
+/// A not-implemented branch other than `LOOKUP_BRANCH`: the wrong expected
+/// branch of a BOUNDARY probe.
+const OTHER_LOOKUP_BRANCH: &str = "PO-09.b6";
+
+/// What a probe requires of `corpus::classify`.
+#[derive(Debug)]
+enum Expect {
+    /// Exactly this outcome.
+    Exactly(corpus::Outcome),
+    /// A `Failure` with any cause text, so the gate does not pin the
+    /// classifier's wording.
+    AnyFailure,
+}
+
+impl Expect {
+    /// Whether `outcome` meets the expectation.
+    fn admits(&self, outcome: &corpus::Outcome) -> bool {
+        match self {
+            Expect::Exactly(expected) => outcome == expected,
+            Expect::AnyFailure => matches!(outcome, corpus::Outcome::Failure(_)),
+        }
+    }
+}
+
+/// One in-memory session of the classifier probes: its label, the session,
+/// the exact transcript length it needs (checked before it is classified),
+/// what `corpus::classify` must give, and synthetic rows, each with whether
+/// `judge` must accept it.
+struct Probe {
+    label: &'static str,
+    run: corpus::CaseRun,
+    bytes: Option<usize>,
+    expect: Expect,
+    rows: Vec<(Row, bool)>,
+}
+
+/// A synthetic manifest row of `class`, tagged `tags` and expecting
+/// `expected_branch`, with the manifest's seed and no order.
+fn probe_row(class: &str, tags: &[&str], expected_branch: &str) -> Row {
+    Row {
+        case: "probe".to_string(),
+        class: class.to_string(),
+        seed: SEED_DECIMAL.to_string(),
+        order_ien: String::new(),
+        c_value: String::new(),
+        item_count: String::new(),
+        tags: tags.iter().copied().map(str::to_string).collect(),
+        expected_branch: expected_branch.to_string(),
+    }
+}
+
+/// A session that wrote `transcript` and halted at `branch`, with `error`.
+fn session(
+    transcript: String,
+    branch: Option<&'static str>,
+    error: Option<&str>,
+) -> corpus::CaseRun {
+    corpus::CaseRun {
+        transcript,
+        branch,
+        error: error.map(str::to_string),
+    }
+}
+
+/// A transcript of `bytes` bytes, `x` repeated and then `EXIT_TAIL`; below
+/// the tail's length it is the tail alone, which the probe's length check
+/// reports.
+fn sized_transcript(bytes: usize) -> String {
+    let mut text = "x".repeat(bytes.saturating_sub(EXIT_TAIL.len()));
+    text.push_str(EXIT_TAIL);
+    text
+}
+
+/// Whether `SPEC.md` "### Branch inventory" has a row for branch `id`, read
+/// as `corpus::ne_branches` reads the table: the lines from that heading to
+/// the next, each row a line beginning `| PO-` whose first cell is its ID.
+fn inventory_lists(id: &str) -> bool {
+    SPEC.lines()
+        .skip_while(|line| line.trim_end() != "### Branch inventory")
+        .skip(1)
+        .take_while(|line| !line.starts_with('#'))
+        .filter(|line| line.starts_with("| PO-"))
+        .filter_map(|line| line.strip_prefix('|'))
+        .filter_map(|cells| cells.split_once('|'))
+        .any(|(first, _)| first.trim() == id)
+}
+
+/// The in-memory sessions that `gate_every_case_meets_its_class` runs
+/// through the real `corpus::classify` and `judge`, for the outcomes no
+/// committed case gives (`SPEC.md` "Parity corpus", offline gate): a session
+/// that ends; halts at a not-implemented and at an implemented branch; an
+/// error, alone and with either kind of branch; a transcript without the
+/// K14 exit newline; transcripts one byte under, at and one byte over the
+/// 1,048,576-byte session output limit; and one at the limit with either
+/// kind of branch. An error and the limit come before a branch, and a row
+/// tagged `finding=<id>` is accepted only for `Implemented(id)` at that
+/// expected branch, whatever its class.
+fn classifier_probes() -> Vec<Probe> {
+    let error =
+        ifcap_po_inquiry::InquiryError::CorruptStore("^PRC(442,991001,0)".to_string()).to_string();
+    let finding = format!("finding={IMPLEMENTED_BRANCH}");
+    let other_finding = format!("finding={OTHER_IMPLEMENTED_BRANCH}");
+    let lookup_finding = format!("finding={LOOKUP_BRANCH}");
+    let untagged = |class: &str| probe_row(class, &[], "none");
+    let boundary = |expected: &str| probe_row("BOUNDARY", &[], expected);
+    let found = || probe_row("CP", &[finding.as_str()], IMPLEMENTED_BRANCH);
+    let unterminated = EXIT_TAIL.trim_end_matches('\n').to_string();
+    let limit = SESSION_OUTPUT_LIMIT;
+    vec![
+        Probe {
+            label: "a session that ends",
+            run: session(EXIT_TAIL.to_string(), None, None),
+            bytes: None,
+            expect: Expect::Exactly(corpus::Outcome::End),
+            rows: vec![
+                (untagged("CP"), true),
+                (untagged("IN"), true),
+                (untagged("CR"), true),
+                (boundary(LOOKUP_BRANCH), false),
+                (found(), false),
+            ],
+        },
+        Probe {
+            label: "a halt at a not-implemented branch",
+            run: session(String::new(), Some(LOOKUP_BRANCH), None),
+            bytes: None,
+            expect: Expect::Exactly(corpus::Outcome::Unimplemented(LOOKUP_BRANCH)),
+            rows: vec![
+                (boundary(LOOKUP_BRANCH), true),
+                (boundary(OTHER_LOOKUP_BRANCH), false),
+                (untagged("CP"), false),
+                (
+                    probe_row("BOUNDARY", &[lookup_finding.as_str()], LOOKUP_BRANCH),
+                    false,
+                ),
+            ],
+        },
+        Probe {
+            label: "a halt at an implemented branch",
+            run: session(String::new(), Some(IMPLEMENTED_BRANCH), None),
+            bytes: None,
+            expect: Expect::Exactly(corpus::Outcome::Implemented(IMPLEMENTED_BRANCH)),
+            rows: CLASSES
+                .iter()
+                .map(|class| {
+                    (
+                        probe_row(class, &[finding.as_str()], IMPLEMENTED_BRANCH),
+                        true,
+                    )
+                })
+                .chain([
+                    (
+                        probe_row("CP", &[other_finding.as_str()], OTHER_IMPLEMENTED_BRANCH),
+                        false,
+                    ),
+                    (probe_row("CP", &[finding.as_str()], "none"), false),
+                    (untagged("CP"), false),
+                    (boundary(IMPLEMENTED_BRANCH), false),
+                ])
+                .collect(),
+        },
+        Probe {
+            label: "an error",
+            run: session(String::new(), None, Some(&error)),
+            bytes: None,
+            expect: Expect::Exactly(corpus::Outcome::Failure(error.clone())),
+            rows: vec![
+                (untagged("CP"), false),
+                (untagged("IN"), false),
+                (untagged("CR"), false),
+                (boundary(LOOKUP_BRANCH), false),
+                (found(), false),
+            ],
+        },
+        Probe {
+            label: "an error with a halt at an implemented branch",
+            run: session(String::new(), Some(IMPLEMENTED_BRANCH), Some(&error)),
+            bytes: None,
+            expect: Expect::Exactly(corpus::Outcome::Failure(error.clone())),
+            rows: vec![(found(), false)],
+        },
+        Probe {
+            label: "an error with a halt at a not-implemented branch",
+            run: session(String::new(), Some(LOOKUP_BRANCH), Some(&error)),
+            bytes: None,
+            expect: Expect::Exactly(corpus::Outcome::Failure(error.clone())),
+            rows: vec![(boundary(LOOKUP_BRANCH), false)],
+        },
+        Probe {
+            label: "no K14 exit newline",
+            run: session(unterminated, None, None),
+            bytes: None,
+            expect: Expect::AnyFailure,
+            rows: vec![(untagged("CP"), false), (found(), false)],
+        },
+        Probe {
+            label: "one byte under the output limit",
+            run: session(sized_transcript(limit - 1), None, None),
+            bytes: Some(limit - 1),
+            expect: Expect::Exactly(corpus::Outcome::End),
+            rows: vec![(untagged("CP"), true)],
+        },
+        Probe {
+            label: "at the output limit",
+            run: session(sized_transcript(limit), None, None),
+            bytes: Some(limit),
+            expect: Expect::AnyFailure,
+            rows: vec![(untagged("CP"), false)],
+        },
+        Probe {
+            label: "one byte over the output limit",
+            run: session(sized_transcript(limit + 1), None, None),
+            bytes: Some(limit + 1),
+            expect: Expect::AnyFailure,
+            rows: vec![(untagged("CP"), false)],
+        },
+        Probe {
+            label: "at the output limit with a halt at an implemented branch",
+            run: session(sized_transcript(limit), Some(IMPLEMENTED_BRANCH), None),
+            bytes: Some(limit),
+            expect: Expect::AnyFailure,
+            rows: vec![(found(), false)],
+        },
+        Probe {
+            label: "at the output limit with a halt at a not-implemented branch",
+            run: session(sized_transcript(limit), Some(LOOKUP_BRANCH), None),
+            bytes: Some(limit),
+            expect: Expect::AnyFailure,
+            rows: vec![(boundary(LOOKUP_BRANCH), false)],
+        },
+    ]
+}
+
 /// Every committed case input is the model's, runs on world B through
 /// `inquire_traced` exactly as `corpus::run_case` runs it, and ends as its
 /// class says (`SPEC.md` "Parity corpus", offline gate); the class counts,
-/// the class moves, the K17 moves and the CR inputs are as specified.
+/// the class moves, the K17 moves and the CR inputs are as specified. The
+/// classifier and `judge` are also probed with the in-memory sessions of
+/// `classifier_probes`, so that `Implemented`, every `Failure` cause, the
+/// finding tag, the K14 exit newline and the exact output limit are
+/// exercised although no committed case reaches them.
 #[test]
 fn gate_every_case_meets_its_class() {
     let gate = gate();
@@ -901,6 +1153,66 @@ fn gate_every_case_meets_its_class() {
             failures.push(format!(
                 "{id}: the committed inputs {committed:?} are not corpus::CR_INPUTS {inputs:?}"
             ));
+        }
+    }
+
+    for id in [LOOKUP_BRANCH, OTHER_LOOKUP_BRANCH] {
+        if !gate.not_implemented.iter().any(|known| known == id) {
+            failures.push(format!(
+                "probe precondition: {id} is not a not-implemented branch of SPEC.md \
+                 \"Branch inventory\""
+            ));
+        }
+    }
+    for id in [IMPLEMENTED_BRANCH, OTHER_IMPLEMENTED_BRANCH] {
+        if !inventory_lists(id) || gate.not_implemented.iter().any(|known| known == id) {
+            failures.push(format!(
+                "probe precondition: {id} is not an implemented branch of SPEC.md \
+                 \"Branch inventory\""
+            ));
+        }
+    }
+    for probe in classifier_probes() {
+        let run = &probe.run;
+        let label = format!(
+            "probe {} (branch {:?}, error {:?}, {} bytes)",
+            probe.label,
+            run.branch,
+            run.error,
+            run.transcript.len()
+        );
+        if let Some(bytes) = probe.bytes
+            && (run.transcript.len() != bytes || !run.transcript.ends_with(EXIT_TAIL))
+        {
+            failures.push(format!(
+                "{label}: the transcript is not {bytes} bytes ending with {EXIT_TAIL:?}"
+            ));
+        }
+        let outcome = corpus::classify(run, &gate.not_implemented);
+        if !probe.expect.admits(&outcome) {
+            failures.push(format!(
+                "{label}: corpus::classify gave {outcome:?}, not {:?}",
+                probe.expect
+            ));
+        }
+        for (row, accept) in &probe.rows {
+            let judged = judge(
+                row,
+                &outcome,
+                run.error.as_deref(),
+                run.branch,
+                &run.transcript,
+                &gate.not_implemented,
+            );
+            if judged.is_ok() != *accept {
+                failures.push(format!(
+                    "{label}: judge of the {} row tagged [{}] expecting {} gave {judged:?}, not {}",
+                    row.class,
+                    row.tags_text(),
+                    row.expected_branch,
+                    if *accept { "Ok" } else { "Err" }
+                ));
+            }
         }
     }
     assert!(failures.is_empty(), "{}", report("case classes", &failures));
@@ -1314,6 +1626,289 @@ impl Minimums<'_> {
     }
 }
 
+/// The new value a malformed copy of the corpus gives one node of an order,
+/// from the order IEN, the node's subscripts below `^PRC(442,ien)` and its
+/// committed value; `None` keeps the committed value.
+type NodeMutation = Box<dyn Fn(&str, &[&str], &str) -> Option<String>>;
+
+/// A malformed copy of the committed corpus that breaks one variation
+/// minimum, which `corpus::minimum_violations` must then report.
+struct MinimumProbe {
+    /// The minimum the copy breaks, named in the probe's failures.
+    name: &'static str,
+    /// How the copy differs from the committed corpus.
+    mutate: NodeMutation,
+    /// The starts of the violations the copy must give: each starts at
+    /// least one violation, and every violation starts with one of them.
+    violations: Vec<String>,
+    /// A dropped variant, its dimension and its value in tag form, that
+    /// exempts the broken minimum: once the model's drops list it, the copy
+    /// gives no violation.
+    exempt: Option<(&'static str, &'static str)>,
+}
+
+impl MinimumProbe {
+    fn new(
+        name: &'static str,
+        violations: &[&str],
+        mutate: impl Fn(&str, &[&str], &str) -> Option<String> + 'static,
+    ) -> MinimumProbe {
+        MinimumProbe {
+            name,
+            mutate: Box::new(mutate),
+            violations: violations.iter().map(|start| start.to_string()).collect(),
+            exempt: None,
+        }
+    }
+}
+
+/// The order IEN of a corpus node `^PRC(442,ien,...)` and the node's
+/// subscripts below the order, or `None` for an index node such as
+/// `^PRC(442,"C",value,ien)`.
+fn order_node(key: &[Sub]) -> Option<(&str, Vec<&str>)> {
+    let [global, file, ien, below @ ..] = key else {
+        return None;
+    };
+    (global.text() == "PRC" && file.text() == "442" && ien.is_num())
+        .then(|| (ien.text(), below.iter().map(Sub::text).collect()))
+}
+
+/// `node` with its 1-based `^`-piece `position` set to `value`, padded with
+/// empty pieces when it has fewer.
+fn with_piece(node: &str, position: usize, value: &str) -> String {
+    let mut pieces: Vec<&str> = node.split('^').collect();
+    if pieces.len() < position {
+        pieces.resize(position, "");
+    }
+    if let Some(slot) = position.checked_sub(1).and_then(|at| pieces.get_mut(at)) {
+        *slot = value;
+    }
+    pieces.join("^")
+}
+
+/// The committed corpus nodes changed by `mutate`, parsed by
+/// `Store::from_zwr` from ZWR text whose every value is quoted with each
+/// `"` doubled, as `corpus::world_b` writes values; with the number of
+/// nodes `mutate` changed.
+///
+/// The store stands for world B: `corpus::minimum_violations` reads world
+/// B only below the corpus orders `^PRC(442,ien)`, which world A never
+/// holds, and reads the reference files and the vendors from world A. So
+/// the corpus nodes alone give it the same facts, without re-parsing world
+/// A's nodes for every probe.
+fn malformed_corpus(gate: &Gate, mutate: &NodeMutation) -> Result<(Store, usize), String> {
+    let mut text = String::new();
+    for header in ZWR_HEADER {
+        text.push_str(header);
+        text.push('\n');
+    }
+    let mut changed = 0;
+    for (key, value) in gate.corpus_nodes.iter() {
+        let new = order_node(key)
+            .and_then(|(ien, below)| mutate(ien, &below, value))
+            .filter(|new| new != value);
+        changed += usize::from(new.is_some());
+        text.push_str(&Store::format_ref(key));
+        text.push_str("=\"");
+        text.push_str(&new.as_deref().unwrap_or(value).replace('"', "\"\""));
+        text.push_str("\"\n");
+    }
+    let store = Store::from_zwr(&text).map_err(|error| error.to_string())?;
+    Ok((store, changed))
+}
+
+/// The malformed copies of the corpus, one for each variation minimum that
+/// `gate_variation_minimums` does not recount from the world B nodes, each
+/// breaking that minimum alone (`SPEC.md` "Parity corpus" names the nodes
+/// and pieces). The one-vendor copy leaves unheld the 8 properties its
+/// vendor lacks, and so also leaves 1 distinct vendor of the 40 required.
+/// The date copy gives order `first` (CP-001), whose delivery date is
+/// `delivery_date`, a different P.O. date. A copy changes values only:
+/// every changed value is printable ASCII without `|`, and no index node
+/// changes.
+fn minimum_probes(first: &str, vendor: &str, delivery_date: &str) -> Vec<MinimumProbe> {
+    let first = first.to_string();
+    let vendor = vendor.to_string();
+    let po_date = if delivery_date == "2990101" {
+        "2991231"
+    } else {
+        "2990101"
+    };
+    let date_violation = format!(
+        "date: order {first} P.O. date 1;15 {} differs from its delivery date 0;10 {}",
+        tag_form(po_date),
+        tag_form(delivery_date)
+    );
+    let truncated = |text: &str, length: usize| text.chars().take(length).collect::<String>();
+    vec![
+        MinimumProbe::new(
+            "source 1 replaced by 2",
+            &["source=1: 0 orders, minimum 1"],
+            |_, below, value| match below {
+                ["1"] if piece(value, 7) == "1" => Some(with_piece(value, 7, "2")),
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "one vendor for every order",
+            &[
+                "vendor: no order's vendor has the property ",
+                "vendor: 1 distinct values, minimum 40",
+            ],
+            move |_, below, value| match below {
+                ["1"] => Some(with_piece(value, 1, &vendor)),
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "no delivery location",
+            &["delivery=present: 0 orders, minimum 8"],
+            |_, below, value| match below {
+                ["1"] => Some(with_piece(value, 11, "")),
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "no confirmation of a verbal order",
+            &["verbal=confirmation: 0 orders, minimum 6"],
+            |_, below, value| match below {
+                ["1"] if piece(value, 4) == "Y" && piece(value, 5) == "Y" => {
+                    Some(with_piece(value, 5, ""))
+                }
+                _ => None,
+            },
+        ),
+        MinimumProbe {
+            exempt: Some(("fob", "D")),
+            ..MinimumProbe::new(
+                "FOB D replaced by O",
+                &["fob=D: 0 orders, minimum 1"],
+                |_, below, value| match below {
+                    ["1"] if piece(value, 6) == "D" => Some(with_piece(value, 6, "O")),
+                    _ => None,
+                },
+            )
+        },
+        MinimumProbe::new(
+            "proposals of 33 characters cut to 32",
+            &["proposal=33: 0 orders, minimum 1"],
+            move |_, below, value| match below {
+                ["1"] if piece(value, 8).chars().count() == 33 => {
+                    Some(with_piece(value, 8, &truncated(piece(value, 8), 32)))
+                }
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "a P.O. date that differs from the delivery date",
+            &[&date_violation],
+            move |ien, below, value| match below {
+                ["1"] if ien == first => Some(with_piece(value, 15, po_date)),
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "APPs of 10 digits cut to 7",
+            &["app: 3 distinct values, minimum 4"],
+            move |_, below, value| match below {
+                ["0"] if piece(value, 4).chars().count() == 10 => {
+                    Some(with_piece(value, 4, &truncated(piece(value, 4), 7)))
+                }
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "descriptions of 32 characters cut to 31",
+            &["item.desc=32: 0 items, minimum 1"],
+            move |_, below, value| match below {
+                ["2", _, "1", "1", "0"] if value.chars().count() == 32 => {
+                    Some(truncated(value, 31))
+                }
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "decimal quantities replaced by 1",
+            &["item.qty=decimal: 0 items, minimum 1"],
+            |_, below, value| match below {
+                ["2", _, "0"] if piece(value, 2).contains('.') => Some(with_piece(value, 2, "1")),
+                _ => None,
+            },
+        ),
+        MinimumProbe {
+            exempt: Some(("item.unit", "1")),
+            ..MinimumProbe::new(
+                "unit 1 replaced by 2",
+                &["item.unit: 9 distinct values, minimum 10"],
+                |_, below, value| match below {
+                    ["2", _, "0"] if piece(value, 3) == "1" => Some(with_piece(value, 3, "2")),
+                    _ => None,
+                },
+            )
+        },
+        MinimumProbe::new(
+            "empty units replaced by 1",
+            &["item.unit=empty: 0 items, minimum 1"],
+            |_, below, value| match below {
+                ["2", _, "0"] if piece(value, 3).is_empty() => Some(with_piece(value, 3, "1")),
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "extended costs over 7 characters replaced by 1",
+            &["item.ext=long: 0 items, minimum 1"],
+            |_, below, value| match below {
+                ["2", _, "2"] if piece(value, 1).chars().count() > 7 => {
+                    Some(with_piece(value, 1, "1"))
+                }
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "no STK#",
+            &["item.stk=present: 0 items, minimum 1"],
+            |_, below, value| match below {
+                ["2", _, "0"] => Some(with_piece(value, 6, "")),
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "no NSN",
+            &["item.nsn=present: 0 items, minimum 1"],
+            |_, below, value| match below {
+                ["2", _, "0"] => Some(with_piece(value, 13, "")),
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "no FOOD GROUP",
+            &["item.food=present: 0 items, minimum 1"],
+            |_, below, value| match below {
+                ["2", _, "4"] => Some(with_piece(value, 12, "")),
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "no Items per",
+            &["item.per=present: 0 items, minimum 1"],
+            |_, below, value| match below {
+                ["2", _, "0"] => Some(with_piece(value, 12, "")),
+                _ => None,
+            },
+        ),
+        MinimumProbe::new(
+            "BOCs of several words cut to the first",
+            &["item.boc=several: 0 items, minimum 1"],
+            |_, below, value| match below {
+                ["2", _, "0"] => piece(value, 4)
+                    .split_once(' ')
+                    .map(|(word, _)| with_piece(value, 4, word)),
+                _ => None,
+            },
+        ),
+    ]
+}
+
 /// Every minimum of the variation matrix (`SPEC.md` "Parity corpus") holds
 /// by `corpus::minimum_violations`, and the item counts are exact. From the
 /// world B nodes the test itself checks only the item counts and the
@@ -1321,8 +1916,12 @@ impl Minimums<'_> {
 /// agent and authority minimums; the distinct vendors, services, totals and
 /// dates; the empty service; the year-end, leap-day, empty, 1999 and 2026
 /// dates; positive estimated shipping; and the unit cost forms on orders
-/// whose type is not `S`. The other minimums rest on the shared checker
-/// alone.
+/// whose type is not `S`. Each other minimum is proved by a malformed copy
+/// of the corpus from `minimum_probes` that breaks it: the shared checker
+/// must report that minimum and only the violations the probe lists (the
+/// one-vendor copy also breaks the distinct-vendor minimum), and for the
+/// FOB and unit copies a dropped variant of the removed value must exempt
+/// that minimum.
 #[test]
 fn gate_variation_minimums() {
     let gate = gate();
@@ -1459,6 +2058,66 @@ fn gate_variation_minimums() {
             held,
             format!("item.cost={form}: on no item of an order whose type is not S"),
         );
+    }
+
+    let first_ien = (IEN_BASE + 1).to_string();
+    let first = read_order(world_b, &first_ien);
+    for probe in minimum_probes(&first_ien, &first.vendor, &first.date) {
+        let name = probe.name;
+        let malformed = match malformed_corpus(gate, &probe.mutate) {
+            Ok((store, changed)) if changed > 0 => store,
+            Ok(_) => {
+                check
+                    .failures
+                    .push(format!("probe {name}: no committed corpus node changes"));
+                continue;
+            }
+            Err(cause) => {
+                check.failures.push(format!(
+                    "probe {name}: the changed corpus does not parse: {cause}"
+                ));
+                continue;
+            }
+        };
+        let found = corpus::minimum_violations(world_a, &malformed, &gate.model);
+        for start in &probe.violations {
+            check.require(
+                found.iter().any(|violation| violation.starts_with(start)),
+                format!(
+                    "probe {name}: corpus::minimum_violations reports no {start:?}, only {found:?}"
+                ),
+            );
+        }
+        for violation in &found {
+            check.require(
+                probe
+                    .violations
+                    .iter()
+                    .any(|start| violation.starts_with(start.as_str())),
+                format!(
+                    "probe {name}: corpus::minimum_violations also reports {violation:?}, a rule the probe does not break"
+                ),
+            );
+        }
+        if let Some((dimension, value)) = probe.exempt {
+            // Only the dimension and the value exempt a minimum; the round,
+            // case and branch only record where a drop came from.
+            let mut model = gate.model.clone();
+            model.drops.push(corpus::DroppedVariant {
+                round: 1,
+                case: "CP-001".to_string(),
+                dimension: dimension.to_string(),
+                value: value.to_string(),
+                branch: gate.not_implemented.first().cloned().unwrap_or_default(),
+            });
+            let exempted = corpus::minimum_violations(world_a, &malformed, &model);
+            check.require(
+                exempted.is_empty(),
+                format!(
+                    "probe {name} with {dimension}={value} dropped: corpus::minimum_violations still reports {exempted:?}"
+                ),
+            );
+        }
     }
     assert!(
         check.failures.is_empty(),
