@@ -385,7 +385,7 @@ if [ -f tests/fixtures/ifcap/cases.zwr ]; then sha256sum tests/fixtures/ifcap/ca
 
 ## Part C: Parity corpus
 
-Part C covers the parity corpus. Its three recording scripts are plan defaults, written in the corpus round and run by no build or test, like the commands of Part B. They stay unverified until the team's first recording (`SPEC.md` O-16, O-17): the corpus round had no Docker, and nothing in it executed them.
+Part C covers the parity corpus. Its three recording scripts are plan defaults, written in the corpus round and run by no build or test, like the commands of Part B. They stay unverified until the team's first recording (`SPEC.md` O-16, O-17): the corpus round's host held no VEHU image, and nothing in the round executed them. The round's records disclose two read-only Docker queries, `docker images -q` and `docker info`, which confirmed that no image was present; they depart from the round's no-Docker rule, as `SPEC.md` O-17 and "Run evidence" record.
 
 ### C1. Purpose and classes
 
