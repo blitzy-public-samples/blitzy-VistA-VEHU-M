@@ -42,10 +42,23 @@
 # the paging detector and whatever exit statuses the cases recorded; 1 on a failed prerequisite or
 # operation (a FAIL: line, at once) or when a difference was collected (after every file is written).
 #
+# Deadlines: every Docker operation except the inquiry sessions runs under a wall-clock deadline,
+# checked once a second, and one still running at its deadline is stopped with every process it
+# started (TERM, then KILL after a 3-s grace) and ends the run with a FAIL: line naming the
+# operation and its deadline. Nothing is retried. The deadlines are 120 s for each docker image
+# inspect and for the start-command detection; 300 s for each container restore (docker rm -f,
+# then docker run -d) and for the final docker rm -f; 600 s for each readiness probe, which keeps
+# its own limit; and 1800 s for each of the two scope exports. The inquiry sessions, the README
+# Part B step 1 start command run twice per case, are not supervised: each runs as given, for as
+# long as the original takes. A FAIL or a signal stops an operation or probe still running the
+# same way, within about 5 s, before the lock is removed.
+#
 # Environment (each optional):
 #   NAME=vehu                                                    container name
 #   BASE_IMAGE=worldvista/vehu:202609                            the original image (its digest goes to meta.txt)
 #   SOURCE_REVISION=dd3fd0f3124c8178657d9fff4173c324da30f7ae     source revision written to meta.txt
+# Inherited: HOME, read only when docker is not on PATH, because vc_find_docker then also looks
+# for Docker Desktop's docker in $HOME/.docker/bin.
 
 set -u
 fail() { echo; echo "FAIL: $*"; exit 1; }
@@ -57,7 +70,12 @@ cd "$(dirname "$0")/../../../../.." || fail "setup: cannot change to the crate f
 
 KIT=scripts/kit/vehu_common.sh
 [ -f "$KIT" ] || fail "$KIT not found: this script needs the committed recording kit."
-. "$KIT"
+. "$KIT" || fail "cannot source $KIT (status $?)"
+# vc_find_docker reads HOME when docker is not on PATH, and under set -u an unset HOME would end
+# the script there with no FAIL line.
+if [ -z "${HOME+set}" ] && ! command -v docker >/dev/null 2>&1; then
+  fail "HOME is not set and docker is not on PATH: vc_find_docker also looks for Docker Desktop's docker in \$HOME/.docker/bin; set HOME or put docker on PATH."
+fi
 vc_find_docker || fail "docker not found: install Docker Desktop or the Docker CLI."
 
 NAME="${NAME:-vehu}"
@@ -83,6 +101,89 @@ restore_container() {
 export_scope() {
   docker exec -i "$NAME" su - vehu -c "mumps -run %XCMD '$(vc_mcmd "$VC_SCOPE_ROOTS")'" < /dev/null > "$1" 2> "$2"
 }
+
+# Deadline supervision, the same text in load_corpus.sh and record_corpus.sh. A Docker operation
+# that hangs, in the daemon, the transport or the container, must end the run with a FAIL: line
+# rather than hold it up, so each one runs under one of these wall-clock deadlines, in seconds.
+DEADLINE_INSPECT=120    # each docker image inspect; the start-command detection
+DEADLINE_CONTAINER=300  # each container restore (docker rm -f, docker run -d); docker stop; the final docker rm -f
+DEADLINE_READY=600      # each readiness wait of load_corpus.sh (record_corpus.sh's probe_ready keeps its own 600)
+DEADLINE_BULK=1800      # the presence check, the load, the read back, each scope export; docker commit
+# JOB_PID: the process group of the operation run_bounded is running, empty when none is, so that
+# the exit cleanup can stop it. BOUNDED_EXPIRED: what the last run_bounded call stopped, or empty.
+JOB_PID=""
+BOUNDED_EXPIRED=""
+
+# stop_owned <target>: stop a process this run started, <target> being its pid, or -<pgid> for
+# its whole process group: TERM, then KILL after a 3-s grace, checked once a second. 0 when it is
+# gone; 1 when KILL has not ended it 1 s later, which means it is stuck in the kernel, and it is
+# not waited for. It takes at most 5 s. Silenced as a group, so that the shell's report of the
+# stopped job is not printed either.
+stop_owned() {
+  local target="$1" spent=0
+  {
+    kill -TERM -- "$target"
+    while [ "$spent" -lt 3 ] && kill -0 -- "$target"; do
+      sleep 1
+      spent=$((spent + 1))
+    done
+    kill -0 -- "$target" && kill -KILL -- "$target" && sleep 1
+    ! kill -0 -- "$target"
+  } 2>/dev/null
+}
+
+# run_bounded <limit> <label> <command> [<arg>...]: run <command>, a function or a program, with
+# standard input from /dev/null, in the background as a process group of its own (JOB_PID), and
+# return its status. It takes at most <limit> s of wall-clock time in all, stopping included:
+# checked once a second, the command gets <limit> s by bash SECONDS less 6 s, which are the 3-s
+# grace, 1 s for KILL to take effect, 1 s by which SECONDS, counting whole seconds, can lag real
+# time, and 1 s for the check. A command still running then is stopped with its whole group
+# (stop_owned) and reaped, or, when KILL has not ended the group, left in JOB_PID for the exit
+# cleanup; BOUNDED_EXPIRED then names <label> and <limit>, and the status is 124. It never calls
+# fail, because callers send its output to files: each caller runs check_deadline straight after.
+run_bounded() {
+  local limit="$1" label="$2" start="$SECONDS" window rc
+  shift 2
+  BOUNDED_EXPIRED=""
+  window=$((limit - 6))
+  # Job control only while the command starts, so that it alone gets a process group of its own.
+  set -m
+  ( "$@" ) < /dev/null &
+  JOB_PID=$!
+  set +m
+  while kill -0 "$JOB_PID" 2>/dev/null; do
+    if [ $((SECONDS - start)) -ge "$window" ]; then
+      if stop_owned "-$JOB_PID"; then
+        { wait "$JOB_PID"; } 2>/dev/null
+        JOB_PID=""
+        BOUNDED_EXPIRED="$label did not finish within $limit s and was stopped"
+      else
+        BOUNDED_EXPIRED="$label did not finish within $limit s, and KILL has not ended its process group $JOB_PID"
+      fi
+      return 124
+    fi
+    sleep 1
+  done
+  wait "$JOB_PID"
+  rc=$?
+  JOB_PID=""
+  return "$rc"
+}
+
+# check_deadline: straight after a run_bounded call, stop with a FAIL: line if it ran out of time.
+check_deadline() {
+  [ -z "$BOUNDED_EXPIRED" ] || fail "$BOUNDED_EXPIRED"
+}
+
+# read_one_line <file>: set LINE to the one line <file> holds, ended by a line feed and at most
+# 4095 characters long. 1, with nothing cut short, when <file> cannot be read, holds no line, a
+# longer one, or anything after it.
+read_one_line() {
+  local extra=""
+  LINE=""
+  { IFS= read -r -n 4096 LINE && [ "${#LINE}" -lt 4096 ] && ! IFS= read -r -n 1 extra && [ -z "$extra" ]; } 2>/dev/null < "$1"
+}
+# End of the deadline supervision.
 
 # The overrides are checked before any scratch or container work; an empty value keeps the default
 # above. NAME must be a Docker container name and BASE_IMAGE an image reference, so neither holds
@@ -173,12 +274,31 @@ mkdir -p "$W" || fail "cannot create $W"
 # One run at a time: concurrent runs would share captures-work/corpus/ and the corpus folder, and
 # step 4 clears run1/ and run2/. The lock is the folder record.lock, taken by an atomic mkdir before
 # any container or scratch work and holding its owner's pid. A run that cannot take it stops and
-# deletes nothing. on_exit runs on every exit, after HUP, INT and TERM too: it stops a readiness
-# probe still running and removes the lock only when this run took it.
+# deletes nothing. on_exit runs on every exit, after HUP, INT and TERM too, and ignores those
+# signals from then on, so that a second signal cannot cut it short. It stops a readiness probe
+# and a Docker operation still running, each with stop_owned (TERM, then KILL after a 3-s grace,
+# at most 5 s), reaps each one that ended and says so of one that did not, and removes the lock
+# only when this run took it. The exit status stays as it was.
 LOCK="$W_ABS/record.lock"
 LOCK_OWNED=""
 on_exit() {
-  [ -z "${PROBE_PID:-}" ] || kill "$PROBE_PID" 2>/dev/null
+  trap '' HUP INT TERM
+  if [ -n "${PROBE_PID:-}" ]; then
+    if stop_owned "$PROBE_PID"; then
+      { wait "$PROBE_PID"; } 2>/dev/null
+    else
+      echo "the readiness probe (pid $PROBE_PID) did not end after KILL and is left behind"
+    fi
+    PROBE_PID=""
+  fi
+  if [ -n "${JOB_PID:-}" ]; then
+    if stop_owned "-$JOB_PID"; then
+      { wait "$JOB_PID"; } 2>/dev/null
+    else
+      echo "the Docker operation of process group $JOB_PID did not end after KILL and is left behind"
+    fi
+    JOB_PID=""
+  fi
   [ -z "$LOCK_OWNED" ] || rm -rf "$LOCK"
 }
 trap on_exit EXIT
@@ -190,9 +310,13 @@ if mkdir "$LOCK" 2>/dev/null; then
   printf '%s\n' "$$" > "$LOCK/pid" || fail "cannot write $LOCK/pid"
 else
   [ -d "$LOCK" ] || fail "cannot create $LOCK"
+  # At most 21 characters of the owner's pid file, and only from a regular file, so that
+  # neither a large file nor a FIFO holds this run up. Anything but 1 to 20 digits with no
+  # leading 0 counts as no pid.
   owner=""
-  { read -r owner < "$LOCK/pid"; } 2>/dev/null
+  [ -f "$LOCK/pid" ] && { IFS= read -r -n 21 owner < "$LOCK/pid"; } 2>/dev/null
   case "$owner" in ''|0*|*[!0123456789]*) owner="" ;; esac
+  [ "${#owner}" -le 20 ] || owner=""
   if [ -z "$owner" ]; then
     fail "another record_corpus.sh run is taking $LOCK (no pid written yet): wait for it. If no record_corpus.sh run is active, remove the folder by hand (rm -r $(printf '%q' "$LOCK")); recording files are untouched"
   elif [ "$owner" != "$$" ] && kill -0 "$owner" 2>/dev/null; then
@@ -267,43 +391,123 @@ check_export() {
   grep -q '^\^' "$W/$1.zwr" || fail "$W/$1.zwr: the export is empty; see $W/$1.err"
 }
 
+# read_capped <file> <budget> <line bound> <handler> <remedy>: read <file> once, line by line, on
+# descriptor 6, and call <handler> <line number> <line> for each line, its newline removed. An
+# unterminated last line is a line too; an empty file calls nothing. Lengths are byte counts
+# (LC_ALL=C). A file larger than <budget> bytes stops before it is read, and a line longer than
+# <line bound> bytes, a bound the caller keeps below <budget>, stops when it is reached, so no
+# read takes more than <line bound> + 1 bytes. The bytes read are counted against the size taken
+# before reading: the run stops once they pass it, because the file grew, and at the end unless
+# they equal it, because a NUL byte (which bash drops), a failed read or a change cut them short.
+# Nothing is truncated: every stop is a FAIL naming <file> and ending with <remedy>.
+read_capped() {
+  local LC_ALL=C file="$1" budget="$2" bound="$3" handler="$4" remedy="$5" size line="" n=0 total=0
+  size="$(wc -c < "$file")" || fail "cannot take the size of $file: $remedy"
+  size="${size// /}"
+  case "$size" in ''|*[!0123456789]*) fail "wc -c gave no byte count for $file: $size";; esac
+  [ "$size" -le "$budget" ] || fail "$file holds $size bytes, more than its budget of $budget bytes: $remedy"
+  exec 6< "$file" || fail "cannot read $file: $remedy"
+  while IFS= read -r -n "$((bound + 1))" -u 6 line; do
+    n=$((n + 1))
+    [ "${#line}" -le "$bound" ] || fail "line $n of $file is longer than $bound bytes: $remedy"
+    total=$((total + ${#line} + 1))
+    [ "$total" -le "$size" ] || fail "$file grew while it was read, past the $size bytes it held before: $remedy"
+    "$handler" "$n" "$line"
+  done
+  exec 6<&-
+  total=$((total + ${#line}))
+  [ "$total" -eq "$size" ] \
+    || fail "read $total of the $size bytes of $file: it holds a NUL byte, could not be read whole or changed while it was read: $remedy"
+  [ -z "$line" ] || "$handler" "$((n + 1))" "$line"
+}
+
 step "1. Prerequisites"
+# BASE.txt and manifest.tsv are read by read_capped within the budgets src/golden.rs uses:
+# 64 KiB (65536 bytes), its budget for BASE.txt, which load_corpus.sh writes as eight short
+# key=value lines, and 1 MiB (1048576 bytes), its budget for input.txt and transcript.txt, for
+# manifest.tsv, which corpus_gen writes as 232 lines and 105,241 bytes, the longest 1531 bytes.
+# A BASE.txt line may fill its budget but for its newline. A manifest line may hold at most
+# 16384 bytes, over ten times the longest, because the row checks below take time that grows
+# with the square of a line's length, and the bound keeps each line's checks short.
+BASE_BUDGET=65536
+BASE_LINE_BOUND=65535
+MANIFEST_BUDGET=1048576
+MANIFEST_LINE_BOUND=16384
 [ -f "$BASE" ] || fail "$BASE not found: run tests/golden/ifcap/corpus/scripts/load_corpus.sh first"
-BASE_SNAP_ID="$(sed -n 's/^snapshot_id=//p' "$BASE")" || fail "cannot read $BASE"
-BASE_EXPORT_SHA="$(sed -n 's/^export_sha256=//p' "$BASE")" || fail "cannot read $BASE"
+# base_line <line number> <line>: take the snapshot_id= and export_sha256= values, each the rest
+# of its line after the key, exactly. A key given twice stops the run, since either value could
+# be the one meant.
+BASE_SNAP_ID=""
+BASE_SNAP_LINE=""
+BASE_EXPORT_SHA=""
+BASE_SHA_LINE=""
+base_line() {
+  case "$2" in
+    snapshot_id=*)
+      [ -z "$BASE_SNAP_LINE" ] || fail "$BASE holds snapshot_id= more than once (lines $BASE_SNAP_LINE and $1): run load_corpus.sh again"
+      BASE_SNAP_LINE="$1"
+      BASE_SNAP_ID="${2#snapshot_id=}" ;;
+    export_sha256=*)
+      [ -z "$BASE_SHA_LINE" ] || fail "$BASE holds export_sha256= more than once (lines $BASE_SHA_LINE and $1): run load_corpus.sh again"
+      BASE_SHA_LINE="$1"
+      BASE_EXPORT_SHA="${2#export_sha256=}" ;;
+  esac
+}
+read_capped "$BASE" "$BASE_BUDGET" "$BASE_LINE_BOUND" base_line "run load_corpus.sh again"
 [ -n "$BASE_SNAP_ID" ] || fail "$BASE holds no snapshot_id= value: run load_corpus.sh again"
 [ -n "$BASE_EXPORT_SHA" ] || fail "$BASE holds no export_sha256= value: run load_corpus.sh again"
 [ -f "$MANIFEST" ] || fail "$MANIFEST not found: run cargo run --offline --locked --bin corpus_gen first"
-# The manifest is read whole, so a failed read stops here, and is split into lines and cells by
-# parameter expansion only, so no word splitting or globbing touches a cell. Its cases are held
-# in the index-aligned arrays IDS and CLASSES, in manifest order. Every loop below walks those
-# arrays, never a `while read` over standard input, which each `docker exec -i` would consume.
-MANIFEST_TEXT="$(cat "$MANIFEST")" || fail "cannot read $MANIFEST"
-NL='
-'
-REST="$MANIFEST_TEXT$NL"
-LINE_NO=0
-HEADER_TABS=0
+# The manifest is read once by read_capped, so a failed or short read stops here, and each line is
+# split into cells by parameter expansion only, so no word splitting or globbing touches a cell.
+# Its cases are held in the index-aligned arrays IDS and CLASSES, in manifest order. read_capped
+# reads on descriptor 6, and its read loop, with the handler it calls, runs no docker command, so
+# nothing in it competes for standard input; every loop below walks those arrays, never a
+# `while read` over standard input, which each `docker exec -i` would consume. Empty lines
+# at the end of the file are ignored; an empty line before a later line is a row, and a bad one.
+HEADER_TABS=""
 COUNT=0
 BAD=""
+BAD_COUNT=0
+BAD_SHOWN=20
+EMPTY_FROM=""
 SEEN=" "
 IDS=()
 CLASSES=()
-while [ -n "$REST" ]; do
-  line="${REST%%"$NL"*}"
-  REST="${REST#*"$NL"}"
-  LINE_NO=$((LINE_NO + 1))
+# bad_row <line number>: count a bad manifest row in BAD_COUNT, and keep the line numbers of the
+# first BAD_SHOWN in BAD for the FAIL line, which says how many more there are, so that BAD stays
+# small however many rows are bad.
+bad_row() {
+  BAD_COUNT=$((BAD_COUNT + 1))
+  [ "$BAD_COUNT" -gt "$BAD_SHOWN" ] || BAD="$BAD $1"
+}
+# manifest_line <line number> <line>: check one manifest line and add a good row's case to IDS and
+# CLASSES, or count it with bad_row. A run of empty rows is held, at no cost per row, as the
+# number of its first line, EMPTY_FROM, until a later line shows the run is not at the end and
+# makes each of them a bad row.
+manifest_line() {
+  if [ -z "$2" ] && [ "$1" -gt 1 ]; then
+    [ -n "$EMPTY_FROM" ] || EMPTY_FROM="$1"
+    return 0
+  fi
+  local line="$2" tabs id cells class ok
   tabs="${line//[!$TAB]/}"
   id="${line%%"$TAB"*}"
   cells="${line#*"$TAB"}"
   class="${cells%%"$TAB"*}"
   # Line 1 is the manifest's eight-column header, byte for byte as corpus_gen writes it, so a
   # renamed, missing or extra column, or a trailing space, TAB or CR, stops the run here.
-  if [ "$LINE_NO" -eq 1 ]; then
+  if [ "$1" -eq 1 ]; then
     [ "$line" = "case${TAB}class${TAB}seed${TAB}order_ien${TAB}c_value${TAB}item_count${TAB}tags${TAB}expected_branch" ] \
       || fail "$MANIFEST line 1 is not the header case<TAB>class<TAB>seed<TAB>order_ien<TAB>c_value<TAB>item_count<TAB>tags<TAB>expected_branch: run corpus_gen again"
     HEADER_TABS="${#tabs}"
-    continue
+    return 0
+  fi
+  if [ -n "$EMPTY_FROM" ]; then
+    while [ "$EMPTY_FROM" -lt "$1" ]; do
+      bad_row "$EMPTY_FROM"
+      EMPTY_FROM=$((EMPTY_FROM + 1))
+    done
+    EMPTY_FROM=""
   fi
   # Every row has the header's eight columns. Ids become paths, so only the three corpus series
   # pass, and a cell is taken exactly as written, so a space in an id or a class rejects the row.
@@ -312,15 +516,19 @@ while [ -n "$REST" ]; do
   case "$id" in CP-[0-9][0-9][0-9]|CE-[0-9][0-9]|CR-[0-9][0-9]) ;; *) ok=0;; esac
   case "$class" in CP|IN|BOUNDARY|CR) ;; *) ok=0;; esac
   if [ "$ok" -eq 0 ]; then
-    BAD="$BAD $LINE_NO"
-    continue
+    bad_row "$1"
+    return 0
   fi
-  case "$SEEN" in *" $id "*) fail "$MANIFEST lists case id $id more than once (line $LINE_NO)";; esac
+  case "$SEEN" in *" $id "*) fail "$MANIFEST lists case id $id more than once (line $1)";; esac
   SEEN="$SEEN$id "
   IDS+=("$id")
   CLASSES+=("$class")
   COUNT=$((COUNT + 1))
-done
+}
+read_capped "$MANIFEST" "$MANIFEST_BUDGET" "$MANIFEST_LINE_BOUND" manifest_line "run corpus_gen again"
+# An empty manifest has no line 1, so it fails the header check as an empty line 1 does.
+[ -n "$HEADER_TABS" ] || manifest_line 1 ""
+[ "$BAD_COUNT" -le "$BAD_SHOWN" ] || BAD="$BAD and $((BAD_COUNT - BAD_SHOWN)) more"
 [ -z "$BAD" ] || fail "$MANIFEST has rows that are not <case id><TAB><class> with the header's $((HEADER_TABS + 1)) columns, at lines:$BAD"
 [ "$COUNT" -gt 0 ] || fail "$MANIFEST lists no case"
 echo "cases: $COUNT (corpus_gen writes 231)"
@@ -329,10 +537,28 @@ for id in "${IDS[@]}"; do
   [ -f "$C/$id/input.txt" ] || MISSING="$MISSING $id"
 done
 [ -z "$MISSING" ] || fail "input.txt missing for:$MISSING (run cargo run --offline --locked --bin corpus_gen)"
-SNAP_ID="$(docker image inspect --format '{{.Id}}' "$CORPUS_SNAP" 2>/dev/null)"
+# Each inspect writes to a file, and its exit status is checked before the file is read, so a
+# failed or stopped inspect never passes its output on; the file must hold exactly one line.
+run_bounded "$DEADLINE_INSPECT" "docker image inspect $CORPUS_SNAP" \
+  docker image inspect --format '{{.Id}}' "$CORPUS_SNAP" > "$W/snapshot-id.out" 2> "$W/snapshot-id.err"
+RC=$?
+check_deadline
+[ "$RC" -eq 0 ] \
+  || fail "image $CORPUS_SNAP not found or not readable (docker image inspect exited with status $RC; see $W/snapshot-id.err): run tests/golden/ifcap/corpus/scripts/load_corpus.sh first"
+read_one_line "$W/snapshot-id.out" \
+  || fail "docker image inspect did not print the id of $CORPUS_SNAP as one line of at most 4095 characters; see $W/snapshot-id.out"
+SNAP_ID="$LINE"
 [ -n "$SNAP_ID" ] || fail "image $CORPUS_SNAP not found: run tests/golden/ifcap/corpus/scripts/load_corpus.sh first"
 [ "$SNAP_ID" = "$BASE_SNAP_ID" ] || fail "the id of $CORPUS_SNAP ($SNAP_ID) differs from $BASE snapshot_id ($BASE_SNAP_ID): run load_corpus.sh again"
-DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$BASE_IMAGE" 2>/dev/null)"
+run_bounded "$DEADLINE_INSPECT" "docker image inspect $BASE_IMAGE" \
+  docker image inspect --format '{{index .RepoDigests 0}}' "$BASE_IMAGE" > "$W/base-digest.out" 2> "$W/base-digest.err"
+RC=$?
+check_deadline
+[ "$RC" -eq 0 ] \
+  || fail "cannot read the digest of $BASE_IMAGE (docker image inspect exited with status $RC; see $W/base-digest.err): pull it with docker pull $BASE_IMAGE"
+read_one_line "$W/base-digest.out" \
+  || fail "docker image inspect did not print the digest of $BASE_IMAGE as one line of at most 4095 characters; see $W/base-digest.out"
+DIGEST="$LINE"
 [ -n "$DIGEST" ] || fail "cannot read the digest of $BASE_IMAGE: pull it with docker pull $BASE_IMAGE"
 echo "container:       $NAME"
 echo "snapshot:        $CORPUS_SNAP ($SNAP_ID)"
@@ -340,12 +566,32 @@ echo "base image:      $BASE_IMAGE ($DIGEST)"
 echo "source revision: $SOURCE_REVISION"
 
 step "2. Container for run 1"
-restore_container "$CORPUS_SNAP" || fail "docker run failed for $CORPUS_SNAP"
+run_bounded "$DEADLINE_CONTAINER" "the restore of container $NAME from $CORPUS_SNAP (docker rm -f, then docker run -d)" \
+  restore_container "$CORPUS_SNAP" || { check_deadline; fail "docker run failed for $CORPUS_SNAP"; }
 probe_ready || fail "container not ready after 600s (shell-only readiness probe, SPEC.md O-16; check: docker logs $NAME)"
 echo "container $NAME ready"
 
 step "3. Start command"
-vc_detect_inquiry "$NAME"
+# detect_start_command <file>: vc_detect_inquiry on container NAME, then INQUIRY_CMD and
+# INQUIRY_NOTE written to <file>, one per line, because run_bounded runs it in a subshell whose
+# variables do not come back. Its status is that of the write: the kit function's last command is
+# an assignment, so its own status means nothing.
+detect_start_command() {
+  vc_detect_inquiry "$NAME"
+  printf '%s\n' "$INQUIRY_CMD" "$INQUIRY_NOTE" > "$1"
+}
+rm -f "$W/start-command.txt" || fail "cannot remove $W/start-command.txt"
+run_bounded "$DEADLINE_INSPECT" "the start-command detection (vc_detect_inquiry $NAME)" \
+  detect_start_command "$W/start-command.txt"
+RC=$?
+check_deadline
+[ "$RC" -eq 0 ] || fail "cannot write the detected start command to $W/start-command.txt (status $RC)"
+# IFS= and -r keep both values byte for byte: the note can end in a space, and the command holds
+# quotes, backslashes and $.
+INQUIRY_CMD=""
+INQUIRY_NOTE=""
+{ IFS= read -r INQUIRY_CMD && IFS= read -r INQUIRY_NOTE; } 2>/dev/null < "$W/start-command.txt" \
+  || fail "cannot read the detected start command back from $W/start-command.txt"
 if [ -n "$INQUIRY_NOTE" ]; then
   echo "note: $INQUIRY_NOTE"
   fail "the start command would not be the README's (tests/golden/ifcap/README.md Part B step 1), so nothing is recorded"
@@ -357,8 +603,10 @@ rm -rf "$W/run1" "$W/run2" || fail "cannot clear $W/run1 and $W/run2"
 mkdir -p "$W/run1" "$W/run2" || fail "cannot create $W/run1 and $W/run2"
 rm -f "$W/diffs.tsv" || fail "cannot remove $W/diffs.tsv"
 : > "$W/diffs.tsv" || fail "cannot write $W/diffs.tsv"
-export_scope "$W/export-before.zwr" "$W/export-before.err"
-check_export export-before "$?"
+run_bounded "$DEADLINE_BULK" "the scope export before run 1" export_scope "$W/export-before.zwr" "$W/export-before.err"
+RC=$?
+check_deadline
+check_export export-before "$RC"
 BEFORE_SHA="$(shasum -a 256 "$W/export-before.zwr" | cut -d' ' -f1)"
 [ -n "$BEFORE_SHA" ] || fail "shasum -a 256 failed on $W/export-before.zwr"
 [ "$BEFORE_SHA" = "$BASE_EXPORT_SHA" ] \
@@ -391,8 +639,10 @@ for id in "${IDS[@]}"; do
 done
 
 step "6. Export after"
-export_scope "$W/export-after.zwr" "$W/export-after.err"
-check_export export-after "$?"
+run_bounded "$DEADLINE_BULK" "the scope export after run 1" export_scope "$W/export-after.zwr" "$W/export-after.err"
+RC=$?
+check_deadline
+check_export export-after "$RC"
 # cmp exits 0 for equal files and 1 for different ones, the only difference collected; any other
 # status is a failed comparison (a file it could not read), which is fatal.
 cmp -s "$W/export-before.zwr" "$W/export-after.zwr"
@@ -413,7 +663,8 @@ esac
 echo "exports=$EXPORTS"
 
 step "7. Run 2 on a fresh container"
-restore_container "$CORPUS_SNAP" || fail "docker run failed for $CORPUS_SNAP"
+run_bounded "$DEADLINE_CONTAINER" "the restore of container $NAME from $CORPUS_SNAP (docker rm -f, then docker run -d)" \
+  restore_container "$CORPUS_SNAP" || { check_deadline; fail "docker run failed for $CORPUS_SNAP"; }
 probe_ready || fail "container not ready after 600s (shell-only readiness probe, SPEC.md O-16; check: docker logs $NAME)"
 echo "container $NAME ready; start command as in step 3"
 : > "$W/run2/status.tsv" || fail "cannot write $W/run2/status.tsv"
@@ -561,8 +812,10 @@ step "12. Result"
 # complete by now and stay as written: the container is the only thing left behind.
 : > "$W/final-remove.err" \
   || fail "cannot write $W/final-remove.err, so container $NAME was not removed: remove it by hand. The recording files in $C (transcripts, run-summary.txt, meta.txt, SHA256SUMS) are already written and kept."
-if ! docker rm -f "$NAME" >/dev/null 2> "$W/final-remove.err"; then
+if ! run_bounded "$DEADLINE_CONTAINER" "docker rm -f $NAME" docker rm -f "$NAME" >/dev/null 2> "$W/final-remove.err"; then
   sed -n 1,10p "$W/final-remove.err"
+  [ -z "$BOUNDED_EXPIRED" ] \
+    || fail "$BOUNDED_EXPIRED, so container $NAME may remain: remove it by hand. The recording files in $C (transcripts, run-summary.txt, meta.txt, SHA256SUMS) are already written and kept."
   fail "docker rm -f $NAME failed, so container $NAME remains: remove it by hand. The recording files in $C (transcripts, run-summary.txt, meta.txt, SHA256SUMS) are already written and kept."
 fi
 NONZERO=0
