@@ -180,8 +180,10 @@ const PROPOSAL_LENGTHS: [&str; 12] = [
     "0", "1", "15", "16", "17", "31", "32", "33", "47", "48", "49", "100",
 ];
 
-/// The stored unit cost forms of the `item.cost` row, each printed through
-/// its own arm of [PRCHDP2.m:52].
+/// The stored unit cost forms of the `item.cost` row. Together the six
+/// exercise the four print arms of [PRCHDP2.m:52]: whole and 2 decimals
+/// through `$J(,7,2)`, 3 decimals through `$J(,6,3)`, 4 and 5 decimals
+/// through `$J(,5,4)`, and `N/C` through `"    N/C"`.
 const COST_FORMS: [&str; 6] = ["N/C", "whole", "2dp", "3dp", "4dp", "5dp"];
 
 /// The description word-processing header of every corpus item, as the GC
@@ -1108,6 +1110,12 @@ fn decimal(rng: &mut Xorshift64, whole_below: usize, places: usize) -> String {
 /// The tag form of a value: `empty` for the empty label.
 fn tag_value(value: &str) -> &str {
     if value.is_empty() { "empty" } else { value }
+}
+
+/// The label a tag value stands for: the empty label for `empty`, inverting
+/// [`tag_value`].
+fn tag_label(value: &str) -> &str {
+    if value == "empty" { "" } else { value }
 }
 
 /// A label that names a length or count, as a number.
@@ -2607,12 +2615,20 @@ impl Tally<'_> {
     }
 
     /// At least `minimum` distinct values that `keep` accepts, less one per
-    /// dropped value of the dimension.
+    /// distinct dropped value of the dimension that `keep` also accepts, so
+    /// a dropped value the count never includes relaxes nothing.
     fn distinct(&mut self, dimension: &str, minimum: usize, keep: impl Fn(&str) -> bool) {
         let found = self.counts.get(dimension).map_or(0, |values| {
             values.keys().filter(|value| keep(value)).count()
         });
-        let needed = minimum.saturating_sub(self.drops_in(dimension));
+        let exempt: BTreeSet<&str> = self
+            .drops
+            .iter()
+            .filter(|drop| drop.dimension == dimension)
+            .map(|drop| tag_label(&drop.value))
+            .filter(|value| keep(value))
+            .collect();
+        let needed = minimum.saturating_sub(exempt.len());
         if found < needed {
             self.out.push(format!(
                 "{dimension}: {found} distinct values, minimum {needed}"
@@ -2625,7 +2641,9 @@ impl Tally<'_> {
 /// `world_b` miss, counted from the world B nodes of `corpus.records`, with
 /// the reference lists read from `world_a`. A value `corpus.drops` lists is
 /// exempt from its minimum, and a minimum over distinct values falls by one
-/// per dropped value of its dimension. The item counts must be exact.
+/// per dropped value of its dimension that the distinct count includes: the
+/// empty service and unit, which their distinct counts exclude, relax only
+/// their own minimums. The item counts must be exact.
 pub fn minimum_violations(world_a: &Store, world_b: &Store, corpus: &Corpus) -> Vec<String> {
     let refs = match References::read(world_a) {
         Ok(refs) => refs,
