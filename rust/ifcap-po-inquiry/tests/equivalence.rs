@@ -1,6 +1,7 @@
 //! Equivalence harness for OPTION `PRCH DISPLAY PO` (`EN3^PRCHRPT`): judges
-//! each golden case GC-01 to GC-05 against [`inquire`], judges each case of
-//! the parity corpus, and writes `REPORT.md` in full.
+//! each golden case GC-01 to GC-05 against [`inquire`] and writes `REPORT.md`
+//! in full.
+//! It also judges each case of the parity corpus.
 //!
 //! The verdicts (AAP 0.7.2):
 //!
@@ -29,28 +30,33 @@
 //! and NOT COMPARED without a usable capture of either.
 //!
 //! Capture files are read only through `golden`: `load_case`, which also
-//! evaluates readiness, and `readiness` alone for an unreadable case, and for
-//! the corpus `load_corpus_case` and `load_corpus_run`, with
+//! evaluates readiness, and `readiness` alone for an unreadable case. The
+//! fixtures are loaded only through `store::load_fixtures`. `SPEC.md` is
+//! compiled in: the report copies its static sections, and its literals table
+//! only labels a differing line. Neither golden nor specification text ever
+//! derives a rule.
+//!
+//! The parity corpus extends this. Its capture files are read only through
+//! `golden` as well: `load_corpus_case` and `load_corpus_run`, with
 //! `corpus_transcript_exists` telling from metadata alone whether a corpus
 //! transcript is present, and `read_corpus_input`, which the reader tests use
-//! for the committed inputs alone. The fixtures are
-//! loaded only through `store::load_fixtures`, and `corpus.zwr` with
-//! `fs::read_to_string`. `SPEC.md` is compiled in: the report copies its
-//! static sections, its literals table only labels a differing line, and the
-//! corpus model takes its branch inventory. Neither golden nor specification
-//! text ever derives a rule.
+//! for the committed inputs alone. `corpus.zwr`, which lives apart from those
+//! fixtures, is read with `fs::read_to_string`, and the corpus model takes
+//! the branch inventory of `SPEC.md`.
 //!
 //! `equivalence_report` is the only writer of `REPORT.md`, and the harness
-//! writes nothing else, except that the corpus reader tests write synthetic
-//! corpus folders under the system temp dir, each removed by its test. A
-//! `SPEC.md` lacking a required section fails it before anything is written,
-//! and an error writing `REPORT.md` fails it. Once the report is written, it
-//! fails only when a case is FAIL, a harness check fails or the corpus fails
-//! an integrity check, and after those when the written `### Parity corpus`
-//! block breaks its own layout (placement, parts, counts), never on a corpus
-//! verdict, so a run with no captures exits 0 when the fixtures load and the
-//! other harness checks pass. Exit 0 is not acceptance, which needs five
-//! PASS.
+//! writes nothing else. A `SPEC.md` lacking a required section fails it before
+//! anything is written, and an error writing `REPORT.md` fails it. Once the
+//! report is written, it fails only when a case is FAIL or a harness check
+//! fails, so a run with no captures exits 0 when the fixtures load and the
+//! other harness checks pass. Exit 0 is not acceptance, which needs five PASS.
+//!
+//! The parity corpus extends this too. Its reader tests write synthetic
+//! corpus folders under the system temp dir, each removed by its test. Once
+//! the report is written, `equivalence_report` also fails on a corpus
+//! integrity failure, and after that on a written `### Parity corpus` block
+//! that breaks its own layout (placement, parts, counts), never on a corpus
+//! verdict.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,7 +104,8 @@ const STATIC_SECTIONS: [&str; 9] = [
 ];
 
 /// The `SPEC.md` subsection whose table names the `TAG^ROUTINE` that writes
-/// each literal, used only to label the first differing line of a FAIL, of a
+/// each literal, used only to label the first differing line of a FAIL.
+/// The parity corpus extends that one use to the first differing line of a
 /// corpus MISMATCH or of a WORLD-DEPENDENT label.
 const LITERALS: &str = "### Literals the five cases can print";
 const NOT_ATTRIBUTED: &str = "not attributed";
@@ -572,10 +579,12 @@ fn compare(
     }
 }
 
-/// The first line, 1-based, where two different transcripts differ, with
-/// both texts and the attribution of the expected line: `attributed to
-/// <TAG^ROUTINE>` or `not attributed`. A GC case passes its normalised
-/// transcripts, and the corpus its raw ones.
+/// The first line, 1-based, where two different normalised transcripts
+/// differ, with both texts and the attribution of the expected line:
+/// `attributed to <TAG^ROUTINE>` or `not attributed`.
+/// The parity corpus extends this to raw transcripts, which `corpus_cause`
+/// passes unnormalised for the first differing line of a corpus MISMATCH or
+/// of a WORLD-DEPENDENT label.
 fn transcript_cause(expected: &str, actual: &str, literals: &[Literal]) -> String {
     let wanted: Vec<&str> = expected.split('\n').collect();
     let got: Vec<&str> = actual.split('\n').collect();
@@ -674,6 +683,7 @@ struct CorpusJudgement {
     /// The recording run line: `none`, the run's `meta.txt` values, or
     /// `INTEGRITY FAIL: <cause>` with the first integrity failure, the
     /// run's when the run failed, else the first case's.
+    /// Its format characters are shown by [`escape_format`].
     run_line: String,
     verdicts: Vec<CorpusVerdict>,
     /// Every integrity failure, of the recording run and of each case, in
@@ -794,12 +804,87 @@ fn judge_corpus(
         _ => run_line,
     };
     CorpusJudgement {
-        run_line,
+        run_line: escape_format(&run_line),
         verdicts,
         integrity,
         matched,
         in_scope,
     }
+}
+
+/// The most characters of one side of a differing line a corpus cause
+/// shows whole.
+const SHOWN_LINE_CHARS: usize = 200;
+/// How many characters before the first differing column the window of a
+/// cut line starts, where the line allows it.
+const SHOWN_LINE_LEAD: usize = 40;
+
+/// The cause of a corpus MISMATCH or WORLD-DEPENDENT label, from the raw
+/// transcripts: exactly [`transcript_cause`] when neither side of the first
+/// differing line has more than [`SHOWN_LINE_CHARS`] characters, an absent
+/// side counting as short. Otherwise the same wording, line number and
+/// attribution of the whole expected line, each side over the limit shown
+/// by [`cut_line`], so no recorded line grows its report cell without
+/// bound. Display only: the verdict is decided before.
+fn corpus_cause(expected: &str, actual: &str, literals: &[Literal]) -> String {
+    let wanted: Vec<&str> = expected.split('\n').collect();
+    let got: Vec<&str> = actual.split('\n').collect();
+    let longest = wanted.len().max(got.len());
+    let index = (0..longest)
+        .find(|&index| wanted.get(index) != got.get(index))
+        .unwrap_or(longest);
+    let (want, have) = (wanted.get(index).copied(), got.get(index).copied());
+    let long =
+        |line: Option<&str>| line.is_some_and(|text| text.chars().count() > SHOWN_LINE_CHARS);
+    if !long(want) && !long(have) {
+        return transcript_cause(expected, actual, literals);
+    }
+    // The first differing column, 0-based: the length of the shorter line
+    // when one begins the other, and 0 when a side is absent.
+    let column = match (want, have) {
+        (Some(left), Some(right)) => left
+            .chars()
+            .zip(right.chars())
+            .take_while(|(a, b)| a == b)
+            .count(),
+        _ => 0,
+    };
+    let side = |line: Option<&str>| {
+        line.map_or_else(|| ABSENT_LINE.to_string(), |text| cut_line(text, column))
+    };
+    format!(
+        "transcript differs at line {}: expected {}, actual {}, {}",
+        index.saturating_add(1),
+        side(want),
+        side(have),
+        attribute(literals, want)
+    )
+}
+
+/// `line` through [`quote`] when it has at most [`SHOWN_LINE_CHARS`]
+/// characters. Otherwise a window of that many characters, starting
+/// [`SHOWN_LINE_LEAD`] characters before the first differing `column` and
+/// moved back where the line ends sooner, so it holds the first difference,
+/// or the line's end when the other line continues it: the window through
+/// [`quote`], `…` before it and after it where the line is cut, then the
+/// line's length and the 1-based positions of the characters shown.
+fn cut_line(line: &str, column: usize) -> String {
+    let length = line.chars().count();
+    if length <= SHOWN_LINE_CHARS {
+        return quote(line);
+    }
+    let from = column
+        .saturating_sub(SHOWN_LINE_LEAD)
+        .min(length.saturating_sub(SHOWN_LINE_CHARS));
+    let to = from.saturating_add(SHOWN_LINE_CHARS);
+    let window: String = line.chars().skip(from).take(SHOWN_LINE_CHARS).collect();
+    let lead = if from > 0 { "…" } else { "" };
+    let tail = if to < length { "…" } else { "" };
+    format!(
+        "{lead}{}{tail} ({length} characters, {} to {to} shown)",
+        quote(&window),
+        from.saturating_add(1)
+    )
 }
 
 /// The verdict of a usable `capture`: the Rust session on `world_b` with
@@ -818,10 +903,7 @@ fn session_verdict(
     } else if run.transcript == capture {
         (MATCH, NO_DETAIL.to_string())
     } else {
-        (
-            MISMATCH,
-            transcript_cause(capture, &run.transcript, literals),
-        )
+        (MISMATCH, corpus_cause(capture, &run.transcript, literals))
     }
 }
 
@@ -843,7 +925,7 @@ fn world_label(
             }
             CaseLoad::Recorded(case) => (
                 WORLD_DEPENDENT,
-                transcript_cause(&case.transcript, capture, literals),
+                corpus_cause(&case.transcript, capture, literals),
             ),
             CaseLoad::Absent | CaseLoad::NotRecorded(_) | CaseLoad::Unreadable(_) => {
                 (NOT_COMPARED, format!("{gc} capture not loaded"))
@@ -943,7 +1025,7 @@ fn corpus_results(world_a: &Result<Store, String>, literals: &[Literal]) -> Corp
             ]
             .join("\n\n");
             CorpusReport {
-                block,
+                block: escape_format(&block),
                 matched_line,
                 integrity,
             }
@@ -962,10 +1044,64 @@ fn corpus_results(world_a: &Result<Store, String>, literals: &[Literal]) -> Corp
     }
 }
 
-/// `text` as one Markdown table cell: on one line, with every `|` escaped,
-/// so no cell breaks its row.
+/// The characters of Unicode 15.1 general category Cf (format), Zl (line
+/// separator) and Zp (paragraph separator), as inclusive ranges: the
+/// invisible, reordering and line-breaking characters that [`one_line`]
+/// keeps, because they are not control characters (Cc).
+const FORMAT_RANGES: [(char, char); 21] = [
+    ('\u{AD}', '\u{AD}'),
+    ('\u{600}', '\u{605}'),
+    ('\u{61C}', '\u{61C}'),
+    ('\u{6DD}', '\u{6DD}'),
+    ('\u{70F}', '\u{70F}'),
+    ('\u{890}', '\u{891}'),
+    ('\u{8E2}', '\u{8E2}'),
+    ('\u{180E}', '\u{180E}'),
+    ('\u{200B}', '\u{200F}'),
+    // U+2028 is Zl, U+2029 Zp, and U+202A to U+202E the bidi embeddings
+    // and overrides.
+    ('\u{2028}', '\u{202E}'),
+    ('\u{2060}', '\u{2064}'),
+    ('\u{2066}', '\u{206F}'),
+    ('\u{FEFF}', '\u{FEFF}'),
+    ('\u{FFF9}', '\u{FFFB}'),
+    ('\u{110BD}', '\u{110BD}'),
+    ('\u{110CD}', '\u{110CD}'),
+    ('\u{13430}', '\u{1343F}'),
+    ('\u{1BCA0}', '\u{1BCA3}'),
+    ('\u{1D173}', '\u{1D17A}'),
+    ('\u{E0001}', '\u{E0001}'),
+    ('\u{E0020}', '\u{E007F}'),
+];
+
+/// `text` with every character of [`FORMAT_RANGES`] shown as `\u{XXXX}`,
+/// its code point in upper-case hex of at least four digits, and every other
+/// character kept, so no corpus text the report shows can reorder, hide or
+/// split its line in a viewer. It runs on text [`one_line`] or [`quote`] has
+/// already escaped, and the result is unambiguous where recorded text
+/// appears: inside a [`quote`] span every original `\` is already doubled,
+/// so a single `\` before `u{` can only be this escape. Display only: no
+/// comparison sees it.
+fn escape_format(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if FORMAT_RANGES
+            .iter()
+            .any(|&(first, last)| (first..=last).contains(&c))
+        {
+            out.push_str(&format!("\\u{{{:04X}}}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `text` as one Markdown table cell: on one line, its format characters
+/// shown by [`escape_format`], with every `|` escaped, so no cell breaks or
+/// reorders its row.
 fn cell(text: &str) -> String {
-    one_line(text).replace('|', "\\|")
+    escape_format(&one_line(text)).replace('|', "\\|")
 }
 
 /// A Markdown table of the `header` cells and `rows`, each row cell through
@@ -1235,8 +1371,8 @@ fn case_block(result: &CaseResult) -> String {
     lines.join("\n")
 }
 
-/// The whole of `REPORT.md`: header, parts 1 to 3, part 3 ending with the
-/// `corpus` block (`### Parity corpus`), then the static sections.
+/// The whole of `REPORT.md`: header, parts 1 to 3, then the static sections.
+/// Part 3 ends with the `corpus` block (`### Parity corpus`).
 fn render(spec: &str, checks: &[Check], results: &[CaseResult], corpus: &str) -> String {
     let mut blocks = vec![TITLE.to_string()];
     blocks.extend(scope_sentence(spec));
@@ -1679,14 +1815,18 @@ fn check_corpus_section(report: &str, corpus: &CorpusReport) {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Computes the five verdicts, prints `GC-0N <verdict>` for each, judges
-/// the parity corpus, prints its `MATCHED n OF m IN-SCOPE CORPUS CASES`
-/// line and writes `REPORT.md` once. A `SPEC.md` lacking a required section
-/// fails the run before anything is written, and an error writing
-/// `REPORT.md` fails it. The run then fails first on the [`run_failures`]
-/// lines: a FAIL case, a failed harness check or a corpus integrity
-/// failure, in that order, never a corpus verdict. Only once those are
-/// empty is the report text written checked in memory by
+/// Computes the five verdicts, prints `GC-0N <verdict>` for each and writes
+/// `REPORT.md`. A `SPEC.md` lacking a required section fails the run before
+/// anything is written, and an error writing `REPORT.md` fails it. Once the
+/// report is written, the run fails only when a case is FAIL or a harness
+/// check fails.
+///
+/// The parity corpus extends this. Before the write, the run also judges the
+/// corpus and prints its `MATCHED n OF m IN-SCOPE CORPUS CASES` line, and it
+/// writes `REPORT.md` once. Once the report is written, the run fails first
+/// on the [`run_failures`] lines: a FAIL case, a failed harness check or a
+/// corpus integrity failure, in that order, never a corpus verdict. Only
+/// once those are empty is the report text written checked in memory by
 /// [`check_corpus_section`]: the `### Parity corpus` block's placement in
 /// part 3, its parts in order, its counts against its per-case rows, and
 /// its run line against the corpus integrity failures.
@@ -1744,9 +1884,12 @@ const SYNTHETIC_START: &str = "docker exec -i vehu su - vehu -c \"<start command
 const SUMS_NAME: &str = "SHA256SUMS";
 
 /// A synthetic corpus folder `ifcap-corpus-<pid>-<name>` under the system
-/// temp dir, removed when dropped. It records each file written to it with
-/// its SHA-256, so its digest list is built from the bytes written and no
-/// capture file is ever read back here.
+/// temp dir, which the guard creates itself and removes when dropped. The
+/// folder is created exclusively, owner-only on Unix, so nothing already at
+/// its path (a leftover, another user's folder holding planted links, or a
+/// symbolic link) is ever adopted, written through or removed. It records
+/// each file written to it with its SHA-256, so its digest list is built
+/// from the bytes written and no capture file is ever read back here.
 struct TempCorpus {
     dir: PathBuf,
     /// Each file written, relative to `dir`, with the SHA-256 of its last
@@ -1755,18 +1898,47 @@ struct TempCorpus {
 }
 
 impl TempCorpus {
-    /// An empty folder for the test `name`, a leftover of an earlier run
-    /// removed first.
+    /// The path of the folder for the test `name`:
+    /// `ifcap-corpus-<pid>-<name>` under the system temp dir.
+    fn root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ifcap-corpus-{}-{name}", std::process::id()))
+    }
+
+    /// A fresh, empty folder for the test `name`, made by
+    /// [`TempCorpus::create`]. Anything already at its path fails the test
+    /// and is left for removal by hand, never removed or reused here.
     fn new(name: &str) -> TempCorpus {
-        let dir = std::env::temp_dir().join(format!("ifcap-corpus-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        if let Err(err) = fs::create_dir_all(&dir) {
-            panic!("cannot create {}: {err}", dir.display());
+        match TempCorpus::create(name) {
+            Ok(folder) => folder,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => panic!(
+                "{} already exists and was not created by this run, so it is not \
+                 reused: remove it by hand",
+                TempCorpus::root(name).display()
+            ),
+            Err(err) => panic!("cannot create {}: {err}", TempCorpus::root(name).display()),
         }
-        TempCorpus {
+    }
+
+    /// Creates the folder for the test `name` exclusively: that one folder,
+    /// never a missing parent, owner-only (`0o700`) on Unix. Anything
+    /// already at the path, a folder, a file or a symbolic link whether or
+    /// not it dangles, is an `AlreadyExists` error and stays as it is,
+    /// neither removed, adopted nor followed, so a guard exists only for a
+    /// folder it made.
+    fn create(name: &str) -> std::io::Result<TempCorpus> {
+        let dir = TempCorpus::root(name);
+        #[cfg(unix)]
+        let created = {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(&dir)
+        };
+        #[cfg(not(unix))]
+        let created = fs::DirBuilder::new().create(&dir);
+        created?;
+        Ok(TempCorpus {
             dir,
             written: Vec::new(),
-        }
+        })
     }
 
     fn path(&self) -> &Path {
@@ -1908,8 +2080,166 @@ impl TempCorpus {
 }
 
 impl Drop for TempCorpus {
+    /// Removes the folder, which this guard created: a guard exists only
+    /// once [`TempCorpus::create`] has made its folder, and
+    /// `remove_dir_all` removes a symbolic link standing at the path rather
+    /// than following it.
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Proves that the reader tests' folders are their own. A fresh folder is a
+/// real directory, owner-only on Unix, and is removed when dropped. On Unix,
+/// a folder already standing at a guard's path and holding a planted link
+/// to a file elsewhere, and a symbolic link standing at the path itself,
+/// each make [`TempCorpus::create`] fail with `AlreadyExists`, and each,
+/// with what it leads to, is left unchanged. Nothing is read back: each
+/// file and folder is compared by its metadata (size, modification time,
+/// inode), and a folder's modification time changes with any entry added
+/// or removed.
+fn assert_temp_folders_exclusive_and_private() {
+    let fresh = TempCorpus::new("temp-guard-root");
+    let root = fresh.path().to_path_buf();
+    let kind = fs::symlink_metadata(&root).map(|meta| (meta.is_dir(), meta.is_symlink()));
+    assert!(
+        matches!(kind, Ok((true, false))),
+        "{} must be a real directory, not a link: {kind:?}",
+        root.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::symlink_metadata(&root)
+            .map(|meta| format!("{:o}", meta.permissions().mode() & 0o777));
+        assert!(
+            matches!(mode.as_deref(), Ok("700")),
+            "{} must be owner-only (700): {mode:?}",
+            root.display()
+        );
+    }
+    drop(fresh);
+    let gone = fs::symlink_metadata(&root).map_err(|err| err.kind());
+    assert!(
+        matches!(gone, Err(std::io::ErrorKind::NotFound)),
+        "{} must be removed when its guard is dropped: {gone:?}",
+        root.display()
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let identity = |meta: fs::Metadata| {
+            let modified = meta.modified().ok();
+            (meta.is_symlink(), meta.len(), modified, meta.ino())
+        };
+        // The entry at `path` itself, and what a link there leads to.
+        let stamp = |path: &Path| {
+            fs::symlink_metadata(path)
+                .map(identity)
+                .map_err(|err| err.kind())
+        };
+        let followed = |path: &Path| fs::metadata(path).map(identity).map_err(|err| err.kind());
+
+        // A folder already at the path, holding a link planted to a file
+        // the test runner can write.
+        let mut victim = TempCorpus::new("temp-guard-victim");
+        victim.write("victim.txt", "victim\n");
+        let victim_file = victim.path().join("victim.txt");
+        let mut holder = TempCorpus::new("temp-guard-holder");
+        holder.link("planted", &victim, "victim.txt");
+        let planted = holder.path().join("planted");
+        let before = (
+            stamp(holder.path()),
+            stamp(&planted),
+            followed(&planted),
+            stamp(&victim_file),
+        );
+        let refused = TempCorpus::create("temp-guard-holder")
+            .err()
+            .map(|err| err.kind());
+        assert_eq!(
+            refused,
+            Some(std::io::ErrorKind::AlreadyExists),
+            "a folder already at {} must be refused, not adopted",
+            holder.path().display()
+        );
+        let after = (
+            stamp(holder.path()),
+            stamp(&planted),
+            followed(&planted),
+            stamp(&victim_file),
+        );
+        assert!(
+            matches!(before.1, Ok((true, ..))),
+            "{} must be a planted link: {:?}",
+            planted.display(),
+            before.1
+        );
+        assert_eq!(
+            before.2,
+            before.3,
+            "{} must lead to {}",
+            planted.display(),
+            victim_file.display()
+        );
+        assert_eq!(
+            after,
+            before,
+            "the refused folder {}, its planted link and the file it leads to must be unchanged",
+            holder.path().display()
+        );
+
+        // A symbolic link standing at the path itself, to a folder holding a
+        // file. The link is removed before any assertion about it, so none
+        // leaks.
+        let mut target = TempCorpus::new("temp-guard-link-target");
+        target.write("kept.txt", "kept\n");
+        let kept = target.path().join("kept.txt");
+        let linked = TempCorpus::root("temp-guard-link");
+        let made = std::os::unix::fs::symlink(target.path(), &linked).map_err(|err| err.kind());
+        assert!(
+            made.is_ok(),
+            "cannot link {} to {}: {made:?}",
+            linked.display(),
+            target.path().display()
+        );
+        let before = (stamp(target.path()), stamp(&kept), followed(&linked));
+        let refused = TempCorpus::create("temp-guard-link")
+            .err()
+            .map(|err| err.kind());
+        let link_after = stamp(&linked);
+        let after = (stamp(target.path()), stamp(&kept), followed(&linked));
+        let removed = fs::remove_file(&linked).map_err(|err| err.kind());
+        assert_eq!(
+            refused,
+            Some(std::io::ErrorKind::AlreadyExists),
+            "a symbolic link at {} must be refused, not followed",
+            linked.display()
+        );
+        assert!(
+            matches!(link_after, Ok((true, ..))),
+            "{} must still be the link: {link_after:?}",
+            linked.display()
+        );
+        assert!(
+            removed.is_ok(),
+            "cannot remove the link {}: {removed:?}",
+            linked.display()
+        );
+        assert_eq!(
+            before.0,
+            before.2,
+            "{} must lead to {}",
+            linked.display(),
+            target.path().display()
+        );
+        assert_eq!(
+            after,
+            before,
+            "the folder {} the link leads to and its file must be unchanged",
+            target.path().display()
+        );
     }
 }
 
@@ -2226,6 +2556,9 @@ fn world_of(verdict: &CorpusVerdict) -> &WorldLabel {
 /// input alone is NOT COMPARED, and so is its world label.
 #[test]
 fn corpus_reader_no_capture_not_compared() {
+    // Every reader test writes only into a folder its guard created
+    // exclusively and privately, never one adopted from what stood there.
+    assert_temp_folders_exclusive_and_private();
     let mut folder = TempCorpus::new("no-capture");
     let cp = committed_inputs("CP-001");
     let boundary = committed_inputs("CE-17");
@@ -2931,6 +3264,54 @@ fn corpus_reader_matching_capture() {
         );
     }
 
+    // A valid `meta.txt` whose source revision holds a bidi override, its
+    // pop, an isolate pair and a line separator, its digest refreshed: the
+    // run verifies, the reader keeps the value raw, CP-001 matches, and the
+    // run line shows each of those characters as an escape and none raw.
+    let revision = "dd3f\u{202E}evil\u{202C}\u{2066}x\u{2069}\u{2028}end";
+    let spoofed = four_keys.replace(
+        "source_revision=synthetic\n",
+        &format!("source_revision={revision}\n"),
+    );
+    assert_ne!(spoofed, four_keys, "the source revision must be replaced");
+    rewritten.write("meta.txt", &format!("{spoofed}{start}"));
+    rewritten.sums();
+    match load_corpus_run(rewritten.path(), &ids) {
+        Ok(CorpusRun::Recorded { meta, .. }) => assert_eq!(
+            meta.get("source_revision"),
+            Some(revision),
+            "meta.txt source_revision, read raw"
+        ),
+        other => panic!("the run with format characters did not verify: {other:?}"),
+    }
+    let judgement = judge(&rewritten, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+    assert!(
+        judgement.integrity.is_empty(),
+        "format characters integrity: {:?}",
+        judgement.integrity
+    );
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(
+        verdict.verdict, MATCH,
+        "format characters detail: {}",
+        verdict.detail
+    );
+    assert_eq!(
+        judgement.run_line,
+        run_line.replace(
+            r#"source_revision=`"synthetic"`"#,
+            r#"source_revision=`"dd3f\u{202E}evil\u{202C}\u{2066}x\u{2069}\u{2028}end"`"#
+        ),
+        "run line with format characters"
+    );
+    assert!(
+        !judgement
+            .run_line
+            .contains(['\u{202E}', '\u{202C}', '\u{2066}', '\u{2069}', '\u{2028}']),
+        "the run line must hold no raw format character: {:?}",
+        judgement.run_line
+    );
+
     // One verified run: CP-001 healthy, and CP-002 recorded with CP-003's
     // input and that input's Rust transcript. Only CP-002 fails, its
     // failure the only one and the run line's, and CP-001 stays MATCH.
@@ -2985,7 +3366,9 @@ fn corpus_reader_matching_capture() {
 /// So is a changed line keeping a `SPEC.md` literal, attributed to its
 /// writer, an original `%YDB-E-` error line, a final `\n` removed or
 /// appended, and a failing Rust session. A class IN MISMATCH counts in m,
-/// and a CR one does not.
+/// and a CR one does not. Format characters stay raw in the cause and show
+/// as escapes in its report cell, and a line over 200 characters shows a
+/// window of 200 around its first difference, with its length.
 #[test]
 fn corpus_reader_mismatch_first_line() {
     let mut folder = TempCorpus::new("mismatch");
@@ -3030,7 +3413,38 @@ fn corpus_reader_mismatch_first_line() {
     let (error_number, error_line) = line_containing(&rust, "PC ORDER: ");
     let (removed, appended) = final_newline_variants(&rust);
     let lines = rust.split('\n').count();
+    // Line and paragraph separators, a bidi override with its pop and a
+    // zero-width joiner, which the cause keeps raw, as part 2's would.
+    let spoofing = "LS\u{2028}PS\u{2029} bidi \u{202E}evil\u{202C} zwj\u{200D} end";
+    let spoofed = format!(
+        "transcript differs at line 2: expected {}, actual {}, not attributed",
+        quote(spoofing),
+        quote(line_at(&rust, 2))
+    );
+    // A 5,000-character line, whose cause shows its first 200 characters
+    // and its length, where the whole line would make it over 5,000.
+    let long_line = format!("{}A{}", "X".repeat(3000), "X".repeat(1999));
+    let long_capture = with_line(&rust, 2, &long_line);
+    let cut = format!(
+        "transcript differs at line 2: expected {}… (5000 characters, 1 to 200 shown), \
+         actual {}, not attributed",
+        quote(&"X".repeat(200)),
+        quote(line_at(&rust, 2))
+    );
+    let whole = transcript_cause(&long_capture, &rust, &literal_rows(SPEC));
+    assert!(
+        cut.len() < 1_000 && whole.len() > 5_000,
+        "the cut cause must stay under 1,000 bytes ({}) where the whole line gives {}",
+        cut.len(),
+        whole.len()
+    );
     let subcases = [
+        (
+            "mismatch-format-characters",
+            with_line(&rust, 2, spoofing),
+            spoofed.clone(),
+        ),
+        ("mismatch-long-line", long_capture.clone(), cut),
         (
             "mismatch-literal",
             with_line(&rust, literal_number, &changed_literal),
@@ -3087,6 +3501,195 @@ fn corpus_reader_mismatch_first_line() {
             "{name} MATCHED n OF m"
         );
     }
+
+    // The report cell of the cause with format characters shows each of
+    // them as an escape and none raw, and every other character as the
+    // cause has it.
+    let shown = cell(&spoofed);
+    assert_eq!(
+        shown,
+        format!(
+            "transcript differs at line 2: expected {}, actual {}, not attributed",
+            r#"`"LS\u{2028}PS\u{2029} bidi \u{202E}evil\u{202C} zwj\u{200D} end"`"#,
+            quote(line_at(&rust, 2))
+        ),
+        "the cell of the cause with format characters"
+    );
+    assert!(
+        !shown.contains(['\u{2028}', '\u{2029}', '\u{202E}', '\u{202C}', '\u{200D}']),
+        "the cell must hold no raw format character: {shown:?}"
+    );
+    // `escape_format` alone. ASCII, other text and the escapes `one_line`
+    // writes pass unchanged, and so do the neighbours just outside a range;
+    // the first and last characters of ranges map to their escapes, a
+    // supplementary one with five digits.
+    let controls = one_line("\u{0}\u{1B}\u{7F}\u{85}\t\n");
+    for (text, wanted) in [
+        ("plain | `ASCII` 0-9 \\x00", "plain | `ASCII` 0-9 \\x00"),
+        ("— é € 漢 😀", "— é € 漢 😀"),
+        (controls.as_str(), "\\x00\\x1B\\x7F\\x85\\t\\n"),
+        (
+            "\u{2027}\u{202F}\u{2030}\u{2065}\u{E0000}\u{E0080}",
+            "\u{2027}\u{202F}\u{2030}\u{2065}\u{E0000}\u{E0080}",
+        ),
+        (
+            "\u{AD}\u{600}\u{605}\u{FEFF}\u{FFFB}",
+            "\\u{00AD}\\u{0600}\\u{0605}\\u{FEFF}\\u{FFFB}",
+        ),
+        (
+            "\u{110BD}\u{1D17A}\u{E0001}\u{E0020}\u{E007F}",
+            "\\u{110BD}\\u{1D17A}\\u{E0001}\\u{E0020}\\u{E007F}",
+        ),
+    ] {
+        assert_eq!(escape_format(text), wanted, "escape_format({text:?})");
+    }
+    // Inside a quote span a written `\u{202E}` keeps its doubled `\`, so it
+    // never reads as the escape of the character itself.
+    assert_eq!(
+        escape_format(&quote("\u{202E}")),
+        r#"`"\u{202E}"`"#,
+        "a quoted U+202E"
+    );
+    assert_eq!(
+        escape_format(&quote(r"\u{202E}")),
+        r#"`"\\u{202E}"`"#,
+        "a quoted written \\u{{202E}}"
+    );
+
+    // `corpus_cause` alone, on texts whose first differing line is long.
+    // Each window of 200 characters starts 40 before the first differing
+    // column, or ends at the line's end where that comes sooner, so it holds
+    // the difference; positions count characters, not bytes, and the
+    // attribution reads the whole expected line. A line of 200 characters
+    // is shown whole, by `transcript_cause` itself.
+    let x = |count: usize| "X".repeat(count);
+    let dash = |count: usize| "—".repeat(count);
+    let literals = literal_rows(SPEC);
+    let differs = |line: usize, expected: String, actual: String, attribution: &str| {
+        format!(
+            "transcript differs at line {line}: expected {expected}, actual {actual}, {attribution}"
+        )
+    };
+    let cuts = [
+        (
+            "differing far right",
+            format!("{}A{}", x(3000), x(1999)),
+            format!("{}B{}", x(3000), x(1999)),
+            differs(
+                1,
+                format!(
+                    "…{}… (5000 characters, 2961 to 3160 shown)",
+                    quote(&format!("{}A{}", x(40), x(159)))
+                ),
+                format!(
+                    "…{}… (5000 characters, 2961 to 3160 shown)",
+                    quote(&format!("{}B{}", x(40), x(159)))
+                ),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+        (
+            "differing near the end",
+            format!("same\n{}A{}", x(4990), x(9)),
+            format!("same\n{}B{}", x(4990), x(9)),
+            differs(
+                2,
+                format!(
+                    "…{} (5000 characters, 4801 to 5000 shown)",
+                    quote(&format!("{}A{}", x(190), x(9)))
+                ),
+                format!(
+                    "…{} (5000 characters, 4801 to 5000 shown)",
+                    quote(&format!("{}B{}", x(190), x(9)))
+                ),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+        (
+            "one line beginning the other",
+            x(300),
+            format!("{}TAIL", x(300)),
+            differs(
+                1,
+                format!("…{} (300 characters, 101 to 300 shown)", quote(&x(200))),
+                format!(
+                    "…{} (304 characters, 105 to 304 shown)",
+                    quote(&format!("{}TAIL", x(196)))
+                ),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+        (
+            "a long line against an absent one",
+            format!("a\n{}", x(201)),
+            "a".to_string(),
+            differs(
+                2,
+                format!("{}… (201 characters, 1 to 200 shown)", quote(&x(200))),
+                ABSENT_LINE.to_string(),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+        (
+            "a literal outside the window, multi-byte characters",
+            format!(
+                "END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: {}",
+                dash(250)
+            ),
+            format!(
+                "END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: {}A",
+                dash(249)
+            ),
+            differs(
+                1,
+                format!("…{} (301 characters, 102 to 301 shown)", quote(&dash(200))),
+                format!(
+                    "…{} (301 characters, 102 to 301 shown)",
+                    quote(&format!("{}A", dash(199)))
+                ),
+                "attributed to ASK1^PRCHDP2",
+            ),
+        ),
+        (
+            "control characters escaped inside the window",
+            "\u{0}".repeat(1000),
+            String::new(),
+            differs(
+                1,
+                format!(
+                    "{}… (1000 characters, 1 to 200 shown)",
+                    quote(&"\u{0}".repeat(200))
+                ),
+                quote(""),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+        (
+            "200 characters, shown whole",
+            x(200),
+            format!("{}Z", x(199)),
+            differs(
+                1,
+                quote(&x(200)),
+                quote(&format!("{}Z", x(199))),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+    ];
+    for (what, expected, actual, wanted) in cuts {
+        let cause = corpus_cause(&expected, &actual, &literals);
+        assert_eq!(cause, wanted, "corpus_cause: {what}");
+        assert!(
+            cause.len() < 2_000,
+            "corpus_cause: {what}: {} bytes",
+            cause.len()
+        );
+    }
+    assert_eq!(
+        corpus_cause(&x(200), &format!("{}Z", x(199)), &literals),
+        transcript_cause(&x(200), &format!("{}Z", x(199)), &literals),
+        "corpus_cause of lines of 200 characters is transcript_cause"
+    );
 
     // A valid capture judged on a store whose only order has a zero node
     // holding only a descendant: the Rust session fails, which is MISMATCH
@@ -4610,7 +5213,8 @@ fn corpus_cr_world_independent() {
 /// detail naming the first differing line with the GC capture as expected
 /// and the CR capture as actual, also when they differ only by a final
 /// `\n` removed or appended. The case is MISMATCH, its sides the other way
-/// round, and outside n and m.
+/// round, and outside n and m. A line over 200 characters is cut in both
+/// causes.
 #[test]
 fn corpus_cr_world_dependent() {
     let mut folder = TempCorpus::new("world-dependent");
@@ -4680,6 +5284,13 @@ fn corpus_cr_world_dependent() {
     let lines = gc_capture.split('\n').count();
     let extra = lines.saturating_add(1);
     let empty = quote("");
+    // A 5,000-character line 2 in the CR capture: both causes show its first
+    // 200 characters and its length, not the whole line.
+    let long_line = format!("{}A{}", "W".repeat(3000), "W".repeat(1999));
+    let cut = format!(
+        "{}… (5000 characters, 1 to 200 shown)",
+        quote(&"W".repeat(200))
+    );
     let differs = |line: usize, expected: &str, actual: &str| {
         format!(
             "transcript differs at line {line}: expected {expected}, actual {actual}, \
@@ -4700,6 +5311,12 @@ fn corpus_cr_world_dependent() {
             appended,
             differs(extra, ABSENT_LINE, &empty),
             differs(extra, &empty, ABSENT_LINE),
+        ),
+        (
+            "world-dependent-long-line",
+            with_line(&gc_capture, 2, &long_line),
+            differs(2, &quote(line_at(&gc_capture, 2)), &cut),
+            differs(2, &cut, &quote(line_at(&gc_capture, 2))),
         ),
     ];
     for (name, capture, world_detail, detail) in subcases {
