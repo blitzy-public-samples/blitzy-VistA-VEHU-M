@@ -37,7 +37,8 @@
 //! derives a rule.
 //!
 //! The parity corpus extends this. Its capture files are read only through
-//! `golden` as well: `load_corpus_case` and `load_corpus_run`, with
+//! `golden` as well: `load_corpus_run`, `CorpusRun::load_case`, which binds
+//! each case to that run, and `load_corpus_case`, with
 //! `corpus_transcript_exists` telling from metadata alone whether a corpus
 //! transcript is present, and `read_corpus_input`, which the reader tests use
 //! for the committed inputs alone. `corpus.zwr`, which lives apart from those
@@ -730,9 +731,11 @@ fn judge_corpus(
 }
 
 /// Judges `entries` as [`judge_corpus`] does, against `run`, the recording
-/// run already read from `corpus_dir`. A case that fails to load, whose
+/// run already read from `corpus_dir`. Each case is read bound to `run` by
+/// [`CorpusRun::load_case`], which reads no `SHA256SUMS`, or, when `run`
+/// failed, by [`load_corpus_case`] alone. A case that fails to load, whose
 /// committed input differs from the model's, or that `run` does not vouch
-/// for ([`CorpusRun::confirm_case`]: a transcript present though the run
+/// for ([`CorpusRun::load_case`]: a transcript present though the run
 /// was read as absent, or other than the bytes the run's verified
 /// `SHA256SUMS` listed for it, or one that listing names but the case no
 /// longer holds, or an input other than the one that listing names) fails
@@ -778,21 +781,16 @@ fn judge_with_run(
     };
     let mut verdicts = Vec::with_capacity(entries.len());
     for entry in entries {
-        let case = match load_corpus_case(corpus_dir, &entry.id) {
-            // Held to the run read above, never to the listing the case
-            // reader read just now. A failed run compares no case anyway.
-            Ok(case) if case.inputs == entry.inputs => {
-                match run
-                    .as_ref()
-                    .map_or(Ok(()), |run| run.confirm_case(corpus_dir, &case))
-                {
-                    Ok(()) => Some(case),
-                    Err(cause) => {
-                        integrity.push(crate_relative(&cause));
-                        None
-                    }
-                }
-            }
+        // Bound to the run read above, through the listing that run
+        // verified, so `SHA256SUMS` is never read again for a case. A failed
+        // run compares no case, so each is then read on its own, and its own
+        // cause is reported.
+        let loaded = match &run {
+            Ok(run) => run.load_case(corpus_dir, &entry.id),
+            Err(_) => load_corpus_case(corpus_dir, &entry.id),
+        };
+        let case = match loaded {
+            Ok(case) if case.inputs == entry.inputs => Some(case),
             Ok(_) => {
                 integrity.push(crate_relative(&format!(
                     "{}: committed input differs from the generated model",
@@ -1010,12 +1008,43 @@ fn corpus_world(world_a: &Store) -> Result<(String, Store), String> {
     Ok((text, world_b))
 }
 
+/// World A, the fixtures, or the crate-relative reason they did not load.
+/// It is built once per test process, by whichever test asks first, and
+/// shared by `equivalence_report` and the reader tests: a `Store` is
+/// immutable, so no test can change what another judges on. The `Result`
+/// is kept, so a fixture failure still reaches the GC verdicts, the corpus
+/// results and the harness checks as before.
+fn shared_world_a() -> &'static Result<Store, String> {
+    static WORLD_A: OnceLock<Result<Store, String>> = OnceLock::new();
+    WORLD_A.get_or_init(|| {
+        let crate_dir = Path::new(CRATE_DIR);
+        load_fixtures(&crate_dir.join("tests").join("fixtures").join("ifcap"))
+            .map_err(|err| crate_relative(&err.to_string()))
+    })
+}
+
+/// The committed `corpus.zwr` text and world B, as [`corpus_world`] builds
+/// them from [`shared_world_a`], or the reason either is missing (world A's
+/// own reason when the fixtures did not load). It is built once per test
+/// process, by whichever test asks first, and shared by `equivalence_report`
+/// and the reader tests, as world A is. The `Result` is kept, so a
+/// `corpus.zwr` failure still reaches the corpus integrity line as before.
+fn shared_world_b() -> &'static Result<(String, Store), String> {
+    static WORLD_B: OnceLock<Result<(String, Store), String>> = OnceLock::new();
+    WORLD_B.get_or_init(|| match shared_world_a() {
+        Ok(world_a) => corpus_world(world_a),
+        Err(cause) => Err(cause.clone()),
+    })
+}
+
 /// The corpus model generated from `world_a` and `SPEC.md`, and world B, or
-/// every reason either is missing. A model whose case ids are not
+/// every reason either is missing. World B is the process's shared one,
+/// [`shared_world_b`], built from the same world A fixtures that the only
+/// caller passes as `world_a`. A model whose case ids are not
 /// `golden::corpus_case_ids()` in order is missing too, and so is world B
 /// when the committed `corpus.zwr` is not the model's ZWR text, so no case
 /// is judged on a world B other than the generated one.
-fn corpus_model(world_a: &Store) -> Result<(corpus::Corpus, Store), Vec<String>> {
+fn corpus_model(world_a: &Store) -> Result<(corpus::Corpus, &'static Store), Vec<String>> {
     let ids = corpus_case_ids();
     let model = corpus::generate(world_a, SPEC)
         .map_err(|err| {
@@ -1031,13 +1060,17 @@ fn corpus_model(world_a: &Store) -> Result<(corpus::Corpus, Store), Vec<String>>
                 Err("corpus model case ids differ from golden::corpus_case_ids()".to_string())
             }
         });
-    match (model, corpus_world(world_a)) {
-        (Ok(model), Ok((text, world_b))) if text == model.render_zwr() => Ok((model, world_b)),
+    match (model, shared_world_b()) {
+        (Ok(model), Ok((text, world_b))) if *text == model.render_zwr() => Ok((model, world_b)),
         (Ok(_), Ok(_)) => Err(vec![crate_relative(&format!(
             "{}: differs from the generated corpus",
             corpus::corpus_zwr_path().display()
         ))]),
-        (model, world_b) => Err(model.err().into_iter().chain(world_b.err()).collect()),
+        (model, world_b) => Err(model
+            .err()
+            .into_iter()
+            .chain(world_b.as_ref().err().cloned())
+            .collect()),
     }
 }
 
@@ -1092,7 +1125,7 @@ fn corpus_results(world_a: &Result<Store, String>, literals: &[Literal]) -> Corp
         Ok((model, world_b)) => {
             let entries = corpus_entries(&model);
             let judgement =
-                judge_corpus(&corpus_dir(), &default_dir(), &world_b, &entries, literals);
+                judge_corpus(&corpus_dir(), &default_dir(), world_b, &entries, literals);
             let matched_line = matched_line(judgement.matched, judgement.in_scope);
             CorpusReport {
                 block: corpus_block(&model, &judgement, &matched_line),
@@ -1889,26 +1922,29 @@ fn check_corpus_section(report: &str, corpus: &CorpusReport) {
 /// [`check_corpus_section`]: the `### Parity corpus` block's placement in
 /// part 3, its parts in order, its counts against its per-case rows, and
 /// its run line against the corpus integrity failures.
+///
+/// World A and world B are the test process's shared ones,
+/// [`shared_world_a`] and [`shared_world_b`], so neither is built again
+/// here when a reader test has already built it.
 #[test]
 fn equivalence_report() {
     let missing = missing_headings(SPEC);
     assert!(missing.is_empty(), "{}", missing_message(&missing));
 
     let crate_dir = Path::new(CRATE_DIR);
-    let fixtures = load_fixtures(&crate_dir.join("tests").join("fixtures").join("ifcap"))
-        .map_err(|err| crate_relative(&err.to_string()));
+    let fixtures = shared_world_a();
     let golden = default_dir();
     let literals = literal_rows(SPEC);
     let results: Vec<CaseResult> = CASE_IDS
         .into_iter()
-        .map(|id| evaluate(id, &golden, &fixtures, &literals))
+        .map(|id| evaluate(id, &golden, fixtures, &literals))
         .collect();
     for result in &results {
         println!("{} {}", result.id, result.verdict);
     }
-    let corpus = corpus_results(&fixtures, &literals);
+    let corpus = corpus_results(fixtures, &literals);
     println!("{}", corpus.matched_line);
-    let checks = harness_checks(&fixtures, &results);
+    let checks = harness_checks(fixtures, &results);
 
     let report = render(SPEC, &checks, &results, &corpus.block);
     if let Err(err) = fs::write(crate_dir.join("REPORT.md"), &report) {
@@ -2302,17 +2338,12 @@ fn assert_temp_folders_exclusive_and_private() {
     }
 }
 
-/// World B for the reader tests, built once: the world A fixtures plus the
-/// committed `corpus.zwr`.
+/// World B for the reader tests: the process's shared world B
+/// ([`shared_world_b`]), the world A fixtures plus the committed
+/// `corpus.zwr`, the same store `equivalence_report` judges the corpus on.
 fn test_world_b() -> &'static Store {
-    static WORLD_B: OnceLock<Result<Store, String>> = OnceLock::new();
-    let built = WORLD_B.get_or_init(|| {
-        load_fixtures(&corpus::world_a_dir())
-            .map_err(|err| crate_relative(&err.to_string()))
-            .and_then(|world_a| corpus_world(&world_a).map(|(_, world_b)| world_b))
-    });
-    match built {
-        Ok(store) => store,
+    match shared_world_b() {
+        Ok((_, store)) => store,
         Err(cause) => panic!("world B not built: {cause}"),
     }
 }

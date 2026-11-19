@@ -1825,15 +1825,12 @@ pub struct CorpusCase {
 ///
 /// With neither, `SHA256SUMS` is not read and the case is unrecorded.
 /// The listing is read afresh on every call, so a caller judging against a
-/// run loaded earlier holds each case to that run's listing with
+/// run loaded earlier reads each case with [`CorpusRun::load_case`], which
+/// binds it to that run's verified listing without reading `SHA256SUMS`
+/// again, or holds a case already loaded to that listing with
 /// [`CorpusRun::confirm_case`].
 pub fn load_corpus_case(corpus_dir: &Path, case_id: &str) -> Result<CorpusCase, String> {
-    let input = read_corpus_input(corpus_dir, case_id)?;
-    let case_dir = corpus_dir.join(case_id);
-    let transcript = read_corpus_text(&case_dir, TRANSCRIPT)?;
-    if transcript.as_deref() == Some("") {
-        return Err(format!("{}: empty", case_dir.join(TRANSCRIPT).display()));
-    }
+    let (input, transcript) = read_corpus_case_texts(corpus_dir, case_id)?;
     if transcript.is_some() || stands(&corpus_dir.join(SHA256SUMS)) {
         bind_case_to_sums(corpus_dir, case_id, &input, transcript.as_deref())?;
     }
@@ -1842,6 +1839,25 @@ pub fn load_corpus_case(corpus_dir: &Path, case_id: &str) -> Result<CorpusCase, 
         inputs: split_input_lines(&input),
         transcript,
     })
+}
+
+/// The texts of corpus case `case_id` under `corpus_dir`, as both case
+/// readers, [`load_corpus_case`] and [`CorpusRun::load_case`], take them,
+/// in this order: the input as [`read_corpus_input`] gives it, with its
+/// errors, then the case's `transcript.txt` read by [`read_corpus_text`],
+/// `None` when nothing is at its path and `Err` as `<path>: empty` when it
+/// is empty. Neither text is hashed or bound to a listing here.
+fn read_corpus_case_texts(
+    corpus_dir: &Path,
+    case_id: &str,
+) -> Result<(String, Option<String>), String> {
+    let input = read_corpus_input(corpus_dir, case_id)?;
+    let case_dir = corpus_dir.join(case_id);
+    let transcript = read_corpus_text(&case_dir, TRANSCRIPT)?;
+    if transcript.as_deref() == Some("") {
+        return Err(format!("{}: empty", case_dir.join(TRANSCRIPT).display()));
+    }
+    Ok((input, transcript))
 }
 
 /// Binds corpus case `case_id`'s `input` text and `transcript`, the very
@@ -1949,8 +1965,9 @@ pub enum CorpusRun {
     /// evidence.
     Absent,
     /// A recording run whose files all verified, as they stood when
-    /// [`load_corpus_run`] read them. A case loaded afterwards is held to
-    /// it by [`CorpusRun::confirm_case`].
+    /// [`load_corpus_run`] read them. A case loaded afterwards is bound to
+    /// it by [`CorpusRun::load_case`], or held to it by
+    /// [`CorpusRun::confirm_case`].
     Recorded {
         /// The run's `meta.txt`.
         meta: CorpusMeta,
@@ -1977,7 +1994,9 @@ impl CorpusRun {
     /// this run, reading no file. [`load_corpus_case`] binds a case's input
     /// and transcript to the `SHA256SUMS` it reads on its own call, which
     /// may differ from the listing this run verified, so a caller judging
-    /// cases against this run confirms each one here. The transcript comes
+    /// cases against this run reads each one with [`CorpusRun::load_case`],
+    /// which holds the texts it reads to the transcript rule below, or
+    /// confirms each one already loaded here. The transcript comes
     /// first: the case must hold no transcript while this run lists none
     /// for it, or hold the transcript whose SHA-256 ([`sha256_hex`]) this
     /// run lists for it. Otherwise it is `Err` as `<path>: <cause>`, the
@@ -2003,30 +2022,92 @@ impl CorpusRun {
     /// only the files listed, and an absent run, which vouches for no file,
     /// accepts any input. Each path is built only for its error.
     pub fn confirm_case(&self, corpus_dir: &Path, case: &CorpusCase) -> Result<(), String> {
+        let listed_input =
+            self.hold_transcript(corpus_dir, &case.id, case.transcript.as_deref())?;
+        match listed_input {
+            Some(digest) if !inputs_have_digest(&case.inputs, digest) => Err(format!(
+                "{}: SHA-256 differs from the SHA256SUMS the recording run verified",
+                corpus_input_path(corpus_dir, &case.id).display()
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Loads corpus case `case_id` from `corpus_dir` bound to this run: the
+    /// read for a caller judging cases against a run it loaded earlier. Its
+    /// texts are read as [`load_corpus_case`] reads them, with the same read
+    /// errors: the input as [`read_corpus_input`] gives it, then a
+    /// `transcript.txt` that, when present, must be readable within its
+    /// 1 MiB budget, UTF-8, free of `\r` and not empty, under the same link
+    /// and changed-while-read rules. The very texts read are then held to
+    /// this run, and no other file is read: the listing this run verified is
+    /// the one used, so `SHA256SUMS` is read once per run however many cases
+    /// are loaded against it. The transcript must pass the rule
+    /// [`CorpusRun::confirm_case`] states, with the same four causes and the
+    /// same `<path>: <cause>` errors, so any transcript fails against
+    /// [`CorpusRun::Absent`]. Then, when this run lists the case's
+    /// `input.txt`, the input text read must have, byte for byte, the
+    /// SHA-256 ([`sha256_hex`]) listed for it, else it is `Err` as
+    /// `<path>: SHA-256 differs from the SHA256SUMS the recording run
+    /// verified`, the path that of the case's `input.txt` under
+    /// `corpus_dir` ([`corpus_input_path`]). An input this run does not
+    /// list is accepted, as [`load_corpus_run`] verifies only the files
+    /// listed, and an absent run accepts any input. Each text is hashed at
+    /// most once, only when this run lists it, and each path is built only
+    /// for its error.
+    pub fn load_case(&self, corpus_dir: &Path, case_id: &str) -> Result<CorpusCase, String> {
+        let (input, transcript) = read_corpus_case_texts(corpus_dir, case_id)?;
+        let listed_input = self.hold_transcript(corpus_dir, case_id, transcript.as_deref())?;
+        match listed_input {
+            Some(digest) if sha256_hex(input.as_bytes()) != digest => Err(format!(
+                "{}: SHA-256 differs from the SHA256SUMS the recording run verified",
+                corpus_input_path(corpus_dir, case_id).display()
+            )),
+            _ => Ok(CorpusCase {
+                id: case_id.to_string(),
+                inputs: split_input_lines(&input),
+                transcript,
+            }),
+        }
+    }
+
+    /// Holds `transcript`, case `case_id`'s transcript text or `None` when
+    /// the case holds none, to this run by the transcript rule
+    /// [`CorpusRun::confirm_case`] states, hashing it at most once, and
+    /// gives the SHA-256 this run lists for the case's `input.txt`: `None`
+    /// when this run lists none for it or is [`CorpusRun::Absent`]. Each
+    /// `Err` is `<path>: <cause>`, the path that of the case's
+    /// `transcript.txt` under `corpus_dir`, built only for the error.
+    fn hold_transcript(
+        &self,
+        corpus_dir: &Path,
+        case_id: &str,
+        transcript: Option<&str>,
+    ) -> Result<Option<&str>, String> {
         let failure = |cause: &str| {
             Err(format!(
                 "{}: {cause}",
-                corpus_dir.join(&case.id).join(TRANSCRIPT).display()
+                corpus_dir.join(case_id).join(TRANSCRIPT).display()
             ))
         };
         let (listed, listed_input) = match self {
-            CorpusRun::Absent if case.transcript.is_some() => {
+            CorpusRun::Absent if transcript.is_some() => {
                 return failure("present though the recording run was read as absent");
             }
-            CorpusRun::Absent => return Ok(()),
+            CorpusRun::Absent => return Ok(None),
             CorpusRun::Recorded {
                 transcripts,
                 inputs,
                 ..
             } => (
-                listed_digest(transcripts, &case.id),
-                listed_digest(inputs, &case.id),
+                listed_digest(transcripts, case_id),
+                listed_digest(inputs, case_id),
             ),
         };
-        match (case.transcript.as_deref(), listed) {
-            (None, None) => Ok(()),
+        match (transcript, listed) {
+            (None, None) => Ok(listed_input),
             (Some(transcript), Some(digest)) if sha256_hex(transcript.as_bytes()) == digest => {
-                Ok(())
+                Ok(listed_input)
             }
             (Some(_), Some(_)) => {
                 failure("SHA-256 differs from the SHA256SUMS the recording run verified")
@@ -2035,13 +2116,6 @@ impl CorpusRun {
             (None, Some(_)) => {
                 failure("listed in the SHA256SUMS the recording run verified but missing")
             }
-        }?;
-        match listed_input {
-            Some(digest) if !inputs_have_digest(&case.inputs, digest) => Err(format!(
-                "{}: SHA-256 differs from the SHA256SUMS the recording run verified",
-                corpus_input_path(corpus_dir, &case.id).display()
-            )),
-            _ => Ok(()),
         }
     }
 }
@@ -2116,7 +2190,8 @@ fn inputs_have_digest(inputs: &[String], digest: &str) -> bool {
 /// - every `transcript.txt` of `case_ids` that exists must be listed. The
 ///   run returned carries the digest listed for each transcript as its
 ///   `transcripts`, and for each listed `input.txt` as its `inputs`: the
-///   listing [`CorpusRun::confirm_case`] holds a case loaded later to.
+///   listing [`CorpusRun::load_case`] binds a case read later to, and
+///   [`CorpusRun::confirm_case`] holds a case loaded later to.
 ///
 /// Each failure is `Err` as `<path>: <cause>`, naming the file or folder
 /// at fault, except an id outside [`corpus_case_ids`], which is
