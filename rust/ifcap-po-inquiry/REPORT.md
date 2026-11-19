@@ -8,6 +8,8 @@ This file is written in full by `tests/equivalence.rs` on every `cargo test` and
 
 Each command below ran on 2026-11-15 in this checkout from `rust/ifcap-po-inquiry/` unless its entry says otherwise (the subsections headed "Round one" ran on 2026-11-17, in round one), with `RUSTUP_AUTO_INSTALL=0` set so that a missing toolchain fails instead of downloading. Each entry gives the command, its exit status and its output, standard error included. An output is complete unless its entry says it is trimmed. Round one's records are history. Each "Round one" heading names the commit its record was observed on, or, for a record taken over uncommitted edits, the commit that committed them; when recorded, these subsections were headed "Refine round", and their own cross-references use that name. Round two's baseline and completion records close this section; its fixture-to-source check is in subsection "Fixture-to-source equality". The read-only searches S5 to S9 are in `SPEC.md` section "Read-only enforcement results", the A7 commands in each round's completion evidence below and in section "Source-unchanged verification", and the capture listings in section "Capture hashes".
 
+The corpus round's two records follow round two's and close this section: "Corpus round: baseline before the first edit", taken at the round's base commit before its first edit of this document, and "Corpus round: completion evidence". The corpus round's capture listing is compared there with its `tests/golden/ifcap/corpus/` lines removed (K20).
+
 ### Round one: baseline before the first edit (commit `0b123807c`)
 
 These commands ran on 2026-11-17 from `rust/ifcap-po-inquiry/` at commit `0b123807c`, with the five capture folders and `tests/fixtures/ifcap/cases.zwr` present, before any edit of this round other than this record. The capture listing is the "Before" row of section "Capture hashes".
@@ -1127,6 +1129,440 @@ On the destination branch the same command lists the commit that delivers this r
 
 **Result.** Every completion condition of round two holds on the Linux build host at commit `7c7959357`, on the destination branch, whose `src/` and `tests/` trees are `ab0e513a…17dd` and `c50b5978…52dd`, and at its parent `a774d2770`: `cargo test --offline --locked` exits 0 with 191 passed and 0 failed; `REPORT.md` part 2 reads `Verdict: PASS` for all five cases; `end_to_end_real_captures` gets `match` true for each READY case; build, clippy, format and documentation exit 0 with no warning; S1 has one hit, S3 and S5 none, and S4 hits only `src/golden.rs`; A7 holds; every stated hash holds. This round records no acceptance (section "Acceptance record"). These runs left `REPORT.md` unchanged, sha256 `917e70c7…ab66` before and after, and `git status --porcelain` printed nothing after them, so no restore was needed. The committed `REPORT.md` is the one `cargo test --offline --locked` wrote after this document's final edit; a second run left its sha256 unchanged, which shows it current.
 
+### Corpus round: baseline before the first edit
+
+These commands ran on 2026-11-19 from 07:29:44Z to 07:34:03Z on the Linux build host (12 CPUs, 1-minute load average 29.88 to 34.26 from other work on the host), at the corpus round's base commit `7afbc4af999d9b2b70a3302ffbb72dcede2952d3`, the merge of pull request #3. When this record was taken the checkout already held the corpus round's other edits (its `HEAD` was `56cde196a`, carrying the corpus code, generated data, scripts, `tests/golden/ifcap/README.md` Part C and `RUNNING.md` step 8, while this document was still byte-identical to the base), so they ran in a scratch `git worktree` of the base commit outside the checkout, created at 07:29:44Z by `git worktree add --detach <scratch>/wt 7afbc4af999d9b2b70a3302ffbb72dcede2952d3`, exit status 0. They ran from the worktree's `rust/ifcap-po-inquiry/`, shown as `<base>`, with `RUSTUP_AUTO_INSTALL=0` set, except `git rev-parse HEAD`, which ran from the worktree root. Every file the corpus round adds was absent there.
+
+`git rev-parse HEAD`, 2026-11-19T07:30:42Z, exit status 0, then `git status --porcelain`, exit status 0 with no output:
+
+```text
+7afbc4af999d9b2b70a3302ffbb72dcede2952d3
+```
+
+**Toolchain**, 2026-11-19T07:30:47Z. `rustc -Vv`, `cargo -V` and `cc --version`, each exit status 0. Output complete:
+
+```text
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+binary: rustc
+commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67
+commit-date: 2026-10-13
+host: x86_64-unknown-linux-gnu
+release: 1.99.1
+LLVM version: 23.1.1
+cargo 1.99.1 (5f94df478 2026-08-27)
+cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+Copyright (C) 2025 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+```
+
+The pinned `rustc 1.99.1` and a C linker are present, so environment blocker C1 does not apply.
+
+**Tests.** `cargo test --offline --locked` ran four times. The first three, started at 07:30:54Z, 07:31:16Z and 07:32:08Z, each exited 101 with one failure, the unit test `bridge::tests::live_admission_bounds_real_runs` of `src/bridge.rs`, and with every other `src/lib.rs` test passing (`168 passed; 1 failed`); Cargo stopped after the failing target, so the later targets did not run. The first run's output, trimmed of its 168 lines `test <name> ... ok`, every other line, standard error included, shown:
+
+```text
+   Compiling ifcap-po-inquiry v0.1.0 (<base>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.36s
+     Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
+
+running 169 tests
+test bridge::tests::live_admission_bounds_real_runs ... FAILED
+
+failures:
+
+---- bridge::tests::live_admission_bounds_real_runs stdout ----
+
+thread 'bridge::tests::live_admission_bounds_real_runs' (984283) panicked at src/bridge.rs:3829:9:
+assertion `left == right` failed
+  left: [Ok(""), Ok(""), Ok(""), Err(Timeout), Ok(""), Ok("")]
+ right: [Ok(""), Ok(""), Ok(""), Ok(""), Ok(""), Ok("")]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    bridge::tests::live_admission_bounds_real_runs
+
+test result: FAILED. 168 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.00s
+
+error: test failed, to rerun pass `--lib`
+```
+
+The second and third runs failed the same assertion, with `left` `[Ok(""), Ok(""), Ok(""), Err(Timeout), Err(Timeout), Ok("")]` and `[Ok(""), Ok(""), Ok(""), Err(Timeout), Ok(""), Err(Timeout)]`. The test starts six 0.3 s `sleep` runs through two admission slots under the 10 s `LIVE_TIMEOUT`; between the second and third runs, `cargo test --offline --locked --lib live_admission_bounds_real_runs`, run three times from 07:31:55Z to 07:31:57Z, passed each time (`1 passed; 0 failed; … 168 filtered out; finished in 0.97s`). It is a host-load timing failure of a test in `src/bridge.rs`, which the corpus round leaves byte-identical, not a state of the base. The fourth run, started 2026-11-19T07:32:33Z at a 1-minute load average of 34.26 and finished 07:33:11Z, exit status 0. Output trimmed: the 191 lines `test <name> ... ok` are omitted; every other line, standard error included, is shown:
+
+```text
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
+
+running 169 tests
+
+test result: ok. 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.46s
+
+     Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bridge.rs (target/debug/deps/bridge-c64136913db311bc)
+
+running 20 tests
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.68s
+
+     Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
+
+running 2 tests
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.90s
+
+   Doc-tests ifcap_po_inquiry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Total over the five test targets: 191 passed (unit tests of `src/lib.rs` 169, `src/bin/bridge.rs` 0, `tests/bridge.rs` 20, `tests/equivalence.rs` 2, doc-tests 0), 0 failed, 0 ignored: the request's 191.
+
+`grep -c '^- Verdict: PASS' REPORT.md`, 2026-11-19T07:33:16Z, on the `REPORT.md` the fourth run wrote, printed `5`, exit status 0; `grep -n '^- Verdict' REPORT.md` printed the five part 2 lines `1141:- Verdict: PASS`, `1148:- Verdict: PASS`, `1155:- Verdict: PASS`, `1162:- Verdict: PASS` and `1169:- Verdict: PASS`, for `GC-01` to `GC-05`; and `git diff --exit-code -- REPORT.md` printed nothing, exit status 0, so the regenerated file is byte-identical to the committed one, sha256 `624f0094a9b14b7005b2fc37086a428878af5b4d1f7272939102e6769d0f8478`. Its part 1 harness checks read `fixtures loaded: PASS — 29874 nodes`, `per-case readiness evaluated: PASS — 5 of 5 cases`, `store equal to its pre-call clone: PASS — sessions run: 5` and `SPEC.md sections found: PASS — 10 of 10`.
+
+`cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, 2026-11-19T07:33:41Z, exit status 0, after which `git diff --exit-code -- REPORT.md` still exited 0. Output complete:
+
+```text
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running tests/equivalence.rs (target/debug/deps/equivalence-7282b6d5b6d35e2c)
+
+running 2 tests
+test equivalence_report ... GC-01 PASS
+GC-02 PASS
+GC-03 PASS
+GC-04 PASS
+GC-05 PASS
+ok
+test spec_has_report_sections ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.78s
+```
+
+**Capture listing**, 2026-11-19T07:33:52Z. The three commands of section "Capture hashes", "Round two, before the first edit", each exit status 0:
+
+```sh
+sha256sum tests/fixtures/ifcap/200.zwr
+find tests/golden/ifcap -type f ! -name README.md -exec sha256sum {} + | sort -k2
+if [ -f tests/fixtures/ifcap/cases.zwr ]; then sha256sum tests/fixtures/ifcap/cases.zwr; else echo "ABSENT tests/fixtures/ifcap/cases.zwr"; fi
+```
+
+They printed 41 lines, identical line for line to the listing verbatim in section "Capture hashes" under "Round two, before the first edit" (`diff` exit status 0), and to the one under "Round two, after the last edit" (`diff` exit status 0). The first line is `836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da  tests/fixtures/ifcap/200.zwr` and the last `9dd56f96bf29c5bb8e0e373cbaf2fb3f912daab4b41bf65fec1df76485da32a0  tests/fixtures/ifcap/cases.zwr`. The two "Capture hashes" listing lines, `find tests/golden/ifcap -type f ! -name README.md -exec sha256sum {} +` and the `cases.zwr` line, were then run again with their output piped to `sort` and saved outside the checkout as the corpus round's baseline: 40 lines, sha256 `d30051be4ccae4ed8ae0d9032f4c97ce96e2783320d05ae3cce3896a2da8a6d5`. `tests/fixtures/ifcap/` holds 13 files.
+
+**Fixture counts**, 2026-11-19T07:34:03Z, from `<base>/tests/fixtures/ifcap/`, each exit status 0, against the corpus minimums of section "Parity corpus":
+
+```text
+$ grep -c '^\^PRC(440,[0-9.]*,0)=' 440.zwr
+2627
+$ grep -E '^\^PRC\(440,[0-9.]+,3\)=' 440.zwr | awk -F'"' '{split($2,p,"^"); if (p[2]=="Y") c++} END{print c+0}'
+0
+$ grep -E '^\^PRCD\(442\.3,[0-9.]+,0\)=' 442.3.zwr | awk -F'"' '{split($2,p,"^"); if (p[2]=="" || p[2]+0<10) c++} END{print c}'
+9
+$ grep -E '^\^PRCD\(442\.5,[0-9.]+,0\)=' 442.5.zwr | sed 's/^\^PRCD(442\.5,\([0-9.]*\),0).*/\1/' | awk '$1<10{c++} END{print c}'
+7
+$ grep -cE '^\^PRC\(411,500,1,[0-9]+,0\)=' 411.zwr
+2
+$ grep -cE '^\^PRC\(411,[0-9]+,1,[0-9]+,0\)=' 411.zwr
+3
+```
+
+| Count | Value | Corpus minimum |
+|---|---|---|
+| File 440 vendors (zero nodes), of which EDI (node 3 piece 2 `Y`) | 2,627, of which 0 | 40 non-EDI vendors: 2,627 are non-EDI |
+| 442.3 statuses whose piece 2 is below 10 or empty | 9 | At least 1, each used twice |
+| 442.5 methods of processing below 10 | 7 | At least 1, each used 5 times |
+| 411 ship-to entries of station 500, and in the whole file | 2, and 3 | At least 1, each used 8 times |
+
+No count falls short of a minimum, so the stop condition does not apply. The baseline is the one the request expects: 191 passed and 0 failed, `Verdict: PASS` for all five cases, `REPORT.md` regenerated byte-identical, and every hash of the round-two listing unchanged.
+
+### Corpus round: completion evidence
+
+These commands ran on 2026-11-19 from 07:42:41Z to 07:47:18Z on the Linux build host (12 CPUs, 1-minute load average about 28 from other work on the host), at commit `486398a59a0b37ef0dcf0080f8f8c91b09433213`, the observed commit, on the work branch `blitzy-98f410cb-da9c-4258-aa61-effc9de33dba`, with no uncommitted change when they started. It holds every corpus-round change: `src/` (tree `028109868c5883153cfe712ce747ff9cfd2eb18d`), `tests/` with the generated data, the three scripts and the golden README Part C (tree `914eca51d2c944bf1c3c4e490e6e58f9a64b98c5`), `RUNNING.md` step 8, and this document's corpus additions and baseline record; the commit that delivers this record follows it and changes only this document. `REPORT.md` is not edited by hand: every `cargo test` below rewrote it in the checkout, each rewrite was restored with `git checkout -- REPORT.md` before the checks that read `git status`, and the committed `REPORT.md` is the one the last `cargo test --offline --locked` writes after this document's final edit. The commands ran from `rust/ifcap-po-inquiry/`, shown as `<crate>`, with `RUSTUP_AUTO_INSTALL=0` set, except `git rev-parse HEAD`, the tree IDs, the A7 commands and the three byte-identity commands, which ran from the repository root.
+
+**Observed commit.** At 2026-11-19T07:42:41Z, `git rev-parse HEAD` and `git status --porcelain`, each exit status 0, the second with no output:
+
+```text
+$ git rev-parse HEAD
+486398a59a0b37ef0dcf0080f8f8c91b09433213
+$ echo src $(git rev-parse HEAD:rust/ifcap-po-inquiry/src); echo tests $(git rev-parse HEAD:rust/ifcap-po-inquiry/tests)
+src 028109868c5883153cfe712ce747ff9cfd2eb18d
+tests 914eca51d2c944bf1c3c4e490e6e58f9a64b98c5
+```
+
+**Build, lint, format and documentation.** `cargo clean` ran at 07:42:46Z, exit status 0, printing `Removed 1049 files, 456.7MiB total`, so everything below was compiled from the committed sources in this run. The build ran at 07:42:47Z, and the other three in sequence from 07:42:49Z to 07:42:51Z, before the tests. Each exited 0 with no warning. Output complete:
+
+| Command | Exit status | Output |
+|---|---|---|
+| `cargo build --offline --locked` | 0 | `Compiling ifcap-po-inquiry v0.1.0 (<crate>)`, then ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.62s`` |
+| `cargo clippy --offline --locked --all-targets` | 0 | `Checking ifcap-po-inquiry v0.1.0 (<crate>)`, then ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.90s`` |
+| `cargo fmt --check` | 0 | none |
+| `RUSTDOCFLAGS='-D warnings' cargo doc --offline --locked --no-deps --document-private-items` | 0 | `Checking ifcap-po-inquiry v0.1.0 (<crate>)`, `Documenting ifcap-po-inquiry v0.1.0 (<crate>)`, ``Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.08s``, `Generated <crate>/target/doc/ifcap_po_inquiry/index.html and 2 other files` |
+
+**Criterion 1, tests.** `cargo test --offline --locked`, started 2026-11-19T07:42:58Z at a 1-minute load average of 27.96, finished 07:43:45Z, exit status 0. Output trimmed: the 209 lines `test <name> ... ok` are omitted; every other line, standard error included, is shown:
+
+```text
+   Compiling ifcap-po-inquiry v0.1.0 (<crate>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.36s
+     Running unittests src/lib.rs (target/debug/deps/ifcap_po_inquiry-3a953f325e76a084)
+
+running 169 tests
+
+test result: ok. 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.27s
+
+     Running unittests src/bin/bridge.rs (target/debug/deps/bridge-758b3ca846ca0af2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/corpus_gen.rs (target/debug/deps/corpus_gen-a1fbdc32ff510447)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/bridge.rs (target/debug/deps/bridge-9beed9b1f5406b38)
+
+running 20 tests
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.12s
+
+     Running tests/corpus.rs (target/debug/deps/corpus-e0897437a71ec731)
+
+running 8 tests
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.75s
+
+     Running tests/equivalence.rs (target/debug/deps/equivalence-3c2b54028f880761)
+
+running 12 tests
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.52s
+
+   Doc-tests ifcap_po_inquiry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+Total over the seven test targets: 209 passed (unit tests of `src/lib.rs` 169, `src/bin/bridge.rs` 0, `src/bin/corpus_gen.rs` 0, `tests/bridge.rs` 20, `tests/corpus.rs` 8, `tests/equivalence.rs` 12, doc-tests 0), 0 failed, 0 ignored. That is the baseline's 191 plus the eight tests of `tests/corpus.rs` and ten corpus tests of `tests/equivalence.rs`: `corpus_reader_no_capture_not_compared`, `corpus_reader_matching_capture`, `corpus_reader_mismatch_first_line`, `corpus_reader_quarantined`, `corpus_reader_missing_sha256sums`, `corpus_reader_edited_transcript`, `corpus_cr_world_independent`, `corpus_cr_world_dependent`, `cr_inputs_equal_gc_inputs` and `sha256_known_answers`, each `... ok` in this run. The run hit no failure of `bridge::tests::live_admission_bounds_real_runs`, the timing failure of the baseline record.
+
+**Criterion 2, generator check.** `cargo run --offline --locked --bin corpus_gen -- --check`, 2026-11-19T07:44:41Z, exit status 0. Output complete, standard error included: Cargo's two indented lines are standard error, and the eight lines after them standard output:
+
+```text
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running `target/debug/corpus_gen --check`
+specified: 200 CP, 26 CE (16 IN, 10 BOUNDARY), 5 CR, 50 multi-item orders
+generated: 200 CP, 26 CE (13 IN, 13 BOUNDARY), 5 CR, 50 multi-item orders
+moved: CE-04 IN->BOUNDARY PO-09.b11; CE-06 IN->BOUNDARY PO-09.b11; CE-08 IN->BOUNDARY PO-09.b11
+dropped variants: 0
+findings: 0
+regeneration rounds: 1
+largest item count: 8; worst $Y: 39 (bound 45)
+check: 233 files equal
+```
+
+**Criterion 3, the report.** On the `REPORT.md` that criterion 1's run wrote, at 2026-11-19T07:43:58Z, `grep -n '^### Parity corpus\|^#### Dropped variants\|^#### BOUNDARY map\|^MATCHED ' REPORT.md`, exit status 0, then `grep -c '^- Verdict: PASS' REPORT.md`, exit status 0:
+
+```text
+1346:### Parity corpus
+1357:MATCHED 0 OF 0 IN-SCOPE CORPUS CASES
+1605:#### Dropped variants
+1609:#### BOUNDARY map
+5
+```
+
+The five `- Verdict: PASS` lines are the part 2 blocks of `GC-01` to `GC-05`, at lines 1294, 1301, 1308, 1315 and 1322. Under `### Parity corpus` the run line reads `Recording run: none`, and the count table, verbatim:
+
+```text
+| Class | MATCH | MISMATCH | NOT COMPARED | BOUNDARY | QUARANTINED | Total |
+|---|---|---|---|---|---|---|
+| CP | 0 | 0 | 200 | 0 | 0 | 200 |
+| IN | 0 | 0 | 13 | 0 | 0 | 13 |
+| BOUNDARY | 0 | 0 | 0 | 13 | 0 | 13 |
+| CR | 0 | 0 | 5 | 0 | 0 | 5 |
+```
+
+So every CP, IN and CR case is NOT COMPARED (200, 13 and 5) and every BOUNDARY case BOUNDARY (13), with no MATCH, MISMATCH or QUARANTINED. `#### Class moves` lists CE-04, CE-06 and CE-08, each IN to BOUNDARY at PO-09.b11; `#### Findings` and `#### Dropped variants` read `none`; `#### CR world labels` follows the BOUNDARY map. These line numbers belong to the file that run wrote, which carries this document's baseline record but not this record, so the committed `REPORT.md` has other line numbers.
+
+`cargo test --offline --locked --test equivalence -- --nocapture --test-threads=1`, `cargo test --offline --locked --test bridge end_to_end_real_captures -- --nocapture` and `cargo test --offline --locked --test corpus -- --test-threads=1` ran next. Each output is complete in its cell, one code span per line, blank lines left out:
+
+| Command | Time | Exit status | Output |
+|---|---|---|---|
+| `--test equivalence -- --nocapture --test-threads=1` | 07:44:04Z | 0 | ``Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s``, ``Running tests/equivalence.rs (target/debug/deps/equivalence-3c2b54028f880761)``, `running 12 tests`, nine lines `test <name> ... ok` (the nine corpus tests before `equivalence_report` in name order), `test equivalence_report ... GC-01 PASS`, `GC-02 PASS`, `GC-03 PASS`, `GC-04 PASS`, `GC-05 PASS`, `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES`, `ok`, `test sha256_known_answers ... ok`, `test spec_has_report_sections ... ok`, `test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.13s` |
+| `--test bridge end_to_end_real_captures -- --nocapture` | 07:44:17Z | 0 | ``Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s``, ``Running tests/bridge.rs (target/debug/deps/bridge-9beed9b1f5406b38)``, `running 1 test`, `GC-01 MATCH`, `GC-02 MATCH`, `GC-03 MATCH`, `GC-04 MATCH`, `GC-05 MATCH`, `test end_to_end_real_captures ... ok`, `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 1.75s` |
+| `--test corpus -- --test-threads=1` | 07:44:19Z | 0 | ``Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s``, ``Running tests/corpus.rs (target/debug/deps/corpus-e0897437a71ec731)``, `running 8 tests`, `test corpus_gen_check_exits_zero ... ok`, `test gate_c_values_and_miss_strings ... ok`, `test gate_every_case_meets_its_class ... ok`, `test gate_no_paging_by_computation ... ok`, `test gate_profile_and_references ... ok`, `test gate_variation_minimums ... ok`, `test generator_is_deterministic ... ok`, `test world_b_keeps_world_a_and_world_a_has_no_corpus ... ok`, `test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.66s` |
+
+Each command is `cargo test --offline --locked` followed by the arguments shown. The nine lines of the first row are `corpus_cr_world_dependent`, `corpus_cr_world_independent`, `corpus_reader_edited_transcript`, `corpus_reader_matching_capture`, `corpus_reader_mismatch_first_line`, `corpus_reader_missing_sha256sums`, `corpus_reader_no_capture_not_compared`, `corpus_reader_quarantined` and `cr_inputs_equal_gc_inputs`. The equivalence test prints `GC-01 PASS` to `GC-05 PASS`, then the MATCHED line, and `end_to_end_real_captures` prints `GC-0N MATCH` only after its assertion that COMPARE answered `match` true for that READY case.
+
+**Criterion 4, read reach.** At 2026-11-19T07:44:55Z, both searches exit status 0:
+
+```sh
+grep -rnE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|SHA256SUMS|run-summary' src/ tests/*.rs
+grep -rnE 'fs::read|File::open|read_to_string|read_dir' src/ tests/*.rs
+```
+
+The first printed 190 hits:
+
+| File | Hits | Reason |
+|---|---|---|
+| `src/golden.rs` | 146 | The capture reader, the one module of `src/` that names capture files |
+| `tests/bridge.rs` | 27 | Byte-identical to the base (`git diff --quiet 7afbc4af9 -- tests/bridge.rs` exits 0), which held the same 27: the synthetic capture folders it writes under the temporary directory and its comments |
+| `tests/corpus.rs` | 2 | Lines 10 and 11, its module doc, which names the files the gate never reads |
+| `tests/equivalence.rs` | 15 | Lines 113, 114, 119, 125, 129 and 134, the readiness-check definitions printed into `REPORT.md` part 3; line 512, the FAIL cause `meta.txt missing or unparsable`; line 1353, `SUMS_NAME`, the name the reader tests write and expect in a failure; lines 1400, 1405, 1409, 1410, 1428 and 1437, the reader tests' synthetic writes under `std::env::temp_dir()` and their doc comment; line 1771, the path `CP-001/transcript.txt` a reader test expects in a failure message |
+
+The second printed 14 hits, none of them a read of a capture file:
+
+| Hit | What it reads |
+|---|---|
+| `src/bridge.rs:1237` | A static `frontend/` file the bridge serves |
+| `src/bridge.rs:3213`, `5410`, `5478` | `/dev/null` and the `frontend/` files, in its test module |
+| `src/bin/corpus_gen.rs:79` | `SPEC.md` |
+| `src/bin/corpus_gen.rs:188` | With `--check`, the committed `corpus.zwr` and `manifest.tsv`; each `input.txt` goes through `golden::read_corpus_input` |
+| `src/store.rs:347`, `373` | `load_fixtures`, the `*.zwr` fixtures of one folder |
+| `src/store.rs:1118` | A fixture in its test module |
+| `tests/bridge.rs:1745` | The `frontend/` files |
+| `tests/corpus.rs:145`, `152` | `corpus.zwr` and `manifest.tsv` |
+| `tests/equivalence.rs:35` | A doc comment naming `fs::read_to_string` |
+| `tests/equivalence.rs:852` | `corpus.zwr`, for world B |
+
+**Criterion 5, byte identity.** From the repository root at 2026-11-19T07:45:13Z, with `BASE=7afbc4af999d9b2b70a3302ffbb72dcede2952d3` and `C=rust/ifcap-po-inquiry`:
+
+```text
+$ git diff --exit-code $BASE -- Packages $C/Cargo.lock $C/rust-toolchain.toml $C/Cargo.toml $C/frontend $C/src/mumps.rs $C/src/bridge.rs $C/src/bin/bridge.rs $C/src/store.rs $C/tests/bridge.rs $C/tests/golden/ifcap/GC-01 $C/tests/golden/ifcap/GC-02 $C/tests/golden/ifcap/GC-03 $C/tests/golden/ifcap/GC-04 $C/tests/golden/ifcap/GC-05 $C/tests/golden/ifcap/state $C/tests/fixtures/ifcap $C/scripts; echo "exit=$?"
+exit=0
+$ for f in src/inquiry.rs src/lib.rs src/golden.rs; do git diff -U0 $BASE -- $C/$f | grep -c '^-[^-]'; done
+0
+0
+0
+$ git diff --name-status $BASE | grep -v 'tests/golden/ifcap/corpus/C[PER]-[0-9]*/input.txt$'
+M	rust/ifcap-po-inquiry/REPORT.md
+M	rust/ifcap-po-inquiry/RUNNING.md
+M	rust/ifcap-po-inquiry/SPEC.md
+A	rust/ifcap-po-inquiry/src/bin/corpus_gen.rs
+A	rust/ifcap-po-inquiry/src/corpus.rs
+M	rust/ifcap-po-inquiry/src/golden.rs
+M	rust/ifcap-po-inquiry/src/inquiry.rs
+M	rust/ifcap-po-inquiry/src/lib.rs
+A	rust/ifcap-po-inquiry/tests/corpus.rs
+M	rust/ifcap-po-inquiry/tests/equivalence.rs
+A	rust/ifcap-po-inquiry/tests/fixtures/ifcap-corpus/corpus.zwr
+M	rust/ifcap-po-inquiry/tests/golden/ifcap/README.md
+A	rust/ifcap-po-inquiry/tests/golden/ifcap/corpus/manifest.tsv
+A	rust/ifcap-po-inquiry/tests/golden/ifcap/corpus/scripts/check_corpus.sh
+A	rust/ifcap-po-inquiry/tests/golden/ifcap/corpus/scripts/load_corpus.sh
+A	rust/ifcap-po-inquiry/tests/golden/ifcap/corpus/scripts/record_corpus.sh
+```
+
+`git diff --name-status $BASE` printed 247 lines, exit status 0: these 16 and 231 lines `A` for the case inputs `CP-001` to `CP-200`, `CE-01` to `CE-26` and `CR-01` to `CR-05`. Every path is in the corpus round's file list. The `REPORT.md` line is the working-tree file criterion 1's run wrote, which the commit does not yet carry.
+
+**Audits**, run 2026-11-19T07:45:20Z, each exit status as shown:
+
+```text
+$ grep -rnE 'unsafe|\.unwrap\(|\.expect\(|panic!' src/          # S1, exit 0
+src/lib.rs:9:#![forbid(unsafe_code)]
+$ grep -rnE '[A-Za-z_)]\[[^]]+\]' src/                          # S2, exit 0
+src/inquiry.rs:859:        // W:DIC(0)["E" ! ends the line before G ASK [DIC.m:63], whose W ! and
+$ grep -n 'golden' src/inquiry.rs src/store.rs src/mumps.rs     # S3, exit 1, no output
+$ grep -rlE 'input\.txt|transcript\.txt|returned\.txt|meta\.txt|normalisation\.txt|db-before|db-after|tests/golden' src/   # S4, exit 0
+src/golden.rs
+$ grep -rnE '<same pattern>' src/ | wc -l
+110
+$ grep -rcE '<same pattern>' src/golden.rs
+110
+$ grep -rn '&mut Store' src/                                    # S5, exit 1, no output
+$ grep -n '&mut self' src/store.rs                              # S5, exit 1, no output
+$ grep -rn 'Command::new' src/                                  # S6, exit 0
+src/bridge.rs:2245:    let mut child = Command::new(program)
+src/bridge.rs:3526:        let spawned = Command::new("sleep")
+$ grep -rnE 'fs::write|File::create|OpenOptions|create_dir|remove_file|rename\(' src/ | wc -l   # S7, exit 0
+27
+$ grep -rnE '<same pattern>' src/ | grep '^src/bin/'                # S7, the generator's hits
+src/bin/corpus_gen.rs:168:        fs::create_dir_all(dir)?;
+src/bin/corpus_gen.rs:170:    fs::write(path, text)
+$ grep -rniE 'create|edit|cancel|delete' frontend/ | wc -l       # S8, exit 0
+8
+$ grep -rnE 'method: *"(PUT|PATCH|DELETE)"' frontend/           # S9, exit 1, no output
+```
+
+- S1 has the one allowlisted crate attribute. The one S2 hit is the comment quoting the M code `DIC(0)["E"` [DIC.m:63], not Rust indexing; `inquire_traced`, added above it, moved it from line 846 to 859. S3 and S5 print nothing. All 110 S4 hits are in `src/golden.rs`: the corpus reader's file names live there, and no other `src/` file names a capture file.
+- S6 equals the `Command::new` listing of section "Read-only enforcement results". S7 has 27 hits. 25 are the base's test-module hits: `src/bridge.rs` 6 and `src/store.rs` 6 at their base lines, and `src/golden.rs` 13 with the same text as at the base (`diff` exit status 0), moved down by the corpus reader items placed before its test module, which now starts at line 2277. The other two are `src/bin/corpus_gen.rs:168` and `170`, the `fs::create_dir_all` and `fs::write` of its `write_file`, the generator's only outputs: the 233 generated files, written only after a successful generation and never with `--check`. S8 prints the 8 lines of section "Read-only enforcement results" unchanged, since `frontend/` is byte-identical.
+
+**A7, source unchanged.** From the repository root at 2026-11-19T07:45:41Z, with `blitzy/screenshots` and `blitzy/screen_recordings` empty; each exit status 0, and neither printed anything:
+
+```text
+$ git diff --quiet HEAD -- Packages Packages.csv README.rst LICENSE NOTICE ATTESTATION     # exit 0, no output
+$ git status --porcelain -- . ':!rust/ifcap-po-inquiry'                                    # exit 0, no output
+```
+
+**Specification counts**, at 07:45:41Z, each exit status 0: `grep -c '^| PO-[0-9]*\.b' SPEC.md` 108, `grep -c '^| PO-' SPEC.md` 108 and `grep -c '^### PO-' SPEC.md` 41, and the coverage of the "Branch inventory" rows, by the three `grep` commands of round two's fence verification, 47 exercised, 0 exercised-not-implemented and 61 not implemented. `### Branch inventory` is unchanged, so `corpus::ne_branches` reads the same 61 IDs and `corpus_gen --check` still holds.
+
+**Capture hashes (K20).** At 2026-11-19T07:45:55Z the two listing lines of section "Capture hashes" printed 275 lines, exit status 0, of which 235 are under `tests/golden/ifcap/corpus/` (`manifest.tsv`, the 231 `input.txt` files and the three scripts). With those removed by `grep -v '  tests/golden/ifcap/corpus/'` and the rest piped to `sort`, the 40 lines equal the baseline saved outside the checkout before the first edit (`diff` exit status 0). Run in round two's form, `sha256sum tests/fixtures/ifcap/200.zwr`, the filtered `find` output piped to `sort -k2`, then the `cases.zwr` line, the 41 lines equal the listing verbatim in section "Capture hashes" under "Round two, before the first edit" (`diff` exit status 0), so every GC, `state/` and `cases.zwr` hash holds and `200.zwr` is still `836c6a9b1ecb94d8246a8c7b34212ca82361fa11c3db918b6e0cf1ffd09ac9da`. `tests/fixtures/ifcap/` still holds 13 files. Section "Capture hashes" itself is unchanged: `diff <(git show 7afbc4af9:rust/ifcap-po-inquiry/SPEC.md | sed -n '/^## Capture hashes/,/^## Run evidence/p') <(sed -n '/^## Capture hashes/,/^## Run evidence/p' SPEC.md)` printed nothing, exit status 0.
+
+**Generator writes.** At 2026-11-19T07:46:26Z, after `git checkout -- REPORT.md` left `git status --porcelain` empty, `cargo run --offline --locked --bin corpus_gen`, with no argument, ran twice, writing its 233 files into the checkout. Each run exited 0 and printed the seven summary lines of criterion 2, identical between the runs (`diff` exit status 0), and after each `git status --porcelain` printed nothing, exit status 0: the generator rewrote the committed files byte for byte.
+
+**Runtime check.** The bridge ran inside this checkout's own network namespace, `pf-18144`, never in the host's, after the build above, at 2026-11-19T07:47:15Z, with nothing listening on port 8080 there or on host port 18144 beforehand:
+
+```sh
+timeout 90 nsenter --net=/run/netns/pf-18144 bash -c 'timeout 60 ./target/debug/bridge > "$TMPDIR/a12.out" 2> "$TMPDIR/a12.err" & P=$!; for i in $(seq 1 120); do r=$(curl -s http://127.0.0.1:8080/api/status) && [ -n "$r" ] && break; sleep 0.5; done; date -u +%Y-%m-%dT%H:%M:%SZ; echo "$r"; echo "curl-exit=$?"; kill $P; wait $P; echo "wait=$?"; ss -Hltn "sport = :8080" | wc -l'; echo "nsenter-exit=$?"
+```
+
+Output complete:
+
+```text
+2026-11-19T07:47:18Z
+{"mumps_mode":"replay","recorded":["GC-01","GC-02","GC-03","GC-04","GC-05"],"ready":["GC-01","GC-02","GC-03","GC-04","GC-05"],"incomplete":{}}
+curl-exit=0
+wait=143
+0
+nsenter-exit=0
+```
+
+The loop breaks only when `curl -s` exits 0 with a non-empty body, so the status call answered by 07:47:18Z; `curl-exit` is the status of the `echo` before it, not of `curl`. The bridge's standard output was exactly the three lines below, and its standard error was empty (0 bytes). After `kill`, `wait` gave 143 (TERM), and no listener remained on port 8080. The corpus folders leave the bridge as it was: it still reports `RECORDED 5 OF 5 READY 5 OF 5`.
+
+```text
+http://127.0.0.1:8080/
+MUMPS MODE: REPLAY
+RECORDED 5 OF 5 READY 5 OF 5
+```
+
+**Recording scripts, without Docker.** At 2026-11-19T07:46:51Z, from `rust/ifcap-po-inquiry/`, with `D=tests/golden/ifcap/corpus/scripts`:
+
+```text
+$ for s in load_corpus record_corpus check_corpus; do bash -n $D/$s.sh; echo "bash -n $s.sh exit=$?"; test -x $D/$s.sh; echo "test -x $s.sh exit=$?"; done
+bash -n load_corpus.sh exit=0
+test -x load_corpus.sh exit=0
+bash -n record_corpus.sh exit=0
+test -x record_corpus.sh exit=0
+bash -n check_corpus.sh exit=0
+test -x check_corpus.sh exit=0
+$ grep -c 'vc_wait_ready\|mumps -dir' $D/record_corpus.sh          # exit 1
+0
+$ grep -n '%XCMD' $D/record_corpus.sh                               # exit 0
+84:  docker exec -i "$NAME" su - vehu -c "mumps -run %XCMD '$(vc_mcmd "$VC_SCOPE_ROOTS")'" < /dev/null > "$1" 2> "$2"
+$ grep -n 'docker exec -t\|docker exec -it\|-ti ' $D/record_corpus.sh   # exit 1, no output
+$ grep -c docker $D/check_corpus.sh                                  # exit 1
+0
+```
+
+`git ls-files -s $D` gives mode `100755` for each script. Line 84 is the body of `export_scope` (lines 83 to 85), so `%XCMD` appears only there; every `docker exec` that runs a case or an export is `docker exec -i`, and the readiness probe's takes no flag.
+
+No recording script ran, and no container, image, snapshot or recording was created: no `transcript.txt`, `returned.txt`, `meta.txt`, `SHA256SUMS`, `run-summary.txt` or `BASE.txt` exists under `tests/golden/ifcap/corpus/`. The host's Docker daemon holds no image, so `worldvista/vehu:202609`, `vehu-snap:gc-base` and `vehu-snap:corpus-base` are all absent; this was read at about 07:47Z by two read-only queries, `docker images -q | wc -l`, which printed `0`, and `docker info`, exit status 0,, the only Docker commands this record's runs issued.
+
+**Handed to the team.** This run could not execute the recording or judge any corpus case beyond NOT COMPARED and BOUNDARY:
+
+- O-16: confirm the shell-only readiness probe of `record_corpus.sh` on `worldvista/vehu:202609`.
+- O-17: run `load_corpus.sh`, `record_corpus.sh`, `check_corpus.sh`, then `cargo test --offline --locked`, and commit the recording.
+- A later round corrects any MISMATCH the recording exposes and implements any BOUNDARY branch the team chooses; the corpus records no finding and no dropped variant to carry into it.
+
+**Result.** Every completion condition of the corpus round holds on the Linux build host at commit `486398a59`: `cargo test --offline --locked` exits 0 with 209 passed and 0 failed; `corpus_gen --check` exits 0, prints the `specified:` line `specified: 200 CP, 26 CE (16 IN, 10 BOUNDARY), 5 CR, 50 multi-item orders` and `check: 233 files equal`; `REPORT.md` part 3 carries `### Parity corpus` with `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES`, every CP, IN and CR case NOT COMPARED and every BOUNDARY case BOUNDARY, and part 2 still reads `Verdict: PASS` for GC-01 to GC-05; `end_to_end_real_captures` gets `match` true for each READY case; build, clippy, format and documentation exit 0 with no warning; the audits, A7, the byte-identity commands, the specification counts and the K20 capture comparison hold; the bridge is unaffected. This round records no acceptance (section "Acceptance record").
+
 ### Harness checks in this run
 
 - fixtures loaded: PASS — 29874 nodes
@@ -1189,6 +1625,297 @@ On the destination branch the same command lists the commit that delivers this r
 | `normalisation_parses` | `normalisation.txt` is UTF-8 and every non-blank line is a non-empty open delimiter, one tab and a non-empty close delimiter (an empty file holds no rules). |
 | `db_before_equals_after` | `db-before.zwr` and `db-after.zwr` are both readable and byte-identical. |
 | `no_carriage_return` | Every capture file that is present is readable and contains no carriage return. |
+
+### Parity corpus
+
+Recording run: none
+
+| Class | MATCH | MISMATCH | NOT COMPARED | BOUNDARY | QUARANTINED | Total |
+|---|---|---|---|---|---|---|
+| CP | 0 | 0 | 200 | 0 | 0 | 200 |
+| IN | 0 | 0 | 13 | 0 | 0 | 13 |
+| BOUNDARY | 0 | 0 | 0 | 13 | 0 | 13 |
+| CR | 0 | 0 | 5 | 0 | 0 | 5 |
+
+MATCHED 0 OF 0 IN-SCOPE CORPUS CASES
+
+| Case | Class | Verdict | First differing line |
+|---|---|---|---|
+| CP-001 | CP | NOT COMPARED | no capture |
+| CP-002 | CP | NOT COMPARED | no capture |
+| CP-003 | CP | NOT COMPARED | no capture |
+| CP-004 | CP | NOT COMPARED | no capture |
+| CP-005 | CP | NOT COMPARED | no capture |
+| CP-006 | CP | NOT COMPARED | no capture |
+| CP-007 | CP | NOT COMPARED | no capture |
+| CP-008 | CP | NOT COMPARED | no capture |
+| CP-009 | CP | NOT COMPARED | no capture |
+| CP-010 | CP | NOT COMPARED | no capture |
+| CP-011 | CP | NOT COMPARED | no capture |
+| CP-012 | CP | NOT COMPARED | no capture |
+| CP-013 | CP | NOT COMPARED | no capture |
+| CP-014 | CP | NOT COMPARED | no capture |
+| CP-015 | CP | NOT COMPARED | no capture |
+| CP-016 | CP | NOT COMPARED | no capture |
+| CP-017 | CP | NOT COMPARED | no capture |
+| CP-018 | CP | NOT COMPARED | no capture |
+| CP-019 | CP | NOT COMPARED | no capture |
+| CP-020 | CP | NOT COMPARED | no capture |
+| CP-021 | CP | NOT COMPARED | no capture |
+| CP-022 | CP | NOT COMPARED | no capture |
+| CP-023 | CP | NOT COMPARED | no capture |
+| CP-024 | CP | NOT COMPARED | no capture |
+| CP-025 | CP | NOT COMPARED | no capture |
+| CP-026 | CP | NOT COMPARED | no capture |
+| CP-027 | CP | NOT COMPARED | no capture |
+| CP-028 | CP | NOT COMPARED | no capture |
+| CP-029 | CP | NOT COMPARED | no capture |
+| CP-030 | CP | NOT COMPARED | no capture |
+| CP-031 | CP | NOT COMPARED | no capture |
+| CP-032 | CP | NOT COMPARED | no capture |
+| CP-033 | CP | NOT COMPARED | no capture |
+| CP-034 | CP | NOT COMPARED | no capture |
+| CP-035 | CP | NOT COMPARED | no capture |
+| CP-036 | CP | NOT COMPARED | no capture |
+| CP-037 | CP | NOT COMPARED | no capture |
+| CP-038 | CP | NOT COMPARED | no capture |
+| CP-039 | CP | NOT COMPARED | no capture |
+| CP-040 | CP | NOT COMPARED | no capture |
+| CP-041 | CP | NOT COMPARED | no capture |
+| CP-042 | CP | NOT COMPARED | no capture |
+| CP-043 | CP | NOT COMPARED | no capture |
+| CP-044 | CP | NOT COMPARED | no capture |
+| CP-045 | CP | NOT COMPARED | no capture |
+| CP-046 | CP | NOT COMPARED | no capture |
+| CP-047 | CP | NOT COMPARED | no capture |
+| CP-048 | CP | NOT COMPARED | no capture |
+| CP-049 | CP | NOT COMPARED | no capture |
+| CP-050 | CP | NOT COMPARED | no capture |
+| CP-051 | CP | NOT COMPARED | no capture |
+| CP-052 | CP | NOT COMPARED | no capture |
+| CP-053 | CP | NOT COMPARED | no capture |
+| CP-054 | CP | NOT COMPARED | no capture |
+| CP-055 | CP | NOT COMPARED | no capture |
+| CP-056 | CP | NOT COMPARED | no capture |
+| CP-057 | CP | NOT COMPARED | no capture |
+| CP-058 | CP | NOT COMPARED | no capture |
+| CP-059 | CP | NOT COMPARED | no capture |
+| CP-060 | CP | NOT COMPARED | no capture |
+| CP-061 | CP | NOT COMPARED | no capture |
+| CP-062 | CP | NOT COMPARED | no capture |
+| CP-063 | CP | NOT COMPARED | no capture |
+| CP-064 | CP | NOT COMPARED | no capture |
+| CP-065 | CP | NOT COMPARED | no capture |
+| CP-066 | CP | NOT COMPARED | no capture |
+| CP-067 | CP | NOT COMPARED | no capture |
+| CP-068 | CP | NOT COMPARED | no capture |
+| CP-069 | CP | NOT COMPARED | no capture |
+| CP-070 | CP | NOT COMPARED | no capture |
+| CP-071 | CP | NOT COMPARED | no capture |
+| CP-072 | CP | NOT COMPARED | no capture |
+| CP-073 | CP | NOT COMPARED | no capture |
+| CP-074 | CP | NOT COMPARED | no capture |
+| CP-075 | CP | NOT COMPARED | no capture |
+| CP-076 | CP | NOT COMPARED | no capture |
+| CP-077 | CP | NOT COMPARED | no capture |
+| CP-078 | CP | NOT COMPARED | no capture |
+| CP-079 | CP | NOT COMPARED | no capture |
+| CP-080 | CP | NOT COMPARED | no capture |
+| CP-081 | CP | NOT COMPARED | no capture |
+| CP-082 | CP | NOT COMPARED | no capture |
+| CP-083 | CP | NOT COMPARED | no capture |
+| CP-084 | CP | NOT COMPARED | no capture |
+| CP-085 | CP | NOT COMPARED | no capture |
+| CP-086 | CP | NOT COMPARED | no capture |
+| CP-087 | CP | NOT COMPARED | no capture |
+| CP-088 | CP | NOT COMPARED | no capture |
+| CP-089 | CP | NOT COMPARED | no capture |
+| CP-090 | CP | NOT COMPARED | no capture |
+| CP-091 | CP | NOT COMPARED | no capture |
+| CP-092 | CP | NOT COMPARED | no capture |
+| CP-093 | CP | NOT COMPARED | no capture |
+| CP-094 | CP | NOT COMPARED | no capture |
+| CP-095 | CP | NOT COMPARED | no capture |
+| CP-096 | CP | NOT COMPARED | no capture |
+| CP-097 | CP | NOT COMPARED | no capture |
+| CP-098 | CP | NOT COMPARED | no capture |
+| CP-099 | CP | NOT COMPARED | no capture |
+| CP-100 | CP | NOT COMPARED | no capture |
+| CP-101 | CP | NOT COMPARED | no capture |
+| CP-102 | CP | NOT COMPARED | no capture |
+| CP-103 | CP | NOT COMPARED | no capture |
+| CP-104 | CP | NOT COMPARED | no capture |
+| CP-105 | CP | NOT COMPARED | no capture |
+| CP-106 | CP | NOT COMPARED | no capture |
+| CP-107 | CP | NOT COMPARED | no capture |
+| CP-108 | CP | NOT COMPARED | no capture |
+| CP-109 | CP | NOT COMPARED | no capture |
+| CP-110 | CP | NOT COMPARED | no capture |
+| CP-111 | CP | NOT COMPARED | no capture |
+| CP-112 | CP | NOT COMPARED | no capture |
+| CP-113 | CP | NOT COMPARED | no capture |
+| CP-114 | CP | NOT COMPARED | no capture |
+| CP-115 | CP | NOT COMPARED | no capture |
+| CP-116 | CP | NOT COMPARED | no capture |
+| CP-117 | CP | NOT COMPARED | no capture |
+| CP-118 | CP | NOT COMPARED | no capture |
+| CP-119 | CP | NOT COMPARED | no capture |
+| CP-120 | CP | NOT COMPARED | no capture |
+| CP-121 | CP | NOT COMPARED | no capture |
+| CP-122 | CP | NOT COMPARED | no capture |
+| CP-123 | CP | NOT COMPARED | no capture |
+| CP-124 | CP | NOT COMPARED | no capture |
+| CP-125 | CP | NOT COMPARED | no capture |
+| CP-126 | CP | NOT COMPARED | no capture |
+| CP-127 | CP | NOT COMPARED | no capture |
+| CP-128 | CP | NOT COMPARED | no capture |
+| CP-129 | CP | NOT COMPARED | no capture |
+| CP-130 | CP | NOT COMPARED | no capture |
+| CP-131 | CP | NOT COMPARED | no capture |
+| CP-132 | CP | NOT COMPARED | no capture |
+| CP-133 | CP | NOT COMPARED | no capture |
+| CP-134 | CP | NOT COMPARED | no capture |
+| CP-135 | CP | NOT COMPARED | no capture |
+| CP-136 | CP | NOT COMPARED | no capture |
+| CP-137 | CP | NOT COMPARED | no capture |
+| CP-138 | CP | NOT COMPARED | no capture |
+| CP-139 | CP | NOT COMPARED | no capture |
+| CP-140 | CP | NOT COMPARED | no capture |
+| CP-141 | CP | NOT COMPARED | no capture |
+| CP-142 | CP | NOT COMPARED | no capture |
+| CP-143 | CP | NOT COMPARED | no capture |
+| CP-144 | CP | NOT COMPARED | no capture |
+| CP-145 | CP | NOT COMPARED | no capture |
+| CP-146 | CP | NOT COMPARED | no capture |
+| CP-147 | CP | NOT COMPARED | no capture |
+| CP-148 | CP | NOT COMPARED | no capture |
+| CP-149 | CP | NOT COMPARED | no capture |
+| CP-150 | CP | NOT COMPARED | no capture |
+| CP-151 | CP | NOT COMPARED | no capture |
+| CP-152 | CP | NOT COMPARED | no capture |
+| CP-153 | CP | NOT COMPARED | no capture |
+| CP-154 | CP | NOT COMPARED | no capture |
+| CP-155 | CP | NOT COMPARED | no capture |
+| CP-156 | CP | NOT COMPARED | no capture |
+| CP-157 | CP | NOT COMPARED | no capture |
+| CP-158 | CP | NOT COMPARED | no capture |
+| CP-159 | CP | NOT COMPARED | no capture |
+| CP-160 | CP | NOT COMPARED | no capture |
+| CP-161 | CP | NOT COMPARED | no capture |
+| CP-162 | CP | NOT COMPARED | no capture |
+| CP-163 | CP | NOT COMPARED | no capture |
+| CP-164 | CP | NOT COMPARED | no capture |
+| CP-165 | CP | NOT COMPARED | no capture |
+| CP-166 | CP | NOT COMPARED | no capture |
+| CP-167 | CP | NOT COMPARED | no capture |
+| CP-168 | CP | NOT COMPARED | no capture |
+| CP-169 | CP | NOT COMPARED | no capture |
+| CP-170 | CP | NOT COMPARED | no capture |
+| CP-171 | CP | NOT COMPARED | no capture |
+| CP-172 | CP | NOT COMPARED | no capture |
+| CP-173 | CP | NOT COMPARED | no capture |
+| CP-174 | CP | NOT COMPARED | no capture |
+| CP-175 | CP | NOT COMPARED | no capture |
+| CP-176 | CP | NOT COMPARED | no capture |
+| CP-177 | CP | NOT COMPARED | no capture |
+| CP-178 | CP | NOT COMPARED | no capture |
+| CP-179 | CP | NOT COMPARED | no capture |
+| CP-180 | CP | NOT COMPARED | no capture |
+| CP-181 | CP | NOT COMPARED | no capture |
+| CP-182 | CP | NOT COMPARED | no capture |
+| CP-183 | CP | NOT COMPARED | no capture |
+| CP-184 | CP | NOT COMPARED | no capture |
+| CP-185 | CP | NOT COMPARED | no capture |
+| CP-186 | CP | NOT COMPARED | no capture |
+| CP-187 | CP | NOT COMPARED | no capture |
+| CP-188 | CP | NOT COMPARED | no capture |
+| CP-189 | CP | NOT COMPARED | no capture |
+| CP-190 | CP | NOT COMPARED | no capture |
+| CP-191 | CP | NOT COMPARED | no capture |
+| CP-192 | CP | NOT COMPARED | no capture |
+| CP-193 | CP | NOT COMPARED | no capture |
+| CP-194 | CP | NOT COMPARED | no capture |
+| CP-195 | CP | NOT COMPARED | no capture |
+| CP-196 | CP | NOT COMPARED | no capture |
+| CP-197 | CP | NOT COMPARED | no capture |
+| CP-198 | CP | NOT COMPARED | no capture |
+| CP-199 | CP | NOT COMPARED | no capture |
+| CP-200 | CP | NOT COMPARED | no capture |
+| CE-01 | IN | NOT COMPARED | no capture |
+| CE-02 | IN | NOT COMPARED | no capture |
+| CE-03 | IN | NOT COMPARED | no capture |
+| CE-04 | BOUNDARY | BOUNDARY | — |
+| CE-05 | IN | NOT COMPARED | no capture |
+| CE-06 | BOUNDARY | BOUNDARY | — |
+| CE-07 | IN | NOT COMPARED | no capture |
+| CE-08 | BOUNDARY | BOUNDARY | — |
+| CE-09 | IN | NOT COMPARED | no capture |
+| CE-10 | IN | NOT COMPARED | no capture |
+| CE-11 | IN | NOT COMPARED | no capture |
+| CE-12 | IN | NOT COMPARED | no capture |
+| CE-13 | IN | NOT COMPARED | no capture |
+| CE-14 | IN | NOT COMPARED | no capture |
+| CE-15 | IN | NOT COMPARED | no capture |
+| CE-16 | IN | NOT COMPARED | no capture |
+| CE-17 | BOUNDARY | BOUNDARY | — |
+| CE-18 | BOUNDARY | BOUNDARY | — |
+| CE-19 | BOUNDARY | BOUNDARY | — |
+| CE-20 | BOUNDARY | BOUNDARY | — |
+| CE-21 | BOUNDARY | BOUNDARY | — |
+| CE-22 | BOUNDARY | BOUNDARY | — |
+| CE-23 | BOUNDARY | BOUNDARY | — |
+| CE-24 | BOUNDARY | BOUNDARY | — |
+| CE-25 | BOUNDARY | BOUNDARY | — |
+| CE-26 | BOUNDARY | BOUNDARY | — |
+| CR-01 | CR | NOT COMPARED | no capture |
+| CR-02 | CR | NOT COMPARED | no capture |
+| CR-03 | CR | NOT COMPARED | no capture |
+| CR-04 | CR | NOT COMPARED | no capture |
+| CR-05 | CR | NOT COMPARED | no capture |
+
+#### Class moves
+
+| Case | Specified class | Final class | Branch |
+|---|---|---|---|
+| CE-04 | IN | BOUNDARY | PO-09.b11 |
+| CE-06 | IN | BOUNDARY | PO-09.b11 |
+| CE-08 | IN | BOUNDARY | PO-09.b11 |
+
+#### Findings
+
+none
+
+#### Dropped variants
+
+none
+
+#### BOUNDARY map
+
+| Case | Input lines | Expected branch | Recorded |
+|---|---|---|---|
+| CE-04 | `""`, `"12345"`, `"^"` | PO-09.b11 | no |
+| CE-06 | `""`, `"gc9999"`, `"^"` | PO-09.b11 | no |
+| CE-08 | `""`, `"991001"`, `"^"` | PO-09.b11 | no |
+| CE-17 | `""`, `""`, `"CP002"`, `""`, `""`, `"^"`, `"^"`, `"^"` | PO-09.b6 | no |
+| CE-18 | `""`, `"?"`, `"CP002"`, `""`, `""`, `"^"`, `"^"`, `"^"` | PO-09.b4 | no |
+| CE-19 | `""`, `"cp002"`, `"CP002"`, `""`, `""`, `"^"`, `"^"`, `"^"` | PO-09.b13 | no |
+| CE-20 | `""`, `"CP01"`, `"CP002"`, `""`, `""`, `"^"`, `"^"`, `"^"` | PO-09.b10 | no |
+| CE-21 | `""`, `"CP20"`, `"CP002"`, `""`, `""`, `"^"`, `"^"`, `"^"` | PO-09.b9 | no |
+| CE-22 | `"500"`, `"CP002"`, `""`, `""`, `"^"`, `"^"`, `"^"` | PO-05.b2 | no |
+| CE-23 | `""`, ``"`"``, `"CP002"`, `""`, `""`, `"^"`, `"^"`, `"^"` | PO-09.b5 | no |
+| CE-24 | `""`, `" "`, `"CP002"`, `""`, `""`, `"^"`, `"^"`, `"^"` | PO-09.b5 | no |
+| CE-25 | `""`, `"CP002"`, `"^"`, `"CP002"`, `""`, `""`, `"^"`, `"^"`, `"^"` | PO-25.b1 | no |
+| CE-26 | `""`, `"ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"`, `"CP002"`, `""`, `""`, `"^"`, `"^"`, `"^"` | PO-09.b2 | no |
+
+#### CR world labels
+
+| CR case | GC case | Label | First differing line |
+|---|---|---|---|
+| CR-01 | GC-01 | NOT COMPARED | no capture |
+| CR-02 | GC-02 | NOT COMPARED | no capture |
+| CR-03 | GC-03 | NOT COMPARED | no capture |
+| CR-04 | GC-04 | NOT COMPARED | no capture |
+| CR-05 | GC-05 | NOT COMPARED | no capture |
 
 ## Stubs
 
@@ -1446,6 +2173,8 @@ Each existing item outside the request's layout is kept only when the layout or 
 | O-13 | `testingMethods.md` sentences that are now false | [testingMethods.md:48]: "O-01 (HOME device `IOF`/`IOSL`) is open, so GC-01, GC-02 and GC-05 FAIL once captured, until it is answered." Against the code and the run: O-01 is closed (this table); `STUB_CONTEXT` holds `IOF` `#` and `IOSL` `60` [src/inquiry.rs:117-122]; PO-10.b4, PO-12.b1, PO-26.b1 and PO-30.b1 are implemented; `cargo test --offline --locked --test equivalence -- --nocapture` prints `GC-01 PASS` to `GC-05 PASS`, and `REPORT.md` part 2 reads PASS for all five cases. The file's other sentences agree with the code and the five-PASS state; the 158 tests of its line 41 are the crate's earlier tests, stated as history | **OPEN.** `testingMethods.md` is frozen in round two and is not edited, so the sentence stands. **Action for the team, in a later round:** replace it with the closed O-01 and the five PASS |
 | O-14 | `tests/golden/ifcap/README.md` sentences that are now false | Line 5: "The folder holds only this README: no case folder, no `.gitkeep` and no placeholder. Every case is ABSENT, and therefore NOT COMPARED." The folder holds `GC-01/` to `GC-05/`, seven files each and all READY, and `state/`. Line 117: "`STUB_CONTEXT` is `[("DUZ", Some(".5")), ("IOF", None), ("IOSL", None), ("STATION", Some("500"))]`." It holds `("IOF", Some("#"))` and `("IOSL", Some("60"))` [src/inquiry.rs:117-122]. Line 119: "`IOF` and `IOSL` are unresolved (`None`, open item O-01). Any value is accepted, but both keys must be present;" O-01 is closed, and `validate_context` accepts only `IOF` `#` and `IOSL` `60`. Line 120: "Examples: `CONTEXT MISMATCH DUZ: expected .5, actual 1`, `CONTEXT MISMATCH IOF: expected UNRESOLVED (O-01), actual ABSENT`, `CONTEXT MISMATCH IOM: expected ABSENT, actual 80`." A missing `IOF` gives `CONTEXT MISMATCH IOF: expected #, actual ABSENT` [src/golden.rs:1885]. Line 172: "**While O-01 is open.** With `cases.zwr` loaded, the Rust sessions of GC-01, GC-02 and GC-05 end after `P.O./REQ.NO.: ` (with its one trailing space), because the display's `W:$Y>0 @IOF` depends on the unresolved HOME device [Packages/IFCAP/Routines/PRCHDP1.m:12]. Those cases FAIL once captured, until O-01 is answered." The three sessions run the whole display, and all five cases PASS. Line 186: "`tests/fixtures/ifcap/*.zwr` are the 11 supporting fixtures, unchanged copies of repository exports: `411.zwr`, `411.2.zwr`, `420.5.zwr`, `420.8.zwr`, `440.zwr`, `442.3.zwr`, `442.4.zwr`, `442.5.zwr`, `442.8.zwr`, `5.zwr` and `49.zwr`." The folder holds 12 supporting fixtures, these 11 and `200.zwr`, plus `cases.zwr`. Line 260: "If paging under the unresolved `IOSL` inserts an `ENTER '^' TO HALT: ` pause [Packages/IFCAP/Routines/PRCHDP2.m:31], the first capture shows it." `IOSL` is resolved, 60, and the GC-01, GC-02 and GC-05 transcripts show only the two display pauses. Line 278: "Include every global root of the supporting fixtures: `^PRC(411)`, `^PRC(411.2)`, `^PRCD(420.5)`, `^PRCD(420.8)`, `^PRC(440)`, `^PRCD(442.3)`, `^PRC(442.4)`, `^PRCD(442.5)`, `^PRC(442.8)`, `^DIC(5)` and `^DIC(49)`." The list lacks `200.zwr`'s root `^VA(200)`; that fixture's one node lies inside line 279's `^VA(200,.5)`, which every `db-before.zwr` holds, so the export scope as captured covers it | **OPEN.** The README's existing lines are frozen in round two: it gains only the step 6 paragraph on `200.zwr`, which passes the command-identity check and stays. **Action for the team, in a later round:** correct these lines to the closed O-01, the five PASS and the 12 supporting fixtures |
 | O-15 | One Rust session's work when it repeats an absent value: the session output limit (K15, O-11) bounds the work only through the output, and a lookup that finds nothing writes 20 bytes, so one request can still cost up to 52,425 lookups, about 44 to 49 s of CPU on the debug build (CWE-400, residual) | Each pass of the `ix_dic` loop [src/inquiry.rs:770-851] READs a value and, for one that no index holds, runs `search`, `pointer_candidate`, the `$ORDER` of file 442 after the index names and `no_match_guard` before it writes the no-match sequence `<BEL> ??\n\nP.O./REQ.NO.: ` (PO-09.b14, R3), 20 bytes. The first 80 bytes end at the first order prompt, so 52,424 sequences fit within 1,048,576 bytes and the order prompt after the 52,425th lookup is refused, which cuts the transcript at 1,048,560 bytes. Measured on 2026-11-17 from 16:50Z to 17:00Z on the debug replay bridge built from `d09596d44`, on the Linux build host (4 CPUs) under a 1-minute load average of 12.96 to 24.73 from other work on the host: `curl -s --max-time 300 -o out.json -w '%{http_code} %{time_total}' -H 'Content-Type: application/json' --data-binary @body.json http://127.0.0.1:<port>/api/rust/session`, the transcript length by `jq -j .transcript out.json \| wc -c`, and the bridge's CPU time from fields 14 and 15 of `/proc/<pid>/stat` before and after. Each body is `{"inputs":["",`, N values, then `"^"]}`, and each answer was 200 with `returned` null. `GC3003`: N = 1,000 (9,019-byte body), 20,081 bytes ending `P.O./REQ.NO.: \n`, 0.77 s wall, 0.77 s CPU; N = 10,000 (90,019), 200,081 bytes, 8.52 s, 8.27 s CPU; N = 52,424 (471,835), 1,048,561 bytes ending `P.O./REQ.NO.: \n`, 58.11 s, 48.46 s CPU; N = 52,425 (471,844), 1,048,560 bytes ending `P.O./REQ.NO.: ` with no `\n`, 49.90 s, 48.71 s CPU; N = 60,000 (540,019), 1,048,560 bytes, 43.94 s, 43.97 s CPU. `INVALID!`: N = 1,000 (11,019), 20,081 bytes, 0.84 s, 0.83 s CPU; N = 10,000 (110,019), 200,081 bytes, 8.66 s, 8.68 s CPU; N = 60,000 (660,019), 1,048,560 bytes, 51.93 s, 44.64 s CPU. The found order repeated, `""`, 60,000 × `"GC1001","",""`, `"^"` (900,019 bytes), took 1.41 s wall and 1.41 s CPU for 1,048,026 bytes. A lookup that finds nothing costs about 0.8 to 0.9 ms of CPU. Admission, from the constants and not run: a session of `""` and 52,425 values with its `"^"` holds 52,427 decoded inputs, so `MAX_HELD_INPUTS`, 524,288 [src/bridge.rs:109], admits 10 such sessions at once and an 11th waits for a charge to be released [src/bridge.rs:1509-1530]; a session of at most `FREE_INPUTS`, 1,024 inputs, is not charged [src/bridge.rs:102] and runs at most 1,023 lookups, under 1 s, within `MAX_CONNECTIONS`, 64 [src/bridge.rs:82]; `rust_session` runs `inquire` to its end with no deadline or cancellation [src/bridge.rs:1933-1941]. The bridge answers only on the loopback address it binds, and a session request only when it names a loopback host and comes from the bridge's own page [src/bridge.rs:18-30] | **OPEN, not blocking.** The five cases run at most one lookup each, and every session's output is bounded (O-11, closed). Round two adds no work bound: it fixes the mechanism to the output limit and requires every session under the limit to write the same bytes, so a READ or lookup budget that ended a session before the limit would change those bytes, and minimal change keeps the lookup's logic as it is. **Question for the team, for a later round:** bound one request's work at the bridge, for example by a cap on a RUST session's inputs or a deadline for `rust_session`, or make the no-match pass cheaper without changing its logic or bytes; `src/bridge.rs` is outside round two's file list |
+| O-16 | Container readiness in a corpus recording run: `record_corpus.sh` probes it from the shell only | The kit's `vc_wait_ready` polls with the M command `mumps -run %XCMD "write 1,!"` [scripts/kit/vehu_common.sh:35-43], and a recording run may run no M command other than the start command and the export command. After each restore from `vehu-snap:corpus-base`, `record_corpus.sh` therefore polls `docker exec NAME su - vehu -c 'test -f /home/vehu/etc/env'` every 5 s for up to 600 s, and stops with `FAIL:` when it times out. `load_corpus.sh` is not a recording run and uses `vc_wait_ready` | **OPEN until the team's first recording.** The probe proves the shell and the environment file the start command sources, not the database. The guards are the export-before hash check against `BASE.txt` `export_sha256` and the two-run identity check, `exports=IDENTICAL` and `runs=IDENTICAL` in `run-summary.txt`, without which the corpus reader rejects the recording. **Question for the team:** confirm on `worldvista/vehu:202609` that a container that passes the probe answers the start command and the export command |
+| O-17 | The parity corpus is unrecorded | The corpus round had no Docker and no VEHU image, and ran no recording script and no Docker command (section "Run evidence", "Corpus round: completion evidence"). `tests/golden/ifcap/corpus/` holds `manifest.tsv`, the 231 `input.txt` files and the three scripts, and no `BASE.txt`, `transcript.txt`, `meta.txt`, `run-summary.txt` or `SHA256SUMS`. `REPORT.md` part 3 "Parity corpus" reads `Recording run: none` and `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES` | **OPEN.** Until the team's run, every CP, IN and CR case is NOT COMPARED and every BOUNDARY case BOUNDARY. **Action for the team:** from `rust/ifcap-po-inquiry/`, with the snapshot `vehu-snap:gc-base`, run `load_corpus.sh`, `record_corpus.sh` and `check_corpus.sh`, then `cargo test --offline --locked`, and commit `BASE.txt`, the transcripts, `meta.txt`, `run-summary.txt` and `SHA256SUMS` (`tests/golden/ifcap/README.md` Part C). Correcting any MISMATCH the recording exposes, and implementing any BOUNDARY branch, is a later round |
 
 ## Scope statement
 
@@ -1456,6 +2185,7 @@ Parity covers OPTION `PRCH DISPLAY PO` (IEN 1901, `EN3^PRCHRPT`), the five cases
 - **Read-only:** the port has no write path. `PRCHQ1` (OPTION 10295, New RFQ, `EN2^PRCHQ2`) was named in the request but creates RFQs, so `PRCH DISPLAY PO` was substituted. The original's own non-business writes (`^DISV`, the device handler's scratch under `^XUTL` and the DEVICE file's open count, word-wrap and delivery scratch under `^UTILITY` and `^TMP`) are documented and not reproduced.
 - **Out of scope:** every write path (creating, editing, receiving, amending or cancelling orders); every other IFCAP function and option; VistA GUI clients, terminal devices and terminal emulators; a Java port; every other VistA package; the earlier GMV vitals slice; and the request's "must not be built" list: a write-guard framework, a CLI or exit-code scheme, git or provenance modules, deterministic-report machinery, Windows or macOS branches, an async runtime, any network service other than the loopback bridge, FFI or C bindings, procedural macros, a second crate or workspace, more than two integration test files, a front-end framework or build tooling, authentication or TLS.
 - **Unexercised branches:** every branch marked "not exercised, not implemented" is outside equivalence; a session that reaches one ends after the last prompt written and invents no output. Before this refine round so were the four exercised branches marked "not implemented (O-01)", which are now implemented.
+- **Parity corpus:** the 231 sessions of section "Parity corpus", run on world B, extend the evidence of the five cases only as far as a recording shows. Until the team records the corpus (O-17), every CP, IN and CR case is NOT COMPARED and every BOUNDARY case is BOUNDARY, so the corpus adds no equivalence claim to the first line of this section. The corpus request names `corpus_gen` with its `--check` mode and its exit statuses 0, 1 and 2, the deterministic generator `src/corpus.rs`, and `tests/corpus.rs`, a third integration test file, although the "must not be built" list above excludes a CLI or exit-code scheme, deterministic-report machinery and more than two integration test files; for the files it names, that request governs (K19).
 
 ## Acceptance record
 
