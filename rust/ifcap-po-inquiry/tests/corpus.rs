@@ -1,8 +1,10 @@
 //! The offline gate of the parity corpus, `SPEC.md` "Parity corpus": every
-//! committed case input runs once on world B through [`inquire_traced`] and
-//! must end as its class says, every generated order must meet the fixture
-//! profile, the non-prefix rule, the variation minimums and the paging
-//! bound, and every committed generated file must equal a fresh generation.
+//! committed case input runs on world B both through [`inquire_traced`]
+//! directly and through `corpus::run_case`, the two results must agree, and
+//! the case must end as its class says; every generated order must meet the
+//! fixture profile, the non-prefix rule, the variation minimums and the
+//! paging bound; and every committed generated file must equal a fresh
+//! generation.
 //!
 //! The gate reads world A through `store::load_fixtures`, the committed
 //! `corpus.zwr` and `manifest.tsv` whole, `SPEC.md` compiled in, and each
@@ -11,10 +13,14 @@
 //! `run-summary.txt`), a GC capture or an export, and it writes nothing; nor
 //! does the `corpus_gen --check` run it starts.
 //!
-//! Each test calls the checker `ifcap_po_inquiry::corpus` shares with the
-//! generator, then checks the same rule again from the world B nodes on its
-//! own, so a fault in a shared checker cannot pass the gate unseen. A test
-//! reports every violation it finds, not only the first.
+//! The class, profile, `C` value, variation and paging tests call checkers
+//! that `ifcap_po_inquiry::corpus` shares with the generator. The profile,
+//! `C` value, variation and paging tests also recheck selected rules on
+//! their own from the world B nodes. The variation test recounts only some
+//! dimensions; the others (source, delivery location, verbal or
+//! confirmation, FOB, proposal, APP, the vendor properties, the P.O. date
+//! and most item dimensions) rest on `corpus::minimum_violations` alone. A
+//! test reports every violation it finds, not only the first.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -1308,9 +1314,15 @@ impl Minimums<'_> {
     }
 }
 
-/// Every minimum of the variation matrix (`SPEC.md` "Parity corpus") holds,
-/// by `corpus::minimum_violations` and counted again from the world B
-/// nodes, and the item counts are exact.
+/// Every minimum of the variation matrix (`SPEC.md` "Parity corpus") holds
+/// by `corpus::minimum_violations`, and the item counts are exact. From the
+/// world B nodes the test itself checks only the item counts and the
+/// multi-item positions; the type, method of processing, status, ship-to,
+/// agent and authority minimums; the distinct vendors, services, totals and
+/// dates; the empty service; the year-end, leap-day, empty, 1999 and 2026
+/// dates; positive estimated shipping; and the unit cost forms on orders
+/// whose type is not `S`. The other minimums rest on the shared checker
+/// alone.
 #[test]
 fn gate_variation_minimums() {
     let gate = gate();
