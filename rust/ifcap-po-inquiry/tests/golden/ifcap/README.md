@@ -385,7 +385,7 @@ if [ -f tests/fixtures/ifcap/cases.zwr ]; then sha256sum tests/fixtures/ifcap/ca
 
 ## Part C: Parity corpus
 
-Part C covers the parity corpus. Its three recording scripts are plan defaults, written in the corpus round and run by no build or test, like the commands of Part B. They stay unverified until the team's first recording (`SPEC.md` O-16, O-17): the corpus round's host held no VEHU image, and nothing in the round executed them. The round's records disclose two read-only Docker queries, `docker images -q` and `docker info`, which confirmed that no image was present; they depart from the round's no-Docker rule, as `SPEC.md` O-17 and "Run evidence" record.
+Part C covers the parity corpus. Its three recording scripts are plan defaults that no build or test runs, like the commands of Part B, and they stay unproven against VEHU until the team's first recording (`SPEC.md` O-16, O-17). `SPEC.md` O-17 and "Run evidence" record what the corpus round did and did not execute, including two read-only Docker queries, `docker images -q` and `docker info`, that departed from that round's no-Docker rule.
 
 ### C1. Purpose and classes
 
@@ -455,7 +455,7 @@ Paths in the table are relative to this folder, except `tests/fixtures/ifcap-cor
 
   A failed run check shows in `REPORT.md` part 3 as `Recording run: INTEGRITY FAIL: <cause>`, and a failed case check makes that case NOT COMPARED. Either fails `cargo test` after the report is written. `manifest.tsv` and `corpus.zwr` are generated data, not captures.
 - **What ignores `corpus/`.** None of the five-case readers looks inside it:
-  - `golden::load_case`, `status`, `find_capture` and `live_start`, which read only the `CASE_IDS` folders;
+  - `golden::status`, `find_capture` and `live_start`, which read only the `CASE_IDS` folders, and `golden::load_case`, which reads whichever case folder its caller names: every existing caller of this folder names a GC id, never `corpus`;
   - the bridge, which reaches captures only through them and still prints `RECORDED <n> OF 5 READY <m> OF 5`;
   - the kit's `GC-0[1-5]` globs (`build_cases_zwr.sh`, `add_buyer_fixture.sh`) and the literal ids of `capture_all.sh`;
   - `scripts/kit/check_captures.sh`, which checks GC-01 to GC-05 only;
@@ -579,7 +579,7 @@ It then prints one `PROBLEM: <cause>` line per problem, then `CORPUS CHECK PASS 
 4. A case `run-summary.txt` marks `QUARANTINED` is `QUARANTINED`.
 5. Otherwise the Rust session runs with the committed inputs, and the case is `MATCH` when its transcript equals the capture byte for byte, or `MISMATCH`, with the first differing line attributed as in `REPORT.md` part 2. A `%YDB-E-` line in a capture, or a Rust session error, is a MISMATCH like any other difference.
 
-- `MATCHED n OF m IN-SCOPE CORPUS CASES`: m counts the CP and IN cases that have a capture and are not quarantined, and n counts those that MATCH. With no recording it reads `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES`.
+- `MATCHED n OF m IN-SCOPE CORPUS CASES`: m counts the CP and IN cases whose verdict is MATCH or MISMATCH, those that are not quarantined and have a usable capture (one that passed the recording-run and case integrity checks), and n counts those that MATCH. A NOT COMPARED case, including one whose capture is present but whose recording-run or case integrity check failed (precedence rule 2), and a QUARANTINED case count in neither. With no recording it reads `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES`.
 - **CR world labels.** Each CR capture is compared byte for byte with the raw `GC-0N/transcript.txt` of the case it replays:
   - equal gives `WORLD-INDEPENDENT`;
   - different gives `WORLD-DEPENDENT`, with the first differing line;
