@@ -51,7 +51,8 @@ set -u
 fail() { echo; echo "FAIL: $*"; exit 1; }
 step() { echo; echo "== $*"; }
 
-cd "$(dirname "$0")/../../../../.." || exit 1
+unset CDPATH || fail "setup: cannot unset CDPATH (read-only)"  # an inherited CDPATH must not pick the folder the relative cd below lands in
+cd "$(dirname "$0")/../../../../.." || fail "setup: cannot change to the crate folder five levels above this script ($0)"
 [ -f Cargo.toml ] && [ -f tests/golden/ifcap/README.md ] || fail "cannot find the crate folder (rust/ifcap-po-inquiry) five levels above this script."
 
 KIT=scripts/kit/vehu_common.sh
@@ -70,7 +71,6 @@ W=captures-work/corpus
 CORPUS_SNAP=vehu-snap:corpus-base
 TAB="$(printf '\t')"
 W_ABS="$(pwd)/$W"
-mkdir -p "$W" || fail "cannot create $W"
 
 # restore_container <image>: replace container NAME with a fresh one started from <image>.
 restore_container() {
@@ -84,18 +84,175 @@ export_scope() {
   docker exec -i "$NAME" su - vehu -c "mumps -run %XCMD '$(vc_mcmd "$VC_SCOPE_ROOTS")'" < /dev/null > "$1" 2> "$2"
 }
 
-# probe_ready: shell-only readiness probe (SPEC.md O-16). It polls container NAME every 5 s, for up
-# to 600 s, until the vehu login shell runs and finds the environment file the start command
-# sources. It runs no M command, so it proves the shell and the environment file, not the
-# database: the export before run 1 and the two-run identity check are the guard. 1 on timeout.
+# The overrides are checked before any scratch or container work; an empty value keeps the default
+# above. NAME must be a Docker container name and BASE_IMAGE an image reference, so neither holds
+# white space or a control character or begins like an option. SOURCE_REVISION goes to meta.txt
+# unchanged, so it must be one line with no control character. The letters are spelled out because
+# a bracket range follows the locale.
+ALNUM=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+case "$NAME" in
+  ?|[!"$ALNUM"]*|*[!"$ALNUM"_.-]*)
+    fail "NAME=$(printf '%q' "$NAME") is not a Docker container name: NAME may hold only letters, digits, _ . and -, at least two characters, the first a letter or digit" ;;
+esac
+# valid_image_ref <ref>: 0 when <ref> follows Docker's image reference grammar, 1 otherwise.
+# A reference is name[:tag][@digest]. The digest follows the first @ and is algorithm:hex: the
+# algorithm is letter-led runs of letters and digits joined by one + . _ or -, the hex is 32 or
+# more hex digits. The tag follows a : in the last /-separated part: 1 to 128 letters, digits,
+# _ . and -, not beginning with . or -. The name, at most 255 characters, is [domain/]path. Its
+# first part is a domain only when a / follows it and it holds . or :, is localhost or holds an
+# upper-case letter. A domain is host[:port]: the host is dot-joined parts of letters, digits and
+# inner dashes, or [hex digits and :]; the port is digits. The path is /-joined components of
+# lower-case letters and digits, joined inside a component by one . or _, by __, or by dashes.
+valid_image_ref() {
+  local lower=abcdefghijklmnopqrstuvwxyz upper=ABCDEFGHIJKLMNOPQRSTUVWXYZ digit=0123456789
+  local hex=0123456789abcdefABCDEF ref="$1" algo digest tag domain host port path
+  case "$ref" in
+    *@*)
+      digest="${ref#*@}"
+      ref="${ref%%@*}"
+      case "$digest" in *:*) ;; *) return 1 ;; esac
+      algo="${digest%%:*}"
+      digest="${digest#*:}"
+      case "$algo" in
+        ''|[!"$lower$upper"]*|*[+._-]|*[+._-][!"$lower$upper"]*|*[!"$lower$upper$digit"+._-]*) return 1 ;;
+      esac
+      case "$digest" in ''|*[!"$hex"]*) return 1 ;; esac
+      [ "${#digest}" -ge 32 ] || return 1 ;;
+  esac
+  case "${ref##*/}" in
+    *:*)
+      tag="${ref##*/}"
+      tag="${tag#*:}"
+      case "$tag" in ''|[!"$lower$upper$digit"_]*|*[!"$lower$upper$digit"_.-]*) return 1 ;; esac
+      [ "${#tag}" -le 128 ] || return 1
+      ref="${ref%:*}" ;;
+  esac
+  [ "${#ref}" -le 255 ] || return 1
+  path="$ref"
+  case "$ref" in
+    */*)
+      domain="${ref%%/*}"
+      case "$domain" in
+        *[.:]*|localhost|*["$upper"]*)
+          path="${ref#*/}"
+          case "$domain" in
+            \[*\]|\[*\]:*)
+              host="${domain#\[}"
+              host="${host%%\]*}"
+              port="${domain#*\]}"
+              case "$host" in ''|*[!"$hex:"]*) return 1 ;; esac ;;
+            *)
+              host="${domain%%:*}"
+              port=""
+              case "$domain" in *:*) port=":${domain#*:}" ;; esac
+              case "$host" in ''|[.-]*|*[.-]|*..*|*.-*|*-.*|*[!"$lower$upper$digit".-]*) return 1 ;; esac ;;
+          esac
+          case "$port" in
+            '') ;;
+            :*) case "${port#:}" in ''|*[!"$digit"]*) return 1 ;; esac ;;
+            *) return 1 ;;
+          esac ;;
+      esac ;;
+  esac
+  case "$path" in
+    ''|/*|*/|*//*|[._-]*|*[._-]|*[._-]/*|*/[._-]*|*..*|*___*|*._*|*_.*|*.-*|*-.*|*_-*|*-_*|*[!"$lower$digit"._/-]*) return 1 ;;
+  esac
+  return 0
+}
+valid_image_ref "$BASE_IMAGE" ||
+  fail "BASE_IMAGE=$(printf '%q' "$BASE_IMAGE") is not an image reference: BASE_IMAGE must be [host[:port]/]path[:tag][@algorithm:hex], with path components of lower-case letters and digits joined by one . or _, by __ or by dashes, a tag of 1 to 128 letters, digits, _ . and - not beginning with . or -, a digest of 32 or more hex digits, and at most 255 characters before the tag"
+case "$SOURCE_REVISION" in
+  *[[:cntrl:]]*)
+    fail "SOURCE_REVISION holds a control character (a line feed, carriage return, tab or other): SOURCE_REVISION may hold only one line of printable text, which meta.txt records unchanged" ;;
+  *[![:space:]]*) ;;
+  *)
+    fail "SOURCE_REVISION holds only white space: SOURCE_REVISION must name the source revision that meta.txt records" ;;
+esac
+mkdir -p "$W" || fail "cannot create $W"
+
+# One run at a time: concurrent runs would share captures-work/corpus/ and the corpus folder, and
+# step 4 clears run1/ and run2/. The lock is the folder record.lock, taken by an atomic mkdir before
+# any container or scratch work and holding its owner's pid. A run that cannot take it stops and
+# deletes nothing. on_exit runs on every exit, after HUP, INT and TERM too: it stops a readiness
+# probe still running and removes the lock only when this run took it.
+LOCK="$W_ABS/record.lock"
+LOCK_OWNED=""
+on_exit() {
+  [ -z "${PROBE_PID:-}" ] || kill "$PROBE_PID" 2>/dev/null
+  [ -z "$LOCK_OWNED" ] || rm -rf "$LOCK"
+}
+trap on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if mkdir "$LOCK" 2>/dev/null; then
+  LOCK_OWNED=1
+  printf '%s\n' "$$" > "$LOCK/pid" || fail "cannot write $LOCK/pid"
+else
+  [ -d "$LOCK" ] || fail "cannot create $LOCK"
+  owner=""
+  { read -r owner < "$LOCK/pid"; } 2>/dev/null
+  case "$owner" in ''|0*|*[!0123456789]*) owner="" ;; esac
+  if [ -z "$owner" ]; then
+    fail "another record_corpus.sh run is taking $LOCK (no pid written yet): wait for it. If no record_corpus.sh run is active, remove the folder by hand (rm -r $(printf '%q' "$LOCK")); recording files are untouched"
+  elif [ "$owner" != "$$" ] && kill -0 "$owner" 2>/dev/null; then
+    fail "another record_corpus.sh run (pid $owner) holds $LOCK: wait for it to finish, because only one run may record at a time"
+  else
+    fail "$LOCK is a stale lock left by an interrupted run (pid $owner, no longer running): check that no record_corpus.sh run is active, then remove the folder by hand (rm -r $(printf '%q' "$LOCK")); recording files are untouched"
+  fi
+fi
+
+# PROBE_PID: the process id of the readiness probe while one runs, empty otherwise, so that the
+# exit cleanup can stop a probe an interrupted run would leave behind.
+PROBE_PID=""
+# probe_ready: shell-only readiness probe (SPEC.md O-16). It polls container NAME every 5 s until
+# the vehu login shell runs and finds the environment file the start command sources, and takes
+# at most 600 s of wall-clock time in all, stopping a probe included. Each probe runs in the
+# background and is checked once a second. Probes and pauses fill the first 594 s by bash
+# SECONDS: 600 s less a 3-s grace, 1 s for KILL to take effect, 1 s by which SECONDS, counting
+# whole seconds, can lag real time, and 1 s for the once-a-second check. A probe still running
+# when those 594 s are up is stopped (TERM, then KILL after the 3-s grace) and reaped; one that
+# KILL has not ended 1 s later is stuck in the kernel and is left to the exit cleanup rather than
+# waited for. A probe that exits non-zero means not ready yet, and the pause after it is 5 s, or
+# what is left of the 594 s when less. It runs no M command, so it proves the shell and the
+# environment file, not the database: the export before run 1 and the two-run identity check
+# are the guard. 0 when ready, 1 on timeout.
 probe_ready() {
-  local waited=0
-  while [ "$waited" -lt 600 ]; do
-    docker exec "$NAME" su - vehu -c 'test -f /home/vehu/etc/env' < /dev/null >/dev/null 2>&1 && return 0
-    sleep 5
-    waited=$((waited + 5))
+  local limit=600 grace=3 start="$SECONDS" window left rc spent
+  window=$((limit - grace - 3))
+  while :; do
+    left=$((window - (SECONDS - start)))
+    [ "$left" -gt 0 ] || return 1
+    docker exec "$NAME" su - vehu -c 'test -f /home/vehu/etc/env' < /dev/null >/dev/null 2>&1 &
+    PROBE_PID=$!
+    while kill -0 "$PROBE_PID" 2>/dev/null; do
+      left=$((window - (SECONDS - start)))
+      if [ "$left" -le 0 ]; then
+        # Silenced as a group, so the shell's report of the stopped job is not printed either.
+        {
+          kill -TERM "$PROBE_PID"
+          spent=0
+          while [ "$spent" -lt "$grace" ] && kill -0 "$PROBE_PID"; do
+            sleep 1
+            spent=$((spent + 1))
+          done
+          kill -0 "$PROBE_PID" && kill -KILL "$PROBE_PID" && sleep 1
+          # Still there 1 s after KILL: not waited for, and PROBE_PID keeps it for on_exit.
+          kill -0 "$PROBE_PID" || { wait "$PROBE_PID"; PROBE_PID=""; }
+        } 2>/dev/null
+        return 1
+      fi
+      sleep 1
+    done
+    wait "$PROBE_PID"
+    rc=$?
+    PROBE_PID=""
+    [ "$rc" -eq 0 ] && return 0
+    left=$((window - (SECONDS - start)))
+    [ "$left" -gt 0 ] || return 1
+    [ "$left" -le 5 ] || left=5
+    sleep "$left"
   done
-  return 1
 }
 
 # check_export <name> <status>: the fatal checks of the scope export captures-work/corpus/<name>.zwr,
@@ -112,36 +269,63 @@ check_export() {
 
 step "1. Prerequisites"
 [ -f "$BASE" ] || fail "$BASE not found: run tests/golden/ifcap/corpus/scripts/load_corpus.sh first"
-BASE_SNAP_ID="$(sed -n 's/^snapshot_id=//p' "$BASE")"
-BASE_EXPORT_SHA="$(sed -n 's/^export_sha256=//p' "$BASE")"
+BASE_SNAP_ID="$(sed -n 's/^snapshot_id=//p' "$BASE")" || fail "cannot read $BASE"
+BASE_EXPORT_SHA="$(sed -n 's/^export_sha256=//p' "$BASE")" || fail "cannot read $BASE"
 [ -n "$BASE_SNAP_ID" ] || fail "$BASE holds no snapshot_id= value: run load_corpus.sh again"
 [ -n "$BASE_EXPORT_SHA" ] || fail "$BASE holds no export_sha256= value: run load_corpus.sh again"
 [ -f "$MANIFEST" ] || fail "$MANIFEST not found: run cargo run --offline --locked --bin corpus_gen first"
-HEADER="$(sed -n 1p "$MANIFEST")"
-[ "$(printf '%s\n' "$HEADER" | cut -f1)" = "case" ] && [ "$(printf '%s\n' "$HEADER" | cut -f2)" = "class" ] \
-  || fail "$MANIFEST line 1 is not the header case<TAB>class<TAB>...: run corpus_gen again"
-# One id:class word per case, in manifest order. Every loop below walks this list with `for`,
-# unquoted on purpose so that it splits into words, and never with a `while read` over standard
-# input, which each `docker exec -i` would consume.
-ROWS="$(sed 1d "$MANIFEST" | cut -f1,2 | tr '\t' ':')"
+# The manifest is read whole, so a failed read stops here, and is split into lines and cells by
+# parameter expansion only, so no word splitting or globbing touches a cell. Its cases are held
+# in the index-aligned arrays IDS and CLASSES, in manifest order. Every loop below walks those
+# arrays, never a `while read` over standard input, which each `docker exec -i` would consume.
+MANIFEST_TEXT="$(cat "$MANIFEST")" || fail "cannot read $MANIFEST"
+NL='
+'
+REST="$MANIFEST_TEXT$NL"
+LINE_NO=0
+HEADER_TABS=0
 COUNT=0
 BAD=""
-for row in $ROWS; do
-  id="${row%%:*}"
-  class="${row#*:}"
-  # Ids become paths, so only the three corpus series pass.
-  case "$id" in CP-[0-9][0-9][0-9]|CE-[0-9][0-9]|CR-[0-9][0-9]) ;; *) BAD="$BAD $row";; esac
-  case "$class" in CP|IN|BOUNDARY|CR) ;; *) BAD="$BAD $row";; esac
+SEEN=" "
+IDS=()
+CLASSES=()
+while [ -n "$REST" ]; do
+  line="${REST%%"$NL"*}"
+  REST="${REST#*"$NL"}"
+  LINE_NO=$((LINE_NO + 1))
+  tabs="${line//[!$TAB]/}"
+  id="${line%%"$TAB"*}"
+  cells="${line#*"$TAB"}"
+  class="${cells%%"$TAB"*}"
+  # Line 1 is the manifest's eight-column header, byte for byte as corpus_gen writes it, so a
+  # renamed, missing or extra column, or a trailing space, TAB or CR, stops the run here.
+  if [ "$LINE_NO" -eq 1 ]; then
+    [ "$line" = "case${TAB}class${TAB}seed${TAB}order_ien${TAB}c_value${TAB}item_count${TAB}tags${TAB}expected_branch" ] \
+      || fail "$MANIFEST line 1 is not the header case<TAB>class<TAB>seed<TAB>order_ien<TAB>c_value<TAB>item_count<TAB>tags<TAB>expected_branch: run corpus_gen again"
+    HEADER_TABS="${#tabs}"
+    continue
+  fi
+  # Every row has the header's eight columns. Ids become paths, so only the three corpus series
+  # pass, and a cell is taken exactly as written, so a space in an id or a class rejects the row.
+  ok=1
+  [ "${#tabs}" -eq "$HEADER_TABS" ] || ok=0
+  case "$id" in CP-[0-9][0-9][0-9]|CE-[0-9][0-9]|CR-[0-9][0-9]) ;; *) ok=0;; esac
+  case "$class" in CP|IN|BOUNDARY|CR) ;; *) ok=0;; esac
+  if [ "$ok" -eq 0 ]; then
+    BAD="$BAD $LINE_NO"
+    continue
+  fi
+  case "$SEEN" in *" $id "*) fail "$MANIFEST lists case id $id more than once (line $LINE_NO)";; esac
+  SEEN="$SEEN$id "
+  IDS+=("$id")
+  CLASSES+=("$class")
   COUNT=$((COUNT + 1))
 done
-[ -z "$BAD" ] || fail "$MANIFEST has rows that are not <case id><TAB><class>:$BAD"
+[ -z "$BAD" ] || fail "$MANIFEST has rows that are not <case id><TAB><class> with the header's $((HEADER_TABS + 1)) columns, at lines:$BAD"
 [ "$COUNT" -gt 0 ] || fail "$MANIFEST lists no case"
-UNIQUE="$(for row in $ROWS; do printf '%s\n' "${row%%:*}"; done | LC_ALL=C sort -u | wc -l | tr -d ' ')"
-[ "$UNIQUE" = "$COUNT" ] || fail "$MANIFEST lists a case id more than once ($UNIQUE distinct ids in $COUNT rows)"
 echo "cases: $COUNT (corpus_gen writes 231)"
 MISSING=""
-for row in $ROWS; do
-  id="${row%%:*}"
+for id in "${IDS[@]}"; do
   [ -f "$C/$id/input.txt" ] || MISSING="$MISSING $id"
 done
 [ -z "$MISSING" ] || fail "input.txt missing for:$MISSING (run cargo run --offline --locked --bin corpus_gen)"
@@ -186,16 +370,22 @@ rm -f "$C/meta.txt" "$C/run-summary.txt" "$C/SHA256SUMS" || fail "cannot remove 
 
 
 step "5. Run 1 ($COUNT cases)"
-# No pseudo-terminal (no -t), so the transcript holds exactly what the original wrote. A case's
-# exit status is evidence only: whatever it is, the transcript is kept as written.
+# No pseudo-terminal (no -t), so the transcript holds exactly what the original wrote. Each case's
+# input, transcript and standard error are opened first, on descriptors 3, 4 and 5, each checked,
+# so a file that cannot be opened stops the run instead of passing for an exit status of the
+# original. A case's exit status is evidence only: whatever it is, the transcript is kept as written.
 : > "$W/run1/status.tsv" || fail "cannot write $W/run1/status.tsv"
 n=0
-for row in $ROWS; do
-  id="${row%%:*}"
+RC1=()
+for id in "${IDS[@]}"; do
   n=$((n + 1))
-  : > "$C/$id/transcript.txt" || fail "cannot write $C/$id/transcript.txt"
-  docker exec -i "$NAME" su - vehu -c "$INQUIRY_CMD" < "$C/$id/input.txt" > "$C/$id/transcript.txt" 2> "$W/run1/$id.stderr"
+  exec 3< "$C/$id/input.txt" || fail "cannot read $C/$id/input.txt"
+  exec 4> "$C/$id/transcript.txt" || fail "cannot write $C/$id/transcript.txt"
+  exec 5> "$W/run1/$id.stderr" || fail "cannot write $W/run1/$id.stderr"
+  docker exec -i "$NAME" su - vehu -c "$INQUIRY_CMD" <&3 >&4 2>&5 3<&- 4>&- 5>&-
   rc=$?
+  exec 3<&- 4>&- 5>&-
+  RC1+=("$rc")
   printf '%s\t%s\n' "$id" "$rc" >> "$W/run1/status.tsv" || fail "cannot write $W/run1/status.tsv"
   echo "run 1: $n of $COUNT $id exit $rc"
 done
@@ -203,15 +393,23 @@ done
 step "6. Export after"
 export_scope "$W/export-after.zwr" "$W/export-after.err"
 check_export export-after "$?"
-if cmp -s "$W/export-before.zwr" "$W/export-after.zwr"; then
-  EXPORTS=IDENTICAL
-  echo "export after equals export before: the inquiries changed no data"
-else
-  EXPORTS=DIFFERENT
-  printf 'DIFF\t%s\n' export >> "$W/diffs.tsv" || fail "cannot write $W/diffs.tsv"
-  echo "export after DIFFERS from export before. First lines of the difference:"
-  diff "$W/export-before.zwr" "$W/export-after.zwr" | sed -n 1,20p
-fi
+# cmp exits 0 for equal files and 1 for different ones, the only difference collected; any other
+# status is a failed comparison (a file it could not read), which is fatal.
+cmp -s "$W/export-before.zwr" "$W/export-after.zwr"
+cmp_rc=$?
+case "$cmp_rc" in
+  0)
+    EXPORTS=IDENTICAL
+    echo "export after equals export before: the inquiries changed no data"
+    ;;
+  1)
+    EXPORTS=DIFFERENT
+    printf 'DIFF\t%s\n' export >> "$W/diffs.tsv" || fail "cannot write $W/diffs.tsv"
+    echo "export after DIFFERS from export before. First lines of the difference:"
+    diff "$W/export-before.zwr" "$W/export-after.zwr" | sed -n 1,20p
+    ;;
+  *) fail "cmp could not compare $W/export-before.zwr with $W/export-after.zwr (status $cmp_rc)";;
+esac
 echo "exports=$EXPORTS"
 
 step "7. Run 2 on a fresh container"
@@ -220,24 +418,35 @@ probe_ready || fail "container not ready after 600s (shell-only readiness probe,
 echo "container $NAME ready; start command as in step 3"
 : > "$W/run2/status.tsv" || fail "cannot write $W/run2/status.tsv"
 n=0
-for row in $ROWS; do
-  id="${row%%:*}"
+RC2=()
+for id in "${IDS[@]}"; do
   n=$((n + 1))
   mkdir -p "$W/run2/$id" || fail "cannot create $W/run2/$id"
-  docker exec -i "$NAME" su - vehu -c "$INQUIRY_CMD" < "$C/$id/input.txt" > "$W/run2/$id/transcript.txt" 2> "$W/run2/$id.stderr"
+  exec 3< "$C/$id/input.txt" || fail "cannot read $C/$id/input.txt"
+  exec 4> "$W/run2/$id/transcript.txt" || fail "cannot write $W/run2/$id/transcript.txt"
+  exec 5> "$W/run2/$id.stderr" || fail "cannot write $W/run2/$id.stderr"
+  docker exec -i "$NAME" su - vehu -c "$INQUIRY_CMD" <&3 >&4 2>&5 3<&- 4>&- 5>&-
   rc=$?
+  exec 3<&- 4>&- 5>&-
+  RC2+=("$rc")
   printf '%s\t%s\n' "$id" "$rc" >> "$W/run2/status.tsv" || fail "cannot write $W/run2/status.tsv"
   echo "run 2: $n of $COUNT $id exit $rc"
 done
 RUNS=IDENTICAL
-for row in $ROWS; do
-  id="${row%%:*}"
-  if ! cmp -s "$C/$id/transcript.txt" "$W/run2/$id/transcript.txt"; then
-    RUNS=DIFFERENT
-    printf 'DIFF\t%s\n' "$id" >> "$W/diffs.tsv" || fail "cannot write $W/diffs.tsv"
-    echo "$id: run 1 and run 2 DIFFER. First lines of the difference:"
-    diff "$C/$id/transcript.txt" "$W/run2/$id/transcript.txt" | sed -n 1,20p
-  fi
+for id in "${IDS[@]}"; do
+  # As in step 6: status 1 is a collected difference, any status above 1 a fatal failed comparison.
+  cmp -s "$C/$id/transcript.txt" "$W/run2/$id/transcript.txt"
+  cmp_rc=$?
+  case "$cmp_rc" in
+    0) ;;
+    1)
+      RUNS=DIFFERENT
+      printf 'DIFF\t%s\n' "$id" >> "$W/diffs.tsv" || fail "cannot write $W/diffs.tsv"
+      echo "$id: run 1 and run 2 DIFFER. First lines of the difference:"
+      diff "$C/$id/transcript.txt" "$W/run2/$id/transcript.txt" | sed -n 1,20p
+      ;;
+    *) fail "cmp could not compare $C/$id/transcript.txt with $W/run2/$id/transcript.txt (status $cmp_rc)";;
+  esac
 done
 echo "runs=$RUNS"
 
@@ -248,16 +457,31 @@ step "8. Paging detector"
 # ^ and legitimately never reaches the second. A quarantine classifies, and never fails, the run.
 HALT_PROMPT="ENTER '^' TO HALT: "
 END_PROMPT="END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: "
+# count_prompt <literal> <file>: set PROMPTS to the number of times <literal> occurs in <file>.
+# grep exits 1 when nothing matches, a valid count of 0. A grep that cannot read the file, a count
+# that cannot be written or read back, or one that is not a number, is fatal.
+count_prompt() {
+  LC_ALL=C grep -a -o -F "$1" "$2" | wc -l > "$W/paging.count"
+  PIPE_ST=("${PIPESTATUS[@]}")
+  [ "${PIPE_ST[1]}" -eq 0 ] || fail "cannot count the prompts of $2 into $W/paging.count"
+  [ "${PIPE_ST[0]}" -le 1 ] || fail "grep could not read $2 (status ${PIPE_ST[0]})"
+  read -r PROMPTS < "$W/paging.count" || fail "cannot read $W/paging.count"
+  case "$PROMPTS" in ''|*[!0123456789]*) fail "$W/paging.count holds no count for $2: $PROMPTS";; esac
+}
 QUARANTINED_IDS=" "
 QUARANTINED=0
-for row in $ROWS; do
-  id="${row%%:*}"
-  class="${row#*:}"
+i=0
+while [ "$i" -lt "$COUNT" ]; do
+  id="${IDS[$i]}"
+  class="${CLASSES[$i]}"
+  i=$((i + 1))
   case "$class" in
     IN|CP|CR)
       f="$C/$id/transcript.txt"
-      a="$(LC_ALL=C grep -a -o -F "$HALT_PROMPT" "$f" | wc -l | tr -d ' ')"
-      b="$(LC_ALL=C grep -a -o -F "$END_PROMPT" "$f" | wc -l | tr -d ' ')"
+      count_prompt "$HALT_PROMPT" "$f"
+      a="$PROMPTS"
+      count_prompt "$END_PROMPT" "$f"
+      b="$PROMPTS"
       if [ "$a" -gt "$((2 * b))" ]; then
         QUARANTINED_IDS="$QUARANTINED_IDS$id "
         QUARANTINED=$((QUARANTINED + 1))
@@ -277,12 +501,12 @@ step "9. run-summary.txt"
   printf 'exports=%s\n' "$EXPORTS"
   printf 'export_sha256=%s\n' "$BEFORE_SHA"
   printf 'runs=%s\n' "$RUNS"
-  for row in $ROWS; do
-    id="${row%%:*}"
+  i=0
+  while [ "$i" -lt "$COUNT" ]; do
+    id="${IDS[$i]}"
     case "$QUARANTINED_IDS" in *" $id "*) status=QUARANTINED;; *) status=RECORDED;; esac
-    rc1="$(grep "^$id$TAB" "$W/run1/status.tsv" | cut -f2)"
-    rc2="$(grep "^$id$TAB" "$W/run2/status.tsv" | cut -f2)"
-    printf '%s\t%s\t%s\t%s\n' "$id" "$status" "$rc1" "$rc2"
+    printf '%s\t%s\t%s\t%s\n' "$id" "$status" "${RC1[$i]}" "${RC2[$i]}"
+    i=$((i + 1))
   done
   cat "$W/diffs.tsv"
 } > "$C/run-summary.txt" || fail "cannot write $C/run-summary.txt"
@@ -307,8 +531,7 @@ step "11. SHA256SUMS"
 # gives <64 lower-case hex digits><two spaces><path>, the form the corpus reader accepts.
 {
   printf '%s\n' BASE.txt meta.txt run-summary.txt
-  for row in $ROWS; do
-    id="${row%%:*}"
+  for id in "${IDS[@]}"; do
     printf '%s\n' "$id/input.txt" "$id/transcript.txt"
   done
 } > "$W/sums.list" || fail "cannot write $W/sums.list"
@@ -321,20 +544,33 @@ rm -f "$W/SHA256SUMS.new" || fail "cannot remove $W/SHA256SUMS.new"
   while IFS= read -r f; do files+=("$f"); done < "$W_ABS/sums.sorted"
   shasum -a 256 "${files[@]}" > "$W_ABS/SHA256SUMS.new"
 ) || fail "shasum -a 256 failed in $C"
-LISTED="$(wc -l < "$W/sums.sorted" | tr -d ' ')"
-SUMS="$(wc -l < "$W/SHA256SUMS.new" | tr -d ' ')"
+LISTED="$(wc -l < "$W/sums.sorted")" || fail "cannot count the lines of $W/sums.sorted"
+LISTED="${LISTED// /}"
+SUMS="$(wc -l < "$W/SHA256SUMS.new")" || fail "cannot count the lines of $W/SHA256SUMS.new"
+SUMS="${SUMS// /}"
+case "$LISTED" in ''|*[!0123456789]*) fail "wc -l gave no line count for $W/sums.sorted: $LISTED";; esac
+case "$SUMS" in ''|*[!0123456789]*) fail "wc -l gave no line count for $W/SHA256SUMS.new: $SUMS";; esac
 [ "$SUMS" = "$LISTED" ] || fail "$W/SHA256SUMS.new has $SUMS lines for $LISTED files"
 BAD_SUMS="$(LC_ALL=C grep -cvE '^[0-9a-f]{64}  [A-Za-z0-9._/-]+$' "$W/SHA256SUMS.new")"
 [ "$BAD_SUMS" = "0" ] || fail "$W/SHA256SUMS.new has $BAD_SUMS lines that are not <sha256><two spaces><path>"
-mv "$W/SHA256SUMS.new" "$C/SHA256SUMS" || fail "cannot write $C/SHA256SUMS"
+cat "$W/SHA256SUMS.new" > "$C/SHA256SUMS" || { rm -f "$C/SHA256SUMS"; fail "cannot write $C/SHA256SUMS"; }
 echo "wrote $C/SHA256SUMS ($SUMS files)"
 
 step "12. Result"
-docker rm -f "$NAME" >/dev/null 2>&1
-NONZERO="$(grep -cv "${TAB}0\$" "$W/run1/status.tsv")"
+# A removal that fails is fatal, as every failed docker command is, but the recording files are
+# complete by now and stay as written: the container is the only thing left behind.
+: > "$W/final-remove.err" \
+  || fail "cannot write $W/final-remove.err, so container $NAME was not removed: remove it by hand. The recording files in $C (transcripts, run-summary.txt, meta.txt, SHA256SUMS) are already written and kept."
+if ! docker rm -f "$NAME" >/dev/null 2> "$W/final-remove.err"; then
+  sed -n 1,10p "$W/final-remove.err"
+  fail "docker rm -f $NAME failed, so container $NAME remains: remove it by hand. The recording files in $C (transcripts, run-summary.txt, meta.txt, SHA256SUMS) are already written and kept."
+fi
+NONZERO=0
+for rc in "${RC1[@]}"; do
+  [ "$rc" -eq 0 ] || NONZERO=$((NONZERO + 1))
+done
 EMPTY=""
-for row in $ROWS; do
-  id="${row%%:*}"
+for id in "${IDS[@]}"; do
   [ -s "$C/$id/transcript.txt" ] || EMPTY="$EMPTY $id"
 done
 echo "exports=$EXPORTS"
@@ -353,4 +589,3 @@ if [ "$EXPORTS" = IDENTICAL ] && [ "$RUNS" = IDENTICAL ]; then
 fi
 echo "RESULT: DIFFERENCES FOUND"
 exit 1
-
