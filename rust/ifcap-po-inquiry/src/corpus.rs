@@ -539,7 +539,8 @@ pub struct CorpusError {
     pub case: Option<String>,
     /// The rule that failed, such as `profile violation`, `unmet minimum`,
     /// `unresolved reference`, `exhausted drop loop`, `item-count
-    /// attribution`, `session failure` or `CR unimplemented`.
+    /// attribution`, `attribution isolation`, `session failure`, `finding
+    /// evidence` or `CR unimplemented`.
     pub rule: String,
     /// What failed.
     pub detail: String,
@@ -1156,12 +1157,12 @@ fn label_number(case: &str, dimension: &str, value: &str) -> Result<usize, Corpu
     })
 }
 
-/// One item of an order as drawn, before its nodes are written.
+/// One item of an order as drawn, before its nodes are written. The unit,
+/// which draws nothing, is read from the plan when the nodes are written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ItemDraft {
     desc: String,
     qty: String,
-    unit: String,
     cost: String,
     ext: String,
     stk: Option<String>,
@@ -1209,6 +1210,25 @@ impl ItemDraft {
     }
 }
 
+/// The values one order draws from the stream, before its nodes are
+/// written: every value of a drawn dimension, and the fund control point
+/// and cost center, which no dimension decides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OrderDraft {
+    /// Node 1 piece 11, empty when the plan has no delivery location.
+    delivery: String,
+    /// Node 1 piece 8.
+    proposal: String,
+    /// Node 0 piece 4.
+    app: String,
+    /// Node 0 piece 3.
+    fund_control_point: String,
+    /// Node 0 piece 5.
+    cost_center: String,
+    /// The items, in item order.
+    items: Vec<ItemDraft>,
+}
+
 /// The largest `$Y` of an order whose items have the paging `shapes` of
 /// [`ItemDraft::shape`], with the estimated-shipping line when `shipping`.
 /// `HDR` leaves `$Y` at 4 [PRCHDP2.m:42]; item k's `ASK` [PRCHDP2.m:60]
@@ -1229,60 +1249,49 @@ fn worst_y(shapes: &[(usize, usize)], shipping: bool) -> usize {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Built {
     plan: Plan,
-    /// The stream state the order's draws started from, so that a reverted
-    /// order can be rebuilt with every other draw unchanged.
+    /// The stream state the order's draws started from. [`revert`] draws
+    /// a reverted plan afresh from a copy of it, so the round's own
+    /// stream is never touched. That fresh draw starts where the order's did
+    /// but shifts every later value once a presence, a length or a form
+    /// changes, so only the reverted dimension's values are taken from it.
     start: Xorshift64,
+    /// The order's drawn values after thinning. A reverted order keeps each
+    /// of them, the fund control point, the cost center and every item's
+    /// thinning included, except those of the reverted dimension.
+    draft: OrderDraft,
     record: OrderRecord,
     tags: Vec<String>,
 }
 
-/// Builds CP-n of `plan` with the stream `rng`, drawn in this order: the
-/// delivery location (a draw for its length, `1 + r mod 20`, then its
-/// text, when present), the proposal text, the APP digits, the fund control
-/// point's three digits and word, the cost center's four digits; then per
-/// item the description text, the quantity, the unit cost (none for
-/// `N/C`), the extended cost, the STK# word, the NSN code ([`nsn_code`]),
-/// the FOOD GROUP code ([`food_group_code`]) and the Items per count when
-/// present, and the BOC with its words. Orders of five or more items are
-/// then thinned until [`worst_y`] is within [`PAGING_BOUND`]: from the last
-/// item back, Items per, FOOD GROUP, NSN and STK#, one printed line at a
-/// time.
-fn build_record(
-    plan: &Plan,
-    refs: &References,
-    rng: &mut Xorshift64,
-) -> Result<Built, CorpusError> {
-    let start = rng.clone();
-    let n = plan.n;
-    let case_id = format!("CP-{n:03}");
-    let ien = (IEN_BASE + n).to_string();
-    let c_value = format!("CP{n:03}");
-    let order_type = plan.value("type").to_string();
-    let purchase_card = order_type == "S";
-
+/// Draws the values of `plan`'s order, CP case `case_id`, from `rng` in
+/// this order: the delivery location (a draw for its length,
+/// `1 + r mod 20`, then its text, when present), the proposal text, the APP
+/// digits, the fund control point's three digits and word, the cost
+/// center's four digits; then per item the description text, the
+/// quantity, the unit cost (none for `N/C`), the extended cost, the STK#
+/// word, the NSN code ([`nsn_code`]), the FOOD GROUP code
+/// ([`food_group_code`]) and the Items per count when present, and the BOC
+/// with its words. Because a draw happens only where the plan gives a
+/// value to draw, a different presence, length or form shifts every later
+/// draw.
+fn draw_order(plan: &Plan, case_id: &str, rng: &mut Xorshift64) -> Result<OrderDraft, CorpusError> {
     let delivery = if plan.value("delivery") == "present" {
         let length = 1 + usize::try_from(rng.next_u64() % 20).unwrap_or(0);
         stream_text(rng, length)
     } else {
         String::new()
     };
-    let proposal_length = label_number(&case_id, "proposal", plan.value("proposal"))?;
+    let proposal_length = label_number(case_id, "proposal", plan.value("proposal"))?;
     let proposal = stream_text(rng, proposal_length);
-    let app_length = label_number(&case_id, "app", plan.value("app"))?;
+    let app_length = label_number(case_id, "app", plan.value("app"))?;
     let app = digits(rng, app_length);
     let fund_control_point = format!("{} {}", digits(rng, 3), word(rng));
     let cost_center = digits(rng, 4);
-    let (verbal, confirmation) = match plan.value("verbal") {
-        "verbal" => ("Y", ""),
-        "confirmation" => ("Y", "Y"),
-        _ => ("", ""),
-    };
-    let authorities = label_number(&case_id, "authority", plan.value("authority"))?;
 
     let mut drafts = Vec::with_capacity(plan.items.len());
     for item in &plan.items {
         let field = |name: &str| Plan::item_value(item, &format!("item.{name}")).to_string();
-        let desc_length = label_number(&case_id, "item.desc", &field("desc"))?;
+        let desc_length = label_number(case_id, "item.desc", &field("desc"))?;
         let desc = stream_text(rng, desc_length);
         let qty = if field("qty") == "decimal" {
             decimal(rng, 99, 1)
@@ -1322,7 +1331,6 @@ fn build_record(
         drafts.push(ItemDraft {
             desc,
             qty,
-            unit: field("unit"),
             cost,
             ext,
             stk,
@@ -1333,17 +1341,31 @@ fn build_record(
             thinned: Vec::new(),
         });
     }
+    Ok(OrderDraft {
+        delivery,
+        proposal,
+        app,
+        fund_control_point,
+        cost_center,
+        items: drafts,
+    })
+}
 
+/// Thins the drawn `items` of `plan`'s order when it has five or more,
+/// until [`worst_y`] is within [`PAGING_BOUND`]: from the last item back,
+/// Items per, FOOD GROUP, NSN and STK#, one printed line at a time.
+fn thin(plan: &Plan, items: &mut [ItemDraft]) {
+    let purchase_card = plan.value("type") == "S";
     let shipping = crate::mumps::num_cmp(plan.value("shipping"), "0") == Ordering::Greater;
-    if drafts.len() >= 5 {
+    if items.len() >= 5 {
         let shapes = |drafts: &[ItemDraft]| -> Vec<(usize, usize)> {
             drafts
                 .iter()
                 .map(|draft| draft.shape(purchase_card))
                 .collect()
         };
-        while worst_y(&shapes(&drafts), shipping) > PAGING_BOUND {
-            if !drafts
+        while worst_y(&shapes(items), shipping) > PAGING_BOUND {
+            if !items
                 .iter_mut()
                 .rev()
                 .any(|draft| draft.thin_one(purchase_card))
@@ -1352,14 +1374,63 @@ fn build_record(
             }
         }
     }
+}
+
+/// Builds CP-n of `plan` with the stream `rng`: [`draw_order`] draws its
+/// values, [`thin`] thins an order of five or more items, and [`assemble`]
+/// writes its nodes and tags.
+fn build_record(
+    plan: &Plan,
+    refs: &References,
+    rng: &mut Xorshift64,
+) -> Result<Built, CorpusError> {
+    let start = rng.clone();
+    let mut draft = draw_order(plan, &format!("CP-{:03}", plan.n), rng)?;
+    thin(plan, &mut draft.items);
+    assemble(plan, refs, start, draft)
+}
+
+/// CP-n of `plan` with the drawn and thinned values `draft`, its draws
+/// started from `start`: its nodes, written from the plan's rotation values
+/// and the draft's drawn ones, the authority entries from `refs`, and its
+/// tags, where a thinned optional line is tagged `thinned`.
+fn assemble(
+    plan: &Plan,
+    refs: &References,
+    start: Xorshift64,
+    draft: OrderDraft,
+) -> Result<Built, CorpusError> {
+    let n = plan.n;
+    let case_id = format!("CP-{n:03}");
+    let ien = (IEN_BASE + n).to_string();
+    let c_value = format!("CP{n:03}");
+    let order_type = plan.value("type").to_string();
+    if draft.items.len() != plan.items.len() {
+        return Err(CorpusError::new(
+            Some(&case_id),
+            "order draft",
+            format!(
+                "{} drawn items for {} planned",
+                draft.items.len(),
+                plan.items.len()
+            ),
+        ));
+    }
+    let (verbal, confirmation) = match plan.value("verbal") {
+        "verbal" => ("Y", ""),
+        "confirmation" => ("Y", "Y"),
+        _ => ("", ""),
+    };
+    let authorities = label_number(&case_id, "authority", plan.value("authority"))?;
+    let drafts = &draft.items;
 
     let date = plan.value("date");
     let node0 = [
         format!("{STATION}-{c_value}").as_str(),
         plan.value("mop"),
-        &fund_control_point,
-        &app,
-        &cost_center,
+        &draft.fund_control_point,
+        &draft.app,
+        &draft.cost_center,
         "",
         "",
         "",
@@ -1380,10 +1451,10 @@ fn build_record(
         confirmation,
         plan.value("fob"),
         plan.value("source"),
-        &proposal,
+        &draft.proposal,
         "",
         plan.value("agent"),
-        &delivery,
+        &draft.delivery,
         "",
         "",
         "",
@@ -1400,12 +1471,12 @@ fn build_record(
         under(&order, &["2", "0"]),
         format!("^442.01^{count}^{count}"),
     );
-    for (index, draft) in drafts.iter().enumerate() {
+    for (index, (planned, draft)) in plan.items.iter().zip(drafts).enumerate() {
         let j = (index + 1).to_string();
         let item0 = [
             j.as_str(),
             &draft.qty,
-            &draft.unit,
+            Plan::item_value(planned, "item.unit"),
             &draft.boc,
             "",
             draft.stk.as_deref().unwrap_or(""),
@@ -1471,7 +1542,7 @@ fn build_record(
         .map(|(dimension, value)| format!("{dimension}={}", tag_value(value)))
         .collect();
     tags.push(format!("items={}", drafts.len()));
-    for (index, (item, draft)) in plan.items.iter().zip(&drafts).enumerate() {
+    for (index, (item, draft)) in plan.items.iter().zip(drafts).enumerate() {
         for field in ITEM_ROWS {
             let planned = Plan::item_value(item, &format!("item.{field}"));
             let value = if draft.thinned.contains(&field) {
@@ -1490,14 +1561,16 @@ fn build_record(
         ));
     }
 
+    let item_count = drafts.len();
     Ok(Built {
         plan: plan.clone(),
         start,
+        draft,
         record: OrderRecord {
             case_id,
             ien,
             c_value,
-            item_count: drafts.len(),
+            item_count,
             order_type,
             nodes: nodes.into_iter().collect(),
         },
@@ -1543,19 +1616,31 @@ fn cp_inputs(c_value: &str) -> Vec<String> {
     owned(&["", c_value, "", "", "^"])
 }
 
+/// The CP orders kept for a finding, by their 0-based position among the
+/// 200, each with the implemented branch its session halted at.
+type Retained = BTreeMap<usize, (Built, &'static str)>;
+
 /// One generation round under `lists`: the 200 orders built from one
-/// stream started at [`SEED`], checked to add no node world A holds and to
-/// survive their own ZWR text unchanged, and world B built from them.
+/// stream started at [`SEED`], then each order of `retained` in place of
+/// the one built at its position, so that no other order's draws move;
+/// all checked to add no node world A holds and to survive their own ZWR
+/// text unchanged, and world B built from them.
 fn run_round(
     world_a: &Store,
     refs: &References,
     lists: &Lists,
+    retained: &Retained,
 ) -> Result<(Vec<Built>, Store), CorpusError> {
     let mut rng = Xorshift64::new(SEED);
-    let built = plans(lists)?
+    let mut built = plans(lists)?
         .iter()
         .map(|plan| build_record(plan, refs, &mut rng))
         .collect::<Result<Vec<_>, CorpusError>>()?;
+    for (index, (kept, _)) in retained {
+        if let Some(slot) = built.get_mut(*index) {
+            slot.clone_from(kept);
+        }
+    }
     for order in &built {
         let record = &order.record;
         let clash = world_a.data(&key("PRC", &["442", &record.ien])) != 0
@@ -1592,12 +1677,36 @@ fn run_round(
     Ok((built, world))
 }
 
-/// Every single-dimension reversion of `plan` under `lists`, each as the
-/// dimension, the value it replaces and the reverted plan: the order rows
+/// One single-dimension reversion of an order.
+struct Reversion {
+    /// The dimension: an order row such as `status`, or `item.` and an item
+    /// field such as `item.cost`.
+    dimension: String,
+    /// The 0-based position of the item an item row reverts; `None` for an
+    /// order row.
+    item: Option<usize>,
+    /// The value the reversion replaces.
+    current: String,
+    /// The order's plan with that one value reverted.
+    plan: Plan,
+}
+
+impl Reversion {
+    /// The name of the tag the reversion changes: the order row, or
+    /// `item<j>.<field>` for item j.
+    fn tag_name(&self) -> String {
+        match (self.item, self.dimension.strip_prefix("item.")) {
+            (Some(at), Some(field)) => format!("item{}.{field}", at + 1),
+            _ => self.dimension.clone(),
+        }
+    }
+}
+
+/// Every single-dimension reversion of `plan` under `lists`: the order rows
 /// in matrix order, then the item rows, each over the items in order. A
 /// value reverts to its list's first value, or to the second when it is the
 /// first. The item count is not a dimension and never reverts.
-fn reversions(plan: &Plan, lists: &Lists) -> Vec<(String, String, Plan)> {
+fn reversions(plan: &Plan, lists: &Lists) -> Vec<Reversion> {
     let target = |dimension: &str, current: &str| -> Option<String> {
         let list = lists.list(dimension);
         let first = list.first()?;
@@ -1614,7 +1723,12 @@ fn reversions(plan: &Plan, lists: &Lists) -> Vec<(String, String, Plan)> {
             if let Some(slot) = reverted.order.get_mut(at) {
                 slot.1 = value;
             }
-            out.push((dimension.clone(), current.clone(), reverted));
+            out.push(Reversion {
+                dimension: dimension.clone(),
+                item: None,
+                current: current.clone(),
+                plan: reverted,
+            });
         }
     }
     for field in ITEM_ROWS {
@@ -1630,18 +1744,216 @@ fn reversions(plan: &Plan, lists: &Lists) -> Vec<(String, String, Plan)> {
                 if let Some(slot) = slot {
                     slot.1 = value;
                 }
-                out.push((dimension.clone(), current.to_string(), reverted));
+                out.push(Reversion {
+                    dimension: dimension.clone(),
+                    item: Some(at),
+                    current: current.to_string(),
+                    plan: reverted,
+                });
             }
         }
     }
     out
 }
 
+/// The candidate order of `reversion` for `target`: `target`'s own draft
+/// with only the reverted dimension changed. A rotation-only dimension,
+/// every order row but `delivery`, `proposal` and `app`, and `item.unit`,
+/// changes through the reverted plan alone. A drawn one takes its new
+/// values from a fresh draw of the reverted plan started at
+/// [`Built::start`], and a reverted optional line is no longer marked
+/// thinned. Every other drawn value is the target's, and nothing is thinned
+/// again.
+fn revert(target: &Built, refs: &References, reversion: &Reversion) -> Result<Built, CorpusError> {
+    let case = target.record.case_id.as_str();
+    let fresh = draw_order(&reversion.plan, case, &mut target.start.clone())?;
+    let mut draft = target.draft.clone();
+    match reversion.item {
+        None => match reversion.dimension.as_str() {
+            "delivery" => draft.delivery = fresh.delivery,
+            "proposal" => draft.proposal = fresh.proposal,
+            "app" => draft.app = fresh.app,
+            _ => {}
+        },
+        Some(at) => {
+            let field = reversion
+                .dimension
+                .strip_prefix("item.")
+                .unwrap_or(&reversion.dimension);
+            let (Some(item), Some(drawn)) = (draft.items.get_mut(at), fresh.items.get(at)) else {
+                return Err(CorpusError::new(
+                    Some(case),
+                    "attribution isolation",
+                    format!("{} names no item of the order", reversion.tag_name()),
+                ));
+            };
+            match field {
+                "desc" => item.desc.clone_from(&drawn.desc),
+                "qty" => item.qty.clone_from(&drawn.qty),
+                "cost" => item.cost.clone_from(&drawn.cost),
+                "ext" => item.ext.clone_from(&drawn.ext),
+                "stk" => item.stk.clone_from(&drawn.stk),
+                "nsn" => item.nsn.clone_from(&drawn.nsn),
+                "food" => item.food.clone_from(&drawn.food),
+                "per" => item.per.clone_from(&drawn.per),
+                "boc" => item.boc.clone_from(&drawn.boc),
+                _ => {}
+            }
+            // Only optional lines are ever marked thinned; a reverted one
+            // now holds its reverted state.
+            item.thinned.retain(|thinned| *thinned != field);
+        }
+    }
+    assemble(&reversion.plan, refs, target.start.clone(), draft)
+}
+
+/// A node one dimension writes, below its order: the node's key, and the
+/// `^`-pieces the dimension sets, or `None` when it sets the whole node and
+/// every node below it.
+type Reach = (Vec<Sub>, Option<&'static [usize]>);
+
+/// The nodes and pieces [`assemble`] writes from the dimension of
+/// `reversion` below `order`, the key of its order, for an item row in the
+/// reverted item only. An unknown dimension writes nothing.
+fn reach(reversion: &Reversion, order: &[Sub]) -> Vec<Reach> {
+    let node =
+        |subs: &[&str], pieces: Option<&'static [usize]>| -> Reach { (under(order, subs), pieces) };
+    let j = reversion
+        .item
+        .map(|at| (at + 1).to_string())
+        .unwrap_or_default();
+    let item = |subs: &[&str], pieces: Option<&'static [usize]>| -> Reach {
+        (under(&under(order, &["2", &j]), subs), pieces)
+    };
+    match reversion.dimension.as_str() {
+        "status" => vec![node(&["7"], Some(&[1]))],
+        "type" => vec![node(&["23"], None)],
+        "source" => vec![node(&["1"], Some(&[7]))],
+        "mop" => vec![node(&["0"], Some(&[2]))],
+        "vendor" => vec![node(&["1"], Some(&[1]))],
+        "service" => vec![node(&["1"], Some(&[2]))],
+        "shipto" => vec![node(&["1"], Some(&[3]))],
+        "delivery" => vec![node(&["1"], Some(&[11]))],
+        "verbal" => vec![node(&["1"], Some(&[4, 5]))],
+        "fob" => vec![node(&["1"], Some(&[6]))],
+        "proposal" => vec![node(&["1"], Some(&[8]))],
+        "authority" => vec![node(&["14"], None)],
+        "date" => vec![node(&["0"], Some(&[10])), node(&["1"], Some(&[15]))],
+        "app" => vec![node(&["0"], Some(&[4]))],
+        "agent" => vec![node(&["1"], Some(&[10]))],
+        "total" => vec![node(&["0"], Some(&[15]))],
+        "shipping" => vec![node(&["0"], Some(&[13]))],
+        "item.desc" => vec![item(&["1", "1", "0"], None)],
+        "item.qty" => vec![item(&["0"], Some(&[2]))],
+        "item.unit" => vec![item(&["0"], Some(&[3]))],
+        "item.cost" => vec![item(&["0"], Some(&[9]))],
+        "item.ext" => vec![item(&["2"], None)],
+        "item.stk" => vec![item(&["0"], Some(&[6]))],
+        "item.nsn" => vec![item(&["0"], Some(&[13]))],
+        "item.food" => vec![item(&["4"], None)],
+        "item.per" => vec![item(&["0"], Some(&[12]))],
+        "item.boc" => vec![item(&["0"], Some(&[4]))],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether the `^`-pieces of `old` and `new` agree at every position but
+/// the 1-based `pieces`.
+fn same_outside(old: &str, new: &str, pieces: &[usize]) -> bool {
+    let count = old.split('^').count().max(new.split('^').count());
+    (1..=count)
+        .filter(|at| !pieces.contains(at))
+        .all(|at| crate::mumps::piece(old, "^", at) == crate::mumps::piece(new, "^", at))
+}
+
+/// What `candidate` changes outside the dimension of `reversion`, against
+/// the order `original` it reverts, or `None` when it changes nothing else:
+/// the case, IEN, `C` value and item count stay, the order type changes
+/// only for `type`, every tag but the reverted one stays, and every node
+/// stays but the nodes and pieces of [`reach`].
+fn isolation_breach(original: &Built, candidate: &Built, reversion: &Reversion) -> Option<String> {
+    let (before, after) = (&original.record, &candidate.record);
+    let same_identity = before.case_id == after.case_id
+        && before.ien == after.ien
+        && before.c_value == after.c_value
+        && before.item_count == after.item_count;
+    if !same_identity {
+        return Some("the order's case, IEN, C value or item count changed".to_string());
+    }
+    if before.order_type != after.order_type && reversion.dimension != "type" {
+        return Some(format!(
+            "the order type {} became {}",
+            tag_value(&before.order_type),
+            tag_value(&after.order_type)
+        ));
+    }
+    if original.tags.len() != candidate.tags.len() {
+        return Some(format!(
+            "its {} tags became {}",
+            original.tags.len(),
+            candidate.tags.len()
+        ));
+    }
+    let name = reversion.tag_name();
+    let reverted = |tag: &str| tag.split_once('=').is_some_and(|(tag, _)| tag == name);
+    if let Some((old, new)) = original
+        .tags
+        .iter()
+        .zip(&candidate.tags)
+        .find(|(old, new)| old != new && !(reverted(old) && reverted(new)))
+    {
+        return Some(format!("tag {old} became {new}"));
+    }
+    let reach = reach(reversion, &key("PRC", &["442", &before.ien]));
+    let nodes = |record: &OrderRecord| -> BTreeMap<Vec<Sub>, String> {
+        record.nodes.iter().cloned().collect()
+    };
+    let (old_nodes, new_nodes) = (nodes(before), nodes(after));
+    let keys: BTreeSet<&Vec<Sub>> = old_nodes.keys().chain(new_nodes.keys()).collect();
+    for node in keys {
+        let (old, new) = (
+            old_nodes.get(node).map(String::as_str),
+            new_nodes.get(node).map(String::as_str),
+        );
+        if old == new {
+            continue;
+        }
+        let allowed = reach.iter().any(|(path, pieces)| match (pieces, old, new) {
+            (None, _, _) => node.starts_with(path),
+            (Some(pieces), Some(old), Some(new)) => node == path && same_outside(old, new, pieces),
+            (Some(_), _, _) => false,
+        });
+        if !allowed {
+            let shown = |value: Option<&str>| value.map_or("nothing".to_string(), str::to_string);
+            return Some(format!(
+                "node {} changed from {} to {}",
+                Store::format_ref(node),
+                shown(old),
+                shown(new)
+            ));
+        }
+    }
+    None
+}
+
 /// The dimension and value that make CP order `index` of `built` halt at a
 /// not-implemented branch: the first of its [`reversions`] after which its
-/// session runs to its end. Each reverted order is rebuilt from the stream
-/// state its own draws started from, so its other text and amounts and the
-/// round's stream stay as they were, and world B is rebuilt around it.
+/// session runs to its end.
+///
+/// Each candidate is [`revert`]'s: the order's own draft with only the
+/// reverted dimension changed, its new drawn values from a fresh draw
+/// started at [`Built::start`], so the round's stream is untouched; every
+/// other value, the fund control point, the cost center and each item's
+/// thinning included, stays as it was, and nothing is thinned again.
+/// Before its session runs, the candidate must differ from the order only
+/// in the reverted dimension's tag and in the nodes and pieces that
+/// dimension writes ([`isolation_breach`]), else the attribution stops
+/// with an `attribution isolation` error; world B is then rebuilt around
+/// it. A candidate whose session fails stops the attribution with a
+/// `session failure` error naming the reversion and the cause, since a
+/// failure is never accepted; one that halts again gives way to the next
+/// reversion, and with none left the case's item count is all that
+/// remains, an `item-count attribution` error.
 fn attribute(
     world_a: &Store,
     refs: &References,
@@ -1654,21 +1966,43 @@ fn attribute(
         .get(index)
         .ok_or_else(|| CorpusError::new(None, "item-count attribution", "no order to attribute"))?;
     let case = target.record.case_id.as_str();
-    for (dimension, current, plan) in reversions(&target.plan, lists) {
-        let mut rng = target.start.clone();
-        let rebuilt = build_record(&plan, refs, &mut rng)?;
+    for reversion in reversions(&target.plan, lists) {
+        let candidate = revert(target, refs, &reversion)?;
+        if let Some(breach) = isolation_breach(target, &candidate, &reversion) {
+            return Err(CorpusError::new(
+                Some(case),
+                "attribution isolation",
+                format!(
+                    "reverting {} from {} also changes more: {breach}",
+                    reversion.tag_name(),
+                    tag_value(&reversion.current)
+                ),
+            ));
+        }
         let text = render_nodes(built.iter().enumerate().flat_map(|(at, order)| {
             if at == index {
-                rebuilt.record.nodes.iter()
+                candidate.record.nodes.iter()
             } else {
                 order.record.nodes.iter()
             }
         }));
         let world = world_b(world_a, &text)
             .map_err(|error| CorpusError::new(Some(case), "world B", error.to_string()))?;
-        let run = run_case(&world, &cp_inputs(&rebuilt.record.c_value));
-        if classify(&run, not_implemented) == Outcome::End {
-            return Ok((dimension, current));
+        let run = run_case(&world, &cp_inputs(&candidate.record.c_value));
+        match classify(&run, not_implemented) {
+            Outcome::End => return Ok((reversion.dimension, reversion.current)),
+            Outcome::Failure(cause) => {
+                return Err(CorpusError::new(
+                    Some(case),
+                    "session failure",
+                    format!(
+                        "with {} reverted from {}: {cause}",
+                        reversion.tag_name(),
+                        tag_value(&reversion.current)
+                    ),
+                ));
+            }
+            Outcome::Unimplemented(_) | Outcome::Implemented(_) => {}
         }
     }
     Err(CorpusError::new(
@@ -1939,77 +2273,91 @@ fn resolve_case(
     })
 }
 
-/// Generates the corpus from `world_a` and the `SPEC.md` text `spec`.
-///
-/// 1. The not-implemented branch IDs come from `spec` ([`ne_branches`]); the
-///    file 442 attributes `442I` and the reference lists from `world_a`.
-/// 2. Each round restarts the stream at [`SEED`] and builds the 200 orders
-///    under the current lists. Orders are built in case order, and each
-///    draws its delivery location, proposal, APP, fund control point and
-///    cost center, then per item its description, quantity, unit cost,
-///    extended cost, STK#, NSN, FOOD GROUP, Items per and BOC, each only
-///    when the rotation gives it a value to draw. No order may add a node
-///    world A holds, and the corpus ZWR text must parse back to exactly the
-///    generated nodes. Every CP case then runs once on world B. A halt at a
-///    not-implemented branch is attributed to the first single-dimension
-///    reversion that lets the session end, and that value leaves its list;
-///    if any was dropped the next round starts, up to five rounds.
-/// 3. On the final world B each CE and CR case runs once, and its outcome
-///    keeps, moves or records it.
-/// 4. Every order must meet the fixture profile ([`profile_violations`])
-///    and the paging bound ([`order_worst_y`]), the `C` values the non-prefix
-///    rule ([`c_value_violations`]), and the corpus every minimum
-///    ([`minimum_violations`]).
-///
-/// A failed session, a CR case at a not-implemented branch, an unmet rule,
-/// an attribution that finds no dimension, or a fifth round that still
-/// drops a variant is a [`CorpusError`] naming the case and the rule.
-pub fn generate(world_a: &Store, spec: &str) -> Result<Corpus, CorpusError> {
-    let not_implemented = ne_branches(spec);
-    if not_implemented.is_empty() {
-        return Err(CorpusError::new(
-            None,
-            "specification",
-            "SPEC.md \"### Branch inventory\" lists no not-implemented branch",
-        ));
+/// What the CP rounds settled: the final round's orders, world B and CP
+/// outcomes, the drops of every round, and the number of rounds run.
+struct Settled {
+    built: Vec<Built>,
+    world: Store,
+    outcomes: Vec<Outcome>,
+    drops: Vec<DroppedVariant>,
+    rounds: usize,
+}
+
+/// A session outcome as an error detail writes it.
+fn outcome_text(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::End => "a session that runs to its end".to_string(),
+        Outcome::Unimplemented(id) => format!("a halt at the not-implemented {id}"),
+        Outcome::Implemented(id) => format!("a halt at {id}"),
+        Outcome::Failure(cause) => format!("a failure: {cause}"),
     }
-    // Without these file attributes every lookup ends at PO-09.b15 before
-    // any order is read, which no reversion could attribute.
-    let header = world_a.get_or_empty(&key("PRC", &["442", "0"]));
-    if crate::mumps::piece(&header, "^", 2) != "442I" {
-        return Err(CorpusError::new(
-            None,
-            "profile violation",
-            "the world A file 442 header piece 2 is not 442I",
-        ));
-    }
-    let refs = References::read(world_a)?;
-    let mut lists = Lists::initial(&refs);
+}
+
+/// The CP rounds of [`generate`], starting from `lists`. Each round
+/// ([`run_round`]) builds the orders, with every order kept for a finding
+/// in its place, and runs every CP case once on its world B. A failed
+/// session stops the rounds. A kept order must halt at its branch again,
+/// else the rounds stop with a `finding evidence` error. An order that
+/// first halts at an implemented branch is kept, record and inputs, for
+/// every later round. An order that halts at a not-implemented branch has
+/// its variant attributed ([`attribute`]) and dropped from its list, and
+/// another round starts, up to [`MAX_ROUNDS`].
+fn settle_cp(
+    world_a: &Store,
+    refs: &References,
+    mut lists: Lists,
+    not_implemented: &[String],
+) -> Result<Settled, CorpusError> {
     let mut drops: Vec<DroppedVariant> = Vec::new();
+    let mut retained: Retained = BTreeMap::new();
     let mut round = 0;
-    let (built, world, outcomes) = loop {
+    loop {
         round += 1;
-        let (built, world) = run_round(world_a, &refs, &lists)?;
+        let (built, world) = run_round(world_a, refs, &lists, &retained)?;
         let mut outcomes = Vec::with_capacity(built.len());
         let mut unresolved = Vec::new();
         for (index, order) in built.iter().enumerate() {
             let run = run_case(&world, &cp_inputs(&order.record.c_value));
-            let outcome = classify(&run, &not_implemented);
+            let outcome = classify(&run, not_implemented);
+            if let Outcome::Failure(cause) = &outcome {
+                return Err(CorpusError::new(
+                    Some(&order.record.case_id),
+                    "session failure",
+                    cause.clone(),
+                ));
+            }
+            if let Some((_, id)) = retained.get(&index)
+                && outcome != Outcome::Implemented(id)
+            {
+                return Err(CorpusError::new(
+                    Some(&order.record.case_id),
+                    "finding evidence",
+                    format!(
+                        "the record kept in an earlier round for its finding at {id} now gives \
+                         {} in round {round}",
+                        outcome_text(&outcome)
+                    ),
+                ));
+            }
             match &outcome {
-                Outcome::Failure(cause) => {
-                    return Err(CorpusError::new(
-                        Some(&order.record.case_id),
-                        "session failure",
-                        cause.clone(),
-                    ));
-                }
                 Outcome::Unimplemented(id) => unresolved.push((index, *id)),
-                Outcome::End | Outcome::Implemented(_) => {}
+                Outcome::Implemented(id) => {
+                    retained
+                        .entry(index)
+                        .or_insert_with(|| (order.clone(), *id));
+                }
+                Outcome::End | Outcome::Failure(_) => {}
             }
             outcomes.push(outcome);
         }
         if unresolved.is_empty() {
-            break (built, world, outcomes);
+            return Ok(Settled {
+                built,
+                world,
+                outcomes,
+                drops,
+                rounds: round,
+            });
         }
         if round >= MAX_ROUNDS {
             let remaining: Vec<String> = unresolved
@@ -2036,14 +2384,8 @@ pub fn generate(world_a: &Store, spec: &str) -> Result<Corpus, CorpusError> {
         }
         let round_lists = lists.clone();
         for (index, branch) in unresolved {
-            let (dimension, value) = attribute(
-                world_a,
-                &refs,
-                &round_lists,
-                &built,
-                index,
-                &not_implemented,
-            )?;
+            let (dimension, value) =
+                attribute(world_a, refs, &round_lists, &built, index, not_implemented)?;
             if !lists.list(&dimension).contains(&value) {
                 continue;
             }
@@ -2060,7 +2402,70 @@ pub fn generate(world_a: &Store, spec: &str) -> Result<Corpus, CorpusError> {
                 branch: branch.to_string(),
             });
         }
-    };
+    }
+}
+
+/// Generates the corpus from `world_a` and the `SPEC.md` text `spec`.
+///
+/// 1. The not-implemented branch IDs come from `spec` ([`ne_branches`]); the
+///    file 442 attributes `442I` and the reference lists from `world_a`.
+/// 2. Each round (`settle_cp`) restarts the stream at [`SEED`] and builds
+///    the 200 orders under the current lists. Orders are built in case
+///    order, and each draws its delivery location, proposal, APP, fund
+///    control point and cost center, then per item its description,
+///    quantity, unit cost, extended cost, STK#, NSN, FOOD GROUP, Items per
+///    and BOC, each only when the rotation gives it a value to draw
+///    (`draw_order`). Every order an earlier round kept for a finding then
+///    takes the place of the one built at its position. No order may add a
+///    node world A holds, and the corpus ZWR text must parse back to exactly
+///    the generated nodes. Every CP case then runs once on world B. A halt
+///    at an implemented branch keeps that order, its record and inputs, for
+///    every later round, where it must halt at that branch again. A halt at
+///    a not-implemented branch is attributed to the first single-dimension
+///    reversion that lets the session end (`attribute`), and that value
+///    leaves its list; while any CP case halts at a not-implemented branch
+///    the next round starts, up to five rounds.
+/// 3. On the final world B each CE and CR case runs once, and its outcome
+///    keeps, moves or records it. The final round's outcomes, the kept
+///    orders' included, give the CP findings.
+/// 4. Every order must meet the fixture profile ([`profile_violations`])
+///    and the paging bound ([`order_worst_y`]), the `C` values the non-prefix
+///    rule ([`c_value_violations`]), and the corpus every minimum
+///    ([`minimum_violations`]).
+///
+/// A failed session, in a round or in an attribution, a CR case at a
+/// not-implemented branch, a kept order that no longer halts at its
+/// finding's branch, an unmet rule, an attribution that finds no dimension
+/// or whose candidate changes more than the reverted dimension, or a fifth
+/// round that still drops a variant is a [`CorpusError`] naming the case
+/// and the rule.
+pub fn generate(world_a: &Store, spec: &str) -> Result<Corpus, CorpusError> {
+    let not_implemented = ne_branches(spec);
+    if not_implemented.is_empty() {
+        return Err(CorpusError::new(
+            None,
+            "specification",
+            "SPEC.md \"### Branch inventory\" lists no not-implemented branch",
+        ));
+    }
+    // Without these file attributes every lookup ends at PO-09.b15 before
+    // any order is read, which no reversion could attribute.
+    let header = world_a.get_or_empty(&key("PRC", &["442", "0"]));
+    if crate::mumps::piece(&header, "^", 2) != "442I" {
+        return Err(CorpusError::new(
+            None,
+            "profile violation",
+            "the world A file 442 header piece 2 is not 442I",
+        ));
+    }
+    let refs = References::read(world_a)?;
+    let Settled {
+        built,
+        world,
+        outcomes,
+        drops,
+        rounds,
+    } = settle_cp(world_a, &refs, Lists::initial(&refs), &not_implemented)?;
 
     let mut cases = Vec::with_capacity(corpus_case_ids().len());
     let mut moves = Vec::new();
@@ -2158,7 +2563,7 @@ pub fn generate(world_a: &Store, spec: &str) -> Result<Corpus, CorpusError> {
         drops,
         moves,
         findings,
-        rounds: round,
+        rounds,
         worst_y: worst,
     };
     let violations = minimum_violations(world_a, &world, &corpus);
