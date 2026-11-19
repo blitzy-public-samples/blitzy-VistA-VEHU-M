@@ -450,6 +450,7 @@ Paths in the table are relative to this folder, except `tests/fixtures/ifcap-cor
   - no file holds `\r`;
   - a present `transcript.txt` is not empty;
   - `input.txt` is not empty, and its last input begins with `^`;
+  - no symbolic link is followed: a link at the corpus folder, a case folder or any corpus file, dangling or not, fails as `<path>: symbolic link`, so nothing outside the corpus folder is read, as `check_corpus.sh` never follows a link either;
   - once any transcript exists, `meta.txt`, `SHA256SUMS` and `run-summary.txt` must all exist, every `SHA256SUMS` line must match its file, every transcript must be listed, and `run-summary.txt` must read `exports=IDENTICAL` and `runs=IDENTICAL` and hold no `DIFF` line. A `BASE.txt` alone, written before any recording, leaves the corpus unrecorded.
 
   A failed run check shows in `REPORT.md` part 3 as `Recording run: INTEGRITY FAIL: <cause>`, and a failed case check makes that case NOT COMPARED. Either fails `cargo test` after the report is written. `manifest.tsv` and `corpus.zwr` are generated data, not captures.

@@ -1494,9 +1494,14 @@ pub fn default_dir() -> PathBuf {
 // failure is `<path>: <cause>`, naming the file or folder at fault, or
 // `<id>: not a corpus case id` for an id outside the series. A cause may
 // quote a value read from a file as it stands, and `parse_corpus_meta`,
-// which reads no file, gives its cause without a path. The corpus
-// generator, its gate and the equivalence harness read these case and run
-// files only through the items below, and nothing here writes.
+// which reads no file, gives its cause without a path. The corpus folder,
+// each case folder and every corpus file are read only as they stand,
+// never through a symbolic link: a link at any of them, dangling or not,
+// is `<path>: symbolic link`, judged from the link's own metadata before
+// anything is read, so nothing outside the corpus folder a reader is given
+// is read. The corpus generator, its gate and the equivalence harness read
+// these case and run files only through the items below, and nothing here
+// writes.
 
 /// The recording run's digest list, `shasum -a 256` output over the run's
 /// files, written last by `record_corpus.sh`.
@@ -1567,11 +1572,52 @@ fn unknown_corpus_case(case_id: &str) -> String {
     format!("{case_id}: not a corpus case id")
 }
 
+/// Whether a symbolic link, dangling or not, stands at `path` itself,
+/// judged from the link's own metadata, so the link is never followed.
+/// Nothing at `path`, or metadata that cannot be read, is no link here: the
+/// reader that follows reports it.
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|entry| entry.file_type().is_symlink())
+}
+
+/// `Err` as `<path>: symbolic link` when a symbolic link stands at `path`
+/// itself ([`is_link`]), else `Ok`, so that no corpus reader follows one.
+fn refuse_link(path: &Path) -> Result<(), String> {
+    if is_link(path) {
+        return Err(format!("{}: symbolic link", path.display()));
+    }
+    Ok(())
+}
+
+/// The corpus folder `corpus_dir` without any trailing separator or `.`,
+/// borrowed from it, for judging whether it is itself a symbolic link:
+/// through either of those, a path's own metadata would be the link's
+/// target's.
+fn corpus_root(corpus_dir: &Path) -> &Path {
+    corpus_dir.components().as_path()
+}
+
+/// Whether anything stands at `path` itself, readable or not, a symbolic
+/// link included whether or not it dangles, judged without following a
+/// link: only metadata that reports the path missing (`NotFound`) means
+/// nothing is there. A link so found is then refused by the reader
+/// ([`read_corpus_text`]), never taken for absence.
+fn stands(path: &Path) -> bool {
+    !fs::symlink_metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+}
+
 /// The corpus file `name` of `dir`, read whole within its budget: `None`
-/// when nothing is at its path. A file that is present but unreadable, over
-/// budget or not UTF-8 is `Err` as [`CaptureFile::failure`] gives it, and
-/// one holding a `\r` is `Err` with the cause `carriage return`.
+/// when nothing is at its path. A symbolic link at `dir` or at the file,
+/// dangling or not, is `Err` as `<path>: symbolic link` and is never
+/// followed, so only a file standing in `dir` itself is read. Both checks
+/// are made just before [`CaptureFile::read`] opens the file, so they hold
+/// for a folder that nothing changes while it is read. A file that
+/// is present but unreadable, over budget or not UTF-8 is `Err` as
+/// [`CaptureFile::failure`] gives it, and one holding a `\r` is `Err` with
+/// the cause `carriage return`.
 fn read_corpus_text(dir: &Path, name: &'static str) -> Result<Option<String>, String> {
+    refuse_link(dir)?;
+    refuse_link(&dir.join(name))?;
     let file = CaptureFile::read(dir, name, true);
     if let Some(cause) = file.failure() {
         return Err(cause);
@@ -1595,19 +1641,26 @@ fn read_corpus_text(dir: &Path, name: &'static str) -> Result<Option<String>, St
 /// The text of corpus case `case_id`'s `input.txt` under `corpus_dir`,
 /// exactly as stored, never touching its `transcript.txt`. It is `Err` as
 /// `<id>: not a corpus case id` when the id is not one of
-/// [`corpus_case_ids`]. It is `Err` as `<path>: <cause>`, naming the folder
-/// or file at fault, when the case folder is missing or cannot be
-/// inspected, the file is missing, unreadable, over its 1 MiB budget, not
-/// UTF-8 or holds a `\r`, it is empty, or the last of its
-/// [`split_input_lines`] does not begin with `^`: every corpus session ends
-/// with a caret-prefixed exit, `SPEC.md` "Exit input" (PO-09.b3). The
-/// five-case check that the last input is exactly [`EXIT_INPUT`] does not
-/// apply, since an edge case may exit with `^FOO`.
+/// [`corpus_case_ids`]. It is `Err` as `<path>: symbolic link` when the
+/// corpus folder, the case folder or the file is a symbolic link, dangling
+/// or not, which is never followed, so nothing outside `corpus_dir` is
+/// read. It is `Err` as `<path>: <cause>`, naming the folder or file at
+/// fault, when the case folder is missing or cannot be inspected, the file
+/// is missing, unreadable, over its 1 MiB budget, not UTF-8 or holds a
+/// `\r`, it is empty, or the last of its [`split_input_lines`] does not
+/// begin with `^`: every corpus session ends with a caret-prefixed exit,
+/// `SPEC.md` "Exit input" (PO-09.b3). The five-case check that the last
+/// input is exactly [`EXIT_INPUT`] does not apply, since an edge case may
+/// exit with `^FOO`.
 pub fn read_corpus_input(corpus_dir: &Path, case_id: &str) -> Result<String, String> {
     if !corpus_case_known(case_id) {
         return Err(unknown_corpus_case(case_id));
     }
+    refuse_link(corpus_root(corpus_dir))?;
     let case_dir = corpus_dir.join(case_id);
+    // Refused before the probe, which follows a link, so that a dangling
+    // case folder link is reported as the link and not as missing.
+    refuse_link(&case_dir)?;
     match probe_folder(&case_dir) {
         Folder::Present => {}
         Folder::Absent => return Err(format!("{}: missing", case_dir.display())),
@@ -1652,16 +1705,21 @@ pub struct CorpusCase {
 /// point it at any corpus folder. The inputs are [`read_corpus_input`]'s,
 /// with its errors. A missing `transcript.txt` leaves the case unrecorded;
 /// a present one must be readable within its 1 MiB budget, UTF-8, free of
-/// `\r` and not empty, else the case is `Err` as `<path>: <cause>`.
+/// `\r` and not empty, else the case is `Err` as `<path>: <cause>`. As for
+/// the input, a symbolic link at the corpus folder, the case folder,
+/// `transcript.txt` or `SHA256SUMS`, dangling or not, is `Err` as
+/// `<path>: symbolic link` and is never followed, so nothing outside
+/// `corpus_dir` is read.
 ///
-/// When recording evidence exists, a present `transcript.txt` or a
-/// `SHA256SUMS` in `corpus_dir`, the very text returned is bound to that
-/// listing, so that a file replaced after [`load_corpus_run`] verified the
-/// run never reaches a verdict unhashed. `SHA256SUMS` is read once, within
-/// its 64 KiB budget, UTF-8 and free of `\r`, and each of its lines must
-/// pass the line rules of [`load_corpus_run`], with every id of
-/// [`corpus_case_ids`] allowed; a line that fails is the same `Err` that
-/// function gives. Then, each `Err` as `<path>: <cause>`:
+/// When recording evidence exists, a present `transcript.txt` or anything
+/// standing as `SHA256SUMS` in `corpus_dir`, a dangling link included, the
+/// very text returned is bound to that listing, so that a file replaced
+/// after [`load_corpus_run`] verified the run never reaches a verdict
+/// unhashed. `SHA256SUMS` is read once, within its 64 KiB budget, UTF-8
+/// and free of `\r`, and each of its lines must pass the line rules of
+/// [`load_corpus_run`], with every id of [`corpus_case_ids`] allowed; a
+/// line that fails is the same `Err` that function gives. Then, each `Err`
+/// as `<path>: <cause>`:
 ///
 /// - a missing `SHA256SUMS` has the cause `missing`;
 /// - a present transcript not listed as `<id>/transcript.txt` has the
@@ -1681,7 +1739,7 @@ pub fn load_corpus_case(corpus_dir: &Path, case_id: &str) -> Result<CorpusCase, 
     if transcript.as_deref() == Some("") {
         return Err(format!("{}: empty", case_dir.join(TRANSCRIPT).display()));
     }
-    if transcript.is_some() || exists(&corpus_dir.join(SHA256SUMS)) {
+    if transcript.is_some() || stands(&corpus_dir.join(SHA256SUMS)) {
         bind_case_to_sums(corpus_dir, case_id, &input, transcript.as_deref())?;
     }
     Ok(CorpusCase {
@@ -1696,7 +1754,8 @@ pub fn load_corpus_case(corpus_dir: &Path, case_id: &str) -> Result<CorpusCase, 
 /// by the rules that function states. The listing is read once here and
 /// walked by [`walk_sha256sums`] with every corpus id allowed. Only the
 /// case's own `input.txt` and `transcript.txt` lines are compared, each
-/// with the digest of the text in hand, so no case file is read again.
+/// with the digest of the text in hand, so no case file is read again, and
+/// a member's path is built only for an error that names one of them.
 fn bind_case_to_sums(
     corpus_dir: &Path,
     case_id: &str,
@@ -1706,7 +1765,7 @@ fn bind_case_to_sums(
     let sums_text = read_run_file(corpus_dir, SHA256SUMS)?;
     let mut transcript_listed = false;
     walk_sha256sums(corpus_dir, &sums_text, corpus_case_known, |line| {
-        let file_path = || line.member.dir.join(line.member.name).display().to_string();
+        let file_path = || line.member.path(corpus_dir).display().to_string();
         let held = match line.listed.split_once('/') {
             Some((id, INPUT)) if id == case_id => input,
             Some((id, TRANSCRIPT)) if id == case_id => {
@@ -1788,7 +1847,9 @@ pub enum CorpusRun {
     /// Nothing is recorded: the corpus folder does not exist, or it holds
     /// no `transcript.txt` in any case folder and none of `meta.txt`,
     /// `SHA256SUMS` and `run-summary.txt`. A `BASE.txt` alone, written
-    /// before any recording, is still absent.
+    /// before any recording, is still absent. A symbolic link is never
+    /// absent: one at the corpus folder, dangling or not, is `Err`, and one
+    /// at a case folder, a transcript or a run file counts as present.
     Absent,
     /// A recording run whose files all verified.
     Recorded {
@@ -1806,13 +1867,17 @@ pub enum CorpusRun {
 /// The recording run of the corpus folder `corpus_dir` for the cases
 /// `case_ids`, verified, read afresh on every call.
 ///
-/// Every id must be one of [`corpus_case_ids`]. A missing corpus folder,
-/// or one holding no `transcript.txt` for any of `case_ids` and none of
+/// Every id must be one of [`corpus_case_ids`]. No symbolic link is
+/// followed, so nothing outside `corpus_dir` is read: a link, dangling or
+/// not, at the corpus folder, at a case folder or at a file this function
+/// reads is `Err` as `<path>: symbolic link`. A missing corpus folder, or
+/// one holding no `transcript.txt` for any of `case_ids` and none of
 /// `meta.txt`, `SHA256SUMS` and `run-summary.txt`, is
-/// [`CorpusRun::Absent`]; a case folder whose metadata cannot be read
-/// counts as holding a transcript, since its absence cannot be confirmed.
-/// Otherwise all three run files must exist, each readable within its
-/// 64 KiB budget, UTF-8 and free of `\r`, and:
+/// [`CorpusRun::Absent`]; a case folder whose metadata cannot be read, or
+/// that is a link, counts as holding a transcript, since its absence cannot
+/// be confirmed, and a link in place of a transcript or a run file counts
+/// as that file. Otherwise all three run files must exist, each readable
+/// within its 64 KiB budget, UTF-8 and free of `\r`, and:
 ///
 /// - `meta.txt` must pass [`parse_corpus_meta`];
 /// - `run-summary.txt` must hold exactly one `exports=IDENTICAL`, one
@@ -1844,6 +1909,9 @@ pub fn load_corpus_run(corpus_dir: &Path, case_ids: &[String]) -> Result<CorpusR
     if let Some(unknown) = case_ids.iter().find(|id| !corpus_case_known(id)) {
         return Err(unknown_corpus_case(unknown));
     }
+    // Refused before the probe, which follows a link, so that a linked or
+    // dangling corpus folder is reported as the link and never as absent.
+    refuse_link(corpus_root(corpus_dir))?;
     match probe_folder(corpus_dir) {
         Folder::Present => {}
         Folder::Absent => return Ok(CorpusRun::Absent),
@@ -1857,7 +1925,7 @@ pub fn load_corpus_run(corpus_dir: &Path, case_ids: &[String]) -> Result<CorpusR
     if recorded.is_empty()
         && ![META, SHA256SUMS, RUN_SUMMARY]
             .into_iter()
-            .any(|name| exists(&corpus_dir.join(name)))
+            .any(|name| stands(&corpus_dir.join(name)))
     {
         return Ok(CorpusRun::Absent);
     }
@@ -1888,20 +1956,26 @@ pub fn load_corpus_run(corpus_dir: &Path, case_ids: &[String]) -> Result<CorpusR
 
 /// Whether corpus case `case_id` under `corpus_dir` holds a
 /// `transcript.txt`, judged from file metadata alone, so no file content
-/// is read. It is `true` for a transcript whether or not it is readable or
-/// valid, and, by the rule [`is_recorded`] applies, for a case folder whose
-/// metadata cannot be read, since its transcript cannot be confirmed
-/// absent. It is `false` for an id outside [`corpus_case_ids`], so no id
-/// leads a path outside its case folder.
+/// is read, and never through a symbolic link. It is `true` for a
+/// transcript whether or not it is readable or valid, a symbolic link in
+/// its place included, dangling or not, and, by the rule [`is_recorded`]
+/// applies, for a case folder whose metadata cannot be read, since its
+/// transcript cannot be confirmed absent. For the same reason it is `true`
+/// when the corpus folder or the case folder is a symbolic link, which is
+/// not followed to look inside. It is `false` for an id outside
+/// [`corpus_case_ids`], so no id leads a path outside its case folder.
 pub fn corpus_transcript_exists(corpus_dir: &Path, case_id: &str) -> bool {
     if !corpus_case_known(case_id) {
         return false;
     }
     let case_dir = corpus_dir.join(case_id);
+    if is_link(corpus_root(corpus_dir)) || is_link(&case_dir) {
+        return true;
+    }
     match probe_folder(&case_dir) {
         Folder::Absent => false,
         Folder::Uninspectable(_) => true,
-        Folder::Present => exists(&case_dir.join(TRANSCRIPT)),
+        Folder::Present => stands(&case_dir.join(TRANSCRIPT)),
     }
 }
 
@@ -2022,29 +2096,48 @@ fn identity_line(
     Ok(())
 }
 
-/// One file a `SHA256SUMS` line may list: its folder, its name, and the
-/// case id when it is a case's transcript.
+/// One file a `SHA256SUMS` line may list, borrowed from the line: the case
+/// id of a case file (`None` for a run file in the corpus folder itself)
+/// and the file's name. No path is held: a member's folder is built only
+/// when the member is read or named in an error ([`RunMember::folder`]),
+/// so a walk allocates nothing for a member its visitor passes over. The
+/// file at that path is read, like every corpus file, only through
+/// [`read_corpus_text`], never through a symbolic link.
 struct RunMember<'a> {
-    dir: PathBuf,
+    case: Option<&'a str>,
     name: &'static str,
-    transcript_of: Option<&'a str>,
+}
+
+impl<'a> RunMember<'a> {
+    /// The folder holding the member under `corpus_dir`: `corpus_dir`
+    /// itself, borrowed, for a run file, and the case folder, built here,
+    /// for a case file.
+    fn folder<'d>(&self, corpus_dir: &'d Path) -> std::borrow::Cow<'d, Path> {
+        match self.case {
+            None => std::borrow::Cow::Borrowed(corpus_dir),
+            Some(id) => std::borrow::Cow::Owned(corpus_dir.join(id)),
+        }
+    }
+
+    /// The member's path under `corpus_dir`, for an error that names it.
+    fn path(&self, corpus_dir: &Path) -> PathBuf {
+        self.folder(corpus_dir).join(self.name)
+    }
+
+    /// The case id when the member is that case's transcript.
+    fn transcript_of(&self) -> Option<&'a str> {
+        self.case.filter(|_| self.name == TRANSCRIPT)
+    }
 }
 
 /// The file the `SHA256SUMS` path `listed` names, when it is one the run
-/// may list: `BASE.txt`, `meta.txt` or `run-summary.txt` in `corpus_dir`,
-/// or `input.txt` or `transcript.txt` in the folder of an id `known`
-/// accepts. Any other path, such as an absolute one, one through `..` or
-/// one starting `./`, is `None`.
-fn run_member<'a>(
-    corpus_dir: &Path,
-    listed: &'a str,
-    known: impl Fn(&str) -> bool,
-) -> Option<RunMember<'a>> {
-    let run_file = |name: &'static str| RunMember {
-        dir: corpus_dir.to_path_buf(),
-        name,
-        transcript_of: None,
-    };
+/// may list: `BASE.txt`, `meta.txt` or `run-summary.txt` in the corpus
+/// folder, or `input.txt` or `transcript.txt` in the folder of an id
+/// `known` accepts. Any other path, such as an absolute one, one through
+/// `..` or one starting `./`, is `None`. It only borrows from `listed`, so
+/// it allocates nothing.
+fn run_member<'a>(listed: &'a str, known: impl Fn(&str) -> bool) -> Option<RunMember<'a>> {
+    let run_file = |name: &'static str| RunMember { case: None, name };
     match listed {
         BASE_FILE => return Some(run_file(BASE_FILE)),
         META => return Some(run_file(META)),
@@ -2055,20 +2148,15 @@ fn run_member<'a>(
     if !known(id) {
         return None;
     }
-    let dir = corpus_dir.join(id);
-    match file {
-        INPUT => Some(RunMember {
-            dir,
-            name: INPUT,
-            transcript_of: None,
-        }),
-        TRANSCRIPT => Some(RunMember {
-            dir,
-            name: TRANSCRIPT,
-            transcript_of: Some(id),
-        }),
-        _ => None,
-    }
+    let name = match file {
+        INPUT => INPUT,
+        TRANSCRIPT => TRANSCRIPT,
+        _ => return None,
+    };
+    Some(RunMember {
+        case: Some(id),
+        name,
+    })
 }
 
 /// One `SHA256SUMS` line that passed the line rules of [`walk_sha256sums`].
@@ -2088,14 +2176,15 @@ struct SumsLine<'a> {
 /// ignored, and every other line is 64 lower-case hex digits, two spaces or
 /// a space and `*`, and a path [`run_member`] allows, `known` judging its
 /// case id, listed once. A line that breaks a rule is `Err` as
-/// `<SHA256SUMS path>: line <n>: <cause>`, with `n` 1-based.
+/// `<SHA256SUMS path>: line <n>: <cause>`, with `n` 1-based, that path
+/// built only then.
 fn walk_sha256sums<'a>(
     corpus_dir: &Path,
     text: &'a str,
     known: impl Fn(&str) -> bool,
     mut visit: impl FnMut(SumsLine<'a>) -> Result<(), String>,
 ) -> Result<(), String> {
-    let sums_path = corpus_dir.join(SHA256SUMS).display().to_string();
+    let sums_path = || corpus_dir.join(SHA256SUMS).display().to_string();
     let mut listed: HashSet<&str> = HashSet::new();
     for (index, line) in text.split('\n').enumerate() {
         let number = index.saturating_add(1);
@@ -2110,14 +2199,15 @@ fn walk_sha256sums<'a>(
         });
         let Some((digest, listed_path)) = parsed else {
             return Err(format!(
-                "{sums_path}: line {number}: not a SHA-256 digest and path"
+                "{}: line {number}: not a SHA-256 digest and path",
+                sums_path()
             ));
         };
-        let Some(member) = run_member(corpus_dir, listed_path, &known) else {
-            return Err(format!("{sums_path}: line {number}: path not allowed"));
+        let Some(member) = run_member(listed_path, &known) else {
+            return Err(format!("{}: line {number}: path not allowed", sums_path()));
         };
         if !listed.insert(listed_path) {
-            return Err(format!("{sums_path}: line {number}: path listed twice"));
+            return Err(format!("{}: line {number}: path listed twice", sums_path()));
         }
         visit(SumsLine {
             digest,
@@ -2135,7 +2225,8 @@ fn walk_sha256sums<'a>(
 /// has already read and parsed with that text: a listed path equal to one
 /// of those names is hashed from that very text and never read again, so
 /// the digest covers the bytes the caller parsed. Every other listed file
-/// is read here.
+/// is read here, its case folder built once for that read, and a member's
+/// path is shown only in an error.
 fn verify_sha256sums<'a>(
     corpus_dir: &Path,
     text: &'a str,
@@ -2149,21 +2240,25 @@ fn verify_sha256sums<'a>(
         |id| case_ids.contains(id),
         |line| {
             let member = line.member;
-            let file_path = member.dir.join(member.name).display().to_string();
+            let folder = member.folder(corpus_dir);
+            let file_path = || folder.join(member.name).display().to_string();
             let content = match retained.iter().find(|(name, _)| *name == line.listed) {
                 Some(&(_, kept)) => std::borrow::Cow::Borrowed(kept),
-                None => match read_corpus_text(&member.dir, member.name)? {
+                None => match read_corpus_text(&folder, member.name)? {
                     Some(read) => std::borrow::Cow::Owned(read),
-                    None => return Err(format!("{file_path}: listed in SHA256SUMS but missing")),
+                    None => {
+                        return Err(format!("{}: listed in SHA256SUMS but missing", file_path()));
+                    }
                 },
             };
-            if member.transcript_of.is_some() && content.is_empty() {
-                return Err(format!("{file_path}: empty"));
+            let transcript_of = member.transcript_of();
+            if transcript_of.is_some() && content.is_empty() {
+                return Err(format!("{}: empty", file_path()));
             }
             if sha256_hex(content.as_bytes()) != line.digest {
-                return Err(format!("{file_path}: SHA-256 differs from SHA256SUMS"));
+                return Err(format!("{}: SHA-256 differs from SHA256SUMS", file_path()));
             }
-            transcripts.extend(member.transcript_of);
+            transcripts.extend(transcript_of);
             Ok(())
         },
     )?;

@@ -32,7 +32,8 @@
 //! evaluates readiness, and `readiness` alone for an unreadable case, and for
 //! the corpus `load_corpus_case` and `load_corpus_run`, with
 //! `corpus_transcript_exists` telling from metadata alone whether a corpus
-//! transcript is present. The fixtures are
+//! transcript is present, and `read_corpus_input`, which the reader tests use
+//! for the committed inputs alone. The fixtures are
 //! loaded only through `store::load_fixtures`, and `corpus.zwr` with
 //! `fs::read_to_string`. `SPEC.md` is compiled in: the report copies its
 //! static sections, its literals table only labels a differing line, and the
@@ -59,8 +60,8 @@ use ifcap_po_inquiry::corpus;
 use ifcap_po_inquiry::golden::{
     CASE_IDS, CHECKS, CORPUS_META_KEYS, Case, CaseLoad, CorpusRun, Readiness, Rule,
     corpus_case_ids, corpus_dir, corpus_input_path, corpus_transcript_exists, default_dir,
-    load_case, load_corpus_case, load_corpus_run, normalise, readiness, sha256_hex,
-    validate_context,
+    load_case, load_corpus_case, load_corpus_run, normalise, parse_corpus_meta, read_corpus_input,
+    readiness, sha256_hex, split_input_lines, validate_context,
 };
 use ifcap_po_inquiry::store::{Store, load_fixtures};
 use ifcap_po_inquiry::{InquiryError, inquire};
@@ -1784,6 +1785,18 @@ impl TempCorpus {
             .push((relative.to_string(), sha256_hex(text.as_bytes())));
     }
 
+    /// Writes `bytes`, which need not be UTF-8, to `relative`, creating its
+    /// folder, and records it, as [`TempCorpus::write`] does for text.
+    fn write_bytes(&mut self, relative: &str, bytes: &[u8]) {
+        let path = self.dir.join(relative);
+        let created = path.parent().map_or(Ok(()), fs::create_dir_all);
+        if let Err(err) = created.and_then(|()| fs::write(&path, bytes)) {
+            panic!("cannot write {}: {err}", path.display());
+        }
+        self.written.retain(|(listed, _)| listed != relative);
+        self.written.push((relative.to_string(), sha256_hex(bytes)));
+    }
+
     /// Writes case `id`'s input file: each of `inputs` followed by `\n`.
     fn input(&mut self, id: &str, inputs: &[String]) {
         let text: String = inputs.iter().map(|input| format!("{input}\n")).collect();
@@ -1849,6 +1862,39 @@ impl TempCorpus {
         self.run_files(cases);
         self.sums();
     }
+
+    /// Makes `relative` a symbolic link to `target` in `holder`, another
+    /// synthetic folder (`""` naming `holder` itself), in place of any file
+    /// written there. The link's own records are replaced by the digest of
+    /// each file `holder` wrote at or beneath `target`, under the path the
+    /// link makes it reachable by, so that [`TempCorpus::sums`] lists those
+    /// bytes as verifying. Nothing is read back.
+    #[cfg(unix)]
+    fn link(&mut self, relative: &str, holder: &TempCorpus, target: &str) {
+        let path = self.dir.join(relative);
+        let to = holder.dir.join(target);
+        let created = path.parent().map_or(Ok(()), fs::create_dir_all);
+        let cleared = created.and_then(|()| match fs::remove_file(&path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+            _ => Ok(()),
+        });
+        if let Err(err) = cleared.and_then(|()| std::os::unix::fs::symlink(&to, &path)) {
+            panic!("cannot link {} to {}: {err}", path.display(), to.display());
+        }
+        self.written
+            .retain(|(listed, _)| Path::new(listed).strip_prefix(relative).is_err());
+        for (listed, digest) in &holder.written {
+            let Ok(rest) = Path::new(listed).strip_prefix(target) else {
+                continue;
+            };
+            let reached = if rest.as_os_str().is_empty() {
+                relative.to_string()
+            } else {
+                format!("{relative}/{}", rest.display())
+            };
+            self.written.push((reached, digest.clone()));
+        }
+    }
 }
 
 impl Drop for TempCorpus {
@@ -1872,11 +1918,15 @@ fn test_world_b() -> &'static Store {
     }
 }
 
-/// The inputs of the committed corpus case `id`.
+/// The inputs of the committed corpus case `id`: [`split_input_lines`] of
+/// its `input.txt`, read through [`read_corpus_input`] alone. The committed
+/// transcript and run files are never read, so the reader tests, which judge
+/// synthetic folders, do not depend on any committed recording or its
+/// integrity.
 fn committed_inputs(id: &str) -> Vec<String> {
-    match load_corpus_case(&corpus_dir(), id) {
-        Ok(case) => case.inputs,
-        Err(cause) => panic!("committed corpus case {id} not loaded: {cause}"),
+    match read_corpus_input(&corpus_dir(), id) {
+        Ok(text) => split_input_lines(&text),
+        Err(cause) => panic!("committed corpus input {id} not read: {cause}"),
     }
 }
 
@@ -2036,8 +2086,19 @@ fn world_of(verdict: &CorpusVerdict) -> &WorldLabel {
 }
 
 /// A capture with no transcript is NOT COMPARED and a BOUNDARY case is
-/// BOUNDARY; with no run files the recording run is absent. A CR case with
-/// its input alone is NOT COMPARED, and so is its world label.
+/// BOUNDARY; with no run files the recording run is absent, as it is for a
+/// corpus folder that does not exist, an empty one and one holding only
+/// `BASE.txt`, while a missing case folder or `input.txt` is named. Each
+/// content rule of `input.txt` and `transcript.txt` (empty, `\r`, not
+/// UTF-8, over 1 MiB, last input not caret-prefixed) rejects its own row
+/// with the file's path and cause, each budget admits exactly 1 MiB, a
+/// `^FOO` exit is accepted, and a transcript is present whether or not it
+/// is valid. A failing input makes its case NOT COMPARED for its own
+/// integrity failure, a failing transcript for the recording run's, and a
+/// BOUNDARY case stays BOUNDARY either way, recorded exactly when its
+/// transcript exists. Every reader refuses an id outside the series by
+/// name, whatever stands at the path it would lead to. A CR case with its
+/// input alone is NOT COMPARED, and so is its world label.
 #[test]
 fn corpus_reader_no_capture_not_compared() {
     let mut folder = TempCorpus::new("no-capture");
@@ -2079,6 +2140,338 @@ fn corpus_reader_no_capture_not_compared() {
         "MATCHED n OF m"
     );
 
+    // Absence, each asserted before the next file is written: a corpus
+    // folder that does not exist, a fresh empty one, and one holding only
+    // the `BASE.txt` that `load_corpus.sh` writes before any recording are
+    // each no recording run. `load_corpus_case` names a missing case
+    // folder, and the missing `input.txt` of a case folder that holds only
+    // a transcript.
+    let mut root_folder = TempCorpus::new("no-capture-root");
+    let case_dir = root_folder.path().join("CP-002");
+    assert_eq!(
+        load_corpus_run(&root_folder.path().join("never-created"), &ids),
+        Ok(CorpusRun::Absent),
+        "a corpus folder that does not exist is no recording run"
+    );
+    assert_eq!(
+        load_corpus_run(root_folder.path(), &ids),
+        Ok(CorpusRun::Absent),
+        "an empty corpus folder is no recording run"
+    );
+    assert_eq!(
+        load_corpus_case(root_folder.path(), "CP-002"),
+        Err(format!("{}: missing", case_dir.display())),
+        "a missing case folder is named"
+    );
+    root_folder.write(
+        "BASE.txt",
+        "synthetic=written by tests/equivalence.rs, not a snapshot\n\
+         snapshot_image=synthetic\nsnapshot_id=synthetic\n",
+    );
+    assert_eq!(
+        load_corpus_run(root_folder.path(), &ids),
+        Ok(CorpusRun::Absent),
+        "BASE.txt alone is no recording run"
+    );
+    root_folder.transcript("CP-002", "SYNTHETIC CAPTURE\n");
+    assert_eq!(
+        load_corpus_case(root_folder.path(), "CP-002"),
+        Err(format!("{}: missing", case_dir.join("input.txt").display())),
+        "a case folder without input.txt is named"
+    );
+
+    // `input.txt` content rows, each in its own case folder so that no row
+    // masks another, read through `load_corpus_case`: each rule rejects its
+    // row with the file's path and cause, the 1 MiB budget admits exactly
+    // 1_048_576 bytes, and a caret-prefixed exit other than `^` is accepted.
+    // The BOUNDARY CE-17's input fails too. With no transcript there is no
+    // recording run, a failing case is NOT COMPARED for its own integrity
+    // failure, an accepted one for want of a capture, and CE-17 stays
+    // BOUNDARY, not recorded.
+    let mut input_folder = TempCorpus::new("no-capture-input");
+    let long = "A".repeat(1_048_572);
+    let input_at_budget = format!("\n{long}\n^\n");
+    let input_over_budget = format!("\n{long}A\n^\n");
+    assert_eq!(
+        (input_at_budget.len(), input_over_budget.len()),
+        (1_048_576, 1_048_577),
+        "input budget row sizes"
+    );
+    let boundary_cr: String = boundary
+        .iter()
+        .map(|input| format!("{input}\r\n"))
+        .collect();
+    let input_rows = [
+        ("CP-011", CLASS_CP, Vec::new(), Err("empty")),
+        (
+            "CP-012",
+            CLASS_CP,
+            b"\nCP001\r\n\n\n^\n".to_vec(),
+            Err("carriage return"),
+        ),
+        (
+            "CP-013",
+            CLASS_CP,
+            b"\nCP\xff01\n\n\n^\n".to_vec(),
+            Err("not UTF-8"),
+        ),
+        (
+            "CP-014",
+            CLASS_CP,
+            input_over_budget.into_bytes(),
+            Err("larger than 1048576 bytes"),
+        ),
+        (
+            "CP-015",
+            CLASS_CP,
+            b"\nCP001\n".to_vec(),
+            Err("last input does not begin with ^"),
+        ),
+        (
+            "CP-016",
+            CLASS_CP,
+            b"\n^FOO\n".to_vec(),
+            Ok(vec![String::new(), "^FOO".to_string()]),
+        ),
+        (
+            "CP-017",
+            CLASS_CP,
+            input_at_budget.into_bytes(),
+            Ok(vec![String::new(), long, "^".to_string()]),
+        ),
+        (
+            "CE-17",
+            CLASS_BOUNDARY,
+            boundary_cr.into_bytes(),
+            Err("carriage return"),
+        ),
+    ];
+    let mut input_entries = Vec::new();
+    let mut input_verdicts = Vec::new();
+    let mut input_failures = Vec::new();
+    for (id, class, bytes, outcome) in input_rows {
+        input_folder.write_bytes(&format!("{id}/input.txt"), &bytes);
+        let path = input_folder.path().join(id).join("input.txt");
+        let wanted = outcome
+            .map(|lines| (id.to_string(), lines, None))
+            .map_err(|cause| format!("{}: {cause}", path.display()));
+        let loaded = load_corpus_case(input_folder.path(), id)
+            .map(|case| (case.id, case.inputs, case.transcript));
+        assert_eq!(loaded, wanted, "{id} input row");
+        let (verdict, detail) = match &wanted {
+            _ if class == CLASS_BOUNDARY => (BOUNDARY, NO_DETAIL),
+            Ok(_) => (NOT_COMPARED, NO_CAPTURE),
+            Err(_) => (NOT_COMPARED, CASE_INTEGRITY_FAILURE),
+        };
+        let model = match wanted {
+            Ok((_, lines, _)) => lines,
+            Err(cause) => {
+                input_failures.push(crate_relative(&cause));
+                if class == CLASS_BOUNDARY {
+                    boundary.clone()
+                } else {
+                    cp.clone()
+                }
+            }
+        };
+        input_entries.push(entry(id, class, &model, None));
+        input_verdicts.push((id, verdict, detail));
+    }
+    let input_ids: Vec<String> = input_entries.iter().map(|row| row.id.clone()).collect();
+    assert_eq!(
+        load_corpus_run(input_folder.path(), &input_ids),
+        Ok(CorpusRun::Absent),
+        "inputs alone, valid or not, are no recording run"
+    );
+    let judgement = judge(&input_folder, &input_entries);
+    assert_eq!(
+        judgement.integrity, input_failures,
+        "each failing input is a case integrity failure"
+    );
+    assert_eq!(
+        input_failures
+            .first()
+            .map(|cause| format!("{RUN_LINE}INTEGRITY FAIL: {}", one_line(cause))),
+        Some(judgement.run_line.clone()),
+        "the run line names the first failing input"
+    );
+    for (id, verdict, detail) in input_verdicts {
+        let judged = verdict_of(&judgement, id);
+        assert_eq!(
+            (judged.verdict, judged.detail.as_str(), judged.recorded),
+            (verdict, detail, false),
+            "{id} verdict, detail and recorded"
+        );
+    }
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m with failing inputs"
+    );
+
+    // `transcript.txt` content rows next to a valid input, each in its own
+    // case folder: each rule rejects its row with the file's path and cause,
+    // while the transcript counts as present whether or not it is valid. A
+    // transcript of exactly 1_048_576 bytes passes every content rule and
+    // fails only for want of the digest list a present transcript needs.
+    // Present transcripts need the run files, which are absent, so the
+    // recording run fails, every CP case is NOT COMPARED for it, and the
+    // BOUNDARY CE-17, whose transcript is empty, stays BOUNDARY, recorded.
+    let mut transcript_folder = TempCorpus::new("no-capture-transcript");
+    let transcript_root = transcript_folder.path().to_path_buf();
+    let rejected = |id: &str, cause: &str| {
+        format!(
+            "{}: {cause}",
+            transcript_root.join(id).join("transcript.txt").display()
+        )
+    };
+    let transcript_at_budget = "A".repeat(1_048_576);
+    let transcript_rows = [
+        ("CP-021", CLASS_CP, Vec::new(), rejected("CP-021", "empty")),
+        (
+            "CP-022",
+            CLASS_CP,
+            b"SYNTHETIC\r\nCAPTURE\n".to_vec(),
+            rejected("CP-022", "carriage return"),
+        ),
+        (
+            "CP-023",
+            CLASS_CP,
+            b"SYNTHETIC \xff CAPTURE\n".to_vec(),
+            rejected("CP-023", "not UTF-8"),
+        ),
+        (
+            "CP-024",
+            CLASS_CP,
+            format!("{transcript_at_budget}A").into_bytes(),
+            rejected("CP-024", "larger than 1048576 bytes"),
+        ),
+        (
+            "CP-025",
+            CLASS_CP,
+            transcript_at_budget.into_bytes(),
+            format!("{}: missing", transcript_root.join(SUMS_NAME).display()),
+        ),
+        (
+            "CE-17",
+            CLASS_BOUNDARY,
+            Vec::new(),
+            rejected("CE-17", "empty"),
+        ),
+    ];
+    let run_cause = format!("{}: missing", transcript_root.join("meta.txt").display());
+    let mut transcript_entries = Vec::new();
+    let mut transcript_failures = vec![crate_relative(&run_cause)];
+    for (id, class, bytes, cause) in transcript_rows {
+        let model = if class == CLASS_BOUNDARY {
+            &boundary
+        } else {
+            &cp
+        };
+        transcript_folder.input(id, model);
+        transcript_folder.write_bytes(&format!("{id}/transcript.txt"), &bytes);
+        assert_eq!(
+            load_corpus_case(&transcript_root, id),
+            Err(cause.clone()),
+            "{id} transcript row"
+        );
+        assert!(
+            corpus_transcript_exists(&transcript_root, id),
+            "{id}'s transcript is present whether or not it is valid"
+        );
+        transcript_failures.push(crate_relative(&cause));
+        transcript_entries.push(entry(id, class, model, None));
+    }
+    let transcript_ids: Vec<String> = transcript_entries
+        .iter()
+        .map(|row| row.id.clone())
+        .collect();
+    assert_eq!(
+        load_corpus_run(&transcript_root, &transcript_ids),
+        Err(run_cause.clone()),
+        "present transcripts need the run files"
+    );
+    let judgement = judge(&transcript_folder, &transcript_entries);
+    assert_eq!(
+        judgement.integrity, transcript_failures,
+        "the run's failure, then each case's"
+    );
+    assert_eq!(
+        judgement.run_line,
+        format!(
+            "{RUN_LINE}INTEGRITY FAIL: {}",
+            one_line(&crate_relative(&run_cause))
+        ),
+        "the run line names the run's failure"
+    );
+    for row in &transcript_entries {
+        let judged = verdict_of(&judgement, &row.id);
+        let (verdict, detail) = if row.class == CLASS_BOUNDARY {
+            (BOUNDARY, NO_DETAIL)
+        } else {
+            (NOT_COMPARED, RUN_INTEGRITY_FAILURE)
+        };
+        assert_eq!(
+            (judged.verdict, judged.detail.as_str(), judged.recorded),
+            (verdict, detail, true),
+            "{} verdict, detail and recorded",
+            row.id
+        );
+    }
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m with failing transcripts"
+    );
+
+    // Ids outside the series, each refused by name by every reader before
+    // any path is built, although a valid input and a transcript stand
+    // wherever such an id would lead inside the folder: in its own case
+    // folder, and at the folder's root, where `""` and `CP-001/..` lead.
+    // The known CP-001's transcript is found, so each `false` below is the
+    // guard's.
+    let mut id_folder = TempCorpus::new("no-capture-ids");
+    for id in [
+        "CP-000", "CP-201", "CP-1", "CE-27", "CR-06", "GC-01", "CP-001",
+    ] {
+        id_folder.input(id, &cp);
+        id_folder.transcript(id, "SYNTHETIC CAPTURE\n");
+    }
+    let cp_text: String = cp.iter().map(|input| format!("{input}\n")).collect();
+    id_folder.write("input.txt", &cp_text);
+    id_folder.write("transcript.txt", "SYNTHETIC CAPTURE\n");
+    assert!(
+        corpus_transcript_exists(id_folder.path(), "CP-001"),
+        "a known id's transcript is found"
+    );
+    for id in [
+        "CP-000",
+        "CP-201",
+        "CP-1",
+        "CE-27",
+        "CR-06",
+        "GC-01",
+        "../CP-001",
+        "CP-001/..",
+        "",
+    ] {
+        let refused = format!("{id}: not a corpus case id");
+        assert_eq!(
+            load_corpus_case(id_folder.path(), id),
+            Err(refused.clone()),
+            "load_corpus_case of {id:?}"
+        );
+        assert_eq!(
+            load_corpus_run(id_folder.path(), &[id.to_string()]),
+            Err(refused),
+            "load_corpus_run of {id:?}"
+        );
+        assert!(
+            !corpus_transcript_exists(id_folder.path(), id),
+            "corpus_transcript_exists of {id:?}"
+        );
+    }
+
     // A CR case with its input alone: the case and its world label are
     // NOT COMPARED for want of a capture.
     let mut replay_only = TempCorpus::new("no-capture-cr");
@@ -2110,7 +2503,11 @@ fn corpus_reader_no_capture_not_compared() {
 /// one recorded with an input other than the model's is NOT COMPARED.
 /// MATCHED n OF m counts the CP and IN cases only, never a matching CR case
 /// or a captured BOUNDARY one, and one case's integrity failure leaves
-/// another case's MATCH standing.
+/// another case's MATCH standing. The run's `meta.txt` reads back as the
+/// literal keys and values written; `parse_corpus_meta` rejects a line
+/// without `=` and an unknown, repeated or missing key with its exact cause;
+/// and a rewritten `meta.txt`, its digest refreshed, fails the recording run
+/// on the parser alone.
 #[test]
 fn corpus_reader_matching_capture() {
     let mut folder = TempCorpus::new("matching");
@@ -2140,6 +2537,57 @@ fn corpus_reader_matching_capture() {
         (1, 1),
         "MATCHED n OF m"
     );
+
+    // The run's metadata, held to literals rather than to the key array or
+    // to the values the synthetic writer shares with it.
+    let keys = [
+        "image_digest",
+        "snapshot_id",
+        "source_revision",
+        "context",
+        "start_command",
+    ];
+    assert_eq!(CORPUS_META_KEYS, keys, "the meta.txt keys, in order");
+    let run_line = concat!(
+        r#"Recording run: image_digest=`"synthetic"`; snapshot_id=`"synthetic"`; "#,
+        r#"source_revision=`"synthetic"`; "#,
+        r##"context=`"{\"DUZ\":\".5\",\"IOF\":\"#\",\"IOSL\":\"60\",\"STATION\":\"500\"}"`; "##,
+        r#"start_command=`"docker exec -i vehu su - vehu -c \"<start command>\""`; "#,
+        "export_sha256=754f3093c3dd04291d93795b6b30ce4eecd15bee326ce99582c4aeb3e2f6491e; ",
+        "exports=IDENTICAL runs=IDENTICAL",
+    );
+    assert_eq!(judgement.run_line, run_line, "run line");
+    let ids = ["CP-001".to_string()];
+    match load_corpus_run(folder.path(), &ids) {
+        Ok(CorpusRun::Recorded {
+            meta,
+            quarantined,
+            export_sha256,
+        }) => {
+            for (key, value) in [
+                ("image_digest", "synthetic"),
+                ("snapshot_id", "synthetic"),
+                ("source_revision", "synthetic"),
+                (
+                    "context",
+                    r##"{"DUZ":".5","IOF":"#","IOSL":"60","STATION":"500"}"##,
+                ),
+                (
+                    "start_command",
+                    r#"docker exec -i vehu su - vehu -c "<start command>""#,
+                ),
+            ] {
+                assert_eq!(meta.get(key), Some(value), "meta.txt {key}");
+            }
+            assert_eq!(meta.get("no_such_key"), None, "a key outside meta.txt");
+            assert!(quarantined.is_empty(), "quarantined: {quarantined:?}");
+            assert_eq!(
+                export_sha256, "754f3093c3dd04291d93795b6b30ce4eecd15bee326ce99582c4aeb3e2f6491e",
+                "SHA-256 of the synthetic export"
+            );
+        }
+        other => panic!("the valid run did not load as recorded: {other:?}"),
+    }
 
     // CP-001 and the class IN case CE-01 each MATCH, beside a captured
     // BOUNDARY case and a CR case whose capture equals its GC capture and
@@ -2234,6 +2682,129 @@ fn corpus_reader_matching_capture() {
         (0, 0),
         "MATCHED n OF m"
     );
+
+    // `parse_corpus_meta` alone, each row the text and either the five
+    // values in `keys` order or the exact cause. Lines are numbered from 1,
+    // blank and whitespace-only lines counted but ignored, keys are taken
+    // as written, values are kept exactly after the first `=`, and a
+    // missing key names the first one missing in key order.
+    let rows: &[(&str, Result<[&str; 5], &str>)] = &[
+        (
+            "image_digest=\nsnapshot_id= spaced \n\n \t\nsource_revision=a=b=c\n\
+             context={\"DUZ\":\".5\"}\nstart_command=docker exec -i vehu su - vehu -c \"a=b c\"\n",
+            Ok([
+                "",
+                " spaced ",
+                "a=b=c",
+                "{\"DUZ\":\".5\"}",
+                "docker exec -i vehu su - vehu -c \"a=b c\"",
+            ]),
+        ),
+        (
+            "start_command=s\ncontext=c\nsource_revision=r\nsnapshot_id=i\nimage_digest=d",
+            Ok(["d", "i", "r", "c", "s"]),
+        ),
+        ("image_digest=d\nsnapshot_id\n", Err("meta line 2: no '='")),
+        (
+            "\n \t\nimage_digest=d\nno equals sign\n",
+            Err("meta line 4: no '='"),
+        ),
+        (
+            "Image_digest=d\n",
+            Err("meta line 1: unknown key Image_digest"),
+        ),
+        (
+            " image_digest=d\n",
+            Err("meta line 1: unknown key  image_digest"),
+        ),
+        ("=d\n", Err("meta line 1: unknown key ")),
+        (
+            "image_digest=d\nsnapshot_id=i\nsource_revision=r\ncontext=c\n\
+             start_command=s\nextra=x\n",
+            Err("meta line 6: unknown key extra"),
+        ),
+        (
+            "image_digest=d\n\nimage_digest=d\n",
+            Err("meta line 3: repeated key image_digest"),
+        ),
+        (
+            "image_digest=d\nsnapshot_id=i\nsource_revision=r\ncontext=c\n",
+            Err("meta: missing key start_command"),
+        ),
+        (
+            "image_digest=d\nsource_revision=r\nstart_command=s\n",
+            Err("meta: missing key snapshot_id"),
+        ),
+        ("", Err("meta: missing key image_digest")),
+    ];
+    for &(text, expected) in rows {
+        let parsed =
+            parse_corpus_meta(text).map(|meta| keys.map(|key| meta.get(key).map(str::to_owned)));
+        let wanted = expected
+            .map(|values| values.map(|value| Some(value.to_owned())))
+            .map_err(str::to_owned);
+        assert_eq!(parsed, wanted, "parse_corpus_meta({text:?})");
+    }
+
+    // The parser wired into the run reader: a valid run whose `meta.txt` is
+    // then rewritten with its digest refreshed, so that the parser and not
+    // a digest rejects it. The run fails, naming `meta.txt` and the cause,
+    // and CP-001 is NOT COMPARED.
+    let mut rewritten = TempCorpus::new("matching-meta");
+    rewritten.input("CP-001", &inputs);
+    rewritten.transcript("CP-001", &rust_transcript(&inputs));
+    rewritten.run(&[("CP-001", "RECORDED")]);
+    assert!(
+        matches!(
+            load_corpus_run(rewritten.path(), &ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "the run must verify before meta.txt is rewritten"
+    );
+    let four_keys = concat!(
+        "image_digest=synthetic\n",
+        "snapshot_id=synthetic\n",
+        "source_revision=synthetic\n",
+        r##"context={"DUZ":".5","IOF":"#","IOSL":"60","STATION":"500"}"##,
+        "\n",
+    );
+    let start = "start_command=docker exec -i vehu su - vehu -c \"<start command>\"\n";
+    for (text, reason) in [
+        (four_keys.to_string(), "meta: missing key start_command"),
+        (
+            format!("{four_keys}{start}extra=synthetic\n"),
+            "meta line 6: unknown key extra",
+        ),
+    ] {
+        rewritten.write("meta.txt", &text);
+        rewritten.sums();
+        let cause = format!("{}: {reason}", rewritten.path().join("meta.txt").display());
+        assert_eq!(
+            load_corpus_run(rewritten.path(), &ids),
+            Err(cause.clone()),
+            "run reader: {reason}"
+        );
+        let judged = crate_relative(&cause);
+        let judgement = judge(&rewritten, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+        assert_eq!(
+            judgement.integrity,
+            vec![judged.clone()],
+            "integrity: {reason}"
+        );
+        assert_eq!(
+            judgement.run_line,
+            format!("Recording run: INTEGRITY FAIL: {}", one_line(&judged)),
+            "run line: {reason}"
+        );
+        let verdict = verdict_of(&judgement, "CP-001");
+        assert_eq!(verdict.verdict, NOT_COMPARED, "detail: {}", verdict.detail);
+        assert_eq!(verdict.detail, RUN_INTEGRITY_FAILURE, "CP-001 detail");
+        assert_eq!(
+            (judgement.matched, judgement.in_scope),
+            (0, 0),
+            "MATCHED n OF m: {reason}"
+        );
+    }
 
     // One verified run: CP-001 healthy, and CP-002 recorded with CP-003's
     // input and that input's Rust transcript. Only CP-002 fails, its
@@ -2684,7 +3255,13 @@ fn corpus_reader_quarantined() {
 /// the missing file, and leave each non-BOUNDARY case NOT COMPARED. A
 /// BOUNDARY case stays BOUNDARY, and its transcript, present but unhashed,
 /// still shows as recorded although the case does not load. A CR case's
-/// world label is NOT COMPARED too.
+/// world label is NOT COMPARED too. A digest list that exists fails both
+/// readers, naming the file or the 1-based line at fault, when it leaves
+/// out a present transcript, lists a path outside the allowlist (through
+/// `..`, absolute, starting `./`, an unknown id, another file name or a
+/// bare id), holds a line that is not a digest and a path, or lists a path
+/// twice. A line for a corpus case outside the run's cases fails the run
+/// only, and a binary-mode line is accepted.
 #[test]
 fn corpus_reader_missing_sha256sums() {
     let mut folder = TempCorpus::new("missing-sums");
@@ -2761,6 +3338,179 @@ fn corpus_reader_missing_sha256sums() {
         (0, 0),
         "MATCHED n OF m"
     );
+
+    // The digest list's own rules, on a valid CP-001 run whose listing is
+    // then rewritten here with one change at a time. Each line names a file
+    // with that file's own digest wherever the file exists, so only the
+    // rule under test can reject it.
+    let cp_ids = ["CP-001".to_string()];
+    let rust = rust_transcript(&inputs);
+    let mut listing = TempCorpus::new("missing-sums-listing");
+    listing.input("CP-001", &inputs);
+    listing.transcript("CP-001", &rust);
+    listing.run(&[("CP-001", "RECORDED")]);
+    assert!(
+        matches!(
+            load_corpus_run(listing.path(), &cp_ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "the valid run must load"
+    );
+    // The valid listing as `TempCorpus::sums` wrote it, rebuilt from the
+    // digests recorded when each file was written, so no capture file is
+    // read back.
+    let mut written: Vec<(String, String)> = listing
+        .written
+        .iter()
+        .filter(|(relative, _)| relative != SUMS_NAME)
+        .cloned()
+        .collect();
+    written.sort();
+    assert_eq!(
+        written
+            .iter()
+            .map(|(relative, _)| relative.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "BASE.txt",
+            "CP-001/input.txt",
+            "CP-001/transcript.txt",
+            "meta.txt",
+            "run-summary.txt"
+        ],
+        "the valid listing, one line per file"
+    );
+    let valid: Vec<String> = written
+        .iter()
+        .map(|(relative, digest)| format!("{digest}  {relative}"))
+        .collect();
+    let digest_of = |relative: &str| {
+        written
+            .iter()
+            .find(|(listed, _)| listed == relative)
+            .map(|(_, digest)| digest.clone())
+            .unwrap_or_default()
+    };
+    let listing_text =
+        |lines: &[String]| -> String { lines.iter().map(|line| format!("{line}\n")).collect() };
+    let sums_path = listing.path().join(SUMS_NAME).display().to_string();
+
+    // A listing that leaves out the present transcript: both readers refuse
+    // the transcript as unlisted.
+    let unlisted: Vec<String> = valid
+        .iter()
+        .filter(|line| !line.ends_with("  CP-001/transcript.txt"))
+        .cloned()
+        .collect();
+    assert_eq!(unlisted.len(), 4, "one line must be left out");
+    listing.write(SUMS_NAME, &listing_text(&unlisted));
+    let not_listed = format!(
+        "{}: not listed in SHA256SUMS",
+        listing
+            .path()
+            .join("CP-001")
+            .join("transcript.txt")
+            .display()
+    );
+    assert_eq!(
+        load_corpus_run(listing.path(), &cp_ids),
+        Err(not_listed.clone()),
+        "run with its transcript unlisted"
+    );
+    assert_eq!(
+        load_corpus_case(listing.path(), "CP-001"),
+        Err(not_listed),
+        "CP-001 with its transcript unlisted"
+    );
+
+    // One line after the five valid ones, so line 6, that breaks a line
+    // rule: a path outside the allowlist, a line that is not a digest and a
+    // path as `shasum -a 256` writes them, or a path listed a second time.
+    // Both readers apply the same rules to every line.
+    let meta = digest_of("meta.txt");
+    let input = digest_of("CP-001/input.txt");
+    let upper = meta.to_uppercase();
+    assert_ne!(upper, meta, "the meta.txt digest must hold a hex letter");
+    let short: String = meta.chars().skip(1).collect();
+    let absolute_meta = listing.path().join("meta.txt").display().to_string();
+    let not_allowed = "path not allowed";
+    let not_a_line = "not a SHA-256 digest and path";
+    let refused = [
+        (format!("{input}  ../CP-001/input.txt"), not_allowed),
+        (format!("{meta}  {absolute_meta}"), not_allowed),
+        (format!("{meta}  ./meta.txt"), not_allowed),
+        (format!("{input}  CP-201/input.txt"), not_allowed),
+        (format!("{input}  CP-001/other.txt"), not_allowed),
+        (format!("{input}  CP-001"), not_allowed),
+        (format!("{short}  meta.txt"), not_a_line),
+        (format!("{upper}  meta.txt"), not_a_line),
+        (format!("{meta} meta.txt"), not_a_line),
+        (meta.clone(), not_a_line),
+        (format!("{meta}\tmeta.txt"), not_a_line),
+        (format!("{meta}  meta.txt"), "path listed twice"),
+    ];
+    for (line, cause) in refused {
+        let lines: Vec<String> = valid.iter().cloned().chain([line.clone()]).collect();
+        listing.write(SUMS_NAME, &listing_text(&lines));
+        let expected = format!("{sums_path}: line 6: {cause}");
+        assert_eq!(
+            load_corpus_run(listing.path(), &cp_ids),
+            Err(expected.clone()),
+            "run listing {line:?}"
+        );
+        assert_eq!(
+            load_corpus_case(listing.path(), "CP-001"),
+            Err(expected),
+            "CP-001 listing {line:?}"
+        );
+    }
+
+    // A line for CP-002, a corpus case outside this run's cases: the run
+    // refuses it, while the case reader, which allows every corpus id and
+    // compares only its own case's lines, loads CP-001.
+    let other_case: Vec<String> = valid
+        .iter()
+        .cloned()
+        .chain([format!("{input}  CP-002/input.txt")])
+        .collect();
+    listing.write(SUMS_NAME, &listing_text(&other_case));
+    assert_eq!(
+        load_corpus_run(listing.path(), &cp_ids),
+        Err(format!("{sums_path}: line 6: {not_allowed}")),
+        "run listing another case"
+    );
+    assert!(
+        matches!(
+            load_corpus_case(listing.path(), "CP-001"),
+            Ok(case) if case.transcript.as_deref() == Some(rust.as_str())
+        ),
+        "CP-001 must load beside another case's line"
+    );
+
+    // The binary-mode marker of `shasum`, a space and `*`, is accepted.
+    let binary: Vec<String> = valid
+        .iter()
+        .map(|line| match line.strip_suffix("  meta.txt") {
+            Some(digest) => format!("{digest} *meta.txt"),
+            None => line.clone(),
+        })
+        .collect();
+    assert_ne!(binary, valid, "the meta.txt line must be marked binary");
+    listing.write(SUMS_NAME, &listing_text(&binary));
+    assert!(
+        matches!(
+            load_corpus_run(listing.path(), &cp_ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "a binary-mode line must load"
+    );
+    assert!(
+        matches!(
+            load_corpus_case(listing.path(), "CP-001"),
+            Ok(case) if case.transcript.as_deref() == Some(rust.as_str())
+        ),
+        "CP-001 must load beside a binary-mode line"
+    );
 }
 
 /// A transcript changed by one byte after the digest list was written
@@ -2780,6 +3530,12 @@ fn corpus_reader_missing_sha256sums() {
 /// label are NOT COMPARED for the run's failure, the BOUNDARY case stays
 /// BOUNDARY and recorded, and [`run_failures`] lists a GC FAIL, then a
 /// failed harness check, then each corpus integrity failure.
+///
+/// Each other listed file, the input, `meta.txt`, `run-summary.txt` and
+/// `BASE.txt`, replaced with valid text under its stale digest, fails the
+/// run too, which leaves CP-001 NOT COMPARED. The case reader binds the
+/// text it returns to the digest list on every call, so a case file
+/// replaced or deleted after the run verified fails it, naming that file.
 #[test]
 fn corpus_reader_edited_transcript() {
     let mut folder = TempCorpus::new("edited");
@@ -3137,12 +3893,164 @@ fn corpus_reader_edited_transcript() {
         ],
         "failures: GC FAIL, then failed harness checks, then corpus integrity"
     );
+
+    // Each folder below records CP-001 alone, so its run is read for that
+    // case only.
+    let ids = ["CP-001".to_string()];
+
+    // Every other listed file replaced after a valid run loaded, in a fresh
+    // folder each, its stale digest kept and its new text still valid: the
+    // run fails and names that file, as the case reader does for the case's
+    // own input, and CP-001 is NOT COMPARED for the failed run.
+    let other = committed_inputs("CP-002");
+    assert_ne!(other, inputs, "CP-002's input must differ from CP-001's");
+    let other_input: String = other.iter().map(|input| format!("{input}\n")).collect();
+    let changed_meta = format!(
+        "image_digest=synthetic\nsnapshot_id=synthetic-changed\nsource_revision=synthetic\n\
+         context={SYNTHETIC_CONTEXT}\nstart_command={SYNTHETIC_START}\n"
+    );
+    let changed_summary = format!(
+        "exports=IDENTICAL\nexport_sha256={}\nruns=IDENTICAL\nCP-001\tRECORDED\t0\t1\n",
+        sha256_hex(b"synthetic export")
+    );
+    let appended_base = "synthetic=written by tests/equivalence.rs, not a snapshot\n\
+                         snapshot_image=synthetic\nsnapshot_id=synthetic\nappended=synthetic\n";
+    let tampered = [
+        ("edited-input", "CP-001/input.txt", other_input.as_str()),
+        ("edited-meta", "meta.txt", changed_meta.as_str()),
+        (
+            "edited-summary",
+            "run-summary.txt",
+            changed_summary.as_str(),
+        ),
+        ("edited-base", "BASE.txt", appended_base),
+    ];
+    for (name, relative, text) in tampered {
+        let mut run = TempCorpus::new(name);
+        run.input("CP-001", &inputs);
+        run.transcript("CP-001", &rust);
+        run.run(&[("CP-001", "RECORDED")]);
+        assert!(
+            matches!(
+                load_corpus_run(run.path(), &ids),
+                Ok(CorpusRun::Recorded { .. })
+            ),
+            "{name}: the valid run must load"
+        );
+        run.write(relative, text);
+        let cause = format!(
+            "{}: SHA-256 differs from SHA256SUMS",
+            run.path().join(relative).display()
+        );
+        assert_eq!(
+            load_corpus_run(run.path(), &ids),
+            Err(cause.clone()),
+            "{name}: run"
+        );
+        if relative == "CP-001/input.txt" {
+            assert_eq!(
+                load_corpus_case(run.path(), "CP-001"),
+                Err(cause.clone()),
+                "{name}: CP-001"
+            );
+        }
+        let judgement = judge(&run, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+        let cause = crate_relative(&cause);
+        assert_eq!(
+            judgement.run_line,
+            format!("Recording run: INTEGRITY FAIL: {}", one_line(&cause)),
+            "{name}: run line"
+        );
+        assert_eq!(
+            judgement.integrity.first(),
+            Some(&cause),
+            "{name}: integrity"
+        );
+        let verdict = verdict_of(&judgement, "CP-001");
+        assert_eq!(verdict.verdict, NOT_COMPARED, "{name}: CP-001 verdict");
+        assert_eq!(
+            verdict.detail, RUN_INTEGRITY_FAILURE,
+            "{name}: CP-001 detail"
+        );
+    }
+
+    // A case file replaced after the run loaded, its stale digest kept: the
+    // case reader binds the very text it returns to the digest list on every
+    // call, so it fails although the run verified, and loads again once the
+    // text is restored. A listed transcript then deleted fails both readers.
+    let mut reload = TempCorpus::new("edited-reload");
+    reload.input("CP-001", &inputs);
+    reload.transcript("CP-001", &rust);
+    reload.run(&[("CP-001", "RECORDED")]);
+    let transcript_path = reload.path().join("CP-001").join("transcript.txt");
+    let input_path = reload.path().join("CP-001").join("input.txt");
+    let loads = |folder: &TempCorpus| {
+        matches!(
+            load_corpus_case(folder.path(), "CP-001"),
+            Ok(case) if case.inputs == inputs && case.transcript.as_deref() == Some(rust.as_str())
+        )
+    };
+    assert!(
+        matches!(
+            load_corpus_run(reload.path(), &ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "the valid run must load"
+    );
+    assert!(loads(&reload), "CP-001 must load from the verified run");
+    reload.transcript("CP-001", &with_line(&rust, 2, "SYNTHETIC REPLACED LINE"));
+    assert_eq!(
+        load_corpus_case(reload.path(), "CP-001"),
+        Err(format!(
+            "{}: SHA-256 differs from SHA256SUMS",
+            transcript_path.display()
+        )),
+        "CP-001 with its transcript replaced after the run loaded"
+    );
+    reload.transcript("CP-001", &rust);
+    assert!(
+        loads(&reload),
+        "CP-001 must load with its transcript restored"
+    );
+    reload.input("CP-001", &other);
+    assert_eq!(
+        load_corpus_case(reload.path(), "CP-001"),
+        Err(format!(
+            "{}: SHA-256 differs from SHA256SUMS",
+            input_path.display()
+        )),
+        "CP-001 with its input replaced after the run loaded"
+    );
+    reload.input("CP-001", &inputs);
+    assert!(loads(&reload), "CP-001 must load with its input restored");
+    if let Err(err) = fs::remove_file(&transcript_path) {
+        panic!("cannot remove {}: {err}", transcript_path.display());
+    }
+    let missing = format!(
+        "{}: listed in SHA256SUMS but missing",
+        transcript_path.display()
+    );
+    assert_eq!(
+        load_corpus_case(reload.path(), "CP-001"),
+        Err(missing.clone()),
+        "CP-001 with its listed transcript deleted"
+    );
+    assert_eq!(
+        load_corpus_run(reload.path(), &ids),
+        Err(missing),
+        "run with a listed transcript deleted"
+    );
 }
 
 /// A CR capture equal to its GC capture is WORLD-INDEPENDENT, unless it was
 /// recorded with an input other than the model's, which makes the case and
 /// its label NOT COMPARED. The case is MATCH and outside n and m, and
 /// without the GC capture its label is NOT COMPARED while its verdict stands.
+/// On Unix, the same capture reached through a symbolic link (at the
+/// transcript, the input, the case folder, `meta.txt` or the corpus folder
+/// itself, its target outside the folder under test) is refused as
+/// `<path>: symbolic link`, so the case and its label are NOT COMPARED, and
+/// a dangling transcript link counts as present.
 #[test]
 fn corpus_cr_world_independent() {
     let mut folder = TempCorpus::new("world-independent");
@@ -3236,6 +4144,195 @@ fn corpus_cr_world_independent() {
             assert_eq!(world.detail, CASE_INTEGRITY_FAILURE, "CR-01 label detail");
         }
         None => panic!("CR-01 has no world label"),
+    }
+
+    // The same capture reached through a symbolic link, whose target lives
+    // in a separate synthetic folder outside the corpus folder under test:
+    // no link is followed, so each is `<path>: symbolic link` even where
+    // the bytes behind it would verify, and a dangling one is a recording
+    // to verify, never an absent one. Unix only, where a test can link.
+    #[cfg(unix)]
+    {
+        let capture = gc_transcript(gc);
+        let ids = ["CR-01".to_string()];
+        let linked = |root: &Path, relative: &str| {
+            format!("{}: symbolic link", root.join(relative).display())
+        };
+
+        // (a) The transcript links to an outside file holding the GC-01
+        // capture bytes, listed with their digest.
+        let mut target = TempCorpus::new("world-independent-link-transcript-target");
+        target.transcript("CR-01", &capture);
+        let mut folder = TempCorpus::new("world-independent-link-transcript");
+        folder.input("CR-01", &inputs);
+        folder.link("CR-01/transcript.txt", &target, "CR-01/transcript.txt");
+        folder.run(&[("CR-01", "RECORDED")]);
+        let cause = linked(folder.path(), "CR-01/transcript.txt");
+        assert_eq!(
+            load_corpus_run(folder.path(), &ids),
+            Err(cause.clone()),
+            "(a) run with a linked transcript"
+        );
+        assert_eq!(
+            load_corpus_case(folder.path(), "CR-01"),
+            Err(cause.clone()),
+            "(a) case with a linked transcript"
+        );
+        assert!(
+            corpus_transcript_exists(folder.path(), "CR-01"),
+            "(a) a linked transcript is present"
+        );
+        let judgement = judge(&folder, &[entry("CR-01", CLASS_CR, &inputs, Some(gc))]);
+        assert!(
+            judgement.integrity.contains(&cause),
+            "(a) integrity: {:?}",
+            judgement.integrity
+        );
+        assert_eq!(
+            judgement.run_line,
+            format!("Recording run: INTEGRITY FAIL: {cause}"),
+            "(a) run line"
+        );
+        let verdict = verdict_of(&judgement, "CR-01");
+        assert_eq!(
+            verdict.verdict, NOT_COMPARED,
+            "(a) detail: {}",
+            verdict.detail
+        );
+        assert_eq!(verdict.detail, RUN_INTEGRITY_FAILURE, "(a) CR-01 detail");
+        match &verdict.world {
+            Some(world) => assert_eq!(world.label, NOT_COMPARED, "(a) {}", world.detail),
+            None => panic!("(a) CR-01 has no world label"),
+        }
+
+        // (b) The input links to an outside file holding the right input.
+        let mut target = TempCorpus::new("world-independent-link-input-target");
+        target.input("CR-01", &inputs);
+        let mut folder = TempCorpus::new("world-independent-link-input");
+        folder.link("CR-01/input.txt", &target, "CR-01/input.txt");
+        folder.transcript("CR-01", &capture);
+        folder.run(&[("CR-01", "RECORDED")]);
+        let cause = linked(folder.path(), "CR-01/input.txt");
+        assert_eq!(
+            load_corpus_run(folder.path(), &ids),
+            Err(cause.clone()),
+            "(b) run with a linked input"
+        );
+        assert_eq!(
+            load_corpus_case(folder.path(), "CR-01"),
+            Err(cause),
+            "(b) case with a linked input"
+        );
+
+        // (c) The case folder links to an outside folder holding a valid
+        // input and transcript.
+        let mut target = TempCorpus::new("world-independent-link-folder-target");
+        target.input("CR-01", &inputs);
+        target.transcript("CR-01", &capture);
+        let mut folder = TempCorpus::new("world-independent-link-folder");
+        folder.link("CR-01", &target, "CR-01");
+        folder.run(&[("CR-01", "RECORDED")]);
+        let cause = linked(folder.path(), "CR-01");
+        assert_eq!(
+            load_corpus_run(folder.path(), &ids),
+            Err(cause.clone()),
+            "(c) run with a linked case folder"
+        );
+        assert_eq!(
+            load_corpus_case(folder.path(), "CR-01"),
+            Err(cause),
+            "(c) case with a linked case folder"
+        );
+        assert!(
+            corpus_transcript_exists(folder.path(), "CR-01"),
+            "(c) a linked case folder is not confirmed to lack a transcript"
+        );
+
+        // (d) `meta.txt` links to an outside valid one. Only the run reads
+        // it: a case reads its own files and the digest list alone.
+        let mut target = TempCorpus::new("world-independent-link-meta-target");
+        target.run_files(&[("CR-01", "RECORDED")]);
+        let mut folder = TempCorpus::new("world-independent-link-meta");
+        folder.input("CR-01", &inputs);
+        folder.transcript("CR-01", &capture);
+        folder.run_files(&[("CR-01", "RECORDED")]);
+        folder.link("meta.txt", &target, "meta.txt");
+        folder.sums();
+        assert_eq!(
+            load_corpus_run(folder.path(), &ids),
+            Err(linked(folder.path(), "meta.txt")),
+            "(d) run with a linked meta.txt"
+        );
+        assert_eq!(
+            load_corpus_case(folder.path(), "CR-01").map(|case| case.transcript),
+            Ok(Some(capture.clone())),
+            "(d) the case reads no meta.txt"
+        );
+
+        // (e) The corpus folder itself is a link, made in an outside
+        // folder, to an otherwise healthy corpus folder; a trailing
+        // separator, through which a path's metadata is its target's,
+        // hides nothing.
+        let mut healthy = TempCorpus::new("world-independent-link-root-target");
+        healthy.input("CR-01", &inputs);
+        healthy.transcript("CR-01", &capture);
+        healthy.run(&[("CR-01", "RECORDED")]);
+        assert!(
+            matches!(
+                load_corpus_run(healthy.path(), &ids),
+                Ok(CorpusRun::Recorded { .. })
+            ),
+            "(e) the linked-to corpus folder verifies on its own"
+        );
+        let mut holder = TempCorpus::new("world-independent-link-root");
+        holder.link("corpus", &healthy, "");
+        let root = holder.path().join("corpus");
+        let slashed = root.join("");
+        let cause = format!("{}: symbolic link", root.display());
+        for given in [&root, &slashed] {
+            assert_eq!(
+                load_corpus_run(given, &ids),
+                Err(cause.clone()),
+                "(e) run from {}",
+                given.display()
+            );
+            assert_eq!(
+                load_corpus_case(given, "CR-01"),
+                Err(cause.clone()),
+                "(e) case from {}",
+                given.display()
+            );
+            assert!(
+                corpus_transcript_exists(given, "CR-01"),
+                "(e) a linked corpus folder is not confirmed to lack a transcript: {}",
+                given.display()
+            );
+        }
+
+        // (f) A dangling transcript link beside the input alone: present,
+        // so the run is not absent and needs its run files, and the case
+        // fails on the link rather than loading unrecorded.
+        let target = TempCorpus::new("world-independent-link-dangling-target");
+        let mut folder = TempCorpus::new("world-independent-link-dangling");
+        folder.input("CR-01", &inputs);
+        folder.link("CR-01/transcript.txt", &target, "CR-01/transcript.txt");
+        assert!(
+            corpus_transcript_exists(folder.path(), "CR-01"),
+            "(f) a dangling transcript link is present"
+        );
+        assert_eq!(
+            load_corpus_run(folder.path(), &ids),
+            Err(format!(
+                "{}: missing",
+                folder.path().join("meta.txt").display()
+            )),
+            "(f) a dangling transcript link is a recording, not Ok(Absent)"
+        );
+        assert_eq!(
+            load_corpus_case(folder.path(), "CR-01"),
+            Err(linked(folder.path(), "CR-01/transcript.txt")),
+            "(f) case with a dangling transcript link"
+        );
     }
 }
 
