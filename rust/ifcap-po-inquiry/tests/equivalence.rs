@@ -1,6 +1,7 @@
 //! Equivalence harness for OPTION `PRCH DISPLAY PO` (`EN3^PRCHRPT`): judges
 //! each golden case GC-01 to GC-05 against [`inquire`] and writes `REPORT.md`
 //! in full.
+//! It also judges each case of the parity corpus.
 //!
 //! The verdicts (AAP 0.7.2):
 //!
@@ -12,6 +13,22 @@
 //! - FAIL: any other recorded case, an unreadable capture included. A case
 //!   that is recorded but not READY is FAIL (conflict K12).
 //!
+//! The GC cases are judged on world A, the fixtures alone. The parity corpus
+//! (`SPEC.md` "Parity corpus") is judged on world B, the fixtures plus
+//! `corpus.zwr`, with raw transcripts and no normalisation. Its verdicts
+//! (AAP 0.5.7), the first that applies winning:
+//!
+//! - BOUNDARY: the case is class BOUNDARY, outside equivalence;
+//! - NOT COMPARED: the recording run or the case fails an integrity check,
+//!   or the case has no transcript capture;
+//! - QUARANTINED: the run summary marks the case as showing a paging prompt;
+//! - MATCH: the capture equals the Rust transcript byte for byte;
+//! - MISMATCH: any other capture, with its first differing line.
+//!
+//! A CR case also gets a world label: WORLD-INDEPENDENT when its capture
+//! equals the raw capture of its GC case, WORLD-DEPENDENT when it differs,
+//! and NOT COMPARED without a usable capture of either.
+//!
 //! Capture files are read only through `golden`: `load_case`, which also
 //! evaluates readiness, and `readiness` alone for an unreadable case. The
 //! fixtures are loaded only through `store::load_fixtures`. `SPEC.md` is
@@ -19,19 +36,39 @@
 //! only labels a differing line. Neither golden nor specification text ever
 //! derives a rule.
 //!
+//! The parity corpus extends this. Its capture files are read only through
+//! `golden` as well: `load_corpus_run`, `CorpusRun::load_case`, which binds
+//! each case to that run, and `load_corpus_case`, with
+//! `corpus_transcript_exists` telling from metadata alone whether a corpus
+//! transcript is present, and `read_corpus_input`, which the reader tests use
+//! for the committed inputs alone. `corpus.zwr`, which lives apart from those
+//! fixtures, is read with `fs::read_to_string`, and the corpus model takes
+//! the branch inventory of `SPEC.md`.
+//!
 //! `equivalence_report` is the only writer of `REPORT.md`, and the harness
 //! writes nothing else. A `SPEC.md` lacking a required section fails it before
 //! anything is written, and an error writing `REPORT.md` fails it. Once the
 //! report is written, it fails only when a case is FAIL or a harness check
 //! fails, so a run with no captures exits 0 when the fixtures load and the
 //! other harness checks pass. Exit 0 is not acceptance, which needs five PASS.
+//!
+//! The parity corpus extends this too. Its reader tests write synthetic
+//! corpus folders under the system temp dir, each removed by its test. Once
+//! the report is written, `equivalence_report` also fails on a corpus
+//! integrity failure, and after that on a written `### Parity corpus` block
+//! that breaks its own layout (placement, parts, counts), never on a corpus
+//! verdict.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+use ifcap_po_inquiry::corpus;
 use ifcap_po_inquiry::golden::{
-    CASE_IDS, CHECKS, Case, CaseLoad, Readiness, Rule, default_dir, load_case, normalise,
-    readiness, validate_context,
+    CASE_IDS, CHECKS, CORPUS_META_KEYS, Case, CaseLoad, CorpusRun, Readiness, Rule,
+    corpus_case_ids, corpus_dir, corpus_input_path, corpus_transcript_exists, default_dir,
+    load_case, load_corpus_case, load_corpus_run, normalise, parse_corpus_meta, read_corpus_input,
+    readiness, sha256_hex, split_input_lines, validate_context,
 };
 use ifcap_po_inquiry::store::{Store, load_fixtures};
 use ifcap_po_inquiry::{InquiryError, inquire};
@@ -69,6 +106,8 @@ const STATIC_SECTIONS: [&str; 9] = [
 
 /// The `SPEC.md` subsection whose table names the `TAG^ROUTINE` that writes
 /// each literal, used only to label the first differing line of a FAIL.
+/// The parity corpus extends that one use to the first differing line of a
+/// corpus MISMATCH or of a WORLD-DEPENDENT label.
 const LITERALS: &str = "### Literals the five cases can print";
 const NOT_ATTRIBUTED: &str = "not attributed";
 
@@ -544,6 +583,9 @@ fn compare(
 /// The first line, 1-based, where two different normalised transcripts
 /// differ, with both texts and the attribution of the expected line:
 /// `attributed to <TAG^ROUTINE>` or `not attributed`.
+/// The parity corpus extends this to raw transcripts, which `corpus_cause`
+/// passes unnormalised for the first differing line of a corpus MISMATCH or
+/// of a WORLD-DEPENDENT label.
 fn transcript_cause(expected: &str, actual: &str, literals: &[Literal]) -> String {
     let wanted: Vec<&str> = expected.split('\n').collect();
     let got: Vec<&str> = actual.split('\n').collect();
@@ -563,6 +605,757 @@ fn transcript_cause(expected: &str, actual: &str, literals: &[Literal]) -> Strin
         line(&got),
         attribute(literals, wanted.get(index).copied())
     )
+}
+
+// ---------------------------------------------------------------------------
+// Parity corpus
+// ---------------------------------------------------------------------------
+
+const MATCH: &str = "MATCH";
+const MISMATCH: &str = "MISMATCH";
+const BOUNDARY: &str = "BOUNDARY";
+const QUARANTINED: &str = "QUARANTINED";
+const WORLD_INDEPENDENT: &str = "WORLD-INDEPENDENT";
+const WORLD_DEPENDENT: &str = "WORLD-DEPENDENT";
+
+/// Why a case with no transcript capture is NOT COMPARED.
+const NO_CAPTURE: &str = "no capture";
+/// Why every non-BOUNDARY case (CP, IN and CR) is NOT COMPARED while the
+/// recording run fails an integrity check.
+const RUN_INTEGRITY_FAILURE: &str = "recording run integrity failure";
+/// Why a case that fails an integrity check of its own is NOT COMPARED.
+const CASE_INTEGRITY_FAILURE: &str = "integrity failure";
+/// The detail of a verdict or label that has no differing line to show.
+const NO_DETAIL: &str = "—";
+
+/// The corpus class labels, as `corpus::Class::label` writes them.
+const CLASS_CP: &str = "CP";
+const CLASS_IN: &str = "IN";
+const CLASS_BOUNDARY: &str = "BOUNDARY";
+const CLASS_CR: &str = "CR";
+/// The class labels in the row order of the count table.
+const CLASS_ROWS: [&str; 4] = [CLASS_CP, CLASS_IN, CLASS_BOUNDARY, CLASS_CR];
+
+/// The verdict columns of the count table, before its total.
+const VERDICT_COLUMNS: [&str; 5] = [MATCH, MISMATCH, NOT_COMPARED, BOUNDARY, QUARANTINED];
+
+/// The heading of the corpus block, a subsection of part 3 (conflict K18).
+const CORPUS_HEADING: &str = "### Parity corpus";
+/// The start of the block's recording run line.
+const RUN_LINE: &str = "Recording run: ";
+
+/// The recording run line for the integrity failure `cause`. A cause may
+/// quote text read from a rejected recording, a `meta.txt` key or a
+/// `run-summary.txt` value, so it is shown through [`quote`], a code span
+/// in which no Markdown or HTML it holds renders.
+fn integrity_line(cause: &str) -> String {
+    format!("{RUN_LINE}INTEGRITY FAIL: {}", quote(cause))
+}
+
+/// One corpus case to judge: its id, its final class label, the inputs the
+/// model generated for it and, for a CR case, the GC case it replays.
+struct CorpusEntry {
+    id: String,
+    class: &'static str,
+    inputs: Vec<String>,
+    gc: Option<&'static str>,
+}
+
+/// The world label of a CR case.
+struct WorldLabel {
+    /// The GC case whose capture the CR capture is compared with.
+    gc: String,
+    label: &'static str,
+    /// The first differing line of a WORLD-DEPENDENT label, why nothing was
+    /// compared, or [`NO_DETAIL`].
+    detail: String,
+}
+
+/// One corpus case's verdict and everything the report shows for it.
+struct CorpusVerdict {
+    id: String,
+    class: &'static str,
+    verdict: &'static str,
+    /// The first differing line of a MISMATCH, why a case is NOT COMPARED,
+    /// or [`NO_DETAIL`].
+    detail: String,
+    /// Whether the case folder holds a transcript capture, valid or not:
+    /// the BOUNDARY map's recorded column.
+    recorded: bool,
+    /// The world label, for a CR case only.
+    world: Option<WorldLabel>,
+}
+
+/// The verdicts of a set of corpus cases, with the recording run line and
+/// the two numbers of the MATCHED line.
+struct CorpusJudgement {
+    /// The recording run line: `none`, the run's `meta.txt` values, or
+    /// `INTEGRITY FAIL: <cause>` with the first integrity failure, the
+    /// run's when the run failed, else the first case's, quoted as
+    /// [`integrity_line`] gives it.
+    /// Its format characters are shown by [`escape_format`].
+    run_line: String,
+    verdicts: Vec<CorpusVerdict>,
+    /// Every integrity failure, of the recording run and of each case, in
+    /// the order found.
+    integrity: Vec<String>,
+    /// n of the MATCHED line: the CP and IN cases that are MATCH.
+    matched: usize,
+    /// m of the MATCHED line: the CP and IN cases that are MATCH or
+    /// MISMATCH, which are those with a usable capture that are not
+    /// quarantined.
+    in_scope: usize,
+}
+
+/// Judges `entries` from the corpus folder `corpus_dir` on `world_b`, and
+/// labels each CR case against its GC capture in `gc_dir`, by the
+/// precedence of the module doc (AAP 0.5.7): the recording run of the
+/// entries' ids is verified once, and [`judge_with_run`] judges every case
+/// against that run.
+fn judge_corpus(
+    corpus_dir: &Path,
+    gc_dir: &Path,
+    world_b: &Store,
+    entries: &[CorpusEntry],
+    literals: &[Literal],
+) -> CorpusJudgement {
+    let ids: Vec<String> = entries.iter().map(|entry| entry.id.clone()).collect();
+    judge_with_run(
+        load_corpus_run(corpus_dir, &ids),
+        corpus_dir,
+        gc_dir,
+        world_b,
+        entries,
+        literals,
+    )
+}
+
+/// Judges `entries` as [`judge_corpus`] does, against `run`, the recording
+/// run already read from `corpus_dir`. Each case is read bound to `run` by
+/// [`CorpusRun::load_case`], which reads no `SHA256SUMS`, or, when `run`
+/// failed, by [`load_corpus_case`] alone. A case that fails to load, whose
+/// committed input differs from the model's, or that `run` does not vouch
+/// for ([`CorpusRun::load_case`]: a transcript present though the run
+/// was read as absent, or other than the bytes the run's verified
+/// `SHA256SUMS` listed for it, or one that listing names but the case no
+/// longer holds, or an input other than the one that listing names) fails
+/// its own integrity check: its cause names the file at fault, and the case
+/// is NOT COMPARED unless it is BOUNDARY, while every other case keeps its
+/// own verdict. So only a committed input equal to the model's, and to the
+/// input the verified run lists, is run, and only for a capture that run
+/// lists byte for byte, so with no recording none runs. The run line shows
+/// the first integrity failure, of the run or else of a case.
+fn judge_with_run(
+    run: Result<CorpusRun, String>,
+    corpus_dir: &Path,
+    gc_dir: &Path,
+    world_b: &Store,
+    entries: &[CorpusEntry],
+    literals: &[Literal],
+) -> CorpusJudgement {
+    let mut integrity = Vec::new();
+    let (run_line, run_failed, quarantined): (String, bool, &[String]) = match &run {
+        Ok(CorpusRun::Absent) => (format!("{RUN_LINE}none"), false, &[]),
+        Ok(CorpusRun::Recorded {
+            meta,
+            quarantined,
+            export_sha256,
+            ..
+        }) => {
+            let values: Vec<String> = CORPUS_META_KEYS
+                .iter()
+                .map(|key| format!("{key}={}", quote(meta.get(key).unwrap_or_default())))
+                .collect();
+            let line = format!(
+                "{RUN_LINE}{}; export_sha256={export_sha256}; exports=IDENTICAL runs=IDENTICAL",
+                values.join("; ")
+            );
+            (line, false, quarantined.as_slice())
+        }
+        Err(cause) => {
+            let cause = crate_relative(cause);
+            let line = integrity_line(&cause);
+            integrity.push(cause);
+            (line, true, &[])
+        }
+    };
+    let mut verdicts = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // Bound to the run read above, through the listing that run
+        // verified, so `SHA256SUMS` is never read again for a case. A failed
+        // run compares no case, so each is then read on its own, and its own
+        // cause is reported.
+        let loaded = match &run {
+            Ok(run) => run.load_case(corpus_dir, &entry.id),
+            Err(_) => load_corpus_case(corpus_dir, &entry.id),
+        };
+        let case = match loaded {
+            Ok(case) if case.inputs == entry.inputs => Some(case),
+            Ok(_) => {
+                integrity.push(crate_relative(&format!(
+                    "{}: committed input differs from the generated model",
+                    corpus_input_path(corpus_dir, &entry.id).display()
+                )));
+                None
+            }
+            Err(cause) => {
+                integrity.push(crate_relative(&cause));
+                None
+            }
+        };
+        // The committed inputs and the capture a verdict may use, or why
+        // there is none: precedence rules (b), (c) and (d), in that order.
+        // `case` is `None` when the case failed its own integrity check: it
+        // did not load, its committed input differs from the model's, or
+        // the run does not vouch for its transcript or its input.
+        let usable: Result<(&[String], &str), &'static str> = match &case {
+            _ if run_failed => Err(RUN_INTEGRITY_FAILURE),
+            None => Err(CASE_INTEGRITY_FAILURE),
+            Some(case) => case
+                .transcript
+                .as_deref()
+                .map(|capture| (case.inputs.as_slice(), capture))
+                .ok_or(NO_CAPTURE),
+        };
+        let (verdict, detail) = match usable {
+            _ if entry.class == CLASS_BOUNDARY => (BOUNDARY, NO_DETAIL.to_string()),
+            Err(reason) => (NOT_COMPARED, reason.to_string()),
+            Ok(_) if quarantined.contains(&entry.id) => (QUARANTINED, NO_DETAIL.to_string()),
+            Ok((inputs, capture)) => session_verdict(world_b, inputs, capture, literals),
+        };
+        let capture = usable.map(|(_, capture)| capture);
+        verdicts.push(CorpusVerdict {
+            id: entry.id.clone(),
+            class: entry.class,
+            verdict,
+            detail,
+            recorded: corpus_transcript_exists(corpus_dir, &entry.id),
+            world: entry
+                .gc
+                .map(|gc| world_label(gc_dir, gc, capture, literals)),
+        });
+    }
+    let counted = |wanted: &[&str]| {
+        verdicts
+            .iter()
+            .filter(|verdict| verdict.class == CLASS_CP || verdict.class == CLASS_IN)
+            .filter(|verdict| wanted.contains(&verdict.verdict))
+            .count()
+    };
+    let matched = counted(&[MATCH]);
+    let in_scope = counted(&[MATCH, MISMATCH]);
+    // A failed run already shows its own cause. When the run verified, the
+    // first case integrity failure replaces the run's line, so that no
+    // failure leaves the line reading healthy.
+    let run_line = match integrity.first() {
+        Some(cause) if !run_failed => integrity_line(cause),
+        _ => run_line,
+    };
+    CorpusJudgement {
+        run_line: escape_format(&run_line),
+        verdicts,
+        integrity,
+        matched,
+        in_scope,
+    }
+}
+
+/// The most characters of one side of a differing line a corpus cause
+/// shows whole.
+const SHOWN_LINE_CHARS: usize = 200;
+/// How many characters before the first differing column the window of a
+/// cut line starts, where the line allows it.
+const SHOWN_LINE_LEAD: usize = 40;
+
+/// The cause of a corpus MISMATCH or WORLD-DEPENDENT label, from the raw
+/// transcripts: exactly [`transcript_cause`] when neither side of the first
+/// differing line has more than [`SHOWN_LINE_CHARS`] characters, an absent
+/// side counting as short. Otherwise the same wording, line number and
+/// attribution of the whole expected line, each side over the limit shown
+/// by [`cut_line`], so no recorded line grows its report cell without
+/// bound. Display only: the verdict is decided before.
+fn corpus_cause(expected: &str, actual: &str, literals: &[Literal]) -> String {
+    let wanted: Vec<&str> = expected.split('\n').collect();
+    let got: Vec<&str> = actual.split('\n').collect();
+    let longest = wanted.len().max(got.len());
+    let index = (0..longest)
+        .find(|&index| wanted.get(index) != got.get(index))
+        .unwrap_or(longest);
+    let (want, have) = (wanted.get(index).copied(), got.get(index).copied());
+    let long =
+        |line: Option<&str>| line.is_some_and(|text| text.chars().count() > SHOWN_LINE_CHARS);
+    if !long(want) && !long(have) {
+        return transcript_cause(expected, actual, literals);
+    }
+    // The first differing column, 0-based: the length of the shorter line
+    // when one begins the other, and 0 when a side is absent.
+    let column = match (want, have) {
+        (Some(left), Some(right)) => left
+            .chars()
+            .zip(right.chars())
+            .take_while(|(a, b)| a == b)
+            .count(),
+        _ => 0,
+    };
+    let side = |line: Option<&str>| {
+        line.map_or_else(|| ABSENT_LINE.to_string(), |text| cut_line(text, column))
+    };
+    format!(
+        "transcript differs at line {}: expected {}, actual {}, {}",
+        index.saturating_add(1),
+        side(want),
+        side(have),
+        attribute(literals, want)
+    )
+}
+
+/// `line` through [`quote`] when it has at most [`SHOWN_LINE_CHARS`]
+/// characters. Otherwise a window of that many characters, starting
+/// [`SHOWN_LINE_LEAD`] characters before the first differing `column` and
+/// moved back where the line ends sooner, so it holds the first difference,
+/// or the line's end when the other line continues it: the window through
+/// [`quote`], `…` before it and after it where the line is cut, then the
+/// line's length and the 1-based positions of the characters shown.
+fn cut_line(line: &str, column: usize) -> String {
+    let length = line.chars().count();
+    if length <= SHOWN_LINE_CHARS {
+        return quote(line);
+    }
+    let from = column
+        .saturating_sub(SHOWN_LINE_LEAD)
+        .min(length.saturating_sub(SHOWN_LINE_CHARS));
+    let to = from.saturating_add(SHOWN_LINE_CHARS);
+    let window: String = line.chars().skip(from).take(SHOWN_LINE_CHARS).collect();
+    let lead = if from > 0 { "…" } else { "" };
+    let tail = if to < length { "…" } else { "" };
+    format!(
+        "{lead}{}{tail} ({length} characters, {} to {to} shown)",
+        quote(&window),
+        from.saturating_add(1)
+    )
+}
+
+/// The verdict of a usable `capture`: the Rust session on `world_b` with
+/// the committed `inputs`, compared with it byte for byte. A Rust session
+/// error is a MISMATCH, and so is a capture that shows a runtime error of
+/// the original.
+fn session_verdict(
+    world_b: &Store,
+    inputs: &[String],
+    capture: &str,
+    literals: &[Literal],
+) -> (&'static str, String) {
+    let run = corpus::run_case(world_b, inputs);
+    if let Some(error) = run.error {
+        (MISMATCH, format!("rust session error: {error}"))
+    } else if run.transcript == capture {
+        (MATCH, NO_DETAIL.to_string())
+    } else {
+        (MISMATCH, corpus_cause(capture, &run.transcript, literals))
+    }
+}
+
+/// The world label of a CR case replaying GC case `gc`: its usable
+/// `capture` compared byte for byte with the raw capture of `gc` in
+/// `gc_dir`, or NOT COMPARED with the reason one of them is not usable.
+/// Quarantine does not change it.
+fn world_label(
+    gc_dir: &Path,
+    gc: &str,
+    capture: Result<&str, &'static str>,
+    literals: &[Literal],
+) -> WorldLabel {
+    let (label, detail) = match capture {
+        Err(reason) => (NOT_COMPARED, reason.to_string()),
+        Ok(capture) => match load_case(gc_dir, gc) {
+            CaseLoad::Recorded(case) if case.transcript == capture => {
+                (WORLD_INDEPENDENT, NO_DETAIL.to_string())
+            }
+            CaseLoad::Recorded(case) => (
+                WORLD_DEPENDENT,
+                corpus_cause(&case.transcript, capture, literals),
+            ),
+            CaseLoad::Absent | CaseLoad::NotRecorded(_) | CaseLoad::Unreadable(_) => {
+                (NOT_COMPARED, format!("{gc} capture not loaded"))
+            }
+        },
+    };
+    WorldLabel {
+        gc: gc.to_string(),
+        label,
+        detail,
+    }
+}
+
+/// The corpus part of the report: the `### Parity corpus` block of part 3,
+/// the MATCHED line the run prints, and every integrity failure, each of
+/// which fails the run once the report is written.
+struct CorpusReport {
+    block: String,
+    matched_line: String,
+    integrity: Vec<String>,
+}
+
+/// The text of the committed `corpus.zwr`, which is a fixture, not a
+/// capture, and world B, `world_a` plus that text. Each error is
+/// crate-relative text naming the file.
+fn corpus_world(world_a: &Store) -> Result<(String, Store), String> {
+    let path = corpus::corpus_zwr_path();
+    let text = fs::read_to_string(&path)
+        .map_err(|err| crate_relative(&format!("{}: {err}", path.display())))?;
+    let world_b = corpus::world_b(world_a, &text)
+        .map_err(|err| crate_relative(&format!("{}: {err}", path.display())))?;
+    Ok((text, world_b))
+}
+
+/// World A, the fixtures, or the crate-relative reason they did not load.
+/// It is built once per test process, by whichever test asks first, and
+/// shared by `equivalence_report` and the reader tests: a `Store` is
+/// immutable, so no test can change what another judges on. The `Result`
+/// is kept, so a fixture failure still reaches the GC verdicts, the corpus
+/// results and the harness checks as before.
+fn shared_world_a() -> &'static Result<Store, String> {
+    static WORLD_A: OnceLock<Result<Store, String>> = OnceLock::new();
+    WORLD_A.get_or_init(|| {
+        let crate_dir = Path::new(CRATE_DIR);
+        load_fixtures(&crate_dir.join("tests").join("fixtures").join("ifcap"))
+            .map_err(|err| crate_relative(&err.to_string()))
+    })
+}
+
+/// The committed `corpus.zwr` text and world B, as [`corpus_world`] builds
+/// them from [`shared_world_a`], or the reason either is missing (world A's
+/// own reason when the fixtures did not load). It is built once per test
+/// process, by whichever test asks first, and shared by `equivalence_report`
+/// and the reader tests, as world A is. The `Result` is kept, so a
+/// `corpus.zwr` failure still reaches the corpus integrity line as before.
+fn shared_world_b() -> &'static Result<(String, Store), String> {
+    static WORLD_B: OnceLock<Result<(String, Store), String>> = OnceLock::new();
+    WORLD_B.get_or_init(|| match shared_world_a() {
+        Ok(world_a) => corpus_world(world_a),
+        Err(cause) => Err(cause.clone()),
+    })
+}
+
+/// The corpus model generated from `world_a` and `SPEC.md`, and world B, or
+/// every reason either is missing. World B is the process's shared one,
+/// [`shared_world_b`], built from the same world A fixtures that the only
+/// caller passes as `world_a`. A model whose case ids are not
+/// `golden::corpus_case_ids()` in order is missing too, and so is world B
+/// when the committed `corpus.zwr` is not the model's ZWR text, so no case
+/// is judged on a world B other than the generated one.
+fn corpus_model(world_a: &Store) -> Result<(corpus::Corpus, &'static Store), Vec<String>> {
+    let ids = corpus_case_ids();
+    let model = corpus::generate(world_a, SPEC)
+        .map_err(|err| {
+            format!(
+                "corpus model not generated: {}",
+                crate_relative(&err.to_string())
+            )
+        })
+        .and_then(|model| {
+            if model.cases.iter().map(|case| &case.id).eq(ids.iter()) {
+                Ok(model)
+            } else {
+                Err("corpus model case ids differ from golden::corpus_case_ids()".to_string())
+            }
+        });
+    match (model, shared_world_b()) {
+        (Ok(model), Ok((text, world_b))) if *text == model.render_zwr() => Ok((model, world_b)),
+        (Ok(_), Ok(_)) => Err(vec![crate_relative(&format!(
+            "{}: differs from the generated corpus",
+            corpus::corpus_zwr_path().display()
+        ))]),
+        (model, world_b) => Err(model
+            .err()
+            .into_iter()
+            .chain(world_b.as_ref().err().cloned())
+            .collect()),
+    }
+}
+
+/// One entry per model case, in case order, with its final class and, for
+/// a CR case, the GC case `corpus::CR_INPUTS` pairs it with.
+fn corpus_entries(model: &corpus::Corpus) -> Vec<CorpusEntry> {
+    model
+        .cases
+        .iter()
+        .map(|case| CorpusEntry {
+            id: case.id.clone(),
+            class: case.class.label(),
+            inputs: case.inputs.clone(),
+            gc: corpus::CR_INPUTS
+                .into_iter()
+                .find(|(cr, _, _)| *cr == case.id)
+                .map(|(_, gc, _)| gc),
+        })
+        .collect()
+}
+
+fn matched_line(matched: usize, in_scope: usize) -> String {
+    format!("MATCHED {matched} OF {in_scope} IN-SCOPE CORPUS CASES")
+}
+
+/// The corpus verdicts over the loaded fixtures, or the reason they did not
+/// load, judged from the committed corpus folder against the GC captures.
+/// When the model or world B is missing, the block holds only its heading,
+/// the first cause in the recording run line, as [`integrity_line`]
+/// quotes it, and `MATCHED 0 OF 0`.
+fn corpus_results(world_a: &Result<Store, String>, literals: &[Literal]) -> CorpusReport {
+    let built = match world_a {
+        Err(cause) => Err(vec![format!("fixtures not loaded: {cause}")]),
+        Ok(store) => corpus_model(store),
+    };
+    match built {
+        Err(integrity) => {
+            let matched_line = matched_line(0, 0);
+            let first = integrity.first().map_or("", String::as_str);
+            let block = [
+                CORPUS_HEADING.to_string(),
+                integrity_line(first),
+                matched_line.clone(),
+            ]
+            .join("\n\n");
+            CorpusReport {
+                block: escape_format(&block),
+                matched_line,
+                integrity,
+            }
+        }
+        Ok((model, world_b)) => {
+            let entries = corpus_entries(&model);
+            let judgement =
+                judge_corpus(&corpus_dir(), &default_dir(), world_b, &entries, literals);
+            let matched_line = matched_line(judgement.matched, judgement.in_scope);
+            CorpusReport {
+                block: corpus_block(&model, &judgement, &matched_line),
+                matched_line,
+                integrity: judgement.integrity,
+            }
+        }
+    }
+}
+
+/// The characters of Unicode 15.1 general category Cf (format), Zl (line
+/// separator) and Zp (paragraph separator), as inclusive ranges: the
+/// invisible, reordering and line-breaking characters that [`one_line`]
+/// keeps, because they are not control characters (Cc).
+const FORMAT_RANGES: [(char, char); 21] = [
+    ('\u{AD}', '\u{AD}'),
+    ('\u{600}', '\u{605}'),
+    ('\u{61C}', '\u{61C}'),
+    ('\u{6DD}', '\u{6DD}'),
+    ('\u{70F}', '\u{70F}'),
+    ('\u{890}', '\u{891}'),
+    ('\u{8E2}', '\u{8E2}'),
+    ('\u{180E}', '\u{180E}'),
+    ('\u{200B}', '\u{200F}'),
+    // U+2028 is Zl, U+2029 Zp, and U+202A to U+202E the bidi embeddings
+    // and overrides.
+    ('\u{2028}', '\u{202E}'),
+    ('\u{2060}', '\u{2064}'),
+    ('\u{2066}', '\u{206F}'),
+    ('\u{FEFF}', '\u{FEFF}'),
+    ('\u{FFF9}', '\u{FFFB}'),
+    ('\u{110BD}', '\u{110BD}'),
+    ('\u{110CD}', '\u{110CD}'),
+    ('\u{13430}', '\u{1343F}'),
+    ('\u{1BCA0}', '\u{1BCA3}'),
+    ('\u{1D173}', '\u{1D17A}'),
+    ('\u{E0001}', '\u{E0001}'),
+    ('\u{E0020}', '\u{E007F}'),
+];
+
+/// `text` with every character of [`FORMAT_RANGES`] shown as `\u{XXXX}`,
+/// its code point in upper-case hex of at least four digits, and every other
+/// character kept, so no corpus text the report shows can reorder, hide or
+/// split its line in a viewer. It runs on text [`one_line`] or [`quote`] has
+/// already escaped, and the result is unambiguous where recorded text
+/// appears: inside a [`quote`] span every original `\` is already doubled,
+/// so a single `\` before `u{` can only be this escape. Display only: no
+/// comparison sees it.
+fn escape_format(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if FORMAT_RANGES
+            .iter()
+            .any(|&(first, last)| (first..=last).contains(&c))
+        {
+            out.push_str(&format!("\\u{{{:04X}}}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `text` as one Markdown table cell: on one line, its format characters
+/// shown by [`escape_format`], with every `|` escaped, so no cell breaks or
+/// reorders its row.
+fn cell(text: &str) -> String {
+    escape_format(&one_line(text)).replace('|', "\\|")
+}
+
+/// A Markdown table of the `header` cells and `rows`, each row cell through
+/// [`cell`].
+fn table(header: &[&str], rows: &[Vec<String>]) -> String {
+    let mut lines = vec![
+        format!("| {} |", header.join(" | ")),
+        format!("|{}", "---|".repeat(header.len())),
+    ];
+    lines.extend(rows.iter().map(|row| {
+        let cells: Vec<String> = row.iter().map(|text| cell(text)).collect();
+        format!("| {} |", cells.join(" | "))
+    }));
+    lines.join("\n")
+}
+
+/// [`table`], or `none` when there are no rows.
+fn table_or_none(header: &[&str], rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        "none".to_string()
+    } else {
+        table(header, rows)
+    }
+}
+
+/// The `### Parity corpus` block of part 3 (AAP 0.5.7): the recording run
+/// line, the count table, the MATCHED line at column 0, the table of every
+/// case, then the class moves, findings and dropped variants of `model`,
+/// the BOUNDARY map and the CR world labels. The first column of every
+/// table is a class, a case id or a round, so no row begins `| PO-`.
+fn corpus_block(model: &corpus::Corpus, judgement: &CorpusJudgement, matched_line: &str) -> String {
+    let verdicts = &judgement.verdicts;
+    let mut count_header = vec!["Class"];
+    count_header.extend(VERDICT_COLUMNS);
+    count_header.push("Total");
+    let counts: Vec<Vec<String>> = CLASS_ROWS
+        .iter()
+        .map(|class| {
+            let of_class: Vec<&CorpusVerdict> = verdicts
+                .iter()
+                .filter(|verdict| verdict.class == *class)
+                .collect();
+            std::iter::once(class.to_string())
+                .chain(VERDICT_COLUMNS.iter().map(|column| {
+                    of_class
+                        .iter()
+                        .filter(|verdict| verdict.verdict == *column)
+                        .count()
+                        .to_string()
+                }))
+                .chain(std::iter::once(of_class.len().to_string()))
+                .collect()
+        })
+        .collect();
+    let cases: Vec<Vec<String>> = verdicts
+        .iter()
+        .map(|verdict| {
+            vec![
+                verdict.id.clone(),
+                verdict.class.to_string(),
+                verdict.verdict.to_string(),
+                verdict.detail.clone(),
+            ]
+        })
+        .collect();
+    let moves: Vec<Vec<String>> = model
+        .moves
+        .iter()
+        .map(|change| {
+            vec![
+                change.case.clone(),
+                change.from.label().to_string(),
+                change.to.label().to_string(),
+                change.branch.clone(),
+            ]
+        })
+        .collect();
+    let findings: Vec<Vec<String>> = model
+        .findings
+        .iter()
+        .map(|finding| {
+            vec![
+                finding.case.clone(),
+                format!("Implemented({})", finding.branch),
+                finding.cause.clone(),
+            ]
+        })
+        .collect();
+    let drops: Vec<Vec<String>> = model
+        .drops
+        .iter()
+        .map(|dropped| {
+            vec![
+                dropped.round.to_string(),
+                dropped.case.clone(),
+                dropped.dimension.clone(),
+                dropped.value.clone(),
+                dropped.branch.clone(),
+            ]
+        })
+        .collect();
+    // The verdicts are in model case order, as `corpus_entries` built them.
+    let boundary: Vec<Vec<String>> = model
+        .cases
+        .iter()
+        .zip(verdicts)
+        .filter(|(case, _)| case.class.label() == CLASS_BOUNDARY)
+        .map(|(case, verdict)| {
+            let inputs: Vec<String> = case.inputs.iter().map(|input| quote(input)).collect();
+            vec![
+                case.id.clone(),
+                inputs.join(", "),
+                case.expected_branch
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string()),
+                if verdict.recorded { "yes" } else { "no" }.to_string(),
+            ]
+        })
+        .collect();
+    let worlds: Vec<Vec<String>> = verdicts
+        .iter()
+        .filter_map(|verdict| {
+            verdict.world.as_ref().map(|world| {
+                vec![
+                    verdict.id.clone(),
+                    world.gc.clone(),
+                    world.label.to_string(),
+                    world.detail.clone(),
+                ]
+            })
+        })
+        .collect();
+    [
+        CORPUS_HEADING.to_string(),
+        judgement.run_line.clone(),
+        table(&count_header, &counts),
+        matched_line.to_string(),
+        table(
+            &["Case", "Class", "Verdict", "First differing line"],
+            &cases,
+        ),
+        "#### Class moves".to_string(),
+        table_or_none(
+            &["Case", "Specified class", "Final class", "Branch"],
+            &moves,
+        ),
+        "#### Findings".to_string(),
+        table_or_none(&["Case", "Outcome", "Cause"], &findings),
+        "#### Dropped variants".to_string(),
+        table_or_none(&["Round", "Case", "Dimension", "Value", "Branch"], &drops),
+        "#### BOUNDARY map".to_string(),
+        table_or_none(
+            &["Case", "Input lines", "Expected branch", "Recorded"],
+            &boundary,
+        ),
+        "#### CR world labels".to_string(),
+        table_or_none(
+            &["CR case", "GC case", "Label", "First differing line"],
+            &worlds,
+        ),
+    ]
+    .join("\n\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +1464,8 @@ fn case_block(result: &CaseResult) -> String {
 }
 
 /// The whole of `REPORT.md`: header, parts 1 to 3, then the static sections.
-fn render(spec: &str, checks: &[Check], results: &[CaseResult]) -> String {
+/// Part 3 ends with the `corpus` block (`### Parity corpus`).
+fn render(spec: &str, checks: &[Check], results: &[CaseResult], corpus: &str) -> String {
     let mut blocks = vec![TITLE.to_string()];
     blocks.extend(scope_sentence(spec));
     blocks.push(WRITTEN_BY.to_string());
@@ -710,6 +1504,7 @@ fn render(spec: &str, checks: &[Check], results: &[CaseResult]) -> String {
             .map(|(name, definition)| format!("| `{name}` | {definition} |")),
     );
     blocks.push(definitions.join("\n"));
+    blocks.push(corpus.to_string());
 
     blocks.extend(
         STATIC_SECTIONS
@@ -721,39 +1516,17 @@ fn render(spec: &str, checks: &[Check], results: &[CaseResult]) -> String {
     report
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-/// Computes the five verdicts, prints `GC-0N <verdict>` for each and writes
-/// `REPORT.md`. A `SPEC.md` lacking a required section fails the run before
-/// anything is written, and an error writing `REPORT.md` fails it. Once the
-/// report is written, the run fails only when a case is FAIL or a harness
-/// check fails.
-#[test]
-fn equivalence_report() {
-    let missing = missing_headings(SPEC);
-    assert!(missing.is_empty(), "{}", missing_message(&missing));
-
-    let crate_dir = Path::new(CRATE_DIR);
-    let fixtures = load_fixtures(&crate_dir.join("tests").join("fixtures").join("ifcap"))
-        .map_err(|err| crate_relative(&err.to_string()));
-    let golden = default_dir();
-    let literals = literal_rows(SPEC);
-    let results: Vec<CaseResult> = CASE_IDS
-        .into_iter()
-        .map(|id| evaluate(id, &golden, &fixtures, &literals))
-        .collect();
-    for result in &results {
-        println!("{} {}", result.id, result.verdict);
-    }
-    let checks = harness_checks(&fixtures, &results);
-
-    if let Err(err) = fs::write(crate_dir.join("REPORT.md"), render(SPEC, &checks, &results)) {
-        panic!("cannot write REPORT.md: {err}");
-    }
-
-    let failures: Vec<String> = results
+/// Every reason the run fails once `REPORT.md` is written, in this order:
+/// each FAIL case of `results` as `<id> FAIL: <first cause>`, each failed
+/// harness check of `checks` as `harness check <name> FAIL: <detail>`, then
+/// each of `corpus_integrity` as `corpus integrity FAIL: <cause>`. Empty
+/// when the run passes; no corpus verdict ever adds a line.
+fn run_failures(
+    results: &[CaseResult],
+    checks: &[Check],
+    corpus_integrity: &[String],
+) -> Vec<String> {
+    results
         .iter()
         .filter(|result| result.verdict == FAIL)
         .map(|result| {
@@ -769,8 +1542,418 @@ fn equivalence_report() {
                 .filter(|check| !check.passed)
                 .map(|check| format!("harness check {} FAIL: {}", check.name, check.detail)),
         )
+        .chain(
+            corpus_integrity
+                .iter()
+                .map(|cause| format!("corpus integrity FAIL: {cause}")),
+        )
+        .collect()
+}
+
+/// The trimmed cells of each line of the rendered Markdown `table`, its
+/// header and separator lines included, without the empty text outside
+/// the outer `|`. An escaped `\|` stays inside its cell.
+fn rendered_rows(table: &str) -> Vec<Vec<String>> {
+    table
+        .lines()
+        .map(|line| {
+            let cells = table_cells(line);
+            let inner = cells.len().saturating_sub(2);
+            cells
+                .iter()
+                .skip(1)
+                .take(inner)
+                .map(|cell| cell.trim().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// Cell `column` of a [`rendered_rows`] row, or empty text past its end.
+fn cell_of(row: &[String], column: usize) -> String {
+    row.get(column).cloned().unwrap_or_default()
+}
+
+/// Checks the `### Parity corpus` block of `corpus` as the rendered
+/// `report` holds it, by rules that hold for every recording state (AAP
+/// 0.4.4, 0.5.7): the block occurs once, directly after the part 3
+/// definitions table and directly before the first static section, and
+/// opens with its heading and the recording run line, whose `INTEGRITY
+/// FAIL` agrees with the corpus failures [`run_failures`] reports. The
+/// MATCHED line is the report's only line starting `MATCHED `, and no line
+/// of the block begins `| PO-`. A block with no model holds only its
+/// heading, an `INTEGRITY FAIL` run line and `MATCHED 0 OF 0`. A full
+/// block's parts are, in order, the count table, the MATCHED line, the
+/// table of every case of `golden::corpus_case_ids()` in order, then the
+/// class moves, findings, dropped variants, BOUNDARY map and CR world
+/// labels, each under its heading as a table or `none`. Its counts agree
+/// with the per-case rows, and so do n and m of the MATCHED line. Each
+/// detail fits its verdict, and with no recording run every case is
+/// BOUNDARY or NOT COMPARED for want of a capture. The BOUNDARY map lists
+/// the BOUNDARY cases, and the CR world labels the CR cases with the GC
+/// case `corpus::CR_INPUTS` pairs each with, both in case order.
+fn check_corpus_section(report: &str, corpus: &CorpusReport) {
+    let block = corpus.block.as_str();
+    assert_eq!(
+        report.matches(block).count(),
+        1,
+        "the corpus block must occur exactly once in REPORT.md"
+    );
+    let Some(at) = report.find(block) else {
+        panic!("the corpus block is not in REPORT.md");
+    };
+    let end = at.saturating_add(block.len());
+    let part3 = report.find("\n## Part 3: Capture readiness\n");
+    let definitions_end = CHECK_DEFINITIONS.last().and_then(|(name, definition)| {
+        let row = format!("| `{name}` | {definition} |");
+        part3.and_then(|start| {
+            report
+                .get(start..)
+                .and_then(|rest| rest.find(&row))
+                .map(|found| start.saturating_add(found).saturating_add(row.len()))
+        })
+    });
+    let first_static = STATIC_SECTIONS
+        .first()
+        .and_then(|heading| report.find(&format!("\n{heading}\n")));
+    match (part3, definitions_end, first_static) {
+        (Some(part3), Some(definitions_end), Some(first_static)) => {
+            assert!(
+                part3 < definitions_end && definitions_end <= at && end < first_static,
+                "the corpus block (bytes {at}..{end}) must follow part 3 (byte {part3}) and its \
+                 definitions table (ending at byte {definitions_end}) and precede the first \
+                 static section (byte {first_static})"
+            );
+            assert_eq!(
+                report.get(definitions_end..at),
+                Some("\n\n"),
+                "the corpus block must follow the definitions table directly"
+            );
+            assert_eq!(
+                report.get(end..first_static),
+                Some("\n"),
+                "the first static section must follow the corpus block directly"
+            );
+        }
+        found => panic!(
+            "part 3, its definitions table or the first static section is missing from \
+             REPORT.md: {found:?}"
+        ),
+    }
+    let opening = format!("{CORPUS_HEADING}\n\n{RUN_LINE}");
+    assert!(
+        block.starts_with(&opening),
+        "the corpus block must open with its heading and the recording run line: {:?}",
+        block.lines().take(3).collect::<Vec<_>>()
+    );
+    assert!(
+        report.contains(&format!("\n{}\n", corpus.matched_line)),
+        "REPORT.md must hold the MATCHED line at column 0: {}",
+        corpus.matched_line
+    );
+    let matched_lines: Vec<&str> = report
+        .lines()
+        .filter(|line| line.starts_with("MATCHED "))
         .collect();
+    assert_eq!(
+        matched_lines,
+        [corpus.matched_line.as_str()],
+        "REPORT.md must hold exactly one line starting MATCHED"
+    );
+    let po_rows: Vec<&str> = block
+        .lines()
+        .filter(|line| line.starts_with("| PO-"))
+        .collect();
+    assert!(
+        po_rows.is_empty(),
+        "corpus block rows begin | PO-: {po_rows:?}"
+    );
+
+    let parts: Vec<&str> = block.split("\n\n").collect();
+    let run_line = parts.get(1).copied().unwrap_or_default();
+    let integrity_fail = format!("{RUN_LINE}INTEGRITY FAIL: ");
+    assert_eq!(
+        run_failures(&[], &[], &corpus.integrity).is_empty(),
+        !run_line.starts_with(&integrity_fail),
+        "the run line {run_line:?} must show INTEGRITY FAIL exactly when the corpus fails an \
+         integrity check: {:?}",
+        corpus.integrity
+    );
+    if let &[heading, run_line, matched] = parts.as_slice() {
+        assert_eq!(heading, CORPUS_HEADING, "corpus block heading");
+        assert!(
+            run_line.starts_with(&integrity_fail) && !corpus.integrity.is_empty(),
+            "a corpus block with no model must show its integrity failure: {run_line}"
+        );
+        assert_eq!(matched, matched_line(0, 0), "MATCHED line with no model");
+        assert_eq!(corpus.matched_line, matched, "printed MATCHED line");
+        return;
+    }
+    let &[
+        heading,
+        run_line,
+        counts,
+        matched,
+        cases,
+        moves_heading,
+        moves,
+        findings_heading,
+        findings,
+        drops_heading,
+        drops,
+        boundary_heading,
+        boundary,
+        worlds_heading,
+        worlds,
+    ] = parts.as_slice()
+    else {
+        panic!(
+            "the corpus block must have 15 blank-line-separated parts, not {}: {parts:?}",
+            parts.len()
+        );
+    };
+    assert_eq!(heading, CORPUS_HEADING, "corpus block heading");
+    assert!(
+        run_line.starts_with(RUN_LINE) && !run_line.contains('\n'),
+        "recording run line: {run_line}"
+    );
+    assert_eq!(matched, corpus.matched_line, "MATCHED line in the block");
+    assert_eq!(
+        [
+            moves_heading,
+            findings_heading,
+            drops_heading,
+            boundary_heading,
+            worlds_heading
+        ],
+        [
+            "#### Class moves",
+            "#### Findings",
+            "#### Dropped variants",
+            "#### BOUNDARY map",
+            "#### CR world labels"
+        ],
+        "corpus block subsection headings, in order"
+    );
+
+    assert_eq!(
+        counts.lines().take(2).collect::<Vec<_>>(),
+        [
+            "| Class | MATCH | MISMATCH | NOT COMPARED | BOUNDARY | QUARANTINED | Total |",
+            "|---|---|---|---|---|---|---|"
+        ],
+        "count table header"
+    );
+    assert_eq!(
+        cases.lines().take(2).collect::<Vec<_>>(),
+        [
+            "| Case | Class | Verdict | First differing line |",
+            "|---|---|---|---|"
+        ],
+        "per-case table header"
+    );
+    let count_table = rendered_rows(counts);
+    let count_rows: Vec<&[String]> = count_table.iter().skip(2).map(Vec::as_slice).collect();
+    let case_table = rendered_rows(cases);
+    let case_rows: Vec<&[String]> = case_table.iter().skip(2).map(Vec::as_slice).collect();
+    let ids = corpus_case_ids();
+    let row_ids: Vec<String> = case_rows.iter().map(|row| cell_of(row, 0)).collect();
+    assert_eq!(
+        row_ids, ids,
+        "per-case rows must be golden::corpus_case_ids() in order"
+    );
+    let classes: Vec<String> = count_rows.iter().map(|row| cell_of(row, 0)).collect();
+    assert_eq!(classes, CLASS_ROWS, "count table rows");
+    let mut total = 0_usize;
+    for row in &count_rows {
+        let class = cell_of(row, 0);
+        let numbers: Vec<usize> = row
+            .iter()
+            .skip(1)
+            .map(|cell| match cell.parse() {
+                Ok(number) => number,
+                Err(err) => panic!("count {cell:?} of class {class} is not a number: {err}"),
+            })
+            .collect();
+        let Some((row_total, by_verdict)) = numbers.split_last() else {
+            panic!("count row {class} is empty");
+        };
+        assert_eq!(
+            by_verdict.len(),
+            VERDICT_COLUMNS.len(),
+            "count row {class} columns"
+        );
+        assert_eq!(
+            by_verdict.iter().sum::<usize>(),
+            *row_total,
+            "count row {class}: verdict columns must sum to its Total"
+        );
+        for (column, count) in VERDICT_COLUMNS.iter().zip(by_verdict) {
+            let listed = case_rows
+                .iter()
+                .filter(|case| cell_of(case, 1) == class && cell_of(case, 2) == *column)
+                .count();
+            assert_eq!(
+                listed, *count,
+                "count of {class} {column} must equal the per-case rows"
+            );
+            assert!(
+                (class == CLASS_BOUNDARY) == (*column == BOUNDARY) || *count == 0,
+                "{count} {class} cases are {column}: only class BOUNDARY is BOUNDARY"
+            );
+        }
+        total = total.saturating_add(*row_total);
+    }
+    assert_eq!(total, ids.len(), "count table Total column");
+    for case in &case_rows {
+        let (id, verdict, detail) = (cell_of(case, 0), cell_of(case, 2), cell_of(case, 3));
+        let allowed = match verdict.as_str() {
+            MATCH | BOUNDARY | QUARANTINED => detail == NO_DETAIL,
+            NOT_COMPARED => [NO_CAPTURE, RUN_INTEGRITY_FAILURE, CASE_INTEGRITY_FAILURE]
+                .contains(&detail.as_str()),
+            MISMATCH => {
+                detail.starts_with("transcript differs at line ")
+                    || detail.starts_with("rust session error: ")
+            }
+            _ => false,
+        };
+        assert!(allowed, "{id}: verdict {verdict:?} with detail {detail:?}");
+        if run_line == format!("{RUN_LINE}none") {
+            assert!(
+                verdict == BOUNDARY || (verdict == NOT_COMPARED && detail == NO_CAPTURE),
+                "{id} is {verdict} ({detail}) with no recording run"
+            );
+        }
+    }
+    let in_scope = |wanted: &[&str]| {
+        case_rows
+            .iter()
+            .filter(|case| [CLASS_CP, CLASS_IN].contains(&cell_of(case, 1).as_str()))
+            .filter(|case| wanted.contains(&cell_of(case, 2).as_str()))
+            .count()
+    };
+    assert_eq!(
+        matched,
+        matched_line(in_scope(&[MATCH]), in_scope(&[MATCH, MISMATCH])),
+        "MATCHED n OF m must count the CP and IN rows"
+    );
+
+    let tables: [(&str, &[&str]); 5] = [
+        (moves, &["Case", "Specified class", "Final class", "Branch"]),
+        (findings, &["Case", "Outcome", "Cause"]),
+        (drops, &["Round", "Case", "Dimension", "Value", "Branch"]),
+        (
+            boundary,
+            &["Case", "Input lines", "Expected branch", "Recorded"],
+        ),
+        (
+            worlds,
+            &["CR case", "GC case", "Label", "First differing line"],
+        ),
+    ];
+    for (table, header) in tables {
+        let expected_header = format!("| {} |", header.join(" | "));
+        assert!(
+            table == "none" || table.lines().next() == Some(expected_header.as_str()),
+            "a corpus subsection must be none or a table headed {expected_header}: {table}"
+        );
+    }
+    let boundary_ids: Vec<String> = case_rows
+        .iter()
+        .filter(|case| cell_of(case, 1) == CLASS_BOUNDARY)
+        .map(|case| cell_of(case, 0))
+        .collect();
+    let mapped: Vec<String> = rendered_rows(boundary)
+        .iter()
+        .skip(2)
+        .map(|row| {
+            let recorded = cell_of(row, 3);
+            assert!(
+                recorded == "yes" || recorded == "no",
+                "BOUNDARY map recorded column: {row:?}"
+            );
+            cell_of(row, 0)
+        })
+        .collect();
+    assert_eq!(mapped, boundary_ids, "BOUNDARY map rows");
+    let cr_rows: Vec<(String, String)> = case_rows
+        .iter()
+        .filter(|case| cell_of(case, 1) == CLASS_CR)
+        .map(|case| {
+            let id = cell_of(case, 0);
+            let gc = corpus::CR_INPUTS
+                .into_iter()
+                .find(|(cr, _, _)| *cr == id)
+                .map_or("", |(_, gc, _)| gc);
+            (id, gc.to_string())
+        })
+        .collect();
+    let labelled: Vec<(String, String)> = rendered_rows(worlds)
+        .iter()
+        .skip(2)
+        .map(|row| {
+            let label = cell_of(row, 2);
+            assert!(
+                [WORLD_INDEPENDENT, WORLD_DEPENDENT, NOT_COMPARED].contains(&label.as_str()),
+                "CR world label: {row:?}"
+            );
+            (cell_of(row, 0), cell_of(row, 1))
+        })
+        .collect();
+    assert_eq!(labelled, cr_rows, "CR world label rows and their GC cases");
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Computes the five verdicts, prints `GC-0N <verdict>` for each and writes
+/// `REPORT.md`. A `SPEC.md` lacking a required section fails the run before
+/// anything is written, and an error writing `REPORT.md` fails it. Once the
+/// report is written, the run fails only when a case is FAIL or a harness
+/// check fails.
+///
+/// The parity corpus extends this. Before the write, the run also judges the
+/// corpus and prints its `MATCHED n OF m IN-SCOPE CORPUS CASES` line, and it
+/// writes `REPORT.md` once. Once the report is written, the run fails first
+/// on the [`run_failures`] lines: a FAIL case, a failed harness check or a
+/// corpus integrity failure, in that order, never a corpus verdict. Only
+/// once those are empty is the report text written checked in memory by
+/// [`check_corpus_section`]: the `### Parity corpus` block's placement in
+/// part 3, its parts in order, its counts against its per-case rows, and
+/// its run line against the corpus integrity failures.
+///
+/// World A and world B are the test process's shared ones,
+/// [`shared_world_a`] and [`shared_world_b`], so neither is built again
+/// here when a reader test has already built it.
+#[test]
+fn equivalence_report() {
+    let missing = missing_headings(SPEC);
+    assert!(missing.is_empty(), "{}", missing_message(&missing));
+
+    let crate_dir = Path::new(CRATE_DIR);
+    let fixtures = shared_world_a();
+    let golden = default_dir();
+    let literals = literal_rows(SPEC);
+    let results: Vec<CaseResult> = CASE_IDS
+        .into_iter()
+        .map(|id| evaluate(id, &golden, fixtures, &literals))
+        .collect();
+    for result in &results {
+        println!("{} {}", result.id, result.verdict);
+    }
+    let corpus = corpus_results(fixtures, &literals);
+    println!("{}", corpus.matched_line);
+    let checks = harness_checks(fixtures, &results);
+
+    let report = render(SPEC, &checks, &results, &corpus.block);
+    if let Err(err) = fs::write(crate_dir.join("REPORT.md"), &report) {
+        panic!("cannot write REPORT.md: {err}");
+    }
+
+    let failures = run_failures(&results, &checks, &corpus.integrity);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    check_corpus_section(&report, &corpus);
 }
 
 /// Every `SPEC.md` section the report includes exists as a heading line.
@@ -778,4 +1961,4090 @@ fn equivalence_report() {
 fn spec_has_report_sections() {
     let missing = missing_headings(SPEC);
     assert!(missing.is_empty(), "{}", missing_message(&missing));
+}
+
+// ---------------------------------------------------------------------------
+// Corpus reader tests: synthetic corpus folders under the system temp dir
+// ---------------------------------------------------------------------------
+
+/// The `context` a synthetic run records: the fixed O-01 answer that
+/// `record_corpus.sh` writes.
+const SYNTHETIC_CONTEXT: &str = r##"{"DUZ":".5","IOF":"#","IOSL":"60","STATION":"500"}"##;
+
+/// The `start_command` a synthetic run records, in the form
+/// `record_corpus.sh` writes with the default container name.
+const SYNTHETIC_START: &str = "docker exec -i vehu su - vehu -c \"<start command>\"";
+
+/// The digest list's name, which the listing never includes.
+const SUMS_NAME: &str = "SHA256SUMS";
+
+/// A synthetic corpus folder `ifcap-corpus-<pid>-<name>` under the system
+/// temp dir, which the guard creates itself and removes when dropped. The
+/// folder is created exclusively, owner-only on Unix, so nothing already at
+/// its path (a leftover, another user's folder holding planted links, or a
+/// symbolic link) is ever adopted, written through or removed. It records
+/// each file written to it with its SHA-256, so its digest list is built
+/// from the bytes written and no capture file is ever read back here.
+struct TempCorpus {
+    dir: PathBuf,
+    /// Each file written, relative to `dir`, with the SHA-256 of its last
+    /// content.
+    written: Vec<(String, String)>,
+}
+
+impl TempCorpus {
+    /// The path of the folder for the test `name`:
+    /// `ifcap-corpus-<pid>-<name>` under the system temp dir.
+    fn root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ifcap-corpus-{}-{name}", std::process::id()))
+    }
+
+    /// A fresh, empty folder for the test `name`, made by
+    /// [`TempCorpus::create`]. Anything already at its path fails the test
+    /// and is left for removal by hand, never removed or reused here.
+    fn new(name: &str) -> TempCorpus {
+        match TempCorpus::create(name) {
+            Ok(folder) => folder,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => panic!(
+                "{} already exists and was not created by this run, so it is not \
+                 reused: remove it by hand",
+                TempCorpus::root(name).display()
+            ),
+            Err(err) => panic!("cannot create {}: {err}", TempCorpus::root(name).display()),
+        }
+    }
+
+    /// Creates the folder for the test `name` exclusively: that one folder,
+    /// never a missing parent, owner-only (`0o700`) on Unix. Anything
+    /// already at the path, a folder, a file or a symbolic link whether or
+    /// not it dangles, is an `AlreadyExists` error and stays as it is,
+    /// neither removed, adopted nor followed, so a guard exists only for a
+    /// folder it made.
+    fn create(name: &str) -> std::io::Result<TempCorpus> {
+        let dir = TempCorpus::root(name);
+        #[cfg(unix)]
+        let created = {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(&dir)
+        };
+        #[cfg(not(unix))]
+        let created = fs::DirBuilder::new().create(&dir);
+        created?;
+        Ok(TempCorpus {
+            dir,
+            written: Vec::new(),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Writes `text` to `relative`, creating its folder, and records it.
+    fn write(&mut self, relative: &str, text: &str) {
+        let path = self.dir.join(relative);
+        let created = path.parent().map_or(Ok(()), fs::create_dir_all);
+        if let Err(err) = created.and_then(|()| fs::write(&path, text)) {
+            panic!("cannot write {}: {err}", path.display());
+        }
+        self.written.retain(|(listed, _)| listed != relative);
+        self.written
+            .push((relative.to_string(), sha256_hex(text.as_bytes())));
+    }
+
+    /// Removes the written file `relative` and its record, so a later
+    /// digest list leaves it out.
+    fn remove(&mut self, relative: &str) {
+        let path = self.dir.join(relative);
+        if let Err(err) = fs::remove_file(&path) {
+            panic!("cannot remove {}: {err}", path.display());
+        }
+        self.written.retain(|(listed, _)| listed != relative);
+    }
+
+    /// Writes `bytes`, which need not be UTF-8, to `relative`, creating its
+    /// folder, and records it, as [`TempCorpus::write`] does for text.
+    fn write_bytes(&mut self, relative: &str, bytes: &[u8]) {
+        let path = self.dir.join(relative);
+        let created = path.parent().map_or(Ok(()), fs::create_dir_all);
+        if let Err(err) = created.and_then(|()| fs::write(&path, bytes)) {
+            panic!("cannot write {}: {err}", path.display());
+        }
+        self.written.retain(|(listed, _)| listed != relative);
+        self.written.push((relative.to_string(), sha256_hex(bytes)));
+    }
+
+    /// Writes case `id`'s input file: each of `inputs` followed by `\n`.
+    fn input(&mut self, id: &str, inputs: &[String]) {
+        let text: String = inputs.iter().map(|input| format!("{input}\n")).collect();
+        self.write(&format!("{id}/input.txt"), &text);
+    }
+
+    /// Writes case `id`'s transcript capture.
+    fn transcript(&mut self, id: &str, text: &str) {
+        self.write(&format!("{id}/transcript.txt"), text);
+    }
+
+    /// Writes the run files `record_corpus.sh` writes before its digest
+    /// list: a synthetic `BASE.txt`, `meta.txt` with each of the five keys,
+    /// and `run-summary.txt` with one line per `(id, status)` of `cases`.
+    fn run_files(&mut self, cases: &[(&str, &str)]) {
+        self.write(
+            "BASE.txt",
+            "synthetic=written by tests/equivalence.rs, not a snapshot\n\
+             snapshot_image=synthetic\nsnapshot_id=synthetic\n",
+        );
+        let meta: String = CORPUS_META_KEYS
+            .iter()
+            .map(|key| {
+                let value = match *key {
+                    "context" => SYNTHETIC_CONTEXT,
+                    "start_command" => SYNTHETIC_START,
+                    _ => "synthetic",
+                };
+                format!("{key}={value}\n")
+            })
+            .collect();
+        self.write("meta.txt", &meta);
+        let identity = format!(
+            "exports=IDENTICAL\nexport_sha256={}\nruns=IDENTICAL\n",
+            sha256_hex(b"synthetic export")
+        );
+        let lines: String = cases
+            .iter()
+            .map(|(id, status)| format!("{id}\t{status}\t0\t0\n"))
+            .collect();
+        self.write("run-summary.txt", &format!("{identity}{lines}"));
+    }
+
+    /// Writes the digest list last, as `record_corpus.sh` does: every file
+    /// written so far, in byte order of its path, as `<hex>  <path>`.
+    fn sums(&mut self) {
+        let mut listed: Vec<(String, String)> = self
+            .written
+            .iter()
+            .filter(|(relative, _)| relative != SUMS_NAME)
+            .cloned()
+            .collect();
+        listed.sort();
+        let text: String = listed
+            .iter()
+            .map(|(relative, digest)| format!("{digest}  {relative}\n"))
+            .collect();
+        self.write(SUMS_NAME, &text);
+    }
+
+    /// The run files and then the digest list.
+    fn run(&mut self, cases: &[(&str, &str)]) {
+        self.run_files(cases);
+        self.sums();
+    }
+
+    /// Makes `relative` a symbolic link to `target` in `holder`, another
+    /// synthetic folder (`""` naming `holder` itself), in place of any file
+    /// written there. The link's own records are replaced by the digest of
+    /// each file `holder` wrote at or beneath `target`, under the path the
+    /// link makes it reachable by, so that [`TempCorpus::sums`] lists those
+    /// bytes as verifying. Nothing is read back.
+    #[cfg(unix)]
+    fn link(&mut self, relative: &str, holder: &TempCorpus, target: &str) {
+        let path = self.dir.join(relative);
+        let to = holder.dir.join(target);
+        let created = path.parent().map_or(Ok(()), fs::create_dir_all);
+        let cleared = created.and_then(|()| match fs::remove_file(&path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+            _ => Ok(()),
+        });
+        if let Err(err) = cleared.and_then(|()| std::os::unix::fs::symlink(&to, &path)) {
+            panic!("cannot link {} to {}: {err}", path.display(), to.display());
+        }
+        self.written
+            .retain(|(listed, _)| Path::new(listed).strip_prefix(relative).is_err());
+        for (listed, digest) in &holder.written {
+            let Ok(rest) = Path::new(listed).strip_prefix(target) else {
+                continue;
+            };
+            let reached = if rest.as_os_str().is_empty() {
+                relative.to_string()
+            } else {
+                format!("{relative}/{}", rest.display())
+            };
+            self.written.push((reached, digest.clone()));
+        }
+    }
+}
+
+impl Drop for TempCorpus {
+    /// Removes the folder, which this guard created: a guard exists only
+    /// once [`TempCorpus::create`] has made its folder, and
+    /// `remove_dir_all` removes a symbolic link standing at the path rather
+    /// than following it.
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Proves that the reader tests' folders are their own. A fresh folder is a
+/// real directory, owner-only on Unix, and is removed when dropped. On Unix,
+/// a folder already standing at a guard's path and holding a planted link
+/// to a file elsewhere, and a symbolic link standing at the path itself,
+/// each make [`TempCorpus::create`] fail with `AlreadyExists`, and each,
+/// with what it leads to, is left unchanged. Nothing is read back: each
+/// file and folder is compared by its metadata (size, modification time,
+/// inode), and a folder's modification time changes with any entry added
+/// or removed.
+fn assert_temp_folders_exclusive_and_private() {
+    let fresh = TempCorpus::new("temp-guard-root");
+    let root = fresh.path().to_path_buf();
+    let kind = fs::symlink_metadata(&root).map(|meta| (meta.is_dir(), meta.is_symlink()));
+    assert!(
+        matches!(kind, Ok((true, false))),
+        "{} must be a real directory, not a link: {kind:?}",
+        root.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::symlink_metadata(&root)
+            .map(|meta| format!("{:o}", meta.permissions().mode() & 0o777));
+        assert!(
+            matches!(mode.as_deref(), Ok("700")),
+            "{} must be owner-only (700): {mode:?}",
+            root.display()
+        );
+    }
+    drop(fresh);
+    let gone = fs::symlink_metadata(&root).map_err(|err| err.kind());
+    assert!(
+        matches!(gone, Err(std::io::ErrorKind::NotFound)),
+        "{} must be removed when its guard is dropped: {gone:?}",
+        root.display()
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let identity = |meta: fs::Metadata| {
+            let modified = meta.modified().ok();
+            (meta.is_symlink(), meta.len(), modified, meta.ino())
+        };
+        // The entry at `path` itself, and what a link there leads to.
+        let stamp = |path: &Path| {
+            fs::symlink_metadata(path)
+                .map(identity)
+                .map_err(|err| err.kind())
+        };
+        let followed = |path: &Path| fs::metadata(path).map(identity).map_err(|err| err.kind());
+
+        // A folder already at the path, holding a link planted to a file
+        // the test runner can write.
+        let mut victim = TempCorpus::new("temp-guard-victim");
+        victim.write("victim.txt", "victim\n");
+        let victim_file = victim.path().join("victim.txt");
+        let mut holder = TempCorpus::new("temp-guard-holder");
+        holder.link("planted", &victim, "victim.txt");
+        let planted = holder.path().join("planted");
+        let before = (
+            stamp(holder.path()),
+            stamp(&planted),
+            followed(&planted),
+            stamp(&victim_file),
+        );
+        let refused = TempCorpus::create("temp-guard-holder")
+            .err()
+            .map(|err| err.kind());
+        assert_eq!(
+            refused,
+            Some(std::io::ErrorKind::AlreadyExists),
+            "a folder already at {} must be refused, not adopted",
+            holder.path().display()
+        );
+        let after = (
+            stamp(holder.path()),
+            stamp(&planted),
+            followed(&planted),
+            stamp(&victim_file),
+        );
+        assert!(
+            matches!(before.1, Ok((true, ..))),
+            "{} must be a planted link: {:?}",
+            planted.display(),
+            before.1
+        );
+        assert_eq!(
+            before.2,
+            before.3,
+            "{} must lead to {}",
+            planted.display(),
+            victim_file.display()
+        );
+        assert_eq!(
+            after,
+            before,
+            "the refused folder {}, its planted link and the file it leads to must be unchanged",
+            holder.path().display()
+        );
+
+        // A symbolic link standing at the path itself, to a folder holding a
+        // file. The link is removed before any assertion about it, so none
+        // leaks.
+        let mut target = TempCorpus::new("temp-guard-link-target");
+        target.write("kept.txt", "kept\n");
+        let kept = target.path().join("kept.txt");
+        let linked = TempCorpus::root("temp-guard-link");
+        let made = std::os::unix::fs::symlink(target.path(), &linked).map_err(|err| err.kind());
+        assert!(
+            made.is_ok(),
+            "cannot link {} to {}: {made:?}",
+            linked.display(),
+            target.path().display()
+        );
+        let before = (stamp(target.path()), stamp(&kept), followed(&linked));
+        let refused = TempCorpus::create("temp-guard-link")
+            .err()
+            .map(|err| err.kind());
+        let link_after = stamp(&linked);
+        let after = (stamp(target.path()), stamp(&kept), followed(&linked));
+        let removed = fs::remove_file(&linked).map_err(|err| err.kind());
+        assert_eq!(
+            refused,
+            Some(std::io::ErrorKind::AlreadyExists),
+            "a symbolic link at {} must be refused, not followed",
+            linked.display()
+        );
+        assert!(
+            matches!(link_after, Ok((true, ..))),
+            "{} must still be the link: {link_after:?}",
+            linked.display()
+        );
+        assert!(
+            removed.is_ok(),
+            "cannot remove the link {}: {removed:?}",
+            linked.display()
+        );
+        assert_eq!(
+            before.0,
+            before.2,
+            "{} must lead to {}",
+            linked.display(),
+            target.path().display()
+        );
+        assert_eq!(
+            after,
+            before,
+            "the folder {} the link leads to and its file must be unchanged",
+            target.path().display()
+        );
+    }
+}
+
+/// World B for the reader tests: the process's shared world B
+/// ([`shared_world_b`]), the world A fixtures plus the committed
+/// `corpus.zwr`, the same store `equivalence_report` judges the corpus on.
+fn test_world_b() -> &'static Store {
+    match shared_world_b() {
+        Ok((_, store)) => store,
+        Err(cause) => panic!("world B not built: {cause}"),
+    }
+}
+
+/// The inputs of the committed corpus case `id`: [`split_input_lines`] of
+/// its `input.txt`, read through [`read_corpus_input`] alone. The committed
+/// transcript and run files are never read, so the reader tests, which judge
+/// synthetic folders, do not depend on any committed recording or its
+/// integrity.
+fn committed_inputs(id: &str) -> Vec<String> {
+    match read_corpus_input(&corpus_dir(), id) {
+        Ok(text) => split_input_lines(&text),
+        Err(cause) => panic!("committed corpus input {id} not read: {cause}"),
+    }
+}
+
+/// The Rust transcript of `inputs` on world B, which must not be an error.
+fn rust_transcript(inputs: &[String]) -> String {
+    let run = corpus::run_case(test_world_b(), inputs);
+    assert_eq!(run.error, None, "the Rust session failed");
+    run.transcript
+}
+
+/// CR case `cr`'s GC case and inputs, from `corpus::CR_INPUTS`.
+fn cr_case(cr: &str) -> (&'static str, Vec<String>) {
+    match corpus::CR_INPUTS.into_iter().find(|(id, _, _)| *id == cr) {
+        Some((_, gc, inputs)) => (gc, inputs.iter().map(|input| input.to_string()).collect()),
+        None => panic!("{cr} is not in corpus::CR_INPUTS"),
+    }
+}
+
+/// The raw transcript capture of GC case `gc`.
+fn gc_transcript(gc: &str) -> String {
+    match load_case(&default_dir(), gc) {
+        CaseLoad::Recorded(case) => case.transcript,
+        other => panic!("{gc} is not recorded: {other:?}"),
+    }
+}
+
+fn entry(
+    id: &str,
+    class: &'static str,
+    inputs: &[String],
+    gc: Option<&'static str>,
+) -> CorpusEntry {
+    CorpusEntry {
+        id: id.to_string(),
+        class,
+        inputs: inputs.to_vec(),
+        gc,
+    }
+}
+
+/// `entries` judged from the synthetic folder on world B, the CR cases
+/// against the committed GC captures.
+fn judge(folder: &TempCorpus, entries: &[CorpusEntry]) -> CorpusJudgement {
+    judge_corpus(
+        folder.path(),
+        &default_dir(),
+        test_world_b(),
+        entries,
+        &literal_rows(SPEC),
+    )
+}
+
+fn verdict_of<'a>(judgement: &'a CorpusJudgement, id: &str) -> &'a CorpusVerdict {
+    match judgement.verdicts.iter().find(|verdict| verdict.id == id) {
+        Some(verdict) => verdict,
+        None => panic!("no verdict for {id}"),
+    }
+}
+
+/// `text` with its 1-based line `number` replaced by `line`; the result
+/// must differ from `text`.
+fn with_line(text: &str, number: usize, line: &str) -> String {
+    let changed = text
+        .split('\n')
+        .enumerate()
+        .map(|(index, old)| {
+            if index.saturating_add(1) == number {
+                line
+            } else {
+                old
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(changed, text, "line {number} was not replaced");
+    changed
+}
+
+/// A valid `export_sha256=` line of a synthetic run summary, written out
+/// rather than computed, as is every summary built on it.
+const SUMMARY_DIGEST: &str =
+    "export_sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// The cases of a [`recorded_pair`]: CP-001 of class CP and CE-17 of class
+/// BOUNDARY, with their committed inputs.
+fn pair_entries() -> [CorpusEntry; 2] {
+    [
+        entry("CP-001", CLASS_CP, &committed_inputs("CP-001"), None),
+        entry("CE-17", CLASS_BOUNDARY, &committed_inputs("CE-17"), None),
+    ]
+}
+
+/// The folder for the test `name`, recording CP-001, its capture the Rust
+/// transcript, and CE-17 with valid run files, in which the run file `file`
+/// is then rewritten as `text`, or removed for `None`. The digest list is
+/// written last, so each digest it lists matches the bytes on disk and a
+/// failure comes from the rule under test alone.
+fn recorded_pair(name: &str, file: &str, text: Option<&str>) -> TempCorpus {
+    let mut folder = TempCorpus::new(name);
+    let [cp, boundary] = pair_entries();
+    folder.input(&cp.id, &cp.inputs);
+    folder.transcript(&cp.id, &rust_transcript(&cp.inputs));
+    folder.input(&boundary.id, &boundary.inputs);
+    folder.transcript(&boundary.id, "SYNTHETIC BOUNDARY CAPTURE\n");
+    folder.run_files(&[("CP-001", "RECORDED"), ("CE-17", "RECORDED")]);
+    match text {
+        Some(text) => folder.write(file, text),
+        None => folder.remove(file),
+    }
+    folder.sums();
+    folder
+}
+
+/// Asserts that the recording run of the [`recorded_pair`] `folder` fails
+/// with a cause that names its run file `file` and holds `fragment`, and
+/// that judging the pair shows that cause alone: in the run line, CP-001
+/// NOT COMPARED for the run, CE-17 still BOUNDARY, and nothing in m.
+fn assert_run_fails(folder: &TempCorpus, file: &str, fragment: &str) {
+    let named = format!("{}: ", folder.path().join(file).display());
+    let ids = ["CP-001".to_string(), "CE-17".to_string()];
+    let cause = match load_corpus_run(folder.path(), &ids) {
+        Err(cause) => cause,
+        Ok(run) => panic!("{file} with {fragment:?} loaded: {run:?}"),
+    };
+    assert!(
+        cause.starts_with(&named) && cause.contains(fragment),
+        "expected {named}…{fragment}, cause: {cause}"
+    );
+    let judgement = judge(folder, &pair_entries());
+    let cause = crate_relative(&cause);
+    assert_eq!(
+        judgement.integrity,
+        std::slice::from_ref(&cause),
+        "integrity"
+    );
+    assert_eq!(judgement.run_line, integrity_line(&cause), "run line");
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(verdict.verdict, NOT_COMPARED, "CP-001 verdict: {cause}");
+    assert_eq!(
+        verdict.detail, RUN_INTEGRITY_FAILURE,
+        "CP-001 detail: {cause}"
+    );
+    assert_eq!(
+        verdict_of(&judgement, "CE-17").verdict,
+        BOUNDARY,
+        "CE-17 verdict: {cause}"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m: {cause}"
+    );
+}
+
+/// Asserts that the recording run of the [`recorded_pair`] `folder`, whose
+/// summary `what` describes, loads with CP-001 alone quarantined, and that
+/// judging the pair finds no integrity failure: CP-001 QUARANTINED, CE-17
+/// BOUNDARY, and nothing in m.
+fn assert_cp_quarantined(folder: &TempCorpus, what: &str) {
+    let ids = ["CP-001".to_string(), "CE-17".to_string()];
+    match load_corpus_run(folder.path(), &ids) {
+        Ok(CorpusRun::Recorded { quarantined, .. }) => {
+            assert_eq!(quarantined, ["CP-001"], "{what}: quarantined")
+        }
+        other => panic!("{what}: the run must load as recorded: {other:?}"),
+    }
+    let judgement = judge(folder, &pair_entries());
+    assert!(
+        judgement.integrity.is_empty(),
+        "{what}: integrity: {:?}",
+        judgement.integrity
+    );
+    assert_eq!(
+        verdict_of(&judgement, "CP-001").verdict,
+        QUARANTINED,
+        "{what}: CP-001 verdict"
+    );
+    assert_eq!(
+        verdict_of(&judgement, "CE-17").verdict,
+        BOUNDARY,
+        "{what}: CE-17 verdict"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "{what}: MATCHED n OF m"
+    );
+}
+
+/// A synthetic model case `id` of `class`, specified as such, with `inputs`
+/// and the `expected` branch, and nothing else.
+fn model_case(
+    id: &str,
+    class: corpus::Class,
+    inputs: &[String],
+    expected: Option<&str>,
+) -> corpus::CaseEntry {
+    corpus::CaseEntry {
+        id: id.to_string(),
+        class,
+        specified: class,
+        inputs: inputs.to_vec(),
+        orders: Vec::new(),
+        c_values: Vec::new(),
+        item_count: None,
+        tags: Vec::new(),
+        expected_branch: expected.map(str::to_string),
+        finding: None,
+    }
+}
+
+/// Asserts that the blank-line-separated parts of the corpus `block` are
+/// exactly `expected`, in order, each named by its label.
+fn assert_block_parts(block: &str, expected: &[(&str, String)]) {
+    let parts: Vec<&str> = block.split("\n\n").collect();
+    assert_eq!(parts.len(), expected.len(), "corpus block parts: {parts:?}");
+    for (part, (label, wanted)) in parts.iter().zip(expected) {
+        assert_eq!(*part, wanted.as_str(), "corpus block {label}");
+    }
+}
+
+/// The 1-based line `number` of `text`.
+fn line_at(text: &str, number: usize) -> &str {
+    match text.split('\n').nth(number.saturating_sub(1)) {
+        Some(line) => line,
+        None => panic!("the text has no line {number}"),
+    }
+}
+
+/// The 1-based number and the text of the first line of `text` that
+/// contains `fragment`.
+fn line_containing<'a>(text: &'a str, fragment: &str) -> (usize, &'a str) {
+    match text
+        .split('\n')
+        .enumerate()
+        .find(|(_, line)| line.contains(fragment))
+    {
+        Some((index, line)) => (index.saturating_add(1), line),
+        None => panic!("no line contains {fragment:?}"),
+    }
+}
+
+/// `text`, which must end with `\n`, once without that `\n` and once with
+/// one more: two captures that differ from it only in the final line end.
+fn final_newline_variants(text: &str) -> (String, String) {
+    match text.strip_suffix('\n') {
+        Some(removed) => (removed.to_string(), format!("{text}\n")),
+        None => panic!("the transcript must end with \\n"),
+    }
+}
+
+/// `case` judged from a fresh synthetic folder `name` that records it with
+/// the model's input, `capture` as its transcript and valid run files.
+fn judge_recorded(name: &str, case: CorpusEntry, capture: &str) -> CorpusJudgement {
+    let mut folder = TempCorpus::new(name);
+    folder.input(&case.id, &case.inputs);
+    folder.transcript(&case.id, capture);
+    folder.run(&[(case.id.as_str(), "RECORDED")]);
+    judge(&folder, &[case])
+}
+
+/// The world label of a CR case's verdict.
+fn world_of(verdict: &CorpusVerdict) -> &WorldLabel {
+    match &verdict.world {
+        Some(world) => world,
+        None => panic!("{} has no world label", verdict.id),
+    }
+}
+
+/// A capture with no transcript is NOT COMPARED and a BOUNDARY case is
+/// BOUNDARY; with no run files the recording run is absent, as it is for a
+/// corpus folder that does not exist, an empty one and one holding only
+/// `BASE.txt`, while a missing case folder or `input.txt` is named. Each
+/// content rule of `input.txt` and `transcript.txt` (empty, `\r`, not
+/// UTF-8, over 1 MiB, last input not caret-prefixed) rejects its own row
+/// with the file's path and cause, each budget admits exactly 1 MiB, a
+/// `^FOO` exit is accepted, and a transcript is present whether or not it
+/// is valid. A failing input makes its case NOT COMPARED for its own
+/// integrity failure, a failing transcript for the recording run's, and a
+/// BOUNDARY case stays BOUNDARY either way, recorded exactly when its
+/// transcript exists. Every reader refuses an id outside the series by
+/// name, whatever stands at the path it would lead to. A CR case with its
+/// input alone is NOT COMPARED, and so is its world label. A recording
+/// published after the run was read as absent fails each case it holds,
+/// judged against that absent run, although a fresh read verifies it.
+#[test]
+fn corpus_reader_no_capture_not_compared() {
+    // Every reader test writes only into a folder its guard created
+    // exclusively and privately, never one adopted from what stood there.
+    assert_temp_folders_exclusive_and_private();
+    let mut folder = TempCorpus::new("no-capture");
+    let cp = committed_inputs("CP-001");
+    let boundary = committed_inputs("CE-17");
+    folder.input("CP-001", &cp);
+    folder.input("CE-17", &boundary);
+    let ids = ["CP-001".to_string(), "CE-17".to_string()];
+    assert_eq!(
+        load_corpus_run(folder.path(), &ids),
+        Ok(CorpusRun::Absent),
+        "inputs alone are no recording run"
+    );
+    let judgement = judge(
+        &folder,
+        &[
+            entry("CP-001", CLASS_CP, &cp, None),
+            entry("CE-17", CLASS_BOUNDARY, &boundary, None),
+        ],
+    );
+    assert_eq!(judgement.run_line, "Recording run: none", "run line");
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    let cp_verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(cp_verdict.verdict, NOT_COMPARED, "CP-001 verdict");
+    assert_eq!(cp_verdict.detail, NO_CAPTURE, "CP-001 detail");
+    assert!(!cp_verdict.recorded, "CP-001 is not recorded");
+    assert_eq!(
+        verdict_of(&judgement, "CE-17").verdict,
+        BOUNDARY,
+        "CE-17 verdict"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m"
+    );
+
+    // Absence, each asserted before the next file is written: a corpus
+    // folder that does not exist, a fresh empty one, and one holding only
+    // the `BASE.txt` that `load_corpus.sh` writes before any recording are
+    // each no recording run. `load_corpus_case` names a missing case
+    // folder, and the missing `input.txt` of a case folder that holds only
+    // a transcript.
+    let mut root_folder = TempCorpus::new("no-capture-root");
+    let case_dir = root_folder.path().join("CP-002");
+    assert_eq!(
+        load_corpus_run(&root_folder.path().join("never-created"), &ids),
+        Ok(CorpusRun::Absent),
+        "a corpus folder that does not exist is no recording run"
+    );
+    assert_eq!(
+        load_corpus_run(root_folder.path(), &ids),
+        Ok(CorpusRun::Absent),
+        "an empty corpus folder is no recording run"
+    );
+    assert_eq!(
+        load_corpus_case(root_folder.path(), "CP-002"),
+        Err(format!("{}: missing", case_dir.display())),
+        "a missing case folder is named"
+    );
+    root_folder.write(
+        "BASE.txt",
+        "synthetic=written by tests/equivalence.rs, not a snapshot\n\
+         snapshot_image=synthetic\nsnapshot_id=synthetic\n",
+    );
+    assert_eq!(
+        load_corpus_run(root_folder.path(), &ids),
+        Ok(CorpusRun::Absent),
+        "BASE.txt alone is no recording run"
+    );
+    root_folder.transcript("CP-002", "SYNTHETIC CAPTURE\n");
+    assert_eq!(
+        load_corpus_case(root_folder.path(), "CP-002"),
+        Err(format!("{}: missing", case_dir.join("input.txt").display())),
+        "a case folder without input.txt is named"
+    );
+
+    // `input.txt` content rows, each in its own case folder so that no row
+    // masks another, read through `load_corpus_case`: each rule rejects its
+    // row with the file's path and cause, the 1 MiB budget admits exactly
+    // 1_048_576 bytes, and a caret-prefixed exit other than `^` is accepted.
+    // The BOUNDARY CE-17's input fails too. With no transcript there is no
+    // recording run, a failing case is NOT COMPARED for its own integrity
+    // failure, an accepted one for want of a capture, and CE-17 stays
+    // BOUNDARY, not recorded.
+    let mut input_folder = TempCorpus::new("no-capture-input");
+    let long = "A".repeat(1_048_572);
+    let input_at_budget = format!("\n{long}\n^\n");
+    let input_over_budget = format!("\n{long}A\n^\n");
+    assert_eq!(
+        (input_at_budget.len(), input_over_budget.len()),
+        (1_048_576, 1_048_577),
+        "input budget row sizes"
+    );
+    let boundary_cr: String = boundary
+        .iter()
+        .map(|input| format!("{input}\r\n"))
+        .collect();
+    let input_rows = [
+        ("CP-011", CLASS_CP, Vec::new(), Err("empty")),
+        (
+            "CP-012",
+            CLASS_CP,
+            b"\nCP001\r\n\n\n^\n".to_vec(),
+            Err("carriage return"),
+        ),
+        (
+            "CP-013",
+            CLASS_CP,
+            b"\nCP\xff01\n\n\n^\n".to_vec(),
+            Err("not UTF-8"),
+        ),
+        (
+            "CP-014",
+            CLASS_CP,
+            input_over_budget.into_bytes(),
+            Err("larger than 1048576 bytes"),
+        ),
+        (
+            "CP-015",
+            CLASS_CP,
+            b"\nCP001\n".to_vec(),
+            Err("last input does not begin with ^"),
+        ),
+        (
+            "CP-016",
+            CLASS_CP,
+            b"\n^FOO\n".to_vec(),
+            Ok(vec![String::new(), "^FOO".to_string()]),
+        ),
+        (
+            "CP-017",
+            CLASS_CP,
+            input_at_budget.into_bytes(),
+            Ok(vec![String::new(), long, "^".to_string()]),
+        ),
+        (
+            "CE-17",
+            CLASS_BOUNDARY,
+            boundary_cr.into_bytes(),
+            Err("carriage return"),
+        ),
+    ];
+    let mut input_entries = Vec::new();
+    let mut input_verdicts = Vec::new();
+    let mut input_failures = Vec::new();
+    for (id, class, bytes, outcome) in input_rows {
+        input_folder.write_bytes(&format!("{id}/input.txt"), &bytes);
+        let path = input_folder.path().join(id).join("input.txt");
+        let wanted = outcome
+            .map(|lines| (id.to_string(), lines, None))
+            .map_err(|cause| format!("{}: {cause}", path.display()));
+        let loaded = load_corpus_case(input_folder.path(), id)
+            .map(|case| (case.id, case.inputs, case.transcript));
+        assert_eq!(loaded, wanted, "{id} input row");
+        let (verdict, detail) = match &wanted {
+            _ if class == CLASS_BOUNDARY => (BOUNDARY, NO_DETAIL),
+            Ok(_) => (NOT_COMPARED, NO_CAPTURE),
+            Err(_) => (NOT_COMPARED, CASE_INTEGRITY_FAILURE),
+        };
+        let model = match wanted {
+            Ok((_, lines, _)) => lines,
+            Err(cause) => {
+                input_failures.push(crate_relative(&cause));
+                if class == CLASS_BOUNDARY {
+                    boundary.clone()
+                } else {
+                    cp.clone()
+                }
+            }
+        };
+        input_entries.push(entry(id, class, &model, None));
+        input_verdicts.push((id, verdict, detail));
+    }
+    let input_ids: Vec<String> = input_entries.iter().map(|row| row.id.clone()).collect();
+    assert_eq!(
+        load_corpus_run(input_folder.path(), &input_ids),
+        Ok(CorpusRun::Absent),
+        "inputs alone, valid or not, are no recording run"
+    );
+    let judgement = judge(&input_folder, &input_entries);
+    assert_eq!(
+        judgement.integrity, input_failures,
+        "each failing input is a case integrity failure"
+    );
+    assert_eq!(
+        input_failures.first().map(|cause| integrity_line(cause)),
+        Some(judgement.run_line.clone()),
+        "the run line names the first failing input"
+    );
+    for (id, verdict, detail) in input_verdicts {
+        let judged = verdict_of(&judgement, id);
+        assert_eq!(
+            (judged.verdict, judged.detail.as_str(), judged.recorded),
+            (verdict, detail, false),
+            "{id} verdict, detail and recorded"
+        );
+    }
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m with failing inputs"
+    );
+
+    // `transcript.txt` content rows next to a valid input, each in its own
+    // case folder: each rule rejects its row with the file's path and cause,
+    // while the transcript counts as present whether or not it is valid. A
+    // transcript of exactly 1_048_576 bytes passes every content rule and
+    // fails only for want of the digest list a present transcript needs.
+    // Present transcripts need the run files, which are absent, so the
+    // recording run fails, every CP case is NOT COMPARED for it, and the
+    // BOUNDARY CE-17, whose transcript is empty, stays BOUNDARY, recorded.
+    let mut transcript_folder = TempCorpus::new("no-capture-transcript");
+    let transcript_root = transcript_folder.path().to_path_buf();
+    let rejected = |id: &str, cause: &str| {
+        format!(
+            "{}: {cause}",
+            transcript_root.join(id).join("transcript.txt").display()
+        )
+    };
+    let transcript_at_budget = "A".repeat(1_048_576);
+    let transcript_rows = [
+        ("CP-021", CLASS_CP, Vec::new(), rejected("CP-021", "empty")),
+        (
+            "CP-022",
+            CLASS_CP,
+            b"SYNTHETIC\r\nCAPTURE\n".to_vec(),
+            rejected("CP-022", "carriage return"),
+        ),
+        (
+            "CP-023",
+            CLASS_CP,
+            b"SYNTHETIC \xff CAPTURE\n".to_vec(),
+            rejected("CP-023", "not UTF-8"),
+        ),
+        (
+            "CP-024",
+            CLASS_CP,
+            format!("{transcript_at_budget}A").into_bytes(),
+            rejected("CP-024", "larger than 1048576 bytes"),
+        ),
+        (
+            "CP-025",
+            CLASS_CP,
+            transcript_at_budget.into_bytes(),
+            format!("{}: missing", transcript_root.join(SUMS_NAME).display()),
+        ),
+        (
+            "CE-17",
+            CLASS_BOUNDARY,
+            Vec::new(),
+            rejected("CE-17", "empty"),
+        ),
+    ];
+    let run_cause = format!("{}: missing", transcript_root.join("meta.txt").display());
+    let mut transcript_entries = Vec::new();
+    let mut transcript_failures = vec![crate_relative(&run_cause)];
+    for (id, class, bytes, cause) in transcript_rows {
+        let model = if class == CLASS_BOUNDARY {
+            &boundary
+        } else {
+            &cp
+        };
+        transcript_folder.input(id, model);
+        transcript_folder.write_bytes(&format!("{id}/transcript.txt"), &bytes);
+        assert_eq!(
+            load_corpus_case(&transcript_root, id),
+            Err(cause.clone()),
+            "{id} transcript row"
+        );
+        assert!(
+            corpus_transcript_exists(&transcript_root, id),
+            "{id}'s transcript is present whether or not it is valid"
+        );
+        transcript_failures.push(crate_relative(&cause));
+        transcript_entries.push(entry(id, class, model, None));
+    }
+    let transcript_ids: Vec<String> = transcript_entries
+        .iter()
+        .map(|row| row.id.clone())
+        .collect();
+    assert_eq!(
+        load_corpus_run(&transcript_root, &transcript_ids),
+        Err(run_cause.clone()),
+        "present transcripts need the run files"
+    );
+    let judgement = judge(&transcript_folder, &transcript_entries);
+    assert_eq!(
+        judgement.integrity, transcript_failures,
+        "the run's failure, then each case's"
+    );
+    assert_eq!(
+        judgement.run_line,
+        integrity_line(&crate_relative(&run_cause)),
+        "the run line names the run's failure"
+    );
+    for row in &transcript_entries {
+        let judged = verdict_of(&judgement, &row.id);
+        let (verdict, detail) = if row.class == CLASS_BOUNDARY {
+            (BOUNDARY, NO_DETAIL)
+        } else {
+            (NOT_COMPARED, RUN_INTEGRITY_FAILURE)
+        };
+        assert_eq!(
+            (judged.verdict, judged.detail.as_str(), judged.recorded),
+            (verdict, detail, true),
+            "{} verdict, detail and recorded",
+            row.id
+        );
+    }
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m with failing transcripts"
+    );
+
+    // Ids outside the series, each refused by name by every reader before
+    // any path is built, although a valid input and a transcript stand
+    // wherever such an id would lead inside the folder: in its own case
+    // folder, and at the folder's root, where `""` and `CP-001/..` lead.
+    // The known CP-001's transcript is found, so each `false` below is the
+    // guard's.
+    let mut id_folder = TempCorpus::new("no-capture-ids");
+    for id in [
+        "CP-000", "CP-201", "CP-1", "CE-27", "CR-06", "GC-01", "CP-001",
+    ] {
+        id_folder.input(id, &cp);
+        id_folder.transcript(id, "SYNTHETIC CAPTURE\n");
+    }
+    let cp_text: String = cp.iter().map(|input| format!("{input}\n")).collect();
+    id_folder.write("input.txt", &cp_text);
+    id_folder.write("transcript.txt", "SYNTHETIC CAPTURE\n");
+    assert!(
+        corpus_transcript_exists(id_folder.path(), "CP-001"),
+        "a known id's transcript is found"
+    );
+    for id in [
+        "CP-000",
+        "CP-201",
+        "CP-1",
+        "CE-27",
+        "CR-06",
+        "GC-01",
+        "../CP-001",
+        "CP-001/..",
+        "",
+    ] {
+        let refused = format!("{id}: not a corpus case id");
+        assert_eq!(
+            load_corpus_case(id_folder.path(), id),
+            Err(refused.clone()),
+            "load_corpus_case of {id:?}"
+        );
+        assert_eq!(
+            load_corpus_run(id_folder.path(), &[id.to_string()]),
+            Err(refused),
+            "load_corpus_run of {id:?}"
+        );
+        assert!(
+            !corpus_transcript_exists(id_folder.path(), id),
+            "corpus_transcript_exists of {id:?}"
+        );
+    }
+
+    // A CR case with its input alone: the case and its world label are
+    // NOT COMPARED for want of a capture.
+    let mut replay_only = TempCorpus::new("no-capture-cr");
+    let (gc, replay) = cr_case("CR-01");
+    replay_only.input("CR-01", &replay);
+    let judgement = judge(&replay_only, &[entry("CR-01", CLASS_CR, &replay, Some(gc))]);
+    assert_eq!(judgement.run_line, "Recording run: none", "CR-01 run line");
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    let verdict = verdict_of(&judgement, "CR-01");
+    assert_eq!(verdict.verdict, NOT_COMPARED, "CR-01 verdict");
+    assert_eq!(verdict.detail, NO_CAPTURE, "CR-01 detail");
+    assert!(!verdict.recorded, "CR-01 is not recorded");
+    let world = world_of(verdict);
+    assert_eq!(world.gc, gc, "CR-01 GC case");
+    assert_eq!(world.label, NOT_COMPARED, "CR-01 label");
+    assert_eq!(world.detail, NO_CAPTURE, "CR-01 label detail");
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m"
+    );
+
+    // A recording published after the run was read as absent. The run read
+    // first stands for the whole judgement: each transcript that appeared
+    // since fails its own case, although a fresh run and the case reader
+    // now verify every file, CP-001's capture would MATCH and CR-01's
+    // equals its GC capture. No capture is compared, the BOUNDARY case
+    // stays BOUNDARY, and the CR world label is NOT COMPARED.
+    let mut late = TempCorpus::new("no-capture-late");
+    late.input("CP-001", &cp);
+    late.input("CE-17", &boundary);
+    late.input("CR-01", &replay);
+    let late_entries = [
+        entry("CP-001", CLASS_CP, &cp, None),
+        entry("CE-17", CLASS_BOUNDARY, &boundary, None),
+        entry("CR-01", CLASS_CR, &replay, Some(gc)),
+    ];
+    let late_ids: Vec<String> = late_entries.iter().map(|row| row.id.clone()).collect();
+    let stale = load_corpus_run(late.path(), &late_ids);
+    assert_eq!(
+        stale,
+        Ok(CorpusRun::Absent),
+        "inputs alone, read before the recording"
+    );
+    let rust = rust_transcript(&cp);
+    late.transcript("CP-001", &rust);
+    late.transcript("CE-17", "SYNTHETIC BOUNDARY CAPTURE\n");
+    late.transcript("CR-01", &gc_transcript(gc));
+    late.run(&[
+        ("CP-001", "RECORDED"),
+        ("CE-17", "RECORDED"),
+        ("CR-01", "RECORDED"),
+    ]);
+    assert!(
+        matches!(
+            load_corpus_run(late.path(), &late_ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "a fresh read verifies the recording"
+    );
+    let late_case = match load_corpus_case(late.path(), "CP-001") {
+        Ok(case) => case,
+        Err(cause) => panic!("CP-001 must load from the recording: {cause}"),
+    };
+    assert_eq!(
+        late_case.transcript.as_deref(),
+        Some(rust.as_str()),
+        "CP-001's capture, as the case reader returns it"
+    );
+    let fresh = judge(&late, &late_entries);
+    assert_eq!(
+        (
+            fresh.integrity.len(),
+            verdict_of(&fresh, "CP-001").verdict,
+            world_of(verdict_of(&fresh, "CR-01")).label
+        ),
+        (0, MATCH, WORLD_INDEPENDENT),
+        "judged against a fresh read, the recording verifies"
+    );
+    let appeared = |id: &str| {
+        format!(
+            "{}: present though the recording run was read as absent",
+            late.path().join(id).join("transcript.txt").display()
+        )
+    };
+    assert_eq!(
+        CorpusRun::Absent.confirm_case(late.path(), &late_case),
+        Err(appeared("CP-001")),
+        "an absent run vouches for no transcript"
+    );
+    let unrecorded = match load_corpus_case(folder.path(), "CP-001") {
+        Ok(case) => case,
+        Err(cause) => panic!("CP-001 must load from its input alone: {cause}"),
+    };
+    assert_eq!(unrecorded.transcript, None, "CP-001 is not recorded");
+    assert_eq!(
+        CorpusRun::Absent.confirm_case(folder.path(), &unrecorded),
+        Ok(()),
+        "an absent run accepts a case with no transcript"
+    );
+    let judgement = judge_with_run(
+        stale,
+        late.path(),
+        &default_dir(),
+        test_world_b(),
+        &late_entries,
+        &literal_rows(SPEC),
+    );
+    let causes: Vec<String> = late_ids
+        .iter()
+        .map(|id| crate_relative(&appeared(id)))
+        .collect();
+    assert_eq!(
+        judgement.integrity, causes,
+        "each transcript that appeared after the absent read, in case order"
+    );
+    assert_eq!(
+        causes.first().map(|cause| integrity_line(cause)),
+        Some(judgement.run_line.clone()),
+        "the run line names the first transcript that appeared"
+    );
+    for (id, verdict, detail) in [
+        ("CP-001", NOT_COMPARED, CASE_INTEGRITY_FAILURE),
+        ("CE-17", BOUNDARY, NO_DETAIL),
+        ("CR-01", NOT_COMPARED, CASE_INTEGRITY_FAILURE),
+    ] {
+        let judged = verdict_of(&judgement, id);
+        assert_eq!(
+            (judged.verdict, judged.detail.as_str(), judged.recorded),
+            (verdict, detail, true),
+            "{id} verdict, detail and recorded, against the absent run"
+        );
+    }
+    let world = world_of(verdict_of(&judgement, "CR-01"));
+    assert_eq!(
+        (world.label, world.detail.as_str()),
+        (NOT_COMPARED, CASE_INTEGRITY_FAILURE),
+        "CR-01 label against the absent run"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m against the absent run"
+    );
+}
+
+/// A capture equal to the Rust transcript, with valid run files, is MATCH;
+/// one recorded with an input other than the model's is NOT COMPARED.
+/// MATCHED n OF m counts the CP and IN cases only, never a matching CR case
+/// or a captured BOUNDARY one, and one case's integrity failure leaves
+/// another case's MATCH standing. The run's `meta.txt` reads back as the
+/// literal keys and values written; `parse_corpus_meta` rejects a line
+/// without `=` and an unknown, repeated or missing key with its exact cause;
+/// and a rewritten `meta.txt`, its digest refreshed, fails the recording run
+/// on the parser alone.
+#[test]
+fn corpus_reader_matching_capture() {
+    let mut folder = TempCorpus::new("matching");
+    let inputs = committed_inputs("CP-001");
+    folder.input("CP-001", &inputs);
+    folder.transcript("CP-001", &rust_transcript(&inputs));
+    folder.run(&[("CP-001", "RECORDED")]);
+    let judgement = judge(&folder, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    assert!(
+        judgement
+            .run_line
+            .starts_with("Recording run: image_digest="),
+        "run line: {}",
+        judgement.run_line
+    );
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(verdict.verdict, MATCH, "detail: {}", verdict.detail);
+    assert_eq!(verdict.detail, NO_DETAIL, "MATCH detail");
+    assert!(verdict.recorded, "CP-001 is recorded");
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (1, 1),
+        "MATCHED n OF m"
+    );
+
+    // The run's metadata, held to literals rather than to the key array or
+    // to the values the synthetic writer shares with it.
+    let keys = [
+        "image_digest",
+        "snapshot_id",
+        "source_revision",
+        "context",
+        "start_command",
+    ];
+    assert_eq!(CORPUS_META_KEYS, keys, "the meta.txt keys, in order");
+    let run_line = concat!(
+        r#"Recording run: image_digest=`"synthetic"`; snapshot_id=`"synthetic"`; "#,
+        r#"source_revision=`"synthetic"`; "#,
+        r##"context=`"{\"DUZ\":\".5\",\"IOF\":\"#\",\"IOSL\":\"60\",\"STATION\":\"500\"}"`; "##,
+        r#"start_command=`"docker exec -i vehu su - vehu -c \"<start command>\""`; "#,
+        "export_sha256=754f3093c3dd04291d93795b6b30ce4eecd15bee326ce99582c4aeb3e2f6491e; ",
+        "exports=IDENTICAL runs=IDENTICAL",
+    );
+    assert_eq!(judgement.run_line, run_line, "run line");
+    let ids = ["CP-001".to_string()];
+    match load_corpus_run(folder.path(), &ids) {
+        Ok(CorpusRun::Recorded {
+            meta,
+            quarantined,
+            export_sha256,
+            transcripts,
+            inputs: listed_inputs,
+        }) => {
+            assert_eq!(
+                transcripts,
+                [(
+                    "CP-001".to_string(),
+                    sha256_hex(rust_transcript(&inputs).as_bytes())
+                )],
+                "the transcripts the verified listing names, with their digests"
+            );
+            let input_text: String = inputs.iter().map(|input| format!("{input}\n")).collect();
+            assert_eq!(
+                listed_inputs,
+                [("CP-001".to_string(), sha256_hex(input_text.as_bytes()))],
+                "the inputs the verified listing names, with their digests"
+            );
+            for (key, value) in [
+                ("image_digest", "synthetic"),
+                ("snapshot_id", "synthetic"),
+                ("source_revision", "synthetic"),
+                (
+                    "context",
+                    r##"{"DUZ":".5","IOF":"#","IOSL":"60","STATION":"500"}"##,
+                ),
+                (
+                    "start_command",
+                    r#"docker exec -i vehu su - vehu -c "<start command>""#,
+                ),
+            ] {
+                assert_eq!(meta.get(key), Some(value), "meta.txt {key}");
+            }
+            assert_eq!(meta.get("no_such_key"), None, "a key outside meta.txt");
+            assert!(quarantined.is_empty(), "quarantined: {quarantined:?}");
+            assert_eq!(
+                export_sha256, "754f3093c3dd04291d93795b6b30ce4eecd15bee326ce99582c4aeb3e2f6491e",
+                "SHA-256 of the synthetic export"
+            );
+        }
+        other => panic!("the valid run did not load as recorded: {other:?}"),
+    }
+
+    // CP-001 and the class IN case CE-01 each MATCH, beside a captured
+    // BOUNDARY case and a CR case whose capture equals its GC capture and
+    // its Rust transcript: n and m count the CP and IN cases only.
+    let mut mixed = TempCorpus::new("matching-mixed");
+    let edge = committed_inputs("CE-01");
+    let boundary = committed_inputs("CE-17");
+    let (gc, replay) = cr_case("CR-01");
+    mixed.input("CP-001", &inputs);
+    mixed.transcript("CP-001", &rust_transcript(&inputs));
+    mixed.input("CE-01", &edge);
+    mixed.transcript("CE-01", &rust_transcript(&edge));
+    mixed.input("CE-17", &boundary);
+    mixed.transcript("CE-17", "SYNTHETIC BOUNDARY CAPTURE\n");
+    mixed.input("CR-01", &replay);
+    mixed.transcript("CR-01", &gc_transcript(gc));
+    mixed.run(&[
+        ("CP-001", "RECORDED"),
+        ("CE-01", "RECORDED"),
+        ("CE-17", "RECORDED"),
+        ("CR-01", "RECORDED"),
+    ]);
+    let judgement = judge(
+        &mixed,
+        &[
+            entry("CP-001", CLASS_CP, &inputs, None),
+            entry("CE-01", CLASS_IN, &edge, None),
+            entry("CE-17", CLASS_BOUNDARY, &boundary, None),
+            entry("CR-01", CLASS_CR, &replay, Some(gc)),
+        ],
+    );
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    for (id, wanted) in [
+        ("CP-001", MATCH),
+        ("CE-01", MATCH),
+        ("CE-17", BOUNDARY),
+        ("CR-01", MATCH),
+    ] {
+        let verdict = verdict_of(&judgement, id);
+        assert_eq!(verdict.verdict, wanted, "{id} detail: {}", verdict.detail);
+        assert_eq!(verdict.detail, NO_DETAIL, "{id} detail");
+        assert!(verdict.recorded, "{id} is recorded");
+    }
+    assert_eq!(
+        world_of(verdict_of(&judgement, "CR-01")).label,
+        WORLD_INDEPENDENT,
+        "CR-01 label"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (2, 2),
+        "MATCHED n OF m counts CP-001 and CE-01 only"
+    );
+
+    // CP-001 recorded with CP-002's input, its capture equal to the Rust
+    // transcript of that input and every digest refreshed: the case fails
+    // its own integrity check, so it is never compared and stays outside m,
+    // and the run line names its committed input.
+    let mut changed = TempCorpus::new("matching-changed-input");
+    let other = committed_inputs("CP-002");
+    assert_ne!(other, inputs, "CP-002's input must differ from CP-001's");
+    changed.input("CP-001", &other);
+    changed.transcript("CP-001", &rust_transcript(&other));
+    changed.run(&[("CP-001", "RECORDED")]);
+    let named = crate_relative(
+        &corpus_input_path(changed.path(), "CP-001")
+            .display()
+            .to_string(),
+    );
+    let cause = format!("{named}: committed input differs from the generated model");
+    let judgement = judge(&changed, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+    assert!(
+        judgement.integrity.contains(&cause),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    assert_eq!(judgement.run_line, integrity_line(&cause), "run line");
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(verdict.verdict, NOT_COMPARED, "detail: {}", verdict.detail);
+    assert_eq!(verdict.detail, CASE_INTEGRITY_FAILURE, "CP-001 detail");
+    assert!(verdict.recorded, "CP-001 is recorded");
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m"
+    );
+
+    // `parse_corpus_meta` alone, each row the text and either the five
+    // values in `keys` order or the exact cause. Lines are numbered from 1,
+    // blank and whitespace-only lines counted but ignored, keys are taken
+    // as written, values are kept exactly after the first `=`, and a
+    // missing key names the first one missing in key order.
+    let rows: &[(&str, Result<[&str; 5], &str>)] = &[
+        (
+            "image_digest=\nsnapshot_id= spaced \n\n \t\nsource_revision=a=b=c\n\
+             context={\"DUZ\":\".5\"}\nstart_command=docker exec -i vehu su - vehu -c \"a=b c\"\n",
+            Ok([
+                "",
+                " spaced ",
+                "a=b=c",
+                "{\"DUZ\":\".5\"}",
+                "docker exec -i vehu su - vehu -c \"a=b c\"",
+            ]),
+        ),
+        (
+            "start_command=s\ncontext=c\nsource_revision=r\nsnapshot_id=i\nimage_digest=d",
+            Ok(["d", "i", "r", "c", "s"]),
+        ),
+        ("image_digest=d\nsnapshot_id\n", Err("meta line 2: no '='")),
+        (
+            "\n \t\nimage_digest=d\nno equals sign\n",
+            Err("meta line 4: no '='"),
+        ),
+        (
+            "Image_digest=d\n",
+            Err("meta line 1: unknown key Image_digest"),
+        ),
+        (
+            " image_digest=d\n",
+            Err("meta line 1: unknown key  image_digest"),
+        ),
+        ("=d\n", Err("meta line 1: unknown key ")),
+        (
+            "image_digest=d\nsnapshot_id=i\nsource_revision=r\ncontext=c\n\
+             start_command=s\nextra=x\n",
+            Err("meta line 6: unknown key extra"),
+        ),
+        (
+            "image_digest=d\n\nimage_digest=d\n",
+            Err("meta line 3: repeated key image_digest"),
+        ),
+        (
+            "image_digest=d\nsnapshot_id=i\nsource_revision=r\ncontext=c\n",
+            Err("meta: missing key start_command"),
+        ),
+        (
+            "image_digest=d\nsource_revision=r\nstart_command=s\n",
+            Err("meta: missing key snapshot_id"),
+        ),
+        ("", Err("meta: missing key image_digest")),
+    ];
+    for &(text, expected) in rows {
+        let parsed =
+            parse_corpus_meta(text).map(|meta| keys.map(|key| meta.get(key).map(str::to_owned)));
+        let wanted = expected
+            .map(|values| values.map(|value| Some(value.to_owned())))
+            .map_err(str::to_owned);
+        assert_eq!(parsed, wanted, "parse_corpus_meta({text:?})");
+    }
+
+    // The parser wired into the run reader: a valid run whose `meta.txt` is
+    // then rewritten with its digest refreshed, so that the parser and not
+    // a digest rejects it. The run fails, naming `meta.txt` and the cause,
+    // and CP-001 is NOT COMPARED.
+    let mut rewritten = TempCorpus::new("matching-meta");
+    rewritten.input("CP-001", &inputs);
+    rewritten.transcript("CP-001", &rust_transcript(&inputs));
+    rewritten.run(&[("CP-001", "RECORDED")]);
+    assert!(
+        matches!(
+            load_corpus_run(rewritten.path(), &ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "the run must verify before meta.txt is rewritten"
+    );
+    let four_keys = concat!(
+        "image_digest=synthetic\n",
+        "snapshot_id=synthetic\n",
+        "source_revision=synthetic\n",
+        r##"context={"DUZ":".5","IOF":"#","IOSL":"60","STATION":"500"}"##,
+        "\n",
+    );
+    let start = "start_command=docker exec -i vehu su - vehu -c \"<start command>\"\n";
+    for (text, reason) in [
+        (four_keys.to_string(), "meta: missing key start_command"),
+        (
+            format!("{four_keys}{start}extra=synthetic\n"),
+            "meta line 6: unknown key extra",
+        ),
+    ] {
+        rewritten.write("meta.txt", &text);
+        rewritten.sums();
+        let cause = format!("{}: {reason}", rewritten.path().join("meta.txt").display());
+        assert_eq!(
+            load_corpus_run(rewritten.path(), &ids),
+            Err(cause.clone()),
+            "run reader: {reason}"
+        );
+        let judged = crate_relative(&cause);
+        let judgement = judge(&rewritten, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+        assert_eq!(
+            judgement.integrity,
+            vec![judged.clone()],
+            "integrity: {reason}"
+        );
+        assert_eq!(
+            judgement.run_line,
+            integrity_line(&judged),
+            "run line: {reason}"
+        );
+        let verdict = verdict_of(&judgement, "CP-001");
+        assert_eq!(verdict.verdict, NOT_COMPARED, "detail: {}", verdict.detail);
+        assert_eq!(verdict.detail, RUN_INTEGRITY_FAILURE, "CP-001 detail");
+        assert_eq!(
+            (judgement.matched, judgement.in_scope),
+            (0, 0),
+            "MATCHED n OF m: {reason}"
+        );
+    }
+
+    // A valid `meta.txt` whose source revision holds a bidi override, its
+    // pop, an isolate pair and a line separator, its digest refreshed: the
+    // run verifies, the reader keeps the value raw, CP-001 matches, and the
+    // run line shows each of those characters as an escape and none raw.
+    let revision = "dd3f\u{202E}evil\u{202C}\u{2066}x\u{2069}\u{2028}end";
+    let spoofed = four_keys.replace(
+        "source_revision=synthetic\n",
+        &format!("source_revision={revision}\n"),
+    );
+    assert_ne!(spoofed, four_keys, "the source revision must be replaced");
+    rewritten.write("meta.txt", &format!("{spoofed}{start}"));
+    rewritten.sums();
+    match load_corpus_run(rewritten.path(), &ids) {
+        Ok(CorpusRun::Recorded { meta, .. }) => assert_eq!(
+            meta.get("source_revision"),
+            Some(revision),
+            "meta.txt source_revision, read raw"
+        ),
+        other => panic!("the run with format characters did not verify: {other:?}"),
+    }
+    let judgement = judge(&rewritten, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+    assert!(
+        judgement.integrity.is_empty(),
+        "format characters integrity: {:?}",
+        judgement.integrity
+    );
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(
+        verdict.verdict, MATCH,
+        "format characters detail: {}",
+        verdict.detail
+    );
+    assert_eq!(
+        judgement.run_line,
+        run_line.replace(
+            r#"source_revision=`"synthetic"`"#,
+            r#"source_revision=`"dd3f\u{202E}evil\u{202C}\u{2066}x\u{2069}\u{2028}end"`"#
+        ),
+        "run line with format characters"
+    );
+    assert!(
+        !judgement
+            .run_line
+            .contains(['\u{202E}', '\u{202C}', '\u{2066}', '\u{2069}', '\u{2028}']),
+        "the run line must hold no raw format character: {:?}",
+        judgement.run_line
+    );
+
+    // One verified run: CP-001 healthy, and CP-002 recorded with CP-003's
+    // input and that input's Rust transcript. Only CP-002 fails, its
+    // failure the only one and the run line's, and CP-001 stays MATCH.
+    let mut partial = TempCorpus::new("matching-case-failure");
+    let second = committed_inputs("CP-002");
+    let third = committed_inputs("CP-003");
+    assert_ne!(third, second, "CP-003's input must differ from CP-002's");
+    partial.input("CP-001", &inputs);
+    partial.transcript("CP-001", &rust_transcript(&inputs));
+    partial.input("CP-002", &third);
+    partial.transcript("CP-002", &rust_transcript(&third));
+    partial.run(&[("CP-001", "RECORDED"), ("CP-002", "RECORDED")]);
+    let named = crate_relative(
+        &corpus_input_path(partial.path(), "CP-002")
+            .display()
+            .to_string(),
+    );
+    let cause = format!("{named}: committed input differs from the generated model");
+    let judgement = judge(
+        &partial,
+        &[
+            entry("CP-001", CLASS_CP, &inputs, None),
+            entry("CP-002", CLASS_CP, &second, None),
+        ],
+    );
+    assert_eq!(judgement.integrity, [cause.as_str()], "integrity");
+    assert_eq!(judgement.run_line, integrity_line(&cause), "run line");
+    let healthy = verdict_of(&judgement, "CP-001");
+    assert_eq!(healthy.verdict, MATCH, "CP-001 detail: {}", healthy.detail);
+    assert_eq!(healthy.detail, NO_DETAIL, "CP-001 detail");
+    let failed = verdict_of(&judgement, "CP-002");
+    assert_eq!(
+        failed.verdict, NOT_COMPARED,
+        "CP-002 detail: {}",
+        failed.detail
+    );
+    assert_eq!(failed.detail, CASE_INTEGRITY_FAILURE, "CP-002 detail");
+    assert!(failed.recorded, "CP-002 is recorded");
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (1, 1),
+        "MATCHED n OF m"
+    );
+}
+
+/// A capture that differs at line 2 is MISMATCH, its cause naming that
+/// line with the capture as expected and the Rust transcript as actual.
+/// So is a changed line keeping a `SPEC.md` literal, attributed to its
+/// writer, an original `%YDB-E-` error line, a final `\n` removed or
+/// appended, and a failing Rust session. A class IN MISMATCH counts in m,
+/// and a CR one does not. Format characters stay raw in the cause and show
+/// as escapes in its report cell, and a line over 200 characters shows a
+/// window of 200 around its first difference, with its length.
+#[test]
+fn corpus_reader_mismatch_first_line() {
+    let mut folder = TempCorpus::new("mismatch");
+    let inputs = committed_inputs("CP-001");
+    let rust = rust_transcript(&inputs);
+    let capture = with_line(&rust, 2, "SYNTHETIC DIFFERENT LINE");
+    folder.input("CP-001", &inputs);
+    folder.transcript("CP-001", &capture);
+    folder.run(&[("CP-001", "RECORDED")]);
+    let judgement = judge(&folder, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(verdict.verdict, MISMATCH, "CP-001 verdict");
+    assert_eq!(
+        verdict.detail,
+        format!(
+            "transcript differs at line 2: expected {}, actual {}, not attributed",
+            quote("SYNTHETIC DIFFERENT LINE"),
+            quote(line_at(&rust, 2))
+        ),
+        "CP-001 detail: the capture is expected, the Rust transcript actual"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 1),
+        "MATCHED n OF m"
+    );
+
+    // Each capture below is CP-001's Rust transcript changed once, recorded
+    // with every digest fresh. A changed line keeping the literal of
+    // `ASK1^PRCHDP2` is attributed to it, although the shorter
+    // `ENTER '^' TO HALT: ` of `^PRCHDP2` is in it too. An original runtime
+    // error is a difference like any other, and so is the final line end.
+    let literal = "END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: ";
+    let (literal_number, literal_line) = line_containing(&rust, literal);
+    let changed_literal = format!("{literal_line} SYNTHETIC");
+    let error = "%YDB-E-UNDEF, Undefined local variable: SYNTHETIC";
+    let (error_number, error_line) = line_containing(&rust, "PC ORDER: ");
+    let (removed, appended) = final_newline_variants(&rust);
+    let lines = rust.split('\n').count();
+    // Line and paragraph separators, a bidi override with its pop and a
+    // zero-width joiner, which the cause keeps raw, as part 2's would.
+    let spoofing = "LS\u{2028}PS\u{2029} bidi \u{202E}evil\u{202C} zwj\u{200D} end";
+    let spoofed = format!(
+        "transcript differs at line 2: expected {}, actual {}, not attributed",
+        quote(spoofing),
+        quote(line_at(&rust, 2))
+    );
+    // A 5,000-character line, whose cause shows its first 200 characters
+    // and its length, where the whole line would make it over 5,000.
+    let long_line = format!("{}A{}", "X".repeat(3000), "X".repeat(1999));
+    let long_capture = with_line(&rust, 2, &long_line);
+    let cut = format!(
+        "transcript differs at line 2: expected {}… (5000 characters, 1 to 200 shown), \
+         actual {}, not attributed",
+        quote(&"X".repeat(200)),
+        quote(line_at(&rust, 2))
+    );
+    let whole = transcript_cause(&long_capture, &rust, &literal_rows(SPEC));
+    assert!(
+        cut.len() < 1_000 && whole.len() > 5_000,
+        "the cut cause must stay under 1,000 bytes ({}) where the whole line gives {}",
+        cut.len(),
+        whole.len()
+    );
+    let subcases = [
+        (
+            "mismatch-format-characters",
+            with_line(&rust, 2, spoofing),
+            spoofed.clone(),
+        ),
+        ("mismatch-long-line", long_capture.clone(), cut),
+        (
+            "mismatch-literal",
+            with_line(&rust, literal_number, &changed_literal),
+            format!(
+                "transcript differs at line {literal_number}: expected {}, actual {}, \
+                 attributed to ASK1^PRCHDP2",
+                quote(&changed_literal),
+                quote(literal_line)
+            ),
+        ),
+        (
+            "mismatch-original-error",
+            with_line(&rust, error_number, error),
+            format!(
+                "transcript differs at line {error_number}: expected {}, actual {}, \
+                 not attributed",
+                quote(error),
+                quote(error_line)
+            ),
+        ),
+        (
+            "mismatch-no-final-newline",
+            removed,
+            format!(
+                "transcript differs at line {lines}: expected {ABSENT_LINE}, actual {}, \
+                 not attributed",
+                quote("")
+            ),
+        ),
+        (
+            "mismatch-extra-final-newline",
+            appended,
+            format!(
+                "transcript differs at line {}: expected {}, actual {ABSENT_LINE}, \
+                 not attributed",
+                lines.saturating_add(1),
+                quote("")
+            ),
+        ),
+    ];
+    for (name, capture, detail) in subcases {
+        let judgement = judge_recorded(name, entry("CP-001", CLASS_CP, &inputs, None), &capture);
+        assert!(
+            judgement.integrity.is_empty(),
+            "{name} integrity: {:?}",
+            judgement.integrity
+        );
+        let verdict = verdict_of(&judgement, "CP-001");
+        assert_eq!(verdict.verdict, MISMATCH, "{name} verdict");
+        assert_eq!(verdict.detail, detail, "{name} detail");
+        assert_eq!(
+            (judgement.matched, judgement.in_scope),
+            (0, 1),
+            "{name} MATCHED n OF m"
+        );
+    }
+
+    // The report cell of the cause with format characters shows each of
+    // them as an escape and none raw, and every other character as the
+    // cause has it.
+    let shown = cell(&spoofed);
+    assert_eq!(
+        shown,
+        format!(
+            "transcript differs at line 2: expected {}, actual {}, not attributed",
+            r#"`"LS\u{2028}PS\u{2029} bidi \u{202E}evil\u{202C} zwj\u{200D} end"`"#,
+            quote(line_at(&rust, 2))
+        ),
+        "the cell of the cause with format characters"
+    );
+    assert!(
+        !shown.contains(['\u{2028}', '\u{2029}', '\u{202E}', '\u{202C}', '\u{200D}']),
+        "the cell must hold no raw format character: {shown:?}"
+    );
+    // `escape_format` alone. ASCII, other text and the escapes `one_line`
+    // writes pass unchanged, and so do the neighbours just outside a range;
+    // the first and last characters of ranges map to their escapes, a
+    // supplementary one with five digits.
+    let controls = one_line("\u{0}\u{1B}\u{7F}\u{85}\t\n");
+    for (text, wanted) in [
+        ("plain | `ASCII` 0-9 \\x00", "plain | `ASCII` 0-9 \\x00"),
+        ("— é € 漢 😀", "— é € 漢 😀"),
+        (controls.as_str(), "\\x00\\x1B\\x7F\\x85\\t\\n"),
+        (
+            "\u{2027}\u{202F}\u{2030}\u{2065}\u{E0000}\u{E0080}",
+            "\u{2027}\u{202F}\u{2030}\u{2065}\u{E0000}\u{E0080}",
+        ),
+        (
+            "\u{AD}\u{600}\u{605}\u{FEFF}\u{FFFB}",
+            "\\u{00AD}\\u{0600}\\u{0605}\\u{FEFF}\\u{FFFB}",
+        ),
+        (
+            "\u{110BD}\u{1D17A}\u{E0001}\u{E0020}\u{E007F}",
+            "\\u{110BD}\\u{1D17A}\\u{E0001}\\u{E0020}\\u{E007F}",
+        ),
+    ] {
+        assert_eq!(escape_format(text), wanted, "escape_format({text:?})");
+    }
+    // Inside a quote span a written `\u{202E}` keeps its doubled `\`, so it
+    // never reads as the escape of the character itself.
+    assert_eq!(
+        escape_format(&quote("\u{202E}")),
+        r#"`"\u{202E}"`"#,
+        "a quoted U+202E"
+    );
+    assert_eq!(
+        escape_format(&quote(r"\u{202E}")),
+        r#"`"\\u{202E}"`"#,
+        "a quoted written \\u{{202E}}"
+    );
+
+    // `corpus_cause` alone, on texts whose first differing line is long.
+    // Each window of 200 characters starts 40 before the first differing
+    // column, or ends at the line's end where that comes sooner, so it holds
+    // the difference; positions count characters, not bytes, and the
+    // attribution reads the whole expected line. A line of 200 characters
+    // is shown whole, by `transcript_cause` itself.
+    let x = |count: usize| "X".repeat(count);
+    let dash = |count: usize| "—".repeat(count);
+    let literals = literal_rows(SPEC);
+    let differs = |line: usize, expected: String, actual: String, attribution: &str| {
+        format!(
+            "transcript differs at line {line}: expected {expected}, actual {actual}, {attribution}"
+        )
+    };
+    let cuts = [
+        (
+            "differing far right",
+            format!("{}A{}", x(3000), x(1999)),
+            format!("{}B{}", x(3000), x(1999)),
+            differs(
+                1,
+                format!(
+                    "…{}… (5000 characters, 2961 to 3160 shown)",
+                    quote(&format!("{}A{}", x(40), x(159)))
+                ),
+                format!(
+                    "…{}… (5000 characters, 2961 to 3160 shown)",
+                    quote(&format!("{}B{}", x(40), x(159)))
+                ),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+        (
+            "differing near the end",
+            format!("same\n{}A{}", x(4990), x(9)),
+            format!("same\n{}B{}", x(4990), x(9)),
+            differs(
+                2,
+                format!(
+                    "…{} (5000 characters, 4801 to 5000 shown)",
+                    quote(&format!("{}A{}", x(190), x(9)))
+                ),
+                format!(
+                    "…{} (5000 characters, 4801 to 5000 shown)",
+                    quote(&format!("{}B{}", x(190), x(9)))
+                ),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+        (
+            "one line beginning the other",
+            x(300),
+            format!("{}TAIL", x(300)),
+            differs(
+                1,
+                format!("…{} (300 characters, 101 to 300 shown)", quote(&x(200))),
+                format!(
+                    "…{} (304 characters, 105 to 304 shown)",
+                    quote(&format!("{}TAIL", x(196)))
+                ),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+        (
+            "a long line against an absent one",
+            format!("a\n{}", x(201)),
+            "a".to_string(),
+            differs(
+                2,
+                format!("{}… (201 characters, 1 to 200 shown)", quote(&x(200))),
+                ABSENT_LINE.to_string(),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+        (
+            "a literal outside the window, multi-byte characters",
+            format!(
+                "END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: {}",
+                dash(250)
+            ),
+            format!(
+                "END OF DISPLAY--PRESS RETURN OR ENTER '^' TO HALT: {}A",
+                dash(249)
+            ),
+            differs(
+                1,
+                format!("…{} (301 characters, 102 to 301 shown)", quote(&dash(200))),
+                format!(
+                    "…{} (301 characters, 102 to 301 shown)",
+                    quote(&format!("{}A", dash(199)))
+                ),
+                "attributed to ASK1^PRCHDP2",
+            ),
+        ),
+        (
+            "control characters escaped inside the window",
+            "\u{0}".repeat(1000),
+            String::new(),
+            differs(
+                1,
+                format!(
+                    "{}… (1000 characters, 1 to 200 shown)",
+                    quote(&"\u{0}".repeat(200))
+                ),
+                quote(""),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+        (
+            "200 characters, shown whole",
+            x(200),
+            format!("{}Z", x(199)),
+            differs(
+                1,
+                quote(&x(200)),
+                quote(&format!("{}Z", x(199))),
+                NOT_ATTRIBUTED,
+            ),
+        ),
+    ];
+    for (what, expected, actual, wanted) in cuts {
+        let cause = corpus_cause(&expected, &actual, &literals);
+        assert_eq!(cause, wanted, "corpus_cause: {what}");
+        assert!(
+            cause.len() < 2_000,
+            "corpus_cause: {what}: {} bytes",
+            cause.len()
+        );
+    }
+    assert_eq!(
+        corpus_cause(&x(200), &format!("{}Z", x(199)), &literals),
+        transcript_cause(&x(200), &format!("{}Z", x(199)), &literals),
+        "corpus_cause of lines of 200 characters is transcript_cause"
+    );
+
+    // A valid capture judged on a store whose only order has a zero node
+    // holding only a descendant: the Rust session fails, which is MISMATCH
+    // with its error, inside m.
+    let corrupt = match Store::from_zwr(
+        "^PRC(442,0)=\"PROCUREMENT & ACCOUNTING TRANSACTIONS^442I^1^1\"\n\
+         ^PRC(442,1,0,1)=\"x\"\n\
+         ^PRC(442,\"C\",\"CP001\",1)=\"\"\n",
+    ) {
+        Ok(store) => store,
+        Err(err) => panic!("the corrupt store did not parse: {err}"),
+    };
+    let mut failing = TempCorpus::new("mismatch-rust-error");
+    failing.input("CP-001", &inputs);
+    failing.transcript("CP-001", &rust);
+    failing.run(&[("CP-001", "RECORDED")]);
+    let judgement = judge_corpus(
+        failing.path(),
+        &default_dir(),
+        &corrupt,
+        &[entry("CP-001", CLASS_CP, &inputs, None)],
+        &literal_rows(SPEC),
+    );
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(
+        verdict.verdict, MISMATCH,
+        "CP-001 verdict on the corrupt store"
+    );
+    assert_eq!(
+        verdict.detail, "rust session error: CORRUPT STORE ^PRC(442,1,0)",
+        "CP-001 detail on the corrupt store"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 1),
+        "MATCHED n OF m on the corrupt store"
+    );
+
+    // CP-001 MATCH beside the class IN case CE-01 and the CR case CR-01,
+    // each captured with line 2 changed: the IN MISMATCH counts in m, and
+    // the CR one does not.
+    let mut mixed = TempCorpus::new("mismatch-mixed");
+    let edge = committed_inputs("CE-01");
+    let edge_rust = rust_transcript(&edge);
+    let (gc, replay) = cr_case("CR-01");
+    let replay_rust = rust_transcript(&replay);
+    mixed.input("CP-001", &inputs);
+    mixed.transcript("CP-001", &rust);
+    mixed.input("CE-01", &edge);
+    mixed.transcript("CE-01", &with_line(&edge_rust, 2, "SYNTHETIC IN LINE"));
+    mixed.input("CR-01", &replay);
+    mixed.transcript("CR-01", &with_line(&replay_rust, 2, "SYNTHETIC CR LINE"));
+    mixed.run(&[
+        ("CP-001", "RECORDED"),
+        ("CE-01", "RECORDED"),
+        ("CR-01", "RECORDED"),
+    ]);
+    let judgement = judge(
+        &mixed,
+        &[
+            entry("CP-001", CLASS_CP, &inputs, None),
+            entry("CE-01", CLASS_IN, &edge, None),
+            entry("CR-01", CLASS_CR, &replay, Some(gc)),
+        ],
+    );
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(verdict.verdict, MATCH, "CP-001 detail: {}", verdict.detail);
+    for (id, changed, transcript) in [
+        ("CE-01", "SYNTHETIC IN LINE", &edge_rust),
+        ("CR-01", "SYNTHETIC CR LINE", &replay_rust),
+    ] {
+        let verdict = verdict_of(&judgement, id);
+        assert_eq!(verdict.verdict, MISMATCH, "{id} verdict");
+        assert_eq!(
+            verdict.detail,
+            format!(
+                "transcript differs at line 2: expected {}, actual {}, not attributed",
+                quote(changed),
+                quote(line_at(transcript, 2))
+            ),
+            "{id} detail"
+        );
+    }
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (1, 2),
+        "MATCHED n OF m counts CP-001 and CE-01 only"
+    );
+}
+
+/// A case the run summary marks QUARANTINED is QUARANTINED and outside m.
+/// A failed case or run integrity check and a missing transcript each win
+/// over the quarantine, a BOUNDARY case stays BOUNDARY with or without one,
+/// and a quarantined CR case keeps its world label.
+/// Any status other than RECORDED or QUARANTINED fails the run. The exit
+/// statuses are evidence only and change nothing. A DIFF line naming the
+/// export or a case fails the run beside exports=IDENTICAL and
+/// runs=IDENTICAL, naming its line, and beside a DIFFERENT identity line,
+/// before or after it, the identity line fails the run.
+#[test]
+fn corpus_reader_quarantined() {
+    let mut folder = TempCorpus::new("quarantined");
+    let inputs = committed_inputs("CP-001");
+    folder.input("CP-001", &inputs);
+    folder.transcript("CP-001", &rust_transcript(&inputs));
+    folder.run(&[("CP-001", "QUARANTINED")]);
+    let ids = ["CP-001".to_string()];
+    assert!(
+        matches!(
+            load_corpus_run(folder.path(), &ids),
+            Ok(CorpusRun::Recorded { quarantined, .. }) if quarantined == ids
+        ),
+        "the run must record CP-001 as quarantined"
+    );
+    let judgement = judge(&folder, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    assert_eq!(
+        verdict_of(&judgement, "CP-001").verdict,
+        QUARANTINED,
+        "CP-001 verdict"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m"
+    );
+
+    // A quarantined CP-001 recorded with CP-002's input, its capture that
+    // input's Rust transcript and every digest fresh: the run verifies and
+    // records the quarantine, but the case's own integrity failure wins.
+    let mut changed = TempCorpus::new("quarantined-changed-input");
+    let other = committed_inputs("CP-002");
+    assert_ne!(other, inputs, "CP-002's input must differ from CP-001's");
+    changed.input("CP-001", &other);
+    changed.transcript("CP-001", &rust_transcript(&other));
+    changed.run(&[("CP-001", "QUARANTINED")]);
+    assert!(
+        matches!(
+            load_corpus_run(changed.path(), &ids),
+            Ok(CorpusRun::Recorded { quarantined, .. }) if quarantined == ids
+        ),
+        "the run must record CP-001 as quarantined"
+    );
+    let named = crate_relative(
+        &corpus_input_path(changed.path(), "CP-001")
+            .display()
+            .to_string(),
+    );
+    let cause = format!("{named}: committed input differs from the generated model");
+    let judgement = judge(&changed, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+    assert_eq!(judgement.integrity, [cause.as_str()], "integrity");
+    assert_eq!(judgement.run_line, integrity_line(&cause), "run line");
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(verdict.verdict, NOT_COMPARED, "detail: {}", verdict.detail);
+    assert_eq!(verdict.detail, CASE_INTEGRITY_FAILURE, "CP-001 detail");
+    assert!(verdict.recorded, "CP-001 is recorded");
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m"
+    );
+
+    // A quarantined CP-001 whose run has no digest list: the run's
+    // integrity failure wins.
+    let mut unhashed = TempCorpus::new("quarantined-no-sums");
+    unhashed.input("CP-001", &inputs);
+    unhashed.transcript("CP-001", &rust_transcript(&inputs));
+    unhashed.run_files(&[("CP-001", "QUARANTINED")]);
+    let missing = format!("{}: missing", unhashed.path().join(SUMS_NAME).display());
+    let judgement = judge(&unhashed, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+    assert_eq!(
+        judgement.integrity.first(),
+        Some(&missing),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    assert_eq!(judgement.run_line, integrity_line(&missing), "run line");
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(verdict.verdict, NOT_COMPARED, "detail: {}", verdict.detail);
+    assert_eq!(verdict.detail, RUN_INTEGRITY_FAILURE, "CP-001 detail");
+    assert!(verdict.recorded, "CP-001 is recorded");
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m"
+    );
+
+    // One verified run: CP-001 recorded and MATCH; CP-002 quarantined with
+    // no transcript, which is NOT COMPARED; CE-17 recorded and CE-18
+    // quarantined, each with a usable capture and each BOUNDARY; CR-01
+    // quarantined with a capture equal to its GC capture, which is
+    // QUARANTINED and keeps its WORLD-INDEPENDENT label.
+    let mut mixed = TempCorpus::new("quarantined-precedence");
+    let absent = committed_inputs("CP-002");
+    let recorded_boundary = committed_inputs("CE-17");
+    let quarantined_boundary = committed_inputs("CE-18");
+    let (gc, replay) = cr_case("CR-01");
+    mixed.input("CP-001", &inputs);
+    mixed.transcript("CP-001", &rust_transcript(&inputs));
+    mixed.input("CP-002", &absent);
+    mixed.input("CE-17", &recorded_boundary);
+    mixed.transcript("CE-17", "SYNTHETIC BOUNDARY CAPTURE\n");
+    mixed.input("CE-18", &quarantined_boundary);
+    mixed.transcript("CE-18", "SYNTHETIC QUARANTINED BOUNDARY CAPTURE\n");
+    mixed.input("CR-01", &replay);
+    mixed.transcript("CR-01", &gc_transcript(gc));
+    let statuses = [
+        ("CP-001", "RECORDED"),
+        ("CP-002", "QUARANTINED"),
+        ("CE-17", "RECORDED"),
+        ("CE-18", "QUARANTINED"),
+        ("CR-01", "QUARANTINED"),
+    ];
+    mixed.run(&statuses);
+    let mixed_ids: Vec<String> = statuses.iter().map(|(id, _)| id.to_string()).collect();
+    let quarantined_ids = [
+        "CP-002".to_string(),
+        "CE-18".to_string(),
+        "CR-01".to_string(),
+    ];
+    assert!(
+        matches!(
+            load_corpus_run(mixed.path(), &mixed_ids),
+            Ok(CorpusRun::Recorded { quarantined, .. }) if quarantined == quarantined_ids
+        ),
+        "the run must record CP-002, CE-18 and CR-01 as quarantined"
+    );
+    let judgement = judge(
+        &mixed,
+        &[
+            entry("CP-001", CLASS_CP, &inputs, None),
+            entry("CP-002", CLASS_CP, &absent, None),
+            entry("CE-17", CLASS_BOUNDARY, &recorded_boundary, None),
+            entry("CE-18", CLASS_BOUNDARY, &quarantined_boundary, None),
+            entry("CR-01", CLASS_CR, &replay, Some(gc)),
+        ],
+    );
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    assert!(
+        judgement
+            .run_line
+            .starts_with("Recording run: image_digest="),
+        "run line: {}",
+        judgement.run_line
+    );
+    for (id, wanted, detail, recorded) in [
+        ("CP-001", MATCH, NO_DETAIL, true),
+        ("CP-002", NOT_COMPARED, NO_CAPTURE, false),
+        ("CE-17", BOUNDARY, NO_DETAIL, true),
+        ("CE-18", BOUNDARY, NO_DETAIL, true),
+        ("CR-01", QUARANTINED, NO_DETAIL, true),
+    ] {
+        let verdict = verdict_of(&judgement, id);
+        assert_eq!(verdict.verdict, wanted, "{id} detail: {}", verdict.detail);
+        assert_eq!(verdict.detail, detail, "{id} detail");
+        assert_eq!(verdict.recorded, recorded, "{id} recorded");
+    }
+    let world = world_of(verdict_of(&judgement, "CR-01"));
+    assert_eq!(world.gc, gc, "CR-01 GC case");
+    assert_eq!(world.label, WORLD_INDEPENDENT, "detail: {}", world.detail);
+    assert_eq!(world.detail, NO_DETAIL, "CR-01 label detail");
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (1, 1),
+        "MATCHED n OF m counts CP-001 only"
+    );
+
+    // Every digest matches in each folder below, so only the summary's own
+    // rules decide. A status other than exactly RECORDED or QUARANTINED, a
+    // lower-case spelling included, fails the run and names the status.
+    let head = format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\nruns=IDENTICAL\n");
+    let statuses = [
+        ("skipped", "SKIPPED"),
+        ("lower-case", "quarantined"),
+        ("empty", ""),
+    ];
+    for (name, status) in statuses {
+        let summary = format!("{head}CP-001\t{status}\t0\t0\nCE-17\tRECORDED\t0\t0\n");
+        let folder = recorded_pair(
+            &format!("quarantined-status-{name}"),
+            "run-summary.txt",
+            Some(&summary),
+        );
+        let fragment = format!("line 4: status {status} is neither RECORDED nor QUARANTINED");
+        assert_run_fails(&folder, "run-summary.txt", &fragment);
+    }
+    // Nonzero, absent or odd exit statuses leave the run recorded and
+    // CP-001 QUARANTINED.
+    let evidence = [
+        (
+            "nonzero exit statuses",
+            "CP-001\tQUARANTINED\t255\t1\nCE-17\tRECORDED\t0\t0\n",
+        ),
+        ("no exit statuses", "CP-001\tQUARANTINED\nCE-17\tRECORDED\n"),
+        (
+            "odd exit statuses",
+            "CP-001\tQUARANTINED\t-\tx\nCE-17\tRECORDED\t0\t0\n",
+        ),
+    ];
+    for (index, (what, cases)) in evidence.into_iter().enumerate() {
+        let folder = recorded_pair(
+            &format!("quarantined-evidence-{index}"),
+            "run-summary.txt",
+            Some(&format!("{head}{cases}")),
+        );
+        assert_cp_quarantined(&folder, what);
+    }
+    // record_corpus.sh writes a DIFF line only beside a DIFFERENT identity
+    // line, so one beside two IDENTICAL lines contradicts them and fails the
+    // run at the first DIFF line. Beside a DIFFERENT line, before or after
+    // it, the identity line fails the run instead.
+    let cases = "CP-001\tQUARANTINED\t0\t0\nCE-17\tRECORDED\t0\t0\n";
+    let contradiction = "DIFF contradicts exports=IDENTICAL and runs=IDENTICAL";
+    let diffs = [
+        (
+            format!("{head}{cases}DIFF\texport\n"),
+            format!("line 6: {contradiction}"),
+        ),
+        (
+            format!("{head}{cases}DIFF\tCP-001\n"),
+            format!("line 6: {contradiction}"),
+        ),
+        (
+            format!("{head}{cases}DIFF\texport\nDIFF\tCP-001\nDIFF\tCE-17\n"),
+            format!("line 6: {contradiction}"),
+        ),
+        (
+            format!("DIFF\tCE-17\n{head}{cases}"),
+            format!("line 1: {contradiction}"),
+        ),
+        (
+            format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\nruns=DIFFERENT\n{cases}DIFF\tCP-001\n"),
+            "runs=DIFFERENT".to_string(),
+        ),
+        (
+            format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\nDIFF\tCP-001\nruns=DIFFERENT\n{cases}"),
+            "runs=DIFFERENT".to_string(),
+        ),
+        (
+            format!("exports=DIFFERENT\n{SUMMARY_DIGEST}\nruns=IDENTICAL\n{cases}DIFF\texport\n"),
+            "exports=DIFFERENT".to_string(),
+        ),
+    ];
+    for (index, (summary, fragment)) in diffs.iter().enumerate() {
+        let folder = recorded_pair(
+            &format!("quarantined-diff-{index}"),
+            "run-summary.txt",
+            Some(summary),
+        );
+        assert_run_fails(&folder, "run-summary.txt", fragment);
+    }
+}
+
+/// Transcripts without a digest list fail the recording run, which names
+/// the missing file, and leave each non-BOUNDARY case NOT COMPARED. A
+/// BOUNDARY case stays BOUNDARY, and its transcript, present but unhashed,
+/// still shows as recorded although the case does not load. A CR case's
+/// world label is NOT COMPARED too. A digest list that exists fails both
+/// readers, naming the file or the 1-based line at fault, when it leaves
+/// out a present transcript, lists a path outside the allowlist (through
+/// `..`, absolute, starting `./`, an unknown id, another file name or a
+/// bare id), holds a line that is not a digest and a path, or lists a path
+/// twice. A line for a corpus case outside the run's cases fails the run
+/// only, and a binary-mode line is accepted.
+/// A missing `meta.txt` or `run-summary.txt`, the other files present and
+/// hashed, fails the run the same way, naming that file, and so does a
+/// correctly hashed summary that breaks any of its rules. Markup that a
+/// rejected run file holds and its cause quotes, an image, an HTML element,
+/// a link or a backtick run, stays inside the run line's code span.
+#[test]
+fn corpus_reader_missing_sha256sums() {
+    let mut folder = TempCorpus::new("missing-sums");
+    let inputs = committed_inputs("CP-001");
+    let boundary = committed_inputs("CE-17");
+    folder.input("CP-001", &inputs);
+    folder.transcript("CP-001", &rust_transcript(&inputs));
+    folder.input("CE-17", &boundary);
+    folder.transcript("CE-17", "SYNTHETIC BOUNDARY CAPTURE\n");
+    let (gc, replay) = cr_case("CR-01");
+    folder.input("CR-01", &replay);
+    folder.transcript("CR-01", &gc_transcript(gc));
+    folder.run_files(&[
+        ("CP-001", "RECORDED"),
+        ("CE-17", "RECORDED"),
+        ("CR-01", "RECORDED"),
+    ]);
+    let ids = [
+        "CP-001".to_string(),
+        "CE-17".to_string(),
+        "CR-01".to_string(),
+    ];
+    match load_corpus_run(folder.path(), &ids) {
+        Err(cause) => assert!(cause.contains(SUMS_NAME), "cause: {cause}"),
+        Ok(run) => panic!("a run without its digest list loaded: {run:?}"),
+    }
+    assert!(
+        load_corpus_case(folder.path(), "CE-17").is_err(),
+        "an unhashed CE-17 transcript must not load"
+    );
+    let judgement = judge(
+        &folder,
+        &[
+            entry("CP-001", CLASS_CP, &inputs, None),
+            entry("CE-17", CLASS_BOUNDARY, &boundary, None),
+            entry("CR-01", CLASS_CR, &replay, Some(gc)),
+        ],
+    );
+    let boundary_verdict = verdict_of(&judgement, "CE-17");
+    assert_eq!(boundary_verdict.verdict, BOUNDARY, "CE-17 verdict");
+    assert!(
+        boundary_verdict.recorded,
+        "CE-17's transcript exists, so it is recorded although it does not load"
+    );
+    assert!(
+        judgement
+            .integrity
+            .iter()
+            .any(|cause| cause.contains(SUMS_NAME)),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    assert!(
+        judgement
+            .run_line
+            .starts_with("Recording run: INTEGRITY FAIL:"),
+        "run line: {}",
+        judgement.run_line
+    );
+    let verdict = verdict_of(&judgement, "CP-001");
+    assert_eq!(verdict.verdict, NOT_COMPARED, "CP-001 verdict");
+    assert_eq!(verdict.detail, RUN_INTEGRITY_FAILURE, "CP-001 detail");
+    // CR-01's capture equals its GC capture, yet the failed run makes the
+    // case and its world label NOT COMPARED.
+    let verdict = verdict_of(&judgement, "CR-01");
+    assert_eq!(verdict.verdict, NOT_COMPARED, "CR-01 verdict");
+    assert_eq!(verdict.detail, RUN_INTEGRITY_FAILURE, "CR-01 detail");
+    assert!(verdict.recorded, "CR-01 is recorded");
+    let world = world_of(verdict);
+    assert_eq!(world.label, NOT_COMPARED, "CR-01 label");
+    assert_eq!(world.detail, RUN_INTEGRITY_FAILURE, "CR-01 label detail");
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m"
+    );
+
+    // The digest list's own rules, on a valid CP-001 run whose listing is
+    // then rewritten here with one change at a time. Each line names a file
+    // with that file's own digest wherever the file exists, so only the
+    // rule under test can reject it.
+    let cp_ids = ["CP-001".to_string()];
+    let rust = rust_transcript(&inputs);
+    let mut listing = TempCorpus::new("missing-sums-listing");
+    listing.input("CP-001", &inputs);
+    listing.transcript("CP-001", &rust);
+    listing.run(&[("CP-001", "RECORDED")]);
+    assert!(
+        matches!(
+            load_corpus_run(listing.path(), &cp_ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "the valid run must load"
+    );
+    // The valid listing as `TempCorpus::sums` wrote it, rebuilt from the
+    // digests recorded when each file was written, so no capture file is
+    // read back.
+    let mut written: Vec<(String, String)> = listing
+        .written
+        .iter()
+        .filter(|(relative, _)| relative != SUMS_NAME)
+        .cloned()
+        .collect();
+    written.sort();
+    assert_eq!(
+        written
+            .iter()
+            .map(|(relative, _)| relative.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "BASE.txt",
+            "CP-001/input.txt",
+            "CP-001/transcript.txt",
+            "meta.txt",
+            "run-summary.txt"
+        ],
+        "the valid listing, one line per file"
+    );
+    let valid: Vec<String> = written
+        .iter()
+        .map(|(relative, digest)| format!("{digest}  {relative}"))
+        .collect();
+    let digest_of = |relative: &str| {
+        written
+            .iter()
+            .find(|(listed, _)| listed == relative)
+            .map(|(_, digest)| digest.clone())
+            .unwrap_or_default()
+    };
+    let listing_text =
+        |lines: &[String]| -> String { lines.iter().map(|line| format!("{line}\n")).collect() };
+    let sums_path = listing.path().join(SUMS_NAME).display().to_string();
+
+    // A listing that leaves out the present transcript: both readers refuse
+    // the transcript as unlisted.
+    let unlisted: Vec<String> = valid
+        .iter()
+        .filter(|line| !line.ends_with("  CP-001/transcript.txt"))
+        .cloned()
+        .collect();
+    assert_eq!(unlisted.len(), 4, "one line must be left out");
+    listing.write(SUMS_NAME, &listing_text(&unlisted));
+    let not_listed = format!(
+        "{}: not listed in SHA256SUMS",
+        listing
+            .path()
+            .join("CP-001")
+            .join("transcript.txt")
+            .display()
+    );
+    assert_eq!(
+        load_corpus_run(listing.path(), &cp_ids),
+        Err(not_listed.clone()),
+        "run with its transcript unlisted"
+    );
+    assert_eq!(
+        load_corpus_case(listing.path(), "CP-001"),
+        Err(not_listed),
+        "CP-001 with its transcript unlisted"
+    );
+
+    // One line after the five valid ones, so line 6, that breaks a line
+    // rule: a path outside the allowlist, a line that is not a digest and a
+    // path as `shasum -a 256` writes them, or a path listed a second time.
+    // Both readers apply the same rules to every line.
+    let meta = digest_of("meta.txt");
+    let input = digest_of("CP-001/input.txt");
+    let upper = meta.to_uppercase();
+    assert_ne!(upper, meta, "the meta.txt digest must hold a hex letter");
+    let short: String = meta.chars().skip(1).collect();
+    let absolute_meta = listing.path().join("meta.txt").display().to_string();
+    let not_allowed = "path not allowed";
+    let not_a_line = "not a SHA-256 digest and path";
+    let refused = [
+        (format!("{input}  ../CP-001/input.txt"), not_allowed),
+        (format!("{meta}  {absolute_meta}"), not_allowed),
+        (format!("{meta}  ./meta.txt"), not_allowed),
+        (format!("{input}  CP-201/input.txt"), not_allowed),
+        (format!("{input}  CP-001/other.txt"), not_allowed),
+        (format!("{input}  CP-001"), not_allowed),
+        (format!("{short}  meta.txt"), not_a_line),
+        (format!("{upper}  meta.txt"), not_a_line),
+        (format!("{meta} meta.txt"), not_a_line),
+        (meta.clone(), not_a_line),
+        (format!("{meta}\tmeta.txt"), not_a_line),
+        (format!("{meta}  meta.txt"), "path listed twice"),
+    ];
+    for (line, cause) in refused {
+        let lines: Vec<String> = valid.iter().cloned().chain([line.clone()]).collect();
+        listing.write(SUMS_NAME, &listing_text(&lines));
+        let expected = format!("{sums_path}: line 6: {cause}");
+        assert_eq!(
+            load_corpus_run(listing.path(), &cp_ids),
+            Err(expected.clone()),
+            "run listing {line:?}"
+        );
+        assert_eq!(
+            load_corpus_case(listing.path(), "CP-001"),
+            Err(expected),
+            "CP-001 listing {line:?}"
+        );
+    }
+
+    // A line for CP-002, a corpus case outside this run's cases: the run
+    // refuses it, while the case reader, which allows every corpus id and
+    // compares only its own case's lines, loads CP-001.
+    let other_case: Vec<String> = valid
+        .iter()
+        .cloned()
+        .chain([format!("{input}  CP-002/input.txt")])
+        .collect();
+    listing.write(SUMS_NAME, &listing_text(&other_case));
+    assert_eq!(
+        load_corpus_run(listing.path(), &cp_ids),
+        Err(format!("{sums_path}: line 6: {not_allowed}")),
+        "run listing another case"
+    );
+    assert!(
+        matches!(
+            load_corpus_case(listing.path(), "CP-001"),
+            Ok(case) if case.transcript.as_deref() == Some(rust.as_str())
+        ),
+        "CP-001 must load beside another case's line"
+    );
+
+    // The binary-mode marker of `shasum`, a space and `*`, is accepted.
+    let binary: Vec<String> = valid
+        .iter()
+        .map(|line| match line.strip_suffix("  meta.txt") {
+            Some(digest) => format!("{digest} *meta.txt"),
+            None => line.clone(),
+        })
+        .collect();
+    assert_ne!(binary, valid, "the meta.txt line must be marked binary");
+    listing.write(SUMS_NAME, &listing_text(&binary));
+    assert!(
+        matches!(
+            load_corpus_run(listing.path(), &cp_ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "a binary-mode line must load"
+    );
+    assert!(
+        matches!(
+            load_corpus_case(listing.path(), "CP-001"),
+            Ok(case) if case.transcript.as_deref() == Some(rust.as_str())
+        ),
+        "CP-001 must load beside a binary-mode line"
+    );
+
+    for file in ["meta.txt", "run-summary.txt"] {
+        let folder = recorded_pair(&format!("missing-sums-no-{file}"), file, None);
+        assert_run_fails(&folder, file, "missing");
+    }
+    // Each summary below breaks one rule, and its digest is listed afresh.
+    let head = format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\nruns=IDENTICAL\n");
+    let cases = "CP-001\tRECORDED\t0\t0\nCE-17\tRECORDED\t0\t0\n";
+    let summaries = [
+        (
+            format!("exports=DIFFERENT\n{SUMMARY_DIGEST}\nruns=IDENTICAL\n{cases}"),
+            "exports=DIFFERENT",
+        ),
+        (
+            format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\nruns=DIFFERENT\n{cases}"),
+            "runs=DIFFERENT",
+        ),
+        (
+            format!("{SUMMARY_DIGEST}\nruns=IDENTICAL\n{cases}"),
+            "missing exports= line",
+        ),
+        (
+            format!("exports=IDENTICAL\n{SUMMARY_DIGEST}\n{cases}"),
+            "missing runs= line",
+        ),
+        (
+            format!("exports=IDENTICAL\nruns=IDENTICAL\n{cases}"),
+            "missing export_sha256= line",
+        ),
+        (
+            format!("{head}exports=IDENTICAL\n{cases}"),
+            "line 4: repeated exports=",
+        ),
+        (
+            format!("{head}runs=IDENTICAL\n{cases}"),
+            "line 4: repeated runs=",
+        ),
+        (
+            format!("{head}{SUMMARY_DIGEST}\n{cases}"),
+            "line 4: repeated export_sha256=",
+        ),
+        (
+            format!(
+                "exports=IDENTICAL\n{}\nruns=IDENTICAL\n{cases}",
+                "export_sha256=0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+            ),
+            "line 2: export_sha256 is not 64 lower-case hex digits",
+        ),
+        (
+            format!(
+                "exports=IDENTICAL\n{}\nruns=IDENTICAL\n{cases}",
+                "export_sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"
+            ),
+            "line 2: export_sha256 is not 64 lower-case hex digits",
+        ),
+        (
+            format!("{head}CE-17\tRECORDED\t0\t0\n"),
+            "missing case CP-001",
+        ),
+        (
+            format!("{head}{cases}CP-001\tRECORDED\t0\t0\n"),
+            "line 6: repeated case CP-001",
+        ),
+        (
+            format!("{head}{cases}CP-002\tRECORDED\t0\t0\n"),
+            "line 6: unexpected case CP-002",
+        ),
+        (
+            format!("{head}{cases}SYNTHETIC LINE\n"),
+            "line 6: not recognised",
+        ),
+        (
+            format!("{head}{cases}DIFF\tCP-999\n"),
+            "line 6: DIFF names neither the export nor a case: CP-999",
+        ),
+        (
+            format!("{head}{cases}DIFF\tCP-002\n"),
+            "line 6: DIFF names neither the export nor a case: CP-002",
+        ),
+        (
+            format!("{head}{cases}DIFF\tnothing\n"),
+            "line 6: DIFF names neither the export nor a case: nothing",
+        ),
+    ];
+    for (index, (summary, fragment)) in summaries.iter().enumerate() {
+        let folder = recorded_pair(
+            &format!("missing-sums-summary-{index}"),
+            "run-summary.txt",
+            Some(summary),
+        );
+        assert_run_fails(&folder, "run-summary.txt", fragment);
+    }
+
+    // Hostile markup in a rejected run file, quoted by the cause, reaches
+    // the run line only inside its code span: an image, an HTML element
+    // with a handler, a link and a backtick run. Each run line is spelled
+    // out here, its fence one backtick longer than the longest run in the
+    // cause, so the payload can neither close the span nor render.
+    let hostile_meta = format!(
+        "image_digest=synthetic\nsnapshot_id=synthetic\nsource_revision=synthetic\n\
+         context={SYNTHETIC_CONTEXT}\nstart_command={SYNTHETIC_START}\n\
+         ![t](https://example.invalid/pixel)=synthetic\n"
+    );
+    let hostile = [
+        (
+            "image",
+            "meta.txt",
+            hostile_meta,
+            "meta line 6: unknown key ![t](https://example.invalid/pixel)",
+            "`",
+        ),
+        (
+            "html",
+            "run-summary.txt",
+            format!("{head}{cases}<img src=x onerror=alert(1)>\tRECORDED\t0\t0\n"),
+            "line 6: unexpected case <img src=x onerror=alert(1)>",
+            "`",
+        ),
+        (
+            "link",
+            "run-summary.txt",
+            format!(
+                "exports=[phish](https://example.invalid)\n{SUMMARY_DIGEST}\nruns=IDENTICAL\n{cases}"
+            ),
+            "exports=[phish](https://example.invalid)",
+            "`",
+        ),
+        (
+            "backticks",
+            "run-summary.txt",
+            format!("{head}CP-001\t``x``\t0\t0\nCE-17\tRECORDED\t0\t0\n"),
+            "line 4: status ``x`` is neither RECORDED nor QUARANTINED",
+            "```",
+        ),
+    ];
+    for (name, file, text, payload, fence) in hostile {
+        let folder = recorded_pair(&format!("missing-sums-hostile-{name}"), file, Some(&text));
+        assert_run_fails(&folder, file, payload);
+        let judgement = judge(&folder, &pair_entries());
+        let cause = judgement.integrity.first().cloned().unwrap_or_default();
+        assert!(
+            !cause.contains(['"', '\\'])
+                && !cause.contains(char::is_control)
+                && cause.matches('`').count() == payload.matches('`').count(),
+            "{name}: only the payload may hold a backtick, and nothing a code span escapes: \
+             {cause:?}"
+        );
+        assert_eq!(
+            judgement.run_line,
+            format!("Recording run: INTEGRITY FAIL: {fence}\"{cause}\"{fence}"),
+            "{name}: the payload stays inside the run line's code span"
+        );
+    }
+}
+
+/// A transcript changed by one byte after the digest list was written
+/// fails the recording run, which names that transcript.
+///
+/// The folder first holds a verified run of every class: CP-001 MATCH,
+/// CP-002 MISMATCH at a line holding `|` and a backtick, CP-003
+/// QUARANTINED, the IN case CE-01 with no capture, the BOUNDARY case CE-17
+/// with one, and CR-01 equal to its GC capture. Rendered by
+/// `corpus_block` with a synthetic model holding one class move, one
+/// finding and one dropped variant, every table of the `### Parity corpus`
+/// block is exact, row for row: the run line shows the `meta.txt` values,
+/// the export digest and `exports=IDENTICAL runs=IDENTICAL`, the MISMATCH
+/// cell escapes `|` and widens its code-span fence, and [`run_failures`]
+/// reports nothing. After the edit, the rendered run line reads
+/// `INTEGRITY FAIL: <cause>`, every non-BOUNDARY case and the CR world
+/// label are NOT COMPARED for the run's failure, the BOUNDARY case stays
+/// BOUNDARY and recorded, and [`run_failures`] lists a GC FAIL, then a
+/// failed harness check, then each corpus integrity failure.
+///
+/// Each other listed file, the input, `meta.txt`, `run-summary.txt` and
+/// `BASE.txt`, replaced with valid text under its stale digest, fails the
+/// run too, which leaves CP-001 NOT COMPARED. The case reader binds the
+/// text it returns to the digest list on every call, so a case file
+/// replaced or deleted after the run verified fails it, naming that file.
+/// Judged against the run read first, a transcript replaced, added or
+/// removed with the listing rewritten to match fails its case, naming its
+/// transcript, although a fresh read verifies the new listing. So does an
+/// input relisted that way, even the model's own, naming its input, while
+/// an input the run lists without its final newline, or does not list,
+/// is accepted.
+#[test]
+fn corpus_reader_edited_transcript() {
+    let mut folder = TempCorpus::new("edited");
+    let inputs = committed_inputs("CP-001");
+    let rust = rust_transcript(&inputs);
+    let differing = committed_inputs("CP-002");
+    let paging = committed_inputs("CP-003");
+    let edge = committed_inputs("CE-01");
+    let boundary = committed_inputs("CE-17");
+    let (gc, replay) = cr_case("CR-01");
+    folder.input("CP-001", &inputs);
+    folder.transcript("CP-001", &rust);
+    folder.input("CP-002", &differing);
+    folder.transcript(
+        "CP-002",
+        &with_line(&rust_transcript(&differing), 2, "A|B `C`"),
+    );
+    folder.input("CP-003", &paging);
+    folder.transcript("CP-003", &rust_transcript(&paging));
+    folder.input("CE-01", &edge);
+    folder.input("CE-17", &boundary);
+    folder.transcript("CE-17", "SYNTHETIC BOUNDARY CAPTURE\n");
+    folder.input("CR-01", &replay);
+    folder.transcript("CR-01", &gc_transcript(gc));
+    folder.run(&[
+        ("CP-001", "RECORDED"),
+        ("CP-002", "RECORDED"),
+        ("CP-003", "QUARANTINED"),
+        ("CE-01", "RECORDED"),
+        ("CE-17", "RECORDED"),
+        ("CR-01", "RECORDED"),
+    ]);
+    let model = corpus::Corpus {
+        cases: vec![
+            model_case("CP-001", corpus::Class::Cp, &inputs, None),
+            model_case("CP-002", corpus::Class::Cp, &differing, None),
+            model_case("CP-003", corpus::Class::Cp, &paging, None),
+            model_case("CE-01", corpus::Class::In, &edge, None),
+            model_case(
+                "CE-17",
+                corpus::Class::Boundary,
+                &boundary,
+                Some("PO-09.b6"),
+            ),
+            model_case("CR-01", corpus::Class::Cr, &replay, None),
+        ],
+        records: Vec::new(),
+        drops: vec![corpus::DroppedVariant {
+            round: 1,
+            case: "CP-002".to_string(),
+            dimension: "item.cost".to_string(),
+            value: "3dp".to_string(),
+            branch: "PO-30.b2".to_string(),
+        }],
+        moves: vec![corpus::ClassMove {
+            case: "CE-04".to_string(),
+            from: corpus::Class::In,
+            to: corpus::Class::Boundary,
+            branch: "PO-09.b11".to_string(),
+        }],
+        findings: vec![corpus::Finding {
+            case: "CP-003".to_string(),
+            branch: "PO-30.b1".to_string(),
+            cause: "synthetic | finding".to_string(),
+        }],
+        rounds: 2,
+        largest_item_count: 8,
+        worst_y: 44,
+        zwr: "OSEHRA ZGO Export: IFCAP PO INQUIRY PARITY CORPUS\nZWR\n".to_string(),
+    };
+    let entries = corpus_entries(&model);
+    let ids: Vec<String> = entries.iter().map(|entry| entry.id.clone()).collect();
+    assert!(
+        matches!(
+            load_corpus_run(folder.path(), &ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "the run must verify before the edit"
+    );
+    let judgement = judge(&folder, &entries);
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    assert!(
+        run_failures(&[], &[], &judgement.integrity).is_empty(),
+        "a verified run adds no failure"
+    );
+    let export = format!("export_sha256={}", sha256_hex(b"synthetic export"));
+    let run_line = [
+        r#"Recording run: image_digest=`"synthetic"`"#,
+        r#"snapshot_id=`"synthetic"`"#,
+        r#"source_revision=`"synthetic"`"#,
+        r##"context=`"{\"DUZ\":\".5\",\"IOF\":\"#\",\"IOSL\":\"60\",\"STATION\":\"500\"}"`"##,
+        r#"start_command=`"docker exec -i vehu su - vehu -c \"<start command>\""`"#,
+        export.as_str(),
+        "exports=IDENTICAL runs=IDENTICAL",
+    ]
+    .join("; ");
+    let moves = [
+        "| Case | Specified class | Final class | Branch |",
+        "|---|---|---|---|",
+        "| CE-04 | IN | BOUNDARY | PO-09.b11 |",
+    ]
+    .join("\n");
+    let findings = [
+        "| Case | Outcome | Cause |",
+        "|---|---|---|",
+        r"| CP-003 | Implemented(PO-30.b1) | synthetic \| finding |",
+    ]
+    .join("\n");
+    let drops = [
+        "| Round | Case | Dimension | Value | Branch |",
+        "|---|---|---|---|---|",
+        "| 1 | CP-002 | item.cost | 3dp | PO-30.b2 |",
+    ]
+    .join("\n");
+    let boundary_map = [
+        "| Case | Input lines | Expected branch | Recorded |",
+        "|---|---|---|---|",
+        r#"| CE-17 | `""`, `""`, `"CP002"`, `""`, `""`, `"^"`, `"^"`, `"^"` | PO-09.b6 | yes |"#,
+    ]
+    .join("\n");
+    // The MISMATCH cell: `|` escaped, and a two-backtick fence around the
+    // quoted line, which holds one backtick on each side of `C`.
+    let cases = [
+        "| Case | Class | Verdict | First differing line |",
+        "|---|---|---|---|",
+        "| CP-001 | CP | MATCH | — |",
+        r#"| CP-002 | CP | MISMATCH | transcript differs at line 2: expected ``"A\|B `C`"``, actual `""`, not attributed |"#,
+        "| CP-003 | CP | QUARANTINED | — |",
+        "| CE-01 | IN | NOT COMPARED | no capture |",
+        "| CE-17 | BOUNDARY | BOUNDARY | — |",
+        "| CR-01 | CR | MATCH | — |",
+    ]
+    .join("\n");
+    let matched = matched_line(judgement.matched, judgement.in_scope);
+    assert_eq!(
+        matched, "MATCHED 1 OF 2 IN-SCOPE CORPUS CASES",
+        "n counts CP-001 alone, and m CP-001 and CP-002"
+    );
+    assert_block_parts(
+        &corpus_block(&model, &judgement, &matched),
+        &[
+            ("heading", CORPUS_HEADING.to_string()),
+            ("run line", run_line),
+            (
+                "count table",
+                [
+                    "| Class | MATCH | MISMATCH | NOT COMPARED | BOUNDARY | QUARANTINED | Total |",
+                    "|---|---|---|---|---|---|---|",
+                    "| CP | 1 | 1 | 0 | 0 | 1 | 3 |",
+                    "| IN | 0 | 0 | 1 | 0 | 0 | 1 |",
+                    "| BOUNDARY | 0 | 0 | 0 | 1 | 0 | 1 |",
+                    "| CR | 1 | 0 | 0 | 0 | 0 | 1 |",
+                ]
+                .join("\n"),
+            ),
+            ("MATCHED line", matched.clone()),
+            ("per-case table", cases),
+            ("class moves heading", "#### Class moves".to_string()),
+            ("class moves", moves.clone()),
+            ("findings heading", "#### Findings".to_string()),
+            ("findings", findings.clone()),
+            (
+                "dropped variants heading",
+                "#### Dropped variants".to_string(),
+            ),
+            ("dropped variants", drops.clone()),
+            ("BOUNDARY map heading", "#### BOUNDARY map".to_string()),
+            ("BOUNDARY map", boundary_map.clone()),
+            (
+                "CR world labels heading",
+                "#### CR world labels".to_string(),
+            ),
+            (
+                "CR world labels",
+                [
+                    "| CR case | GC case | Label | First differing line |",
+                    "|---|---|---|---|",
+                    "| CR-01 | GC-01 | WORLD-INDEPENDENT | — |",
+                ]
+                .join("\n"),
+            ),
+        ],
+    );
+
+    let mut replaced = false;
+    let edited: String = rust
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' if !replaced => {
+                replaced = true;
+                if c == 'X' { 'Y' } else { 'X' }
+            }
+            c => c,
+        })
+        .collect();
+    assert!(
+        replaced && edited.len() == rust.len(),
+        "one byte must change"
+    );
+    folder.transcript("CP-001", &edited);
+    let named = Path::new("CP-001")
+        .join("transcript.txt")
+        .display()
+        .to_string();
+    let cause = match load_corpus_run(folder.path(), &ids) {
+        Err(cause) => cause,
+        Ok(run) => panic!("an edited transcript passed its digest list: {run:?}"),
+    };
+    assert!(cause.contains(&named), "cause: {cause}");
+    assert_eq!(
+        cause,
+        format!(
+            "{}: SHA-256 differs from {SUMS_NAME}",
+            folder.path().join(&named).display()
+        ),
+        "the run's cause names the edited transcript"
+    );
+    let judgement = judge(&folder, &entries);
+    assert!(
+        judgement
+            .integrity
+            .iter()
+            .any(|cause| cause.contains(&named)),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    assert_eq!(
+        verdict_of(&judgement, "CP-001").verdict,
+        NOT_COMPARED,
+        "CP-001 verdict"
+    );
+    // The run's failure, then CP-001's own: its load binds the edited
+    // transcript to the same listing, which fails with the same cause.
+    let cause = crate_relative(&cause);
+    assert_eq!(
+        judgement.integrity,
+        [cause.clone(), cause.clone()],
+        "integrity failures, the run's first"
+    );
+    let corpus_failure = format!("corpus integrity FAIL: {cause}");
+    assert_eq!(
+        run_failures(&[], &[], &judgement.integrity),
+        [corpus_failure.clone(), corpus_failure.clone()],
+        "a failed run adds one failure per integrity cause"
+    );
+    let failed = integrity_line(&cause);
+    let not_compared = matched_line(judgement.matched, judgement.in_scope);
+    assert_eq!(
+        not_compared,
+        matched_line(0, 0),
+        "a failed run compares nothing"
+    );
+    assert_block_parts(
+        &corpus_block(&model, &judgement, &not_compared),
+        &[
+            ("heading", CORPUS_HEADING.to_string()),
+            ("run line", failed),
+            (
+                "count table",
+                [
+                    "| Class | MATCH | MISMATCH | NOT COMPARED | BOUNDARY | QUARANTINED | Total |",
+                    "|---|---|---|---|---|---|---|",
+                    "| CP | 0 | 0 | 3 | 0 | 0 | 3 |",
+                    "| IN | 0 | 0 | 1 | 0 | 0 | 1 |",
+                    "| BOUNDARY | 0 | 0 | 0 | 1 | 0 | 1 |",
+                    "| CR | 0 | 0 | 1 | 0 | 0 | 1 |",
+                ]
+                .join("\n"),
+            ),
+            ("MATCHED line", not_compared.clone()),
+            (
+                "per-case table",
+                [
+                    "| Case | Class | Verdict | First differing line |",
+                    "|---|---|---|---|",
+                    "| CP-001 | CP | NOT COMPARED | recording run integrity failure |",
+                    "| CP-002 | CP | NOT COMPARED | recording run integrity failure |",
+                    "| CP-003 | CP | NOT COMPARED | recording run integrity failure |",
+                    "| CE-01 | IN | NOT COMPARED | recording run integrity failure |",
+                    "| CE-17 | BOUNDARY | BOUNDARY | — |",
+                    "| CR-01 | CR | NOT COMPARED | recording run integrity failure |",
+                ]
+                .join("\n"),
+            ),
+            ("class moves heading", "#### Class moves".to_string()),
+            ("class moves", moves),
+            ("findings heading", "#### Findings".to_string()),
+            ("findings", findings),
+            (
+                "dropped variants heading",
+                "#### Dropped variants".to_string(),
+            ),
+            ("dropped variants", drops),
+            ("BOUNDARY map heading", "#### BOUNDARY map".to_string()),
+            ("BOUNDARY map", boundary_map),
+            (
+                "CR world labels heading",
+                "#### CR world labels".to_string(),
+            ),
+            (
+                "CR world labels",
+                [
+                    "| CR case | GC case | Label | First differing line |",
+                    "|---|---|---|---|",
+                    "| CR-01 | GC-01 | NOT COMPARED | recording run integrity failure |",
+                ]
+                .join("\n"),
+            ),
+        ],
+    );
+
+    // The failure order of `equivalence_report`: a FAIL case with its first
+    // cause, then a failed harness check, then each corpus failure. A PASS
+    // case and a passed check add nothing.
+    let gc_result = |id: &'static str, verdict: &'static str, causes: &[&str]| CaseResult {
+        id,
+        verdict,
+        readiness: "READY".to_string(),
+        rules: Rules::Listed(Vec::new()),
+        image_digest: None,
+        snapshot_id: None,
+        causes: causes.iter().map(|cause| cause.to_string()).collect(),
+        store_changed: Some(false),
+    };
+    let results = [
+        gc_result("GC-01", PASS, &[]),
+        gc_result(
+            "GC-02",
+            FAIL,
+            &["synthetic first cause", "synthetic second cause"],
+        ),
+    ];
+    let checks = [
+        Check {
+            name: "fixtures loaded",
+            passed: true,
+            detail: "synthetic nodes".to_string(),
+        },
+        Check {
+            name: "store equal to its pre-call clone",
+            passed: false,
+            detail: "synthetic change".to_string(),
+        },
+    ];
+    assert_eq!(
+        run_failures(&results, &checks, &judgement.integrity),
+        [
+            "GC-02 FAIL: synthetic first cause".to_string(),
+            "harness check store equal to its pre-call clone FAIL: synthetic change".to_string(),
+            corpus_failure.clone(),
+            corpus_failure,
+        ],
+        "failures: GC FAIL, then failed harness checks, then corpus integrity"
+    );
+
+    // Each folder below records CP-001 alone, so its run is read for that
+    // case only.
+    let ids = ["CP-001".to_string()];
+
+    // Every other listed file replaced after a valid run loaded, in a fresh
+    // folder each, its stale digest kept and its new text still valid: the
+    // run fails and names that file, as the case reader does for the case's
+    // own input, and CP-001 is NOT COMPARED for the failed run.
+    let other = committed_inputs("CP-002");
+    assert_ne!(other, inputs, "CP-002's input must differ from CP-001's");
+    let other_input: String = other.iter().map(|input| format!("{input}\n")).collect();
+    let changed_meta = format!(
+        "image_digest=synthetic\nsnapshot_id=synthetic-changed\nsource_revision=synthetic\n\
+         context={SYNTHETIC_CONTEXT}\nstart_command={SYNTHETIC_START}\n"
+    );
+    let changed_summary = format!(
+        "exports=IDENTICAL\nexport_sha256={}\nruns=IDENTICAL\nCP-001\tRECORDED\t0\t1\n",
+        sha256_hex(b"synthetic export")
+    );
+    let appended_base = "synthetic=written by tests/equivalence.rs, not a snapshot\n\
+                         snapshot_image=synthetic\nsnapshot_id=synthetic\nappended=synthetic\n";
+    let tampered = [
+        ("edited-input", "CP-001/input.txt", other_input.as_str()),
+        ("edited-meta", "meta.txt", changed_meta.as_str()),
+        (
+            "edited-summary",
+            "run-summary.txt",
+            changed_summary.as_str(),
+        ),
+        ("edited-base", "BASE.txt", appended_base),
+    ];
+    for (name, relative, text) in tampered {
+        let mut run = TempCorpus::new(name);
+        run.input("CP-001", &inputs);
+        run.transcript("CP-001", &rust);
+        run.run(&[("CP-001", "RECORDED")]);
+        assert!(
+            matches!(
+                load_corpus_run(run.path(), &ids),
+                Ok(CorpusRun::Recorded { .. })
+            ),
+            "{name}: the valid run must load"
+        );
+        run.write(relative, text);
+        let cause = format!(
+            "{}: SHA-256 differs from SHA256SUMS",
+            run.path().join(relative).display()
+        );
+        assert_eq!(
+            load_corpus_run(run.path(), &ids),
+            Err(cause.clone()),
+            "{name}: run"
+        );
+        if relative == "CP-001/input.txt" {
+            assert_eq!(
+                load_corpus_case(run.path(), "CP-001"),
+                Err(cause.clone()),
+                "{name}: CP-001"
+            );
+        }
+        let judgement = judge(&run, &[entry("CP-001", CLASS_CP, &inputs, None)]);
+        let cause = crate_relative(&cause);
+        assert_eq!(
+            judgement.run_line,
+            integrity_line(&cause),
+            "{name}: run line"
+        );
+        assert_eq!(
+            judgement.integrity.first(),
+            Some(&cause),
+            "{name}: integrity"
+        );
+        let verdict = verdict_of(&judgement, "CP-001");
+        assert_eq!(verdict.verdict, NOT_COMPARED, "{name}: CP-001 verdict");
+        assert_eq!(
+            verdict.detail, RUN_INTEGRITY_FAILURE,
+            "{name}: CP-001 detail"
+        );
+    }
+
+    // A case file replaced after the run loaded, its stale digest kept: the
+    // case reader binds the very text it returns to the digest list on every
+    // call, so it fails although the run verified, and loads again once the
+    // text is restored. A listed transcript then deleted fails both readers.
+    let mut reload = TempCorpus::new("edited-reload");
+    reload.input("CP-001", &inputs);
+    reload.transcript("CP-001", &rust);
+    reload.run(&[("CP-001", "RECORDED")]);
+    let transcript_path = reload.path().join("CP-001").join("transcript.txt");
+    let input_path = reload.path().join("CP-001").join("input.txt");
+    let loads = |folder: &TempCorpus| {
+        matches!(
+            load_corpus_case(folder.path(), "CP-001"),
+            Ok(case) if case.inputs == inputs && case.transcript.as_deref() == Some(rust.as_str())
+        )
+    };
+    assert!(
+        matches!(
+            load_corpus_run(reload.path(), &ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "the valid run must load"
+    );
+    assert!(loads(&reload), "CP-001 must load from the verified run");
+    reload.transcript("CP-001", &with_line(&rust, 2, "SYNTHETIC REPLACED LINE"));
+    assert_eq!(
+        load_corpus_case(reload.path(), "CP-001"),
+        Err(format!(
+            "{}: SHA-256 differs from SHA256SUMS",
+            transcript_path.display()
+        )),
+        "CP-001 with its transcript replaced after the run loaded"
+    );
+    reload.transcript("CP-001", &rust);
+    assert!(
+        loads(&reload),
+        "CP-001 must load with its transcript restored"
+    );
+    reload.input("CP-001", &other);
+    assert_eq!(
+        load_corpus_case(reload.path(), "CP-001"),
+        Err(format!(
+            "{}: SHA-256 differs from SHA256SUMS",
+            input_path.display()
+        )),
+        "CP-001 with its input replaced after the run loaded"
+    );
+    reload.input("CP-001", &inputs);
+    assert!(loads(&reload), "CP-001 must load with its input restored");
+    if let Err(err) = fs::remove_file(&transcript_path) {
+        panic!("cannot remove {}: {err}", transcript_path.display());
+    }
+    let missing = format!(
+        "{}: listed in SHA256SUMS but missing",
+        transcript_path.display()
+    );
+    assert_eq!(
+        load_corpus_case(reload.path(), "CP-001"),
+        Err(missing.clone()),
+        "CP-001 with its listed transcript deleted"
+    );
+    assert_eq!(
+        load_corpus_run(reload.path(), &ids),
+        Err(missing),
+        "run with a listed transcript deleted"
+    );
+
+    // The listing rewritten after a run verified, so that a fresh run and
+    // the case reader verify the new bytes: judged against the run read
+    // first, each case whose transcript that run does not vouch for fails,
+    // naming its transcript, and none is compared. CP-001's transcript is
+    // replaced, CP-002, which held none, gains one that would MATCH, and
+    // CP-003's listed transcript is removed.
+    let mut relisted = TempCorpus::new("edited-relisted");
+    relisted.input("CP-001", &inputs);
+    relisted.transcript("CP-001", &rust);
+    relisted.input("CP-002", &other);
+    relisted.input("CP-003", &paging);
+    relisted.transcript("CP-003", "SYNTHETIC CAPTURE\n");
+    relisted.run(&[
+        ("CP-001", "RECORDED"),
+        ("CP-002", "RECORDED"),
+        ("CP-003", "RECORDED"),
+    ]);
+    let relisted_entries = [
+        entry("CP-001", CLASS_CP, &inputs, None),
+        entry("CP-002", CLASS_CP, &other, None),
+        entry("CP-003", CLASS_CP, &paging, None),
+    ];
+    let relisted_ids: Vec<String> = relisted_entries.iter().map(|row| row.id.clone()).collect();
+    let verified = load_corpus_run(relisted.path(), &relisted_ids);
+    match &verified {
+        Ok(CorpusRun::Recorded { transcripts, .. }) => assert_eq!(
+            transcripts,
+            &[
+                ("CP-001".to_string(), sha256_hex(rust.as_bytes())),
+                ("CP-003".to_string(), sha256_hex(b"SYNTHETIC CAPTURE\n")),
+            ],
+            "the transcripts the first listing names, in listing order"
+        ),
+        unverified => panic!("the first listing must verify: {unverified:?}"),
+    }
+    relisted.transcript("CP-001", &with_line(&rust, 2, "SYNTHETIC RELISTED LINE"));
+    relisted.transcript("CP-002", &rust_transcript(&other));
+    relisted.remove("CP-003/transcript.txt");
+    relisted.sums();
+    assert!(
+        matches!(
+            load_corpus_run(relisted.path(), &relisted_ids),
+            Ok(CorpusRun::Recorded { .. })
+        ),
+        "a fresh read verifies the rewritten listing"
+    );
+    for id in &relisted_ids {
+        if let Err(cause) = load_corpus_case(relisted.path(), id) {
+            panic!("{id} must load under the rewritten listing: {cause}");
+        }
+    }
+    let held = |id: &str, cause: &str| {
+        crate_relative(&format!(
+            "{}: {cause}",
+            relisted.path().join(id).join("transcript.txt").display()
+        ))
+    };
+    let causes = [
+        held(
+            "CP-001",
+            "SHA-256 differs from the SHA256SUMS the recording run verified",
+        ),
+        held(
+            "CP-002",
+            "not listed in the SHA256SUMS the recording run verified",
+        ),
+        held(
+            "CP-003",
+            "listed in the SHA256SUMS the recording run verified but missing",
+        ),
+    ];
+    let judgement = judge_with_run(
+        verified,
+        relisted.path(),
+        &default_dir(),
+        test_world_b(),
+        &relisted_entries,
+        &literal_rows(SPEC),
+    );
+    assert_eq!(
+        judgement.integrity, causes,
+        "each case the first listing does not vouch for, in case order"
+    );
+    assert_eq!(
+        causes.first().map(|cause| integrity_line(cause)),
+        Some(judgement.run_line.clone()),
+        "the run line names CP-001's transcript"
+    );
+    for (id, recorded) in [("CP-001", true), ("CP-002", true), ("CP-003", false)] {
+        let judged = verdict_of(&judgement, id);
+        assert_eq!(
+            (judged.verdict, judged.detail.as_str(), judged.recorded),
+            (NOT_COMPARED, CASE_INTEGRITY_FAILURE, recorded),
+            "{id} verdict, detail and recorded, against the first listing"
+        );
+    }
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m against the first listing"
+    );
+
+    // An input relisted after a run verified: the run read first recorded
+    // CP-001 with CP-002's committed input beside the model's CP-001
+    // transcript, so the case is NOT COMPARED for its input. CP-001's model
+    // input is then written and the listing rewritten to match, which a
+    // fresh run and the case reader verify, but judged against the run read
+    // first the case fails, naming its input, and nothing is compared.
+    let mut relisted_input = TempCorpus::new("edited-relisted-input");
+    relisted_input.input("CP-001", &other);
+    relisted_input.transcript("CP-001", &rust);
+    relisted_input.run(&[("CP-001", "RECORDED")]);
+    let input_entries = [entry("CP-001", CLASS_CP, &inputs, None)];
+    let first = load_corpus_run(relisted_input.path(), &ids);
+    match &first {
+        Ok(CorpusRun::Recorded {
+            inputs: listed_inputs,
+            ..
+        }) => assert_eq!(
+            listed_inputs,
+            &[("CP-001".to_string(), sha256_hex(other_input.as_bytes()))],
+            "the input the first listing names, with its digest"
+        ),
+        unverified => panic!("the first listing must verify: {unverified:?}"),
+    }
+    let relisted_path = relisted_input.path().join("CP-001").join("input.txt");
+    let before = judge(&relisted_input, &input_entries);
+    assert_eq!(
+        before.integrity,
+        [crate_relative(&format!(
+            "{}: committed input differs from the generated model",
+            relisted_path.display()
+        ))],
+        "CP-001 recorded with another case's input"
+    );
+    relisted_input.input("CP-001", &inputs);
+    relisted_input.sums();
+    let fresh = load_corpus_run(relisted_input.path(), &ids);
+    assert!(
+        matches!(fresh, Ok(CorpusRun::Recorded { .. })),
+        "a fresh read verifies the relisted input: {fresh:?}"
+    );
+    let relisted_case = match load_corpus_case(relisted_input.path(), "CP-001") {
+        Ok(case) => case,
+        Err(cause) => panic!("CP-001 must load under the relisted input: {cause}"),
+    };
+    assert_eq!(
+        relisted_case.inputs, inputs,
+        "CP-001 loads the model's inputs under the rewritten listing"
+    );
+    assert_eq!(
+        fresh.map(|run| run.confirm_case(relisted_input.path(), &relisted_case)),
+        Ok(Ok(())),
+        "the fresh run vouches for the input it lists with its final newline"
+    );
+    let input_cause = crate_relative(&format!(
+        "{}: SHA-256 differs from the SHA256SUMS the recording run verified",
+        relisted_path.display()
+    ));
+    let judgement = judge_with_run(
+        first,
+        relisted_input.path(),
+        &default_dir(),
+        test_world_b(),
+        &input_entries,
+        &literal_rows(SPEC),
+    );
+    assert_eq!(
+        judgement.integrity,
+        [input_cause.as_str()],
+        "CP-001's relisted input, against the first listing"
+    );
+    assert_eq!(
+        judgement.run_line,
+        integrity_line(&input_cause),
+        "the run line names CP-001's input"
+    );
+    let judged = verdict_of(&judgement, "CP-001");
+    assert_eq!(
+        (judged.verdict, judged.detail.as_str()),
+        (NOT_COMPARED, CASE_INTEGRITY_FAILURE),
+        "CP-001 verdict and detail, its input relisted"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m, CP-001's input relisted"
+    );
+
+    // An input the run lists as written without its final newline, which
+    // splits into the same inputs, and an input the run does not list at
+    // all, written after the digest list: each run vouches for its case.
+    let mut unterminated = TempCorpus::new("edited-unterminated-input");
+    unterminated.write("CP-001/input.txt", &inputs.join("\n"));
+    unterminated.transcript("CP-001", &rust);
+    unterminated.run(&[("CP-001", "RECORDED")]);
+    let mut unlisted = TempCorpus::new("edited-unlisted-input");
+    unlisted.transcript("CP-001", &rust);
+    unlisted.run(&[("CP-001", "RECORDED")]);
+    unlisted.input("CP-001", &inputs);
+    let unterminated_digest = sha256_hex(inputs.join("\n").as_bytes());
+    for (name, folder, listed) in [
+        (
+            "unterminated",
+            &unterminated,
+            vec![("CP-001".to_string(), unterminated_digest)],
+        ),
+        ("unlisted", &unlisted, Vec::new()),
+    ] {
+        let run = load_corpus_run(folder.path(), &ids);
+        match &run {
+            Ok(CorpusRun::Recorded {
+                inputs: listed_inputs,
+                ..
+            }) => assert_eq!(listed_inputs, &listed, "{name}: the inputs listed"),
+            unverified => panic!("{name}: the run must verify: {unverified:?}"),
+        }
+        let case = match load_corpus_case(folder.path(), "CP-001") {
+            Ok(case) => case,
+            Err(cause) => panic!("{name}: CP-001 must load: {cause}"),
+        };
+        assert_eq!(case.inputs, inputs, "{name}: CP-001 inputs");
+        assert_eq!(
+            run.map(|run| run.confirm_case(folder.path(), &case)),
+            Ok(Ok(())),
+            "{name}: the run vouches for CP-001's input"
+        );
+    }
+}
+
+/// A CR capture equal to its GC capture is WORLD-INDEPENDENT, unless it was
+/// recorded with an input other than the model's, which makes the case and
+/// its label NOT COMPARED. The case is MATCH and outside n and m, and
+/// without the GC capture its label is NOT COMPARED while its verdict stands.
+/// On Unix, the same capture reached through a symbolic link (at the
+/// transcript, the input, the case folder, `meta.txt` or the corpus folder
+/// itself, its target outside the folder under test) is refused as
+/// `<path>: symbolic link`, so the case and its label are NOT COMPARED, and
+/// a dangling transcript link counts as present. On Linux, a case folder
+/// swapped for a link to an outside folder holding the only transcript the
+/// listing verifies, and back, again and again while the run and the case
+/// are read, never lets either reader accept.
+#[test]
+fn corpus_cr_world_independent() {
+    let mut folder = TempCorpus::new("world-independent");
+    let (gc, inputs) = cr_case("CR-01");
+    folder.input("CR-01", &inputs);
+    folder.transcript("CR-01", &gc_transcript(gc));
+    folder.run(&[("CR-01", "RECORDED")]);
+    let judgement = judge(&folder, &[entry("CR-01", CLASS_CR, &inputs, Some(gc))]);
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    match &verdict_of(&judgement, "CR-01").world {
+        Some(world) => {
+            assert_eq!(world.gc, gc, "GC case");
+            assert_eq!(world.label, WORLD_INDEPENDENT, "detail: {}", world.detail);
+            assert_eq!(world.detail, NO_DETAIL, "WORLD-INDEPENDENT detail");
+        }
+        None => panic!("CR-01 has no world label"),
+    }
+    // CR-01's Rust transcript on world B equals the GC-01 capture, so the
+    // case is MATCH, and a CR MATCH stays outside n and m.
+    assert_eq!(
+        rust_transcript(&inputs),
+        gc_transcript(gc),
+        "CR-01's Rust transcript on world B must equal the GC-01 capture"
+    );
+    let verdict = verdict_of(&judgement, "CR-01");
+    assert_eq!(verdict.verdict, MATCH, "detail: {}", verdict.detail);
+    assert_eq!(verdict.detail, NO_DETAIL, "CR-01 detail");
+    assert!(verdict.recorded, "CR-01 is recorded");
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m"
+    );
+
+    // The same folder judged against a GC folder that does not exist: the
+    // label is NOT COMPARED for want of the GC capture, while the case
+    // keeps its own verdict.
+    let no_gc = folder.path().join("no-gc");
+    let judgement = judge_corpus(
+        folder.path(),
+        &no_gc,
+        test_world_b(),
+        &[entry("CR-01", CLASS_CR, &inputs, Some(gc))],
+        &literal_rows(SPEC),
+    );
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    let verdict = verdict_of(&judgement, "CR-01");
+    assert_eq!(verdict.verdict, MATCH, "detail: {}", verdict.detail);
+    assert_eq!(verdict.detail, NO_DETAIL, "CR-01 detail");
+    let world = world_of(verdict);
+    assert_eq!(world.gc, gc, "GC case");
+    assert_eq!(world.label, NOT_COMPARED, "label without the GC capture");
+    assert_eq!(
+        world.detail, "GC-01 capture not loaded",
+        "label detail without the GC capture"
+    );
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m"
+    );
+
+    // The same capture recorded with CR-02's input and refreshed digests:
+    // the case fails its own integrity check, so its verdict and its world
+    // label are NOT COMPARED, not WORLD-INDEPENDENT.
+    let mut changed = TempCorpus::new("world-independent-changed-input");
+    let (_, other) = cr_case("CR-02");
+    assert_ne!(other, inputs, "CR-02's input must differ from CR-01's");
+    changed.input("CR-01", &other);
+    changed.transcript("CR-01", &gc_transcript(gc));
+    changed.run(&[("CR-01", "RECORDED")]);
+    let judgement = judge(&changed, &[entry("CR-01", CLASS_CR, &inputs, Some(gc))]);
+    assert!(
+        !judgement.integrity.is_empty(),
+        "a changed CR input must fail integrity"
+    );
+    let verdict = verdict_of(&judgement, "CR-01");
+    assert_eq!(verdict.verdict, NOT_COMPARED, "detail: {}", verdict.detail);
+    assert_eq!(verdict.detail, CASE_INTEGRITY_FAILURE, "CR-01 detail");
+    match &verdict.world {
+        Some(world) => {
+            assert_eq!(world.label, NOT_COMPARED, "detail: {}", world.detail);
+            assert_eq!(world.detail, CASE_INTEGRITY_FAILURE, "CR-01 label detail");
+        }
+        None => panic!("CR-01 has no world label"),
+    }
+
+    // The same capture reached through a symbolic link, whose target lives
+    // in a separate synthetic folder outside the corpus folder under test:
+    // no link is followed, so each is `<path>: symbolic link` even where
+    // the bytes behind it would verify, and a dangling one is a recording
+    // to verify, never an absent one. Unix only, where a test can link.
+    #[cfg(unix)]
+    {
+        let capture = gc_transcript(gc);
+        let ids = ["CR-01".to_string()];
+        let linked = |root: &Path, relative: &str| {
+            format!("{}: symbolic link", root.join(relative).display())
+        };
+
+        // (a) The transcript links to an outside file holding the GC-01
+        // capture bytes, listed with their digest.
+        let mut target = TempCorpus::new("world-independent-link-transcript-target");
+        target.transcript("CR-01", &capture);
+        let mut folder = TempCorpus::new("world-independent-link-transcript");
+        folder.input("CR-01", &inputs);
+        folder.link("CR-01/transcript.txt", &target, "CR-01/transcript.txt");
+        folder.run(&[("CR-01", "RECORDED")]);
+        let cause = linked(folder.path(), "CR-01/transcript.txt");
+        assert_eq!(
+            load_corpus_run(folder.path(), &ids),
+            Err(cause.clone()),
+            "(a) run with a linked transcript"
+        );
+        assert_eq!(
+            load_corpus_case(folder.path(), "CR-01"),
+            Err(cause.clone()),
+            "(a) case with a linked transcript"
+        );
+        assert!(
+            corpus_transcript_exists(folder.path(), "CR-01"),
+            "(a) a linked transcript is present"
+        );
+        let judgement = judge(&folder, &[entry("CR-01", CLASS_CR, &inputs, Some(gc))]);
+        assert!(
+            judgement.integrity.contains(&cause),
+            "(a) integrity: {:?}",
+            judgement.integrity
+        );
+        assert_eq!(judgement.run_line, integrity_line(&cause), "(a) run line");
+        let verdict = verdict_of(&judgement, "CR-01");
+        assert_eq!(
+            verdict.verdict, NOT_COMPARED,
+            "(a) detail: {}",
+            verdict.detail
+        );
+        assert_eq!(verdict.detail, RUN_INTEGRITY_FAILURE, "(a) CR-01 detail");
+        match &verdict.world {
+            Some(world) => assert_eq!(world.label, NOT_COMPARED, "(a) {}", world.detail),
+            None => panic!("(a) CR-01 has no world label"),
+        }
+
+        // (b) The input links to an outside file holding the right input.
+        let mut target = TempCorpus::new("world-independent-link-input-target");
+        target.input("CR-01", &inputs);
+        let mut folder = TempCorpus::new("world-independent-link-input");
+        folder.link("CR-01/input.txt", &target, "CR-01/input.txt");
+        folder.transcript("CR-01", &capture);
+        folder.run(&[("CR-01", "RECORDED")]);
+        let cause = linked(folder.path(), "CR-01/input.txt");
+        assert_eq!(
+            load_corpus_run(folder.path(), &ids),
+            Err(cause.clone()),
+            "(b) run with a linked input"
+        );
+        assert_eq!(
+            load_corpus_case(folder.path(), "CR-01"),
+            Err(cause),
+            "(b) case with a linked input"
+        );
+
+        // (c) The case folder links to an outside folder holding a valid
+        // input and transcript.
+        let mut target = TempCorpus::new("world-independent-link-folder-target");
+        target.input("CR-01", &inputs);
+        target.transcript("CR-01", &capture);
+        let mut folder = TempCorpus::new("world-independent-link-folder");
+        folder.link("CR-01", &target, "CR-01");
+        folder.run(&[("CR-01", "RECORDED")]);
+        let cause = linked(folder.path(), "CR-01");
+        assert_eq!(
+            load_corpus_run(folder.path(), &ids),
+            Err(cause.clone()),
+            "(c) run with a linked case folder"
+        );
+        assert_eq!(
+            load_corpus_case(folder.path(), "CR-01"),
+            Err(cause),
+            "(c) case with a linked case folder"
+        );
+        assert!(
+            corpus_transcript_exists(folder.path(), "CR-01"),
+            "(c) a linked case folder is not confirmed to lack a transcript"
+        );
+
+        // (d) `meta.txt` links to an outside valid one. Only the run reads
+        // it: a case reads its own files and the digest list alone.
+        let mut target = TempCorpus::new("world-independent-link-meta-target");
+        target.run_files(&[("CR-01", "RECORDED")]);
+        let mut folder = TempCorpus::new("world-independent-link-meta");
+        folder.input("CR-01", &inputs);
+        folder.transcript("CR-01", &capture);
+        folder.run_files(&[("CR-01", "RECORDED")]);
+        folder.link("meta.txt", &target, "meta.txt");
+        folder.sums();
+        assert_eq!(
+            load_corpus_run(folder.path(), &ids),
+            Err(linked(folder.path(), "meta.txt")),
+            "(d) run with a linked meta.txt"
+        );
+        assert_eq!(
+            load_corpus_case(folder.path(), "CR-01").map(|case| case.transcript),
+            Ok(Some(capture.clone())),
+            "(d) the case reads no meta.txt"
+        );
+
+        // (e) The corpus folder itself is a link, made in an outside
+        // folder, to an otherwise healthy corpus folder; a trailing
+        // separator, through which a path's metadata is its target's,
+        // hides nothing.
+        let mut healthy = TempCorpus::new("world-independent-link-root-target");
+        healthy.input("CR-01", &inputs);
+        healthy.transcript("CR-01", &capture);
+        healthy.run(&[("CR-01", "RECORDED")]);
+        assert!(
+            matches!(
+                load_corpus_run(healthy.path(), &ids),
+                Ok(CorpusRun::Recorded { .. })
+            ),
+            "(e) the linked-to corpus folder verifies on its own"
+        );
+        let mut holder = TempCorpus::new("world-independent-link-root");
+        holder.link("corpus", &healthy, "");
+        let root = holder.path().join("corpus");
+        let slashed = root.join("");
+        let cause = format!("{}: symbolic link", root.display());
+        for given in [&root, &slashed] {
+            assert_eq!(
+                load_corpus_run(given, &ids),
+                Err(cause.clone()),
+                "(e) run from {}",
+                given.display()
+            );
+            assert_eq!(
+                load_corpus_case(given, "CR-01"),
+                Err(cause.clone()),
+                "(e) case from {}",
+                given.display()
+            );
+            assert!(
+                corpus_transcript_exists(given, "CR-01"),
+                "(e) a linked corpus folder is not confirmed to lack a transcript: {}",
+                given.display()
+            );
+        }
+
+        // (f) A dangling transcript link beside the input alone: present,
+        // so the run is not absent and needs its run files, and the case
+        // fails on the link rather than loading unrecorded.
+        let target = TempCorpus::new("world-independent-link-dangling-target");
+        let mut folder = TempCorpus::new("world-independent-link-dangling");
+        folder.input("CR-01", &inputs);
+        folder.link("CR-01/transcript.txt", &target, "CR-01/transcript.txt");
+        assert!(
+            corpus_transcript_exists(folder.path(), "CR-01"),
+            "(f) a dangling transcript link is present"
+        );
+        assert_eq!(
+            load_corpus_run(folder.path(), &ids),
+            Err(format!(
+                "{}: missing",
+                folder.path().join("meta.txt").display()
+            )),
+            "(f) a dangling transcript link is a recording, not Ok(Absent)"
+        );
+        assert_eq!(
+            load_corpus_case(folder.path(), "CR-01"),
+            Err(linked(folder.path(), "CR-01/transcript.txt")),
+            "(f) case with a dangling transcript link"
+        );
+
+        // (g) The case folder swapped for a link to an outside folder that
+        // holds the only transcript the listing verifies, and back, over
+        // and over while the run and the case are read. Each file is
+        // looked up through the folder found at the case path, never
+        // through a link there, so neither reader ever accepts, whether
+        // the link is swapped back before its last check or not. Linux
+        // only, where the reader holds each folder open while it reads.
+        #[cfg(target_os = "linux")]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            /// The reads of each reader made while the folder is swapped.
+            const SWAP_READS: usize = 12_000;
+            let mut outside = TempCorpus::new("world-independent-swap-outside");
+            outside.input("CR-01", &inputs);
+            outside.transcript("CR-01", &capture);
+            let mut folder = TempCorpus::new("world-independent-swap");
+            folder.input("CR-01", &inputs);
+            folder.transcript("CR-01", &capture);
+            folder.run(&[("CR-01", "RECORDED")]);
+            // Rewritten after the listing, so that only the outside
+            // transcript has the digest listed for CR-01's.
+            folder.transcript("CR-01", "ORDINARY\n");
+            let stale = format!(
+                "{}: SHA-256 differs from SHA256SUMS",
+                folder.path().join("CR-01/transcript.txt").display()
+            );
+            assert_eq!(
+                load_corpus_run(folder.path(), &ids),
+                Err(stale.clone()),
+                "(g) unswapped, the run fails on the folder's own transcript"
+            );
+            assert_eq!(
+                load_corpus_case(folder.path(), "CR-01"),
+                Err(stale),
+                "(g) unswapped, the case fails on the folder's own transcript"
+            );
+            let live = folder.path().join("CR-01");
+            let parked = folder.path().join("CR-01-parked");
+            let target = outside.path().join("CR-01");
+            let stop = AtomicBool::new(false);
+            // Only counted inside the scope, with no assertion, so that the
+            // swapper is always stopped and joined before anything fails.
+            let (runs, cases, swapper) = std::thread::scope(|scope| {
+                let swapper = scope.spawn(|| -> std::io::Result<u64> {
+                    // The link and the folder are each held for a time swept
+                    // from 0 to 40 microseconds, independently, so that some
+                    // cycles put the link between a read's first and last
+                    // check of the folder: a reader that looks the file up
+                    // through the case path accepts some of these reads.
+                    let hold = |micros: u64| {
+                        let held = std::time::Instant::now();
+                        let span = std::time::Duration::from_micros(micros);
+                        while held.elapsed() < span {
+                            std::hint::spin_loop();
+                        }
+                    };
+                    let mut cycles = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        fs::rename(&live, &parked)?;
+                        std::os::unix::fs::symlink(&target, &live)?;
+                        hold(cycles % 41);
+                        fs::remove_file(&live)?;
+                        fs::rename(&parked, &live)?;
+                        hold(cycles / 41 % 41);
+                        cycles = cycles.saturating_add(1);
+                    }
+                    Ok(cycles)
+                });
+                let mut runs = 0usize;
+                let mut cases = 0usize;
+                for _ in 0..SWAP_READS {
+                    runs += usize::from(load_corpus_run(folder.path(), &ids).is_ok());
+                    cases += usize::from(load_corpus_case(folder.path(), "CR-01").is_ok());
+                }
+                stop.store(true, Ordering::Relaxed);
+                (runs, cases, swapper.join())
+            });
+            let cycles = match swapper {
+                Ok(swapped) => swapped.map_err(|err| err.to_string()),
+                Err(_) => Err("the swapper panicked".to_string()),
+            };
+            assert!(
+                matches!(cycles, Ok(count) if count > 0),
+                "(g) the case folder must have been swapped without error: {cycles:?}"
+            );
+            assert_eq!(
+                (runs, cases),
+                (0, 0),
+                "(g) runs and cases accepted while {} was swapped for a link to {}",
+                live.display(),
+                target.display()
+            );
+            let restored = fs::symlink_metadata(&live).map(|meta| meta.is_dir());
+            assert!(
+                matches!(restored, Ok(true)),
+                "(g) {} must be a real folder again: {restored:?}",
+                live.display()
+            );
+        }
+    }
+}
+
+/// A CR capture that differs from its GC capture is WORLD-DEPENDENT, its
+/// detail naming the first differing line with the GC capture as expected
+/// and the CR capture as actual, also when they differ only by a final
+/// `\n` removed or appended. The case is MISMATCH, its sides the other way
+/// round, and outside n and m. A line over 200 characters is cut in both
+/// causes.
+#[test]
+fn corpus_cr_world_dependent() {
+    let mut folder = TempCorpus::new("world-dependent");
+    let (gc, inputs) = cr_case("CR-01");
+    let gc_capture = gc_transcript(gc);
+    let capture = with_line(&gc_capture, 2, "SYNTHETIC WORLD B LINE");
+    folder.input("CR-01", &inputs);
+    folder.transcript("CR-01", &capture);
+    folder.run(&[("CR-01", "RECORDED")]);
+    let judgement = judge(&folder, &[entry("CR-01", CLASS_CR, &inputs, Some(gc))]);
+    assert!(
+        judgement.integrity.is_empty(),
+        "integrity: {:?}",
+        judgement.integrity
+    );
+    match &verdict_of(&judgement, "CR-01").world {
+        Some(world) => {
+            assert_eq!(world.label, WORLD_DEPENDENT, "CR-01 label");
+            assert!(
+                world.detail.contains("transcript differs at line 2")
+                    && world.detail.contains("SYNTHETIC WORLD B LINE"),
+                "detail: {}",
+                world.detail
+            );
+            assert_eq!(
+                world.detail,
+                format!(
+                    "transcript differs at line 2: expected {}, actual {}, not attributed",
+                    quote(line_at(&gc_capture, 2)),
+                    quote("SYNTHETIC WORLD B LINE")
+                ),
+                "CR-01 label detail: the GC capture is expected, the CR capture actual"
+            );
+        }
+        None => panic!("CR-01 has no world label"),
+    }
+    // CR-01's Rust transcript on world B equals the GC-01 capture, so the
+    // case verdict is MISMATCH at the same line with the sides the other way
+    // round, and a CR case stays outside n and m.
+    assert_eq!(
+        rust_transcript(&inputs),
+        gc_capture,
+        "CR-01's Rust transcript on world B must equal the GC-01 capture"
+    );
+    let verdict = verdict_of(&judgement, "CR-01");
+    assert_eq!(verdict.verdict, MISMATCH, "CR-01 verdict");
+    assert_eq!(
+        verdict.detail,
+        format!(
+            "transcript differs at line 2: expected {}, actual {}, not attributed",
+            quote("SYNTHETIC WORLD B LINE"),
+            quote(line_at(&gc_capture, 2))
+        ),
+        "CR-01 detail: the capture is expected, the Rust transcript actual"
+    );
+    assert!(verdict.recorded, "CR-01 is recorded");
+    assert_eq!(
+        (judgement.matched, judgement.in_scope),
+        (0, 0),
+        "MATCHED n OF m"
+    );
+
+    // The GC capture with its final `\n` removed, then with one appended,
+    // each recorded with fresh digests: WORLD-DEPENDENT and MISMATCH at the
+    // line past the shorter text, one side absent and the other empty.
+    let (removed, appended) = final_newline_variants(&gc_capture);
+    let lines = gc_capture.split('\n').count();
+    let extra = lines.saturating_add(1);
+    let empty = quote("");
+    // A 5,000-character line 2 in the CR capture: both causes show its first
+    // 200 characters and its length, not the whole line.
+    let long_line = format!("{}A{}", "W".repeat(3000), "W".repeat(1999));
+    let cut = format!(
+        "{}… (5000 characters, 1 to 200 shown)",
+        quote(&"W".repeat(200))
+    );
+    let differs = |line: usize, expected: &str, actual: &str| {
+        format!(
+            "transcript differs at line {line}: expected {expected}, actual {actual}, \
+             not attributed"
+        )
+    };
+    // Each: the folder, the capture, the label detail with the GC capture
+    // expected, and the verdict detail with the capture expected.
+    let subcases = [
+        (
+            "world-dependent-no-final-newline",
+            removed,
+            differs(lines, &empty, ABSENT_LINE),
+            differs(lines, ABSENT_LINE, &empty),
+        ),
+        (
+            "world-dependent-extra-final-newline",
+            appended,
+            differs(extra, ABSENT_LINE, &empty),
+            differs(extra, &empty, ABSENT_LINE),
+        ),
+        (
+            "world-dependent-long-line",
+            with_line(&gc_capture, 2, &long_line),
+            differs(2, &quote(line_at(&gc_capture, 2)), &cut),
+            differs(2, &cut, &quote(line_at(&gc_capture, 2))),
+        ),
+    ];
+    for (name, capture, world_detail, detail) in subcases {
+        let judgement = judge_recorded(name, entry("CR-01", CLASS_CR, &inputs, Some(gc)), &capture);
+        assert!(
+            judgement.integrity.is_empty(),
+            "{name} integrity: {:?}",
+            judgement.integrity
+        );
+        let verdict = verdict_of(&judgement, "CR-01");
+        let world = world_of(verdict);
+        assert_eq!(world.label, WORLD_DEPENDENT, "{name} label");
+        assert_eq!(world.detail, world_detail, "{name} label detail");
+        assert_eq!(verdict.verdict, MISMATCH, "{name} verdict");
+        assert_eq!(verdict.detail, detail, "{name} detail");
+        assert_eq!(
+            (judgement.matched, judgement.in_scope),
+            (0, 0),
+            "{name} MATCHED n OF m"
+        );
+    }
+}
+
+/// Each CR case replays exactly the inputs of the GC case it names.
+#[test]
+fn cr_inputs_equal_gc_inputs() {
+    for (index, (cr, gc, inputs)) in corpus::CR_INPUTS.into_iter().enumerate() {
+        let number = index.saturating_add(1);
+        assert_eq!(cr, format!("CR-{number:02}"), "CR case {number}");
+        assert_eq!(gc, format!("GC-{number:02}"), "GC case of {cr}");
+        match load_case(&default_dir(), gc) {
+            CaseLoad::Recorded(case) => assert_eq!(
+                case.inputs,
+                inputs
+                    .iter()
+                    .map(|input| input.to_string())
+                    .collect::<Vec<_>>(),
+                "{cr} inputs differ from the inputs of {gc}"
+            ),
+            other => panic!("{gc} is not recorded: {other:?}"),
+        }
+    }
+}
+
+/// `sha256_hex` gives the FIPS 180-2 example digests, the two-block padding
+/// case of 56 bytes, 15,625 full blocks, and 55 bytes, the largest message
+/// that pads into one block.
+#[test]
+fn sha256_known_answers() {
+    let million = "a".repeat(1_000_000);
+    let fifty_five = "a".repeat(55);
+    let vectors: [(&str, &str); 6] = [
+        (
+            "",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            "abc",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        ),
+        (
+            "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopq\
+             rlmnopqrsmnopqrstnopqrstu",
+            "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1",
+        ),
+        (
+            &million,
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+        ),
+        (
+            &fifty_five,
+            "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+        ),
+    ];
+    for (message, digest) in vectors {
+        assert_eq!(
+            sha256_hex(message.as_bytes()),
+            digest,
+            "SHA-256 of a {}-byte message",
+            message.len()
+        );
+    }
 }

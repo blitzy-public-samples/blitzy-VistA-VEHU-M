@@ -157,6 +157,19 @@ pub fn inquire(store: &Store, inputs: &[String]) -> Result<InquiryOutput, Inquir
     run(store, inputs).0
 }
 
+/// The session of [`inquire`], returned together with the `SPEC.md` branch
+/// ID of the not-implemented branch that ended it. The ID is `None` when the
+/// session ran to its end, ran out of input or reached the session output
+/// limit, and whenever the result is `Err`. This is the one way the ID leaves
+/// the crate (`SPEC.md` K16): the parity corpus uses it to classify each
+/// session.
+pub fn inquire_traced(
+    store: &Store,
+    inputs: &[String],
+) -> (Result<InquiryOutput, InquiryError>, Option<&'static str>) {
+    run(store, inputs)
+}
+
 /// The session of [`inquire`], also returning the `SPEC.md` branch ID of the
 /// unimplemented branch that ended it, if one did. It exists so unit tests
 /// can assert which branch ended a session; the ID never leaves the crate.

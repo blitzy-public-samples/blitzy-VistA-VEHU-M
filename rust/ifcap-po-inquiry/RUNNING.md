@@ -129,6 +129,56 @@ VEHU_CONTAINER=<container name> cargo run --offline --locked --bin bridge
   - The documented docker-vista start command needs an argument containing spaces, its `-c` script, which the single-space `docker_exec_args` convention cannot express (open item O-07).
   - Replay is the delivered MUMPS backend.
 
+## Step 8. Parity corpus
+
+The parity corpus is 231 sessions judged on world B: the fixtures of `tests/fixtures/ifcap/` plus `tests/fixtures/ifcap-corpus/corpus.zwr` (`SPEC.md` "Parity corpus"). This branch holds the corpus's generated data and inputs, and no recording.
+
+```text
+cargo run --offline --locked --bin corpus_gen
+cargo run --offline --locked --bin corpus_gen -- --check
+```
+
+- **`corpus_gen`**, with no argument, generates the corpus from `tests/fixtures/ifcap/*.zwr` and `SPEC.md`. Only after a successful generation does it write the 233 files: `tests/fixtures/ifcap-corpus/corpus.zwr`, `tests/golden/ifcap/corpus/manifest.tsv` and one `tests/golden/ifcap/corpus/<case id>/input.txt` per case, `CP-001` to `CP-200`, `CE-01` to `CE-26` and `CR-01` to `CR-05`. It never writes a recording file. Generated files are never edited by hand: change the generator and run it again.
+- **`--check`** writes nothing. It compares the 233 generated files byte for byte with the committed ones. It prints `check: 233 files equal` and exits 0, or prints one `differs: <path>` line per differing or missing file, then `check: <k> of 233 files differ`, and exits 1.
+- Both modes first print the summary. On this branch it reads:
+
+  ```text
+  specified: 200 CP, 26 CE (16 IN, 10 BOUNDARY), 5 CR, 50 multi-item orders
+  generated: 200 CP, 26 CE (13 IN, 13 BOUNDARY), 5 CR, 50 multi-item orders
+  moved: CE-04 IN->BOUNDARY PO-09.b11; CE-06 IN->BOUNDARY PO-09.b11; CE-08 IN->BOUNDARY PO-09.b11
+  dropped variants: 0
+  findings: 0
+  regeneration rounds: 1
+  largest item count: 8; worst $Y: 39 (bound 45)
+  ```
+
+  `specified:` counts the classes as specified, and `generated:` counts them after the generator's gate: CE-04, CE-06 and CE-08 move from IN to BOUNDARY at PO-09.b11, with their inputs unchanged (`SPEC.md` K17).
+- A generation failure writes nothing, prints `corpus_gen: <cause>` on standard error and exits 1. Any other argument prints `usage: corpus_gen [--check]` on standard error and exits 2.
+- **`cargo test --offline --locked`** now also runs `tests/corpus.rs`, the offline gate, which needs no Docker. Its 8 tests prove each case's class, the fixture profile and references, the `C`-value rules, the variation minimums, the no-paging bound, the generator's determinism, `corpus_gen --check`, and that world B keeps every world A node while world A holds no corpus node. To run it alone:
+
+  ```text
+  cargo test --offline --locked --test corpus
+  ```
+
+- **`REPORT.md` part 3** now also carries the subsection `### Parity corpus`, after the capture-readiness tables. It holds the recording-run line, the count table, the line `MATCHED n OF m IN-SCOPE CORPUS CASES`, the per-case table, and `#### Class moves`, `#### Findings`, `#### Dropped variants`, `#### BOUNDARY map` and `#### CR world labels`.
+  - With no recording, as on this branch, it reads `Recording run: none` and `MATCHED 0 OF 0 IN-SCOPE CORPUS CASES`, every CP, IN and CR case is NOT COMPARED, and every BOUNDARY case is BOUNDARY.
+  - `cargo test --offline --locked --test equivalence -- --nocapture` prints the MATCHED line after the `GC-0N <verdict>` lines.
+  - A corpus verdict never fails `cargo test`. A corpus integrity failure does, and only after `REPORT.md` is written: a recording run or a corpus case that fails its integrity checks, a committed input or `corpus.zwr` that differs from the generated one, or a corpus model or world B that cannot be built.
+- **Recording** is the team's, on its Docker host only. The prerequisite is the snapshot `vehu-snap:gc-base` of the pinned `worldvista/vehu:202609`, made by `scripts/kit/load_orders.sh` and `scripts/kit/save_state.sh`. The order is:
+
+  ```text
+  bash tests/golden/ifcap/corpus/scripts/load_corpus.sh
+  bash tests/golden/ifcap/corpus/scripts/record_corpus.sh
+  bash tests/golden/ifcap/corpus/scripts/check_corpus.sh
+  cargo test --offline --locked
+  ```
+
+  - Each script changes to the crate folder itself, so it can be started from any directory.
+  - `load_corpus.sh` and `record_corpus.sh` take `NAME` (default `vehu`), `BASE_IMAGE` (default `worldvista/vehu:202609`) and `SOURCE_REVISION` (default `dd3fd0f3124c8178657d9fff4173c324da30f7ae`) from the environment. `NAME` names a container the scripts remove and replace, and they stop before removing one not started from `vehu-snap:gc-base` or `vehu-snap:corpus-base` (or an image made from one), as `tests/golden/ifcap/README.md` Part C (C5) describes.
+  - `tests/golden/ifcap/README.md` Part C gives each script's steps, the files each writes (`BASE.txt`, the transcripts, `meta.txt`, `run-summary.txt` and `SHA256SUMS`) and the paging quarantine.
+  - This branch holds no recording.
+- On macOS the serial-run advice of `SPEC.md` open item O-12 applies to `tests/corpus.rs` too: run `cargo test --offline --locked --no-fail-fast -- --test-threads=1`.
+
 ## Failure messages
 
 | Message | Meaning | What to do |
